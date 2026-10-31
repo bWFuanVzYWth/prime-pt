@@ -1,0 +1,7 @@
+{
+  "required": true,
+  "package": "dev.primept.mixin",
+  "compatibilityLevel": "JAVA_25",
+  "client": ["DeviceAccess", "VulkanDeviceMixin", "VulkanInstanceMixin", "BackendMixin", "StreamlineBootstrapMixin", "StreamlineSurfaceMixin", "TextureMixin", "MainTargetMixin", "TargetMixin", "GameRendererMixin", "AtlasMixin", "SpriteAccess", "LevelMixin", "ExtractorMixin", "CommandMixin", "VideoSettingsScreenMixin"],
+  "injectors": {"defaultRequire": 1}
+}

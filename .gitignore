@@ -1,0 +1,10 @@
+/target/
+/native/target/
+/build/
+/.gradle/
+/run/
+/logs/
+/temp/
+/third_party/streamline/
+__pycache__/
+*.log

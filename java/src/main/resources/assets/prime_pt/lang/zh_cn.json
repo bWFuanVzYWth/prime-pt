@@ -1,0 +1,23 @@
+{
+  "primept.settings.reset": "恢复 PT 默认设置",
+  "primept.settings.render": "PT 渲染",
+  "primept.settings.ser": "Shader Execution Reordering",
+  "primept.settings.ser.tooltip": "自动检测设备能力，支持时默认启用 SER。可即时关闭或重新开启，无需重启；切换时创建对应管线，保留采样历史。\n命令：/pt ser on|off",
+  "primept.settings.rr": "DLSS Ray Reconstruction",
+  "primept.settings.rr.tooltip": "使用 DLSS RR 降噪并按所选质量档重建画面。关闭或不可用时使用原生分辨率 PT。\n命令：/pt rr on|off",
+  "primept.settings.quality": "DLSS 质量",
+  "primept.settings.quality.tooltip": "仅在 RR 启用且可用时生效。默认性能档以约一半宽高渲染（2× 超分），输出保持窗口分辨率。\n命令：/pt quality dlaa|quality|balanced|performance|ultra_performance",
+  "primept.settings.quality.dlaa": "DLAA（原生分辨率）",
+  "primept.settings.quality.quality": "质量",
+  "primept.settings.quality.balanced": "均衡",
+  "primept.settings.quality.performance": "性能（2×）",
+  "primept.settings.quality.ultra_performance": "超级性能",
+  "primept.settings.samples": "每帧采样数",
+  "primept.settings.samples.tooltip": "每像素每帧追踪 1–64 条路径。RR 开启时先平均本帧样本，再重建画面；提高采样数增加 GPU 开销。\n命令：/pt spp 1..64",
+  "primept.settings.bounces": "路径顶点预算",
+  "primept.settings.bounces.tooltip": "每条路径最多 1–64 个顶点，包括主命中；最后一个顶点仍计算直接光与自发光。\n命令：/pt bounces 1..64",
+  "primept.settings.display": "PT 显示",
+  "primept.settings.exposure": "曝光",
+  "primept.settings.exposure.tooltip": "在 RR 之后、显示映射之前调整亮度。+1 EV 将亮度加倍。滑条步长 0.25 EV；打开设置保留命令输入的精确值。\n命令：/pt exposure -16..16",
+  "primept.settings.save_failed": "PT 设置保存失败"
+}

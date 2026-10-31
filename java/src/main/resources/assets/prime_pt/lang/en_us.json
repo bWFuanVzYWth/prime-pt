@@ -1,0 +1,23 @@
+{
+  "primept.settings.reset": "Restore PT defaults",
+  "primept.settings.render": "PT rendering",
+  "primept.settings.ser": "Shader Execution Reordering",
+  "primept.settings.ser.tooltip": "Automatically enable SER when supported. Toggle without restarting; switching creates the corresponding pipeline and preserves sample history.\nCommand: /pt ser on|off",
+  "primept.settings.rr": "DLSS Ray Reconstruction",
+  "primept.settings.rr.tooltip": "Denoise and reconstruct with DLSS RR at the selected quality. Native resolution PT is used when RR is disabled or unavailable.\nCommand: /pt rr on|off",
+  "primept.settings.quality": "DLSS quality",
+  "primept.settings.quality.tooltip": "Applies when RR is enabled and available. Default Performance renders at roughly half width and height (2× upscale), preserving window output resolution.\nCommand: /pt quality dlaa|quality|balanced|performance|ultra_performance",
+  "primept.settings.quality.dlaa": "DLAA (native resolution)",
+  "primept.settings.quality.quality": "Quality",
+  "primept.settings.quality.balanced": "Balanced",
+  "primept.settings.quality.performance": "Performance (2×)",
+  "primept.settings.quality.ultra_performance": "Ultra Performance",
+  "primept.settings.samples": "Samples per frame",
+  "primept.settings.samples.tooltip": "Trace 1–64 paths per pixel per frame. RR averages this frame's samples before reconstruction. More samples increase GPU cost.\nCommand: /pt spp 1..64",
+  "primept.settings.bounces": "Path vertex budget",
+  "primept.settings.bounces.tooltip": "Allow 1–64 vertices per path, including the primary hit. The last vertex still evaluates direct lighting and emission.\nCommand: /pt bounces 1..64",
+  "primept.settings.display": "PT display",
+  "primept.settings.exposure": "Exposure",
+  "primept.settings.exposure.tooltip": "Adjust brightness after RR and before display mapping. +1 EV doubles brightness. Slider steps are 0.25 EV; opening settings preserves precise command values.\nCommand: /pt exposure -16..16",
+  "primept.settings.save_failed": "Could not save PT settings"
+}

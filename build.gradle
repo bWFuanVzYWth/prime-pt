@@ -1,0 +1,104 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version '1.18.1'
+}
+version = '0.1.0'
+group = 'dev.primept'
+base { archivesName = 'prime-pt' }
+repositories { mavenCentral() }
+dependencies {
+    minecraft 'com.mojang:minecraft:26.3'
+    implementation 'net.fabricmc:fabric-loader:0.19.5'
+}
+sourceSets.main.java.srcDirs = ['java/src/main/java']
+sourceSets.main.resources.srcDirs = ['java/src/main/resources']
+sourceSets {
+    fixture {
+        java.srcDirs = ['java/src/fixture/java']
+        compileClasspath += sourceSets.main.output + sourceSets.main.compileClasspath
+        runtimeClasspath += sourceSets.main.output + sourceSets.main.runtimeClasspath
+    }
+}
+java { toolchain.languageVersion = JavaLanguageVersion.of(25) }
+tasks.withType(JavaCompile).configureEach {
+    options.release = 25
+    options.encoding = 'UTF-8'
+}
+loom {
+    runs {
+        client {
+            client()
+            runDir = 'run'
+            vmArgs '--enable-native-access=ALL-UNNAMED'
+            vmArgs "-Dprimept.native=${providers.gradleProperty('nativeLibrary').getOrElse(rootProject.file('target/release/prime_pt.dll').absolutePath)}"
+            vmArgs "-Dprimept.rr=${providers.gradleProperty('rr').getOrElse('true')}"
+            if (providers.gradleProperty('ser').isPresent())
+                vmArgs "-Dprimept.ser=${providers.gradleProperty('ser').get()}"
+            programArgs '--graphicsBackend', 'VULKAN'
+        }
+    }
+}
+def streamlineSdk = providers.environmentVariable('STREAMLINE_SDK').getOrElse(rootProject.file('../../target/streamline-sdk').absolutePath)
+
+tasks.register('verifyStreamline', Exec) {
+    workingDir rootDir
+    commandLine 'pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/setup-streamline.ps1', '-SdkRoot', streamlineSdk, '-VerifyOnly'
+}
+tasks.register('buildNative', Exec) {
+    dependsOn tasks.named('verifyStreamline')
+    workingDir rootDir
+    environment 'STREAMLINE_SDK', streamlineSdk
+    commandLine 'cargo', 'build', '--release', '--locked', '--manifest-path', 'native/Cargo.toml'
+}
+tasks.named('runClient') {
+    if (!providers.gradleProperty('nativeLibrary').isPresent()) dependsOn tasks.named('buildNative')
+}
+tasks.register('wireFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.WireFixture'
+    args rootProject.file('target/java-source.prt').absolutePath
+}
+
+tasks.register('cameraFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.CameraFixture'
+}
+
+tasks.register('environmentFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.EnvironmentFixture'
+}
+
+tasks.register('exposureFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.ExposureFixture'
+    args rootProject.file('target/exposure-fixture.properties').absolutePath
+}
+
+tasks.register('videoOptionsFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.VideoOptionsFixture'
+}
+
+tasks.register('commandHintsFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.CommandHintsFixture'
+}
+
+tasks.register('streamlineFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.StreamlineFixture'
+    jvmArgs '--enable-native-access=ALL-UNNAMED', '-Dorg.lwjgl.vulkan.explicitInit=true'
+    systemProperty 'primept.native', providers.gradleProperty('nativeLibrary').getOrElse(rootProject.file('target/release/prime_pt.dll').absolutePath)
+}
+
+tasks.named('check') {
+    dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),
+            tasks.named('videoOptionsFixture'), tasks.named('commandHintsFixture')
+}

@@ -1,0 +1,101 @@
+package dev.primept;
+
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.renderpearl.api.GpuFormat;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuTexture;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuTextureView;
+import dev.primept.mixin.DeviceAccess;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import net.minecraft.client.Camera;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.core.BlockPos;
+import org.joml.Vector4f;
+import org.lwjgl.vulkan.VK10;
+
+/** 渲染线程唯一所有者；显式完成宿主提交后才修改或销毁 native 资源。 */
+public final class Renderer {
+    /** 宿主尚无 storage usage，将该私有位映射到 VkImageUsageFlags。 */
+    public static final int STORAGE = 32;
+    private static final Capture CAPTURE = new Capture();
+    private static final ByteBuffer CAMERA = ByteBuffer.allocateDirect(72).order(ByteOrder.LITTLE_ENDIAN);
+    private static final ByteBuffer ENVIRONMENT = ByteBuffer.allocateDirect(20).order(ByteOrder.LITTLE_ENDIAN);
+    private static Native renderer;
+    private static VulkanCommandEncoder encoder;
+    private static long generation = -1;
+    private Renderer() {}
+
+    /** 替代原版世界绘制；相机、手持物和 UI 继续使用宿主路径。 */
+    public static void render(CameraRenderState camera, RenderTarget target) {
+        var minecraft = Minecraft.getInstance();
+        if (minecraft.level == null || target.width <= 0 || target.height <= 0) return;
+        RenderSystem.assertOnRenderThread();
+        var host = RenderSystem.getDevice().createCommandEncoder();
+        host.clearDepthTexture(target.getDepthTexture(), 1.0);
+        if (!Atlas.ready() || !CameraPacket.write(camera, CAMERA)) {
+            host.clearColorTexture(target.getColorTexture(), new Vector4f(0.2f, 0.4f, 0.7f, 1));
+            return;
+        }
+        if (renderer == null) {
+            var backend = ((DeviceAccess) RenderSystem.getDevice()).primept$backend();
+            if (!(backend instanceof VulkanDevice device))
+                throw new IllegalStateException("Prime PT 需要 --graphicsBackend VULKAN");
+            encoder = device.createCommandEncoder();
+            await();
+            renderer = new Native(device.instance().vkInstance().address(), device.vkDevice().getPhysicalDevice().address(),
+                    device.vkDevice().address(), device.graphicsQueue().vkQueue().address(), device.graphicsQueue().queueFamilyIndex(),
+                    Bootstrap.graphicsQueueIndex(), Bootstrap.invocationReorder(device.vkDevice()), Settings.requestedSer());
+        }
+        await();
+        renderer.ser(Settings.requestedSer());
+        if (generation != Atlas.generation) {
+            Atlas.send(renderer); renderer.reset(); generation = Atlas.generation; CAPTURE.invalidate();
+        }
+        if (CAPTURE.select(minecraft.level, BlockPos.containing(camera.pos))) renderer.reset();
+        var batch = CAPTURE.next(minecraft);
+        if (batch != null) renderer.batch(batch);
+        if (!(target.getColorTexture() instanceof VulkanGpuTexture texture)
+                || !(target.getColorTextureView() instanceof VulkanGpuTextureView view)
+                || texture.getFormat() != GpuFormat.RGBA8_UNORM || (texture.usage() & STORAGE) == 0)
+            throw new IllegalStateException("Prime PT 目标必须是支持 storage 的 RGBA8_UNORM");
+        var command = encoder.allocateAndBeginTransientCommandBuffer();
+        ENVIRONMENT.putFloat(12, Settings.exposure());
+        renderer.draw(command.address(), texture.vkImage(), view.vkImageView(), target.width, target.height,
+                CAMERA, ENVIRONMENT, Settings.rr(), Settings.quality(), Settings.samples(), Settings.bounces());
+        int status = VK10.vkEndCommandBuffer(command);
+        if (status != VK10.VK_SUCCESS) throw new IllegalStateException("vkEndCommandBuffer: " + status);
+        encoder.execute(command);
+    }
+
+    private static void await() {
+        try (var fence = encoder.createFence()) {
+            encoder.submit();
+            if (!fence.awaitCompletion(5_000_000_000L))
+                throw new IllegalStateException("Prime PT 宿主 GPU 提交未完成；资源保留到进程退出");
+        }
+    }
+
+    /** 世界替换延迟到下次 render 的完成边界处理。 */
+    public static void reset() { CAPTURE.invalidate(); }
+    /** 与宿主天空使用同一个相机 attribute probe 和插值时刻。 */
+    public static void environment(ClientLevel level, Camera camera, float partial) {
+        EnvironmentPacket.write(level, camera, partial, ENVIRONMENT);
+    }
+    /** block 变化同时失效相邻 section 的剔除结果。 */
+    public static void dirty(BlockPos pos) { CAPTURE.block(pos); }
+    /** chunk 加载和卸载统一替换对应 section 源。 */
+    public static void column(int x, int z) { CAPTURE.column(x, z); }
+    /** 只标记源，GPU 不在世界更新回调中使用。 */
+    public static void section(int x, int y, int z) { CAPTURE.section(x, y, z); }
+
+    /** 必须在宿主 VulkanDevice.close 之前调用。 */
+    public static void close() {
+        if (renderer == null) return;
+        await(); renderer.close(); renderer = null; generation = -1; CAPTURE.invalidate();
+    }
+}
