@@ -118,7 +118,7 @@ void primary_miss(inout TracePayload payload)
 [shader("anyhit")]
 void primary_anyhit(inout TracePayload payload, BuiltInTriangleIntersectionAttributes attributes)
 {
-    if (texel(PrimitiveIndex(), attributes.barycentrics).a < 0.5)
+    if (texel(PrimitiveIndex() + InstanceID() * 2u, attributes.barycentrics).a < 0.5)
         IgnoreHit();
 }
 
@@ -126,13 +126,13 @@ void primary_anyhit(inout TracePayload payload, BuiltInTriangleIntersectionAttri
 void primary_closesthit(inout TracePayload payload,
                         BuiltInTriangleIntersectionAttributes attributes)
 {
-    payload.primitive = PrimitiveIndex();
+    payload.primitive = PrimitiveIndex() + InstanceID() * 2u;
     payload.bary = attributes.barycentrics;
     payload.distance = RayTCurrent();
     float3 a = HitTriangleVertexPosition(0), b = HitTriangleVertexPosition(1),
            c = HitTriangleVertexPosition(2);
-    // 当前 AS 顶点为世界坐标、instance 恒等；保留迁移前重建算序。
-    payload.surface = geometry::triangle_point(a, b, c, attributes.barycentrics);
+    payload.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
+                                               WorldToObject3x4());
 }
 
 void store_landing(uint pixel, pt::TransportCall data)

@@ -134,6 +134,7 @@ impl Quad {
         ]
     }
 
+    #[cfg(test)]
     pub(crate) fn translate(&mut self, offset: [f32; 3]) {
         let positions = self
             .positions()
@@ -460,10 +461,17 @@ fn compile(section: &Section<'_>) -> Mesh {
 
 /// section 缓存拥有 CPU mesh；工作池只在批次层调度，内核没有嵌套调度。
 pub(crate) struct Scene {
-    sections: BTreeMap<[i32; 3], Mesh>,
+    sections: BTreeMap<[i32; 3], SectionMesh>,
     pool: rayon::ThreadPool,
     anchor: [f64; 3],
+    next_revision: u64,
     pub(crate) dirty: bool,
+}
+
+struct SectionMesh {
+    mesh: Mesh,
+    // 仅有序quad数量/P48位置位值变化分配新世代；属性更新不改变BLAS身份。
+    revision: u64,
 }
 
 impl Scene {
@@ -479,6 +487,7 @@ impl Scene {
             sections: BTreeMap::new(),
             pool,
             anchor: [0.0; 3],
+            next_revision: 1,
             dirty: true,
         })
     }
@@ -501,43 +510,88 @@ impl Scene {
         let replaced = sources
             .iter()
             .filter_map(|s| self.sections.get(&s.key))
-            .map(|m| m.quads.len())
+            .map(|m| m.mesh.quads.len())
             .sum::<usize>();
-        let current = self.sections.values().map(|m| m.quads.len()).sum::<usize>();
+        let current = self
+            .sections
+            .values()
+            .map(|m| m.mesh.quads.len())
+            .sum::<usize>();
         if current - replaced + incoming > MAX_VERTICES / 4 {
             return Err(crate::Error::Input("场景几何超过 16M 顶点预算"));
         }
+        let sections = &self.sections;
+        let build = |source: &Section<'_>| {
+            let mesh = compile(source);
+            let revision = sections
+                .get(&source.key)
+                .filter(|old| {
+                    old.mesh.quads.len() == mesh.quads.len()
+                        && old
+                            .mesh
+                            .quads
+                            .iter()
+                            .zip(&mesh.quads)
+                            .all(|(old, new)| old.blocks[3..] == new.blocks[3..])
+                })
+                .map_or(0, |old| old.revision);
+            SectionMesh { mesh, revision }
+        };
         let meshes: Vec<_> = if sources.len() < 4 || incoming < 1024 {
-            sources.iter().map(compile).collect()
+            sources.iter().map(build).collect()
         } else {
             self.pool
-                .install(|| sources.par_iter().map(compile).collect())
+                .install(|| sources.par_iter().map(build).collect())
         };
-        for (source, mesh) in sources.into_iter().zip(meshes) {
-            if mesh.quads.is_empty() {
+        let fresh = meshes
+            .iter()
+            .filter(|entry| !entry.mesh.quads.is_empty() && entry.revision == 0)
+            .count();
+        let next_revision = self
+            .next_revision
+            .checked_add(fresh as u64)
+            .ok_or(crate::Error::Input("section revision溢出"))?;
+        for (source, mut entry) in sources.into_iter().zip(meshes) {
+            if entry.mesh.quads.is_empty() {
                 self.sections.remove(&source.key);
             } else {
-                self.sections.insert(source.key, mesh);
+                if entry.revision == 0 {
+                    entry.revision = self.next_revision;
+                    self.next_revision += 1;
+                }
+                self.sections.insert(source.key, entry);
             }
         }
+        self.next_revision = next_revision;
         self.dirty = true;
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn merge(&self) -> Mesh {
         let mut result = Mesh {
-            quads: Vec::with_capacity(self.sections.values().map(|m| m.quads.len()).sum()),
+            quads: Vec::with_capacity(self.sections.values().map(|m| m.mesh.quads.len()).sum()),
         };
         for (key, mesh) in &self.sections {
             let offset =
                 std::array::from_fn(|i| (f64::from(key[i]) * 16.0 - self.anchor[i]) as f32);
-            result.quads.extend(mesh.quads.iter().map(|quad| {
+            result.quads.extend(mesh.mesh.quads.iter().map(|quad| {
                 let mut quad = *quad;
                 quad.translate(offset);
                 quad
             }));
         }
         result
+    }
+
+    pub(crate) const fn anchor(&self) -> [f64; 3] {
+        self.anchor
+    }
+
+    pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = ([i32; 3], u64, &Mesh)> {
+        self.sections
+            .iter()
+            .map(|(&key, entry)| (key, entry.revision, &entry.mesh))
     }
 }
 
@@ -648,6 +702,16 @@ mod tests {
         scene.apply(&packet([0, 0, 0], true)).unwrap();
         scene.apply(&packet([0, 0, 0], false)).unwrap();
         assert!(scene.merge().quads.is_empty());
+    }
+
+    #[test]
+    fn unchanged_source_preserves_geometry_revision() {
+        let mut scene = Scene::new().unwrap();
+        let bytes = packet([0, 0, 0], true);
+        scene.apply(&bytes).unwrap();
+        let revision = scene.entries().next().unwrap().1;
+        scene.apply(&bytes).unwrap();
+        assert_eq!(scene.entries().next().unwrap().1, revision);
     }
 
     #[test]

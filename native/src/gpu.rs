@@ -2,9 +2,14 @@
 //!
 //! 每次调用或销毁前宿主须确认前次命令完成，并在调用期间独占队列。
 //! 设备/输出导入、宿主命令编码与 引擎 SDK 求值共享同一完成边界。
+//! section局部BLAS由scene_cache独占；revision变化只重建对应BLAS，anchor只改变TLAS平移。
+//! 一批dirty三角输入连续收集，共享native上传与scratch并只提交等待一次；返回后释放CPU输入。
+//! 属性仍按活动槽全量重新打包上传；更新完成前保留旧资源，所有准备成功后发布。
 
 use crate::scene::{Camera, Environment, Mesh};
 use crate::{reconstruction::CameraFrame, streamline};
+#[path = "exposure.rs"]
+mod exposure;
 use pt::gpu::{Programs, Renderer};
 use vulkan::{
     AccelerationStructure, TriangleInstance,
@@ -18,6 +23,8 @@ use vulkan::{
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     #[error(transparent)]
+    SceneCache(#[from] scene_cache::Error),
+    #[error(transparent)]
     Vulkan(#[from] vulkan::Error),
     #[error(transparent)]
     Renderer(#[from] pt::gpu::Error),
@@ -25,6 +32,8 @@ pub(crate) enum Error {
     Settings(#[from] pt::Error),
     #[error(transparent)]
     Display(#[from] simple_engine::display::Error),
+    #[error(transparent)]
+    Exposure(#[from] simple_engine::display::exposure::Error),
     #[error(transparent)]
     Atmosphere(#[from] atmosphere::Error),
     #[error(transparent)]
@@ -35,6 +44,10 @@ pub(crate) enum Error {
     Shader(#[from] shader_build::Error),
     #[error(transparent)]
     Flow(#[from] openpbr::FlowError),
+    #[error(transparent)]
+    Resources(#[from] openpbr::resource::Error),
+    #[error(transparent)]
+    MaterialPrograms(#[from] openpbr::program::Error),
     #[error("PT 宿主输入：{0}")]
     Invalid(&'static str),
 }
@@ -43,6 +56,25 @@ pub(crate) enum Error {
 struct Scene {
     top: AccelerationStructure,
     quads: Buffer,
+}
+
+struct SectionGpu {
+    key: [i32; 3],
+    revision: u64,
+    range: std::ops::Range<u32>,
+    blas: Option<vulkan::TriangleBlas>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct SceneBuildMetrics {
+    triangle_bytes: u64,
+    triangle_capacity_bytes: u64,
+    pending_capacity_bytes: u64,
+    input_capacity_bytes: u64,
+    attribute_capacity_bytes: u64,
+    instance_capacity_bytes: u64,
+    batch: vulkan::BuildTiming,
 }
 
 struct View {
@@ -62,6 +94,7 @@ struct View {
     pack: ComputePipeline,
     rr_present: ComputePipeline,
     rr_fallback: ComputePipeline,
+    display: exposure::Display,
 }
 
 /// SDK 借用这些 image，所有权和退役边界仍在 mod 视图内。
@@ -152,6 +185,7 @@ impl View {
                 .into_iter()
                 .map(vulkan::native::Resource::from),
         );
+        roots.extend(self.display.roots());
         roots
     }
 
@@ -163,6 +197,7 @@ impl View {
             extent,
             rr_enabled,
             streamline::Quality::Dlaa,
+            None,
         )
     }
 
@@ -172,6 +207,7 @@ impl View {
         output_extent: [u32; 2],
         rr_enabled: bool,
         quality: streamline::Quality,
+        previous_display: Option<&exposure::Display>,
     ) -> Result<Self, Error> {
         if extent
             .into_iter()
@@ -193,6 +229,13 @@ impl View {
             if rr_enabled { extent } else { [1, 1] },
             if rr_enabled { output_extent } else { [1, 1] },
         )?;
+        let display = exposure::Display::new(
+            context,
+            output,
+            extent,
+            rr_enabled.then_some((rr.images[6], output_extent)),
+            previous_display,
+        )?;
         // 缓存 program 只引用自有占位资源；宿主 view 每帧通过 rebind 借出。
         let placeholder = Image::new(context, [1, 1, 1], ImageFormat::Rgba8Unorm)?;
         let present_bindings = Bindings::new(
@@ -201,6 +244,8 @@ impl View {
                 Binding::StorageBuffer(params),
                 Binding::StorageBuffer(output),
                 Binding::StorageImage(placeholder),
+                Binding::StorageBuffer(display.state()),
+                Binding::StorageBuffer(display.parameters()),
             ],
         )?;
         let present = ComputePipeline::new(
@@ -223,11 +268,21 @@ impl View {
                 Binding::SampledImage(rr.images[3]),
                 Binding::SampledImage(rr.images[4]),
                 Binding::SampledImage(rr.images[5]),
+                Binding::StorageBuffer(display.state()),
+                Binding::StorageBuffer(display.parameters()),
+            ],
+        )?;
+        let pack_bindings = Bindings::new(
+            context,
+            &[
+                Binding::StorageBuffer(params),
+                Binding::StorageBuffer(output),
+                Binding::StorageImage(rr.images[0]),
             ],
         )?;
         let pack = ComputePipeline::new(
             context,
-            bindings,
+            pack_bindings,
             shader(
                 include_bytes!(concat!(env!("OUT_DIR"), "/rr_pack.spv")),
                 c"pack_main",
@@ -266,6 +321,7 @@ impl View {
             pack,
             rr_present,
             rr_fallback,
+            display,
         })
     }
 }
@@ -310,30 +366,25 @@ fn programs<'a>(callables: &'a [RayShader<'a>], invocation_reorder: bool) -> Pro
 
 // 每代 atlas、能力证明和已初始化程序一起发布；旧命令通过 Flight 保活旧绑定。
 struct MaterialGeneration {
-    flow: openpbr::FlowKey,
-    code: shader_build::Artifact,
+    programs: openpbr::program::ProgramSet,
     program: Renderer,
 }
 
 fn atlas_flow(pixels: &[u8]) -> Result<openpbr::FlowKey, Error> {
-    // nearest、LOD0；alpha<128 的 texel 不会通过主查询或 RayQuery 的覆盖规则。
-    // tint 被 shader 裁到 [0,1]，非零上界足以证明黑色闭包。
-    let mut nonzero = [false; 3];
-    for pixel in pixels
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .filter(|pixel| pixel[3] >= 128)
-    {
-        for channel in 0..3 {
-            nonzero[channel] |= pixel[channel] != 0;
-        }
-    }
+    use openpbr::resource::{ColorScan, Coverage, Filtering, MaterialBinding, Texels};
+    // 源适配只声明实际LOD0/nearest与alpha规则；范围扫描和闭包推导由引擎维护。
+    let mut scan = ColorScan::new(Coverage::AlphaAtLeast(0.5), Filtering::Nearest)?;
+    scan.extend(Texels::Srgb8Rgba(pixels))?;
     let unit = openpbr::Range::new(0.0, 1.0)?;
     let zero = openpbr::Range::point(0.0)?;
-    let ranges = openpbr::MaterialRanges::opaque(openpbr::Range::new(0.25, 0.9)?, zero, zero)?
-        .with_base_color(nonzero.map(|yes| if yes { unit } else { zero }))?;
-    Ok(ranges.flow(openpbr::InterfaceIor::UNKNOWN, false))
+    let ranges = openpbr::MaterialRanges::opaque(openpbr::Range::new(0.25, 0.9)?, zero, zero)?;
+    Ok(MaterialBinding::new(
+        ranges,
+        scan.finish([unit; 3])?,
+        openpbr::InterfaceIor::UNKNOWN,
+        false,
+    )?
+    .flow())
 }
 
 /// 已校验的 mod 设置；UI 与命令共享 Java 配置，此边界只接受实际支持的范围。
@@ -381,6 +432,9 @@ pub(crate) struct Gpu {
     rr_quality: streamline::Quality,
     context: Context,
     scene: Scene,
+    section_cache: scene_cache::Cache<SectionGpu>,
+    #[cfg(test)]
+    scene_build: SceneBuildMetrics,
     // 程序模板只保留初始空场景，不能钉住重载时完整 mesh／AS 的工作集。
     program_scene: Scene,
     atlas: Image,
@@ -401,6 +455,8 @@ pub(crate) struct Gpu {
     test_roots: Vec<vulkan::native::Resource>,
     settings: pt::Settings,
     invocation_reorder: bool,
+    display_origin: std::time::Instant,
+    display_timeline: simple_engine::display::exposure::Timeline,
 }
 
 impl Gpu {
@@ -510,6 +566,7 @@ impl Gpu {
             [1, 1],
             false,
             streamline::Quality::Dlaa,
+            None,
         )?;
         let mut gpu = Self {
             rr_runtime: None,
@@ -527,6 +584,9 @@ impl Gpu {
             rr_quality: streamline::Quality::Performance,
             context,
             scene,
+            section_cache: scene_cache::Cache::new()?,
+            #[cfg(test)]
+            scene_build: SceneBuildMetrics::default(),
             program_scene,
             atlas,
             energy,
@@ -545,6 +605,8 @@ impl Gpu {
             test_roots: Vec::new(),
             settings: pt::Settings::default().validate()?,
             invocation_reorder: invocation_reorder && ser_requested,
+            display_origin: std::time::Instant::now(),
+            display_timeline: simple_engine::display::exposure::Timeline::default(),
         };
         gpu.set_atlas(1, 1, &[255; 4])?;
         Ok(gpu)
@@ -596,7 +658,7 @@ impl Gpu {
         }
         let generation = self.generation.as_ref().unwrap();
         let callables = [RayShader {
-            spirv: generation.code.bytes(),
+            spirv: generation.programs.artifacts()[0].bytes(),
             entry: c"shade_opaque",
         }];
         let descriptors =
@@ -638,6 +700,7 @@ impl Gpu {
         if std::mem::take(&mut self.atmosphere_pending) {
             self.atmosphere.submitted();
         }
+        self.display_timeline.submitted();
         Ok(())
     }
 
@@ -663,17 +726,19 @@ impl Gpu {
         // 当前适配器没有转发 mip／动画更新；分析覆盖 shader 实际可读的全部 atlas。
         let flow = atlas_flow(pixels)?;
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/primary.slang");
-        let definition = format!("-DOPENPBR_FLOW={}", flow.bits());
-        let code = self.compiler.compile(&shader_build::Recipe {
-            source: source
-                .to_str()
-                .ok_or(Error::Invalid("shader 路径不是 UTF-8"))?,
-            entry: "shade_opaque",
-            stage: "callable",
-            output: "flow.spv",
-            target: shader_build::Target::Spirv("spirv_1_4"),
-            args: &["-fp-mode", "precise", &definition],
-        })?;
+        let material_programs = openpbr::program::ProgramSet::compile(
+            &self.compiler,
+            [flow],
+            openpbr::program::Template {
+                source: source
+                    .to_str()
+                    .ok_or(Error::Invalid("shader 路径不是 UTF-8"))?,
+                entry: "shade_opaque",
+                output: "flow.spv",
+                target: shader_build::Target::Spirv("spirv_1_4"),
+                args: &["-fp-mode", "precise"],
+            },
+        )?;
         let atlas = Image::new(
             &mut self.context,
             [width, height, 1],
@@ -683,15 +748,14 @@ impl Gpu {
         let descriptors = self.renderer_bindings(&self.program_view, &atlas, &self.program_scene);
         let (trace, post) = self.allocate_bindings(descriptors)?;
         let program = if let Some(previous) = &self.generation
-            && previous.flow == flow
-            && previous.code.fingerprint() == code.fingerprint()
+            && material_programs.same_code(&previous.programs)
         {
             previous
                 .program
                 .rebind(&mut self.context, trace, post, [1, 1])?
         } else {
             let callables = [RayShader {
-                spirv: code.bytes(),
+                spirv: material_programs.artifacts()[0].bytes(),
                 entry: c"shade_opaque",
             }];
             Renderer::new(
@@ -705,13 +769,13 @@ impl Gpu {
         self.invalidate()?;
         self.atlas = atlas;
         self.generation = Some(MaterialGeneration {
-            flow,
-            code,
+            programs: material_programs,
             program,
         });
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn set_scene(&mut self, mesh: &Mesh) -> Result<(), Error> {
         self.complete_previous()?;
         let result = self.set_scene_inner(mesh);
@@ -719,10 +783,173 @@ impl Gpu {
         result
     }
 
+    #[cfg(test)]
     fn set_scene_inner(&mut self, mesh: &Mesh) -> Result<(), Error> {
         let scene = Self::build_scene(&mut self.context, mesh)?;
         self.invalidate()?;
         self.scene = scene;
+        self.section_cache = scene_cache::Cache::new()?;
+        Ok(())
+    }
+
+    /// 每section复用未变BLAS；anchor只改变TLAS实例平移，不改局部顶点。
+    /// 宿主仍在入口前完成旧命令。属性初期按活动槽全量打包上传，未宣称分段上传。
+    pub(crate) fn set_sections(&mut self, source: &crate::scene::Scene) -> Result<(), Error> {
+        self.complete_previous()?;
+        let result = self.set_sections_inner(source);
+        self.collect_resources()?;
+        result
+    }
+
+    fn set_sections_inner(&mut self, source: &crate::scene::Scene) -> Result<(), Error> {
+        let mut update = self.section_cache.begin(source.entries().len())?;
+        let (slots, entries, _) = update.parts_mut();
+        // 输入只包含dirty集；批构建完成后释放CPU三角与描述符，再准备全量属性。
+        #[cfg(test)]
+        let mut metrics = SceneBuildMetrics::default();
+        {
+            let (dirty_triangles, dirty_sections) = source.entries().try_fold(
+                (0usize, 0usize),
+                |(count, sections), (key, revision, mesh)| {
+                    if scene_cache::find_revision(
+                        self.section_cache.entries(),
+                        key,
+                        revision,
+                        |entry| entry.key,
+                        |entry| entry.revision,
+                    )
+                    .is_some()
+                    {
+                        Ok((count, sections))
+                    } else {
+                        let count = count
+                            .checked_add(
+                                mesh.quads
+                                    .len()
+                                    .checked_mul(2)
+                                    .ok_or(Error::Invalid("dirty三角数量溢出"))?,
+                            )
+                            .ok_or(Error::Invalid("dirty三角数量溢出"))?;
+                        Ok::<_, Error>((count, sections + 1))
+                    }
+                },
+            )?;
+            let mut triangles = Vec::new();
+            triangles
+                .try_reserve_exact(dirty_triangles)
+                .map_err(scene_cache::Error::from)?;
+            let mut pending = Vec::new();
+            pending
+                .try_reserve_exact(dirty_sections)
+                .map_err(scene_cache::Error::from)?;
+            for (key, revision, mesh) in source.entries() {
+                if let Some(index) = scene_cache::find_revision(
+                    self.section_cache.entries(),
+                    key,
+                    revision,
+                    |entry| entry.key,
+                    |entry| entry.revision,
+                ) {
+                    entries.push(scene_cache::Prepared::Reused(index));
+                    continue;
+                }
+                let count = u32::try_from(mesh.quads.len())
+                    .map_err(|_| Error::Invalid("section面索引超过u32"))?;
+                let range = slots.take(count)?;
+                if range.end > (1 << 24) {
+                    return Err(Error::Invalid("section属性槽超过实例24位索引"));
+                }
+                let start = triangles.len();
+                triangles.extend(mesh.quads.iter().flat_map(|quad| {
+                    let [a, b, c, d] = quad.positions();
+                    [[a, b, c], [a, c, d]]
+                }));
+                pending.push((entries.len(), start..triangles.len()));
+                entries.push(scene_cache::Prepared::Built(SectionGpu {
+                    key,
+                    revision,
+                    range,
+                    blas: None,
+                }));
+            }
+            let mut inputs = Vec::new();
+            inputs
+                .try_reserve_exact(pending.len())
+                .map_err(scene_cache::Error::from)?;
+            for (_, range) in &pending {
+                inputs.push(vulkan::TriangleBlasInput {
+                    triangles: &triangles[range.clone()],
+                    opaque: false,
+                    opacity: None,
+                });
+            }
+            let batch = self.context.triangle_blas_batch(&inputs)?;
+            #[cfg(test)]
+            {
+                metrics.triangle_bytes = std::mem::size_of_val(triangles.as_slice()) as u64;
+                metrics.triangle_capacity_bytes =
+                    (triangles.capacity() * size_of::<[[f32; 3]; 3]>()) as u64;
+                metrics.pending_capacity_bytes =
+                    (pending.capacity() * size_of::<(usize, std::ops::Range<usize>)>()) as u64;
+                metrics.input_capacity_bytes =
+                    (inputs.capacity() * size_of::<vulkan::TriangleBlasInput<'_>>()) as u64;
+                metrics.batch = batch.timing;
+            }
+            for ((index, _), blas) in pending.into_iter().zip(batch.blases) {
+                let scene_cache::Prepared::Built(entry) = &mut entries[index] else {
+                    unreachable!("dirty输入只对应本批新建记录");
+                };
+                entry.blas = Some(blas);
+            }
+        }
+        let end = entries
+            .iter()
+            .map(|entry| entry.get(self.section_cache.entries()).range.end)
+            .max()
+            .unwrap_or(0);
+        let mut attributes = vec![[[0u32; 4]; 3]; end.max(1) as usize];
+        let mut instances = Vec::with_capacity(entries.len());
+        let anchor = source.anchor();
+        for ((key, _, mesh), entry) in source.entries().zip(entries.iter()) {
+            let entry = entry.get(self.section_cache.entries());
+            for (target, quad) in attributes[entry.range.start as usize..entry.range.end as usize]
+                .iter_mut()
+                .zip(&mesh.quads)
+            {
+                *target = quad.attributes();
+            }
+            let offset: [f32; 3] =
+                std::array::from_fn(|axis| (f64::from(key[axis]) * 16.0 - anchor[axis]) as f32);
+            instances.push(TriangleInstance {
+                geometry: entry
+                    .blas
+                    .ok_or(Error::Invalid("批构建未完成section BLAS"))?,
+                transform: [
+                    [1., 0., 0., offset[0]],
+                    [0., 1., 0., offset[1]],
+                    [0., 0., 1., offset[2]],
+                ],
+                custom_index: entry.range.start,
+            });
+        }
+        #[cfg(test)]
+        {
+            metrics.attribute_capacity_bytes =
+                (attributes.capacity() * size_of::<[[u32; 4]; 3]>()) as u64;
+            metrics.instance_capacity_bytes =
+                (instances.capacity() * size_of::<TriangleInstance>()) as u64;
+        }
+        let quads = Buffer::upload(&mut self.context, bytemuck::cast_slice(&attributes))?;
+        let top = self.context.acceleration_instances(&instances)?;
+        self.invalidate()?;
+        self.section_cache
+            .commit(update, |entry| entry.range.clone())?;
+        self.scene = Scene { top, quads };
+        #[cfg(test)]
+        {
+            self.scene_build = metrics;
+        }
+
         Ok(())
     }
 
@@ -889,6 +1116,7 @@ impl Gpu {
                     extent,
                     rr_enabled,
                     self.rr_quality,
+                    self.view.as_ref().map(|view| &view.display),
                 )?);
                 self.rr_previous = None;
                 self.renderer = None;
@@ -1015,9 +1243,22 @@ impl Gpu {
                     Binding::StorageBuffer(view.params),
                     Binding::StorageBuffer(view.output),
                     target,
+                    Binding::StorageBuffer(view.display.state()),
+                    Binding::StorageBuffer(view.display.parameters()),
                 ],
             )?;
             let pipeline = view.present.rebind(&mut self.context, bindings)?;
+            let frame =
+                self.display_timeline
+                    .prepare(extent, true, self.display_origin.elapsed())?;
+            if let Some(exposure) = view.display.record(
+                &mut self.context,
+                frame,
+                false,
+                self.display_timeline.enabled(),
+            )? {
+                result.push(exposure);
+            }
             let mut present = Commands::new(&self.context)?;
             present.barrier();
             present.dispatch(pipeline, [extent[0].div_ceil(8), extent[1].div_ceil(8), 1])?;
@@ -1027,6 +1268,7 @@ impl Gpu {
             Ok(())
         })();
         if let Err(error) = recording {
+            self.display_timeline.cancel();
             // SDK 配置可能已改变；宿主已确认前次完成，下一帧必须重建并重新配置。
             if rr_enabled {
                 self.rr_runtime = None;
@@ -1185,6 +1427,8 @@ impl Gpu {
                         Binding::SampledImage(view.rr.images[3]),
                         Binding::SampledImage(view.rr.images[4]),
                         Binding::SampledImage(view.rr.images[5]),
+                        Binding::StorageBuffer(view.display.state()),
+                        Binding::StorageBuffer(view.display.parameters()),
                     ],
                 )?;
                 let pipeline = if evaluated {
@@ -1192,14 +1436,32 @@ impl Gpu {
                 } else {
                     view.rr_fallback.rebind(&mut self.context, bindings)?
                 };
+                let measurement_extent = if evaluated {
+                    view.output_extent
+                } else {
+                    view.extent
+                };
+                let frame = self.display_timeline.prepare(
+                    measurement_extent,
+                    true,
+                    self.display_origin.elapsed(),
+                )?;
+                let exposure = view.display.record(
+                    &mut self.context,
+                    frame,
+                    evaluated,
+                    self.display_timeline.enabled(),
+                )?;
+                recordings.extend(exposure);
                 let mut present = Commands::new(&self.context)?;
                 present.barrier();
                 present.dispatch(pipeline, [extent[0].div_ceil(8), extent[1].div_ceil(8), 1])?;
                 present.barrier();
                 let present = present.finish(&mut self.context)?;
+                recordings.push(present);
                 // SAFETY: 同本帧前序命令，宿主持有并独占 command 至完成。
                 unsafe {
-                    self.encode_recordings([present], command)?;
+                    self.encode_recordings(std::mem::take(&mut recordings), command)?;
                 }
                 self.rr_previous = evaluated.then_some(current);
                 self.rr_index = next_index;
@@ -1210,6 +1472,7 @@ impl Gpu {
             Ok(())
         })();
         if result.is_err() {
+            self.display_timeline.cancel();
             self.view.as_mut().unwrap().progress.reset();
             self.rr_previous = None;
             self.cancel_recordings(recordings)?;

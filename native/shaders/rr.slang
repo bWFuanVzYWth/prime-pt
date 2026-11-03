@@ -2,6 +2,7 @@
 module rr;
 import params;
 import display.prime_drt;
+import display.exposure;
 import pt.spatial_denoise;
 import pt.denoise;
 
@@ -25,6 +26,18 @@ Texture2D<float4> guide_normal;
 Texture2D<float4> guide_diffuse;
 [[vk::binding(8, 0)]]
 Texture2D<float4> guide_specular;
+[[vk::binding(9, 0)]]
+StructuredBuffer<display::ExposureState> exposure_state;
+[[vk::binding(10, 0)]]
+StructuredBuffer<uint4> exposure_parameters;
+
+display::PrimeDrtParameters display_parameters()
+{
+    display::PrimeDrtParameters drt = parameters[0].drt;
+    if (asfloat(exposure_parameters[1].y) > 0)
+        drt.exposure_multiplier *= exp2(exposure_state[0].exposure_ev);
+    return drt;
+}
 
 public struct SpatialInput : pt::ISpatialImage
 {
@@ -64,7 +77,8 @@ void present_main(uint3 id: SV_DispatchThreadID)
     uint2 source = min(id.xy * p.image.xy / p.output_size.xy, p.image.xy - 1);
     bool invalid = pixels[source.y * p.image.x + source.x].w < 0;
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =
-        invalid ? float4(1, 0, 1, 1) : float4(display::prime_drt_bt709(hdr, p.drt), 1);
+        invalid ? float4(1, 0, 1, 1)
+                : float4(display::prime_drt_bt709(hdr, display_parameters()), 1);
 }
 
 /// 本帧求值安全失败时以已有输入和 guides 执行边界保护空间重建，再作显示变换。
@@ -79,5 +93,6 @@ void fallback_main(uint3 id: SV_DispatchThreadID)
     bool valid;
     float3 hdr = pt::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =
-        !valid ? float4(1, 0, 1, 1) : float4(display::prime_drt_bt709(hdr, p.drt), 1);
+        !valid ? float4(1, 0, 1, 1)
+               : float4(display::prime_drt_bt709(hdr, display_parameters()), 1);
 }

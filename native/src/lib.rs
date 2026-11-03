@@ -364,7 +364,7 @@ pub unsafe extern "C" fn prime_draw(
             }
             engine.scene.rebase(anchor);
             if engine.scene.dirty {
-                engine.gpu.set_scene(&engine.scene.merge())?;
+                engine.gpu.set_sections(&engine.scene)?;
                 engine.scene.dirty = false;
             }
             engine.gpu.draw(

@@ -10,16 +10,19 @@ crate-type = ["cdylib", "rlib"]
 camera = { path = "../../../crates/camera" }
 thiserror = "2"
 rayon = "1.12"
+scene_cache = { path = "../../../crates/scene_cache" }
 bytemuck = { version = "1", features = ["derive"] }
 pt = { path = "../../../crates/pt", features = ["vulkan"] }
 vulkan = { path = "../../../crates/vulkan", features = ["dlss_rr"] }
-openpbr = { path = "../../../crates/openpbr" }
+openpbr = { path = "../../../crates/openpbr", features = ["program"] }
 shader_build = { path = "../../../crates/shader_build" }
 atmosphere = { path = "../../../crates/atmosphere", default-features = false, features = ["native"] }
-simple_engine = { path = "../../../", features = ["display"] }
+simple_engine = { path = "../../../", features = ["display", "vulkan"] }
 
 [dev-dependencies]
 ash = { git = "https://github.com/ash-rs/ash.git", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }
+blake3 = "1.8.7"
+serde_json = "1.0.154"
 
 [build-dependencies]
 shader_build = { path = "../../../crates/shader_build" }

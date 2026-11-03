@@ -218,8 +218,9 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         {
             // RayQuery 不执行 any-hit；候选必须使用与主查询相同的覆盖规则。
             if (query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
-                texel(query.CandidatePrimitiveIndex(), query.CandidateTriangleBarycentrics()).a >=
-                    0.5)
+                texel(query.CandidatePrimitiveIndex() + query.CandidateInstanceID() * 2u,
+                      query.CandidateTriangleBarycentrics())
+                        .a >= 0.5)
                 query.CommitNonOpaqueTriangleHit();
         }
         return query.CommittedStatus() != COMMITTED_NOTHING;

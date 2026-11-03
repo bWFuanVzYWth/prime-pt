@@ -9,6 +9,9 @@ use ash::{
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "scene_bench.rs"]
+mod scene_bench;
+
 struct Host {
     _entry: Entry,
     instance: ash::Instance,
@@ -378,6 +381,7 @@ impl Host {
         };
         gpu.settings.samples = 64;
         gpu.settings.max_vertices = 6;
+        gpu.display_timeline.set_enabled(false);
         Ok(gpu)
     }
 
@@ -431,6 +435,9 @@ impl Host {
             })();
             if self.device.queue_wait_idle(self.queue).is_err() {
                 std::process::abort();
+            }
+            if result.is_err() {
+                gpu.display_timeline.cancel();
             }
             gpu.complete_previous()?;
             self.device.destroy_command_pool(pool, None);
@@ -512,6 +519,9 @@ impl Host {
             })();
             if self.device.queue_wait_idle(self.queue).is_err() {
                 std::process::abort();
+            }
+            if result.is_err() {
+                gpu.display_timeline.cancel();
             }
             gpu.complete_previous()?;
             self.device.destroy_command_pool(pool, None);
@@ -783,7 +793,7 @@ fn hardware_pt_material_reload() -> Result<(), Box<dyn std::error::Error>> {
     let compiler = std::mem::replace(&mut gpu.compiler, unavailable);
     assert!(matches!(
         gpu.set_atlas(1, 1, &[255; 4]),
-        Err(Error::Shader(_))
+        Err(Error::MaterialPrograms(openpbr::program::Error::Shader(_)))
     ));
     gpu.compiler = compiler;
     gpu.view.as_mut().unwrap().progress.reset();
@@ -1132,6 +1142,172 @@ fn hardware_pt_exposure_preserves_history() -> Result<(), Box<dyn std::error::Er
         exposed_hdr, reference_hdr,
         "曝光不能改变同一绝对样本序列的 HDR"
     );
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+fn exposure_state(gpu: &mut Gpu) -> Result<[u32; 4], Box<dyn std::error::Error>> {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../tests/shaders/shaders/exposure.slang");
+    let code = gpu.compiler.compile(&shader_build::Recipe {
+        source: source.to_str().ok_or("曝光回读shader路径不是UTF-8")?,
+        entry: "readback_main",
+        stage: "compute",
+        output: "exposure.readback.spv",
+        target: shader_build::Target::Spirv("spirv_1_4"),
+        args: &["-fp-mode", "precise"],
+    })?;
+    let output = Buffer::new(&mut gpu.context, 16, true)?;
+    let state = gpu
+        .view
+        .as_ref()
+        .ok_or("曝光回读需要已创建视图")?
+        .display
+        .state();
+    let bindings = Bindings::new(
+        &mut gpu.context,
+        &[
+            Binding::StorageBuffer(state),
+            Binding::StorageBuffer(output),
+        ],
+    )?;
+    let pipeline = ComputePipeline::new(
+        &mut gpu.context,
+        bindings,
+        RayShader {
+            spirv: code.bytes(),
+            entry: c"readback_main",
+        },
+    )?;
+    gpu.test_roots.push(pipeline.into());
+    let mut commands = Commands::new(&gpu.context)?;
+    commands.barrier();
+    commands.dispatch(pipeline, [1; 3])?;
+    commands.barrier();
+    commands
+        .finish(&mut gpu.context)?
+        .submit_and_wait(&mut gpu.context)?;
+    let mut bytes = [0; 16];
+    output.read(&mut gpu.context, 0, &mut bytes)?;
+    Ok(std::array::from_fn(|i| {
+        u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+    }))
+}
+
+fn exposure_hdr(gpu: &mut Gpu) -> Result<Vec<u8>, Error> {
+    let buffer = gpu.view.as_ref().expect("测试已创建视图").accumulation;
+    let mut bytes = vec![0; buffer.len() as usize];
+    buffer.read(&mut gpu.context, 0, &mut bytes)?;
+    Ok(bytes)
+}
+
+fn exposure_view(gpu: &mut Gpu) -> Result<(), Error> {
+    let mut view = View::new(&mut gpu.context, [32, 32], false)?;
+    view.accumulation = Buffer::new(&mut gpu.context, 32 * 32 * 16, true)?;
+    gpu.view = Some(view);
+    Ok(())
+}
+
+fn freeze_exposure_clock(gpu: &mut Gpu) {
+    // 宿主时钟固定为零：elapsed 对未来原点饱和，避免GPU耗时影响适应断言。
+    gpu.display_origin = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件光追；验证自动测光只改变宿主呈现、不改变HDR"]
+fn hardware_pt_auto_exposure_preserves_hdr() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    exposure_view(&mut gpu)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, 64, 6)?;
+    let environment = Environment::default();
+    host.render_options(&mut gpu, &image, &camera(), environment, options)?;
+    let manual = image.download(&mut gpu.context)?;
+    let manual_hdr = exposure_hdr(&mut gpu)?;
+    gpu.invalidate()?;
+    gpu.display_timeline.set_enabled(true);
+    host.render_options(&mut gpu, &image, &camera(), environment, options)?;
+    let automatic = image.download(&mut gpu.context)?;
+    let state = exposure_state(&mut gpu)?;
+    assert_eq!(
+        manual_hdr,
+        exposure_hdr(&mut gpu)?,
+        "测光不能改写同一绝对样本的HDR"
+    );
+    assert_eq!(state[1], 1);
+    assert!(f32::from_bits(state[0]).is_finite() && f32::from_bits(state[0]).abs() > 0.01);
+    assert_ne!(manual, automatic, "自动曝光必须实际影响宿主呈现");
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件光追；验证resize保留曝光适应历史"]
+fn hardware_pt_auto_exposure_resize_preserves_adaptation() -> Result<(), Box<dyn std::error::Error>>
+{
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    gpu.display_timeline.set_enabled(true);
+    freeze_exposure_clock(&mut gpu);
+    let options = Options::new(false, streamline::Quality::Dlaa, 1, 6)?;
+    host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
+    let before = exposure_state(&mut gpu)?;
+    let resized = Image::new(&mut gpu.context, [64, 32, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(resized.into());
+    let dark = Environment {
+        sun_direction: [0.0; 3],
+        ..Environment::default()
+    };
+    host.render_options(&mut gpu, &resized, &camera(), dark, options)?;
+    let after = exposure_state(&mut gpu)?;
+    assert_eq!(after[0], before[0], "零适应间隔下resize不能跳到新场景曝光");
+    assert_ne!(after[2], before[2], "全黑场景应建立不同的测光目标");
+    assert_eq!(after[1], 1);
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件光追；验证自动曝光下手动EV只作用于最终呈现"]
+fn hardware_pt_auto_exposure_manual_ev_is_display_only() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    exposure_view(&mut gpu)?;
+    gpu.display_timeline.set_enabled(true);
+    freeze_exposure_clock(&mut gpu);
+    let options = Options::new(false, streamline::Quality::Dlaa, 64, 6)?;
+    host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
+    let initial = image.download(&mut gpu.context)?;
+    let initial_hdr = exposure_hdr(&mut gpu)?;
+    let initial_state = exposure_state(&mut gpu)?;
+    gpu.invalidate()?;
+    let environment = Environment {
+        exposure_ev: 2.0,
+        ..Environment::default()
+    };
+    host.render_options(&mut gpu, &image, &camera(), environment, options)?;
+    let exposed = image.download(&mut gpu.context)?;
+    assert_eq!(initial_hdr, exposure_hdr(&mut gpu)?);
+    assert_eq!(
+        initial_state,
+        exposure_state(&mut gpu)?,
+        "手动EV不能进入测光输入"
+    );
+    let brightness = |pixels: &[u8]| {
+        pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| pixel[..3].iter().map(|&v| u64::from(v)).sum::<u64>())
+            .sum::<u64>()
+    };
+    assert!(brightness(&exposed) > brightness(&initial));
     drop(gpu);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
@@ -1489,6 +1665,8 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
             Binding::SampledImage(view.rr.images[3]),
             Binding::SampledImage(view.rr.images[4]),
             Binding::SampledImage(view.rr.images[5]),
+            Binding::StorageBuffer(view.display.state()),
+            Binding::StorageBuffer(view.display.parameters()),
         ],
     )?;
     let fallback = view
@@ -1516,6 +1694,25 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .any(|pixel| pixel[..3].iter().any(|&v| v > 0))
     );
+    // 原图像oracle保持自动曝光关闭；另经生产draw验证RR纹理测光与宿主呈现绑定。
+    gpu.display_timeline.set_enabled(true);
+    host.render_options(&mut gpu, &resized, &camera, environment, performance)?;
+    assert!(gpu.rr_previous.is_some(), "自动曝光帧必须真实完成RR求值");
+    let automatic = exposure_state(&mut gpu)?;
+    assert_eq!(automatic[1], 1);
+    assert!(
+        [automatic[0], automatic[2], automatic[3]]
+            .into_iter()
+            .all(|word| f32::from_bits(word).is_finite())
+    );
+    let mut exposure_frame = [0; 32];
+    gpu.view.as_ref().unwrap().display.parameters().read(
+        &mut gpu.context,
+        0,
+        &mut exposure_frame,
+    )?;
+    assert_eq!(u32::from_le_bytes(exposure_frame[..4].try_into()?), 1280);
+    assert_eq!(u32::from_le_bytes(exposure_frame[4..8].try_into()?), 720);
     // bridge 只允许一个 RR owner；第二会话必须在任何编码前回退，且保留 PT 累积。
     let mut fallback = host.gpu()?;
     let fallback_image = self::image(&mut fallback)?;
