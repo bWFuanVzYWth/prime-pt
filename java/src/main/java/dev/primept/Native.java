@@ -135,16 +135,25 @@ final class Native implements AutoCloseable {
 
     int tintRequests(ByteBuffer output) {
         try {
-            int count=(int)tintRequests.invokeExact(handle,output==null?MemorySegment.NULL:MemorySegment.ofBuffer(output),output==null?0:output.remaining()/24);
-            if(count<0)throw failure();return count;
-        }catch(Throwable e){throw unchecked(e);}
+            // invokeExact以调用点静态类型匹配；条件指针须先固定为MemorySegment。
+            MemorySegment destination = output == null ? MemorySegment.NULL : MemorySegment.ofBuffer(output);
+            int capacity = output == null ? 0 : output.remaining() / 24;
+            int count = (int) tintRequests.invokeExact(handle, destination, capacity);
+            if (count < 0) throw failure();
+            return count;
+        } catch (Throwable e) { throw unchecked(e); }
     }
 
     void beginTints(int radius){try{check((int)tintBegin.invokeExact(handle,radius));}catch(Throwable e){throw unchecked(e);}}
     void biomeWorld(ByteBuffer bytes){try{check((int)biomeWorld.invokeExact(handle,MemorySegment.ofBuffer(bytes),(long)bytes.remaining()));}catch(Throwable e){throw unchecked(e);}}
-    int biomeRequests(ByteBuffer output){
-        try{int count=(int)biomeRequests.invokeExact(handle,output==null?MemorySegment.NULL:MemorySegment.ofBuffer(output),output==null?0:output.remaining()/24);if(count<0)throw failure();return count;}
-        catch(Throwable e){throw unchecked(e);}
+    int biomeRequests(ByteBuffer output) {
+        try {
+            MemorySegment destination = output == null ? MemorySegment.NULL : MemorySegment.ofBuffer(output);
+            int capacity = output == null ? 0 : output.remaining() / 24;
+            int count = (int) biomeRequests.invokeExact(handle, destination, capacity);
+            if (count < 0) throw failure();
+            return count;
+        } catch (Throwable e) { throw unchecked(e); }
     }
     void biomeSamples(ByteBuffer ids){try{check((int)biomeSamples.invokeExact(handle,MemorySegment.ofBuffer(ids),ids.remaining()/4));}catch(Throwable e){throw unchecked(e);}}
 
