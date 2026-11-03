@@ -16,8 +16,17 @@ final class Packet {
     void putInt(int value) { reserve(4); bytes.putInt(value); }
     void putLong(long value) { reserve(8); bytes.putLong(value); }
     void putFloat(float value) { reserve(4); bytes.putFloat(value); }
+    void putDouble(double value) { reserve(8); bytes.putDouble(value); }
+    void putBytes(byte[] value) { reserve(value.length); bytes.put(value); }
+    void putBuffer(ByteBuffer value) { var copy=value.duplicate();reserve(copy.remaining());bytes.put(copy); }
+    void putString(String value) {
+        byte[] encoded = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        putInt(encoded.length); putBytes(encoded);
+    }
     void patchInt(int offset, int value) { bytes.putInt(offset, value); }
     ByteBuffer finish() { return bytes.flip(); }
+    /** 资源字典发布后不再生成本包，解除对大块直接内存的引用。 */
+    void discard() { bytes = null; }
 
     void quad(BakedQuad quad, int tint) {
         reserve(84);

@@ -6,13 +6,13 @@ import java.util.Locale;
 
 /** PFT2 的渲染线程显示副本；统计、窗口与保峰抽样由引擎唯一维护。 */
 final class FrameChart {
-    static final int MAGIC = 0x32544650, VERSION = 2, STAGES = 14, MAX_BARS = 512;
+    static final int MAGIC = 0x32544650, VERSION = 3, STAGES = 14, MAX_BARS = 512;
     static final int HEADER_BYTES = 192, DETAIL_BYTES = 128, BAR_BYTES = 120;
     static final int BARS_OFFSET = HEADER_BYTES + 3 * DETAIL_BYTES;
     static final int CAPACITY = BARS_OFFSET + MAX_BARS * BAR_BYTES;
-    static final String[] LABELS = {"宿主等待", "源/材质", "规划", "宿主捕获", "网格编译/合并", "三角编码", "属性打包",
-            "BLAS构建/等待", "属性分配/写入", "TLAS构建/等待", "场景提交/回收", "录制/SDK", "宿主提交", "未归因"};
-    private static final String[] SHORT_LABELS = {"等待", "源材", "规划", "捕获", "网格", "三角", "打包",
+    static final String[] LABELS = {"宿主等待", "tint/源维护", "规划", "宿主捕获", "网格编译/合并", "三角编码", "属性/光源打包",
+            "BLAS构建/等待", "属性/光源写入", "TLAS构建/等待", "场景提交/回收", "录制/SDK", "宿主提交", "未归因"};
+    private static final String[] SHORT_LABELS = {"等待", "tint", "规划", "捕获", "网格", "三角", "打包",
             "BLAS", "写入", "TLAS", "回收", "录制", "提交", "未归因"};
     static final int[] COLORS = {0xff45b59e, 0xff53c4bd, 0xff9cbbe8, 0xff5b8ff9, 0xffee5b6b,
             0xfff7a8b8, 0xff64cedd, 0xfff0ca52, 0xff90cf66, 0xfff69942, 0xffaa74dd,
@@ -25,6 +25,8 @@ final class FrameChart {
     private static boolean gpuAvailable, sceneAvailable;
     private static long sceneSequence, dirtyRegions, instances, triangleBytes, attributeBytes;
     private static long blasSubmitWaitNs, tlasNs, attributeWriteNs;
+    private static int pressureKind, excludedRegions;
+    private static long requiredBytes, limitBytes, deferredRequests;
 
     private FrameChart() {}
 
@@ -39,6 +41,7 @@ final class FrameChart {
         gpuAvailable = false; gpuSequence = 0; gpuNs = 0;
         sceneAvailable = false; sceneSequence = 0; dirtyRegions = 0; instances = 0;
         triangleBytes = 0; attributeBytes = 0; blasSubmitWaitNs = 0; tlasNs = 0; attributeWriteNs = 0;
+        pressureKind = 0; excludedRegions = 0; requiredBytes = 0; limitBytes = 0; deferredRequests = 0;
     }
 
     /**
@@ -48,7 +51,8 @@ final class FrameChart {
      * header 0/4/8/12 为 magic/version/stages/bars，16/24 为样本数/序号，
      * 32..56 为 FPS/mean/P90/P99 的 f64，64 为 GPU valid，72/80 为序号/ns，88 为 detail mask。
      * 92 为 scene valid，96..152 为场景序号、dirty/instance 数、三角/属性字节与 BLAS提交等待/TLAS/属性写入纳秒。
-     * 场景字段属于最近一次更新，不与选中帧绑定。160..191 保留为零。
+     * 场景字段属于最近一次更新，不与选中帧绑定。v3在160/164保存CPU压力原因/排除region数，
+     * 168/176/184保存需要字节/预算字节/延后请求数；压力属于当前状态。
      * 192 起三条 128B detail（total/reserved/14段），576 起 120B bar（total/14段）。
      */
     static void update(ByteBuffer source) {
@@ -60,8 +64,8 @@ final class FrameChart {
                 || source.getLong(16) < count || source.getLong(24) < 0 || (mask & ~7) != 0
                 || valid < 0 || valid > 1 || scene < 0 || scene > 1 || source.getInt(68) != 0)
             throw invalid();
-        for (int offset = 160; offset < HEADER_BYTES; offset += 8)
-            if (source.getLong(offset) != 0) throw invalid();
+        if (source.getInt(160) < 0 || source.getInt(160) > 3 || source.getInt(164) < 0
+                || source.getLong(168) < 0 || source.getLong(176) < 0 || source.getLong(184) < 0) throw invalid();
         for (int offset = 32; offset <= 56; offset += 8)
             if (!Double.isFinite(source.getDouble(offset)) || source.getDouble(offset) < 0) throw invalid();
         if (valid != 0 && (source.getLong(72) < 0 || source.getLong(80) < 0)) throw invalid();
@@ -96,6 +100,8 @@ final class FrameChart {
         dirtyRegions = source.getLong(104); instances = source.getLong(112);
         triangleBytes = source.getLong(120); attributeBytes = source.getLong(128);
         blasSubmitWaitNs = source.getLong(136); tlasNs = source.getLong(144); attributeWriteNs = source.getLong(152);
+        pressureKind = source.getInt(160); excludedRegions = source.getInt(164);
+        requiredBytes = source.getLong(168); limitBytes = source.getLong(176); deferredRequests = source.getLong(184);
     }
 
     private static IllegalArgumentException invalid() { return new IllegalArgumentException("无效 PFT2 帧图快照"); }
@@ -127,7 +133,8 @@ final class FrameChart {
         int legendColumns = Math.max(1, Math.min(5, graphWidth / (compact ? 36 : 100)));
         int legendRows = (STAGES + legendColumns - 1) / legendColumns;
         int detailRows = compact ? 2 : 3;
-        int fixedHeight = 51 + detailRows * 11 + 6 + legendRows * 10 + 8 + 44 + 6;
+        int pressureHeight = pressureKind == 0 && excludedRegions == 0 && deferredRequests == 0 ? 0 : 22;
+        int fixedHeight = 51 + detailRows * 11 + 6 + legendRows * 10 + 8 + 44 + pressureHeight + 6;
         if (height < fixedHeight + 20) return false;
         int graphHeight = Math.min(72, height - fixedHeight);
         int panelHeight = fixedHeight + graphHeight;
@@ -199,13 +206,18 @@ final class FrameChart {
         surface.fill(left, sceneTop - 3, left + graphWidth, sceneTop - 2, 0xff465262);
         text(surface, sceneAvailable ? "最近场景更新 #" + sceneSequence : "最近场景更新：尚无", left, sceneTop, graphWidth, 0xffc2cad6);
         if (sceneAvailable) {
-            text(surface, format("脏区%d · 实例%d · 三角%s", dirtyRegions, instances, bytes(triangleBytes)),
+            text(surface, format("几何脏区%d · 实例%d · 三角%s", dirtyRegions, instances, bytes(triangleBytes)),
                     left, sceneTop + 11, graphWidth, 0xffc2cad6);
-            text(surface, format("属性写入%s · %.2fms", bytes(attributeBytes), attributeWriteNs / 1_000_000.0),
+            text(surface, format("场景写入%s · %.2fms", bytes(attributeBytes), attributeWriteNs / 1_000_000.0),
                     left, sceneTop + 22, graphWidth, COLORS[8]);
             text(surface, compact ? format("BLAS等 %.1f · TLAS %.1f ms", blasSubmitWaitNs / 1_000_000.0, tlasNs / 1_000_000.0)
                     : format("BLAS提交/等待 %.2fms · TLAS %.2fms", blasSubmitWaitNs / 1_000_000.0, tlasNs / 1_000_000.0),
                     left, sceneTop + 33, graphWidth, 0xffc2cad6);
+        }
+        if (pressureHeight != 0) {
+            String cause = switch (pressureKind) { case 1 -> "常驻预算"; case 2 -> "等待回收"; case 3 -> "单区预算"; default -> "容量状态"; };
+            text(surface, format("CPU %s：%s / %s", cause, bytes(requiredBytes), bytes(limitBytes)), left, sceneTop + 44, graphWidth, 0xffffc46b);
+            text(surface, format("预算排除%d区 · 延后%d请求", excludedRegions, deferredRequests), left, sceneTop + 55, graphWidth, 0xffffc46b);
         }
         return true;
     }

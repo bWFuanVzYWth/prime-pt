@@ -2,7 +2,7 @@
 //! AS等待、属性分配/映射写入分别计时，不伪装成GPU timestamp。
 
 use crate::Error;
-use simple_engine::frame_loop::timing::{FrameAttribution, FrameSample, FrameStats, compact_chart};
+use frame_loop::timing::{FrameAttribution, FrameSample, FrameStats, compact_chart};
 use std::time::Duration;
 
 pub(crate) const STAGES: usize = 14;
@@ -29,9 +29,32 @@ pub(crate) struct Profile {
     pub scene: [u64; 7],
     pub update: Option<SceneInfo>,
     last_update: Option<(u64, SceneInfo)>,
+    pressure: prime_world::Pressure,
 }
 
 impl Profile {
+    pub(crate) fn set_pressure(&mut self, pressure: prime_world::Pressure) {
+        let previous = self.pressure;
+        if (
+            previous.kind,
+            previous.excluded_regions,
+            previous.limit_bytes,
+        ) != (
+            pressure.kind,
+            pressure.excluded_regions,
+            pressure.limit_bytes,
+        ) {
+            eprintln!(
+                "[prime_pt] mesh.pressure kind={:?} required={} limit={} excluded={} deferred={}",
+                pressure.kind,
+                pressure.required_bytes,
+                pressure.limit_bytes,
+                pressure.excluded_regions,
+                pressure.deferred_requests
+            );
+        }
+        self.pressure = pressure;
+    }
     pub(crate) fn record(
         &mut self,
         elapsed_ns: u64,
@@ -80,7 +103,7 @@ impl Profile {
         let output = &mut output[..size];
         output.fill(0);
         put_u32(output, 0, 0x3254_4650);
-        put_u32(output, 4, 2);
+        put_u32(output, 4, 3);
         put_u32(output, 8, STAGES as u32);
         put_u32(output, 12, count as u32);
         let snapshot = self.stats.snapshot();
@@ -106,6 +129,11 @@ impl Profile {
             }
         }
         put_u32(output, 88, mask);
+        put_u32(output, 160, self.pressure.kind as u32);
+        put_u32(output, 164, self.pressure.excluded_regions as u32);
+        put_u64(output, 168, self.pressure.required_bytes as u64);
+        put_u64(output, 176, self.pressure.limit_bytes as u64);
+        put_u64(output, 184, self.pressure.deferred_requests as u64);
         if let Some((sequence, info)) = self.last_update {
             put_u32(output, 92, 1);
             for (index, value) in [

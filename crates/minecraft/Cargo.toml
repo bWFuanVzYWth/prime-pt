@@ -1,0 +1,18 @@
+[package]
+name = "prime_minecraft"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+fixtures = []
+
+[dependencies]
+prime_scene = { path = "../scene" }
+thiserror = "2"
+png = "0.18.1"
+light_sampling = { path = "../../../../crates/light_sampling" }
+
+[lints.rust]
+missing_docs = "deny"
+[lints.rustdoc]
+broken_intra_doc_links = "deny"

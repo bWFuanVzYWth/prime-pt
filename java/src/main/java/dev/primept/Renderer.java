@@ -35,7 +35,46 @@ public final class Renderer {
     private static long generation = -1;
     private static volatile boolean resetRequested;
     private static long lastCompleted;
+    private static ByteBuffer tintRequests=ByteBuffer.allocateDirect(24*1024).order(ByteOrder.LITTLE_ENDIAN);
+    private static ByteBuffer biomeRequests=ByteBuffer.allocateDirect(24*1024).order(ByteOrder.LITTLE_ENDIAN);
+    private static ClientLevel biomeWorld;
     private Renderer() {}
+
+    /** ModelManager完成首次/重载发布时同步准备整代源及GPU产物；不由首次命中懒构建。 */
+    public static void prepareResources(){
+        RenderSystem.assertOnRenderThread();
+        ensureRenderer();await();
+        var next=SourceResources.prepareReload(Minecraft.getInstance());
+        Atlas.send(renderer);renderer.sources(next.packet());next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;
+    }
+
+    private static void ensureRenderer(){
+        if(renderer!=null)return;
+        var backend=((DeviceAccess)RenderSystem.getDevice()).primept$backend();
+        if(!(backend instanceof VulkanDevice device))throw new IllegalStateException("Prime PT需要Vulkan宿主");
+        encoder=device.createCommandEncoder();await();
+        renderer=new Native(device.instance().vkInstance().address(),device.vkDevice().getPhysicalDevice().address(),device.vkDevice().address(),device.graphicsQueue().vkQueue().address(),device.graphicsQueue().queueFamilyIndex(),Bootstrap.graphicsQueueIndex(),Bootstrap.invocationReorder(device.vkDevice()),Settings.requestedSer());
+    }
+
+    private static void completeTints(Minecraft minecraft){
+        renderer.beginTints(minecraft.options.biomeBlendRadius().get());
+        int pages=renderer.biomeRequests(null);
+        if(pages>0){
+            int needed=Math.multiplyExact(pages,24);
+            if(needed>256*1024*1024)throw new IllegalStateException("biome请求超过源包预算");
+            if(biomeRequests.capacity()<needed)biomeRequests=ByteBuffer.allocateDirect(needed).order(ByteOrder.LITTLE_ENDIAN);
+            biomeRequests.clear();biomeRequests.limit(needed);
+            if(renderer.biomeRequests(biomeRequests)!=pages)throw new IllegalStateException("同步biome阶段数量变化");
+            renderer.biomeSamples(SourceResources.prepared().biomes.respond(minecraft.level,biomeRequests,pages));
+        }
+        int count=renderer.tintRequests(null);if(count==0)return;
+        int bytes=Math.multiplyExact(count,24);
+        if(bytes>256*1024*1024)throw new IllegalStateException("tint请求超过源包预算");
+        if(tintRequests.capacity()<bytes)tintRequests=ByteBuffer.allocateDirect(bytes).order(ByteOrder.LITTLE_ENDIAN);
+        tintRequests.clear();tintRequests.limit(bytes);
+        if(renderer.tintRequests(tintRequests)!=count)throw new IllegalStateException("同步tint阶段数量变化");
+        renderer.tints(CAPTURE.tints(minecraft,tintRequests,count));
+    }
 
     /** 替代原版世界绘制；相机、手持物和 UI 继续使用宿主路径。 */
     public static void render(CameraRenderState camera, RenderTarget target) {
@@ -52,16 +91,7 @@ public final class Renderer {
             return;
         }
         for (int i = 0; i < FrameChart.STAGES; i++) STAGES.putLong(i * 8, 0);
-        if (renderer == null) {
-            var backend = ((DeviceAccess) RenderSystem.getDevice()).primept$backend();
-            if (!(backend instanceof VulkanDevice device))
-                throw new IllegalStateException("Prime PT 需要 --graphicsBackend VULKAN");
-            encoder = device.createCommandEncoder();
-            await();
-            renderer = new Native(device.instance().vkInstance().address(), device.vkDevice().getPhysicalDevice().address(),
-                    device.vkDevice().address(), device.graphicsQueue().vkQueue().address(), device.graphicsQueue().queueFamilyIndex(),
-                    Bootstrap.graphicsQueueIndex(), Bootstrap.invocationReorder(device.vkDevice()), Settings.requestedSer());
-        }
+        if(renderer==null)throw new IllegalStateException("首次资源加载尚未准备Prime资源所有者");
         long stage = System.nanoTime();
         await();
         STAGES.putLong(0, System.nanoTime() - stage);
@@ -69,19 +99,18 @@ public final class Renderer {
         renderer.ser(Settings.requestedSer());
         if (CAPTURE.select(minecraft.level) || resetRequested) {
             renderer.reset();
+            biomeWorld=null;
             resetRequested = false;
             lastCompleted = 0;
             FrameChart.clear();
         }
-        if (generation != Atlas.generation) {
-            Atlas.send(renderer); generation = Atlas.generation;
-        }
+        if(biomeWorld!=minecraft.level){renderer.biomeWorld(SourceResources.prepared().biomes.world(minecraft.level));biomeWorld=minecraft.level;}
         if (CHANGES.takeOverflow()) renderer.invalidateAll();
         for (int i = 0; i < 256; i++) {
             var change = CHANGES.poll();
             if (change == null) break;
             if (change.world() != minecraft.level) continue;
-            if (change.all()) renderer.invalidateAll();
+            if (change.all()) renderer.invalidateTints();
             else renderer.invalidateSection(change.x(), change.y(), change.z());
         }
         STAGES.putLong(8, System.nanoTime() - stage);
@@ -106,6 +135,9 @@ public final class Renderer {
                 throw failure;
             }
         }
+        long tintStarted=System.nanoTime();completeTints(minecraft);STAGES.putLong(8,STAGES.getLong(8)+System.nanoTime()-tintStarted);
+        int medium=switch(minecraft.gameRenderer.mainCamera().getFluidInCamera()){case WATER->1;case LAVA->2;default->0;};
+        renderer.cameraMedium(medium);
         if (!(target.getColorTexture() instanceof VulkanGpuTexture texture)
                 || !(target.getColorTextureView() instanceof VulkanGpuTextureView view)
                 || texture.getFormat() != GpuFormat.RGBA8_UNORM || (texture.usage() & STORAGE) == 0)
@@ -166,7 +198,7 @@ public final class Renderer {
     /** 必须在宿主 VulkanDevice.close 之前调用。 */
     public static void close() {
         if (renderer == null) return;
-        await(); renderer.close(); renderer = null; generation = -1; CAPTURE.invalidate(); resetRequested = false;
+        await(); renderer.close(); renderer = null; generation = -1; CAPTURE.invalidate(); resetRequested = false;biomeWorld=null;
         lastCompleted = 0; FrameChart.clear();
     }
 }

@@ -119,3 +119,25 @@ tasks.named('check') {
     dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),
             tasks.named('videoOptionsFixture'), tasks.named('commandHintsFixture'), tasks.named('sourceChangesFixture'), tasks.named('frameChartFixture')
 }
+
+// 不启动客户端；由26.3真实原版代码生成Rust数学对照。
+tasks.register('tintFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.TintFixture'
+    args rootProject.file('target/java-tint.bin').absolutePath
+}
+
+tasks.register('compactSourceFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.CompactSourceFixture'
+    args rootProject.file('target/java-compact.bin').absolutePath
+}
+
+tasks.register('modelRandomFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.ModelRandomFixture'
+    args rootProject.file('target/java-model-random.bin').absolutePath
+}

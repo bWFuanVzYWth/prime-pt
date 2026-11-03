@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["native"]
+members = ["native", "crates/scene", "crates/world", "crates/renderer", "crates/minecraft"]
 
 [profile.release]
 lto = "thin"

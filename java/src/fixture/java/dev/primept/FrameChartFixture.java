@@ -29,7 +29,7 @@ final class FrameChartFixture {
                     && line.contains("81.3%") && line.contains("65.00ms")), "native 峰值、最大项与占比跨语言一致");
             require(nativeBounds.labels.stream().anyMatch(line -> line.contains("最近场景更新 #2"))
                     && nativeBounds.labels.stream().anyMatch(line -> line.contains("脏区2") && line.contains("实例64") && line.contains("6.00MiB"))
-                    && nativeBounds.labels.stream().anyMatch(line -> line.contains("属性写入3.00MiB") && line.contains("1.00ms"))
+                    && nativeBounds.labels.stream().anyMatch(line -> line.contains("场景写入3.00MiB") && line.contains("1.00ms"))
                     && nativeBounds.labels.stream().anyMatch(line -> line.contains("BLAS提交/等待 1.00ms") && line.contains("TLAS 2.00ms")),
                     "真实场景规模与主机子段独立显示");
             if (image != null) render(image.resolveSibling(image.getFileName().toString().replace(".png", "-native.png")));
@@ -63,7 +63,13 @@ final class FrameChartFixture {
         rejects(packet, 8, 10, "阶段数量");
         rejects(packet, 92, 2, "场景有效标志");
         packet.putLong(128, -1); expectRejected(packet, "负属性字节"); packet.putLong(128, 3 * 1_048_576L);
-        packet.putLong(160, 1); expectRejected(packet, "保留头字段"); packet.putLong(160, 0);
+        rejects(packet, 160, 4, "CPU压力原因枚举");
+        packet.putInt(160, 1); packet.putInt(164, 3); packet.putLong(168, 150 * 1_048_576L); packet.putLong(176, 128 * 1_048_576L); packet.putLong(184, 7);
+        FrameChart.update(packet);
+        var pressure = new Bounds(520, 360); FrameChart.paint(pressure, 0, 520, 360, -1, -1);
+        require(pressure.labels.stream().anyMatch(line -> line.contains("常驻预算") && line.contains("150.00MiB"))
+                && pressure.labels.stream().anyMatch(line -> line.contains("预算排除3区") && line.contains("延后7请求")), "预算压力明确显示而非异常");
+        packet.putLong(160, 0); packet.putLong(168, 0); packet.putLong(176, 0); packet.putLong(184, 0); FrameChart.update(packet);
         rejects(packet, 12, FrameChart.MAX_BARS + 1, "柱数上界");
         packet.putLong(FrameChart.BARS_OFFSET + 8, -1);
         expectRejected(packet, "负归因");

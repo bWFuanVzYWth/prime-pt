@@ -3,7 +3,7 @@
 //! Java 在渲染线程同步借出源包、atlas 与宿主 Vulkan 句柄；Rust 拥有 mesh、
 //! 工作池、BLAS/TLAS、SBT 和 pipeline。每次进入 native 前，宿主必须提交并等待
 //! 前次 native 命令完成，且独占 graphics queue。句柄不会转移设备所有权。
-//! 源包只在调用内借用；解码、验证与本轮section编译在返回前完成。
+//! 源包只在调用内借用；palette/资源字典解码成自持输入，section编译及tint续接分阶段发布。
 //! region所需源全部就绪后才成为可发布资源，一个64m region合并4³个section。
 //! 使用 [`Quad`] 的直接寻址属性 ABI：任意四角、固定012/023、三角面退化为quad，
 //! 不要求轴对齐。位置只由 AS position fetch 提供，不保留 shader 顶点/索引副本。
@@ -14,12 +14,11 @@
 #![recursion_limit = "256"]
 
 mod diagnostics;
-mod gpu;
-mod reconstruction;
-mod scene;
-mod streamline;
+use prime_renderer as gpu;
+use prime_renderer::streamline;
+use prime_world as scene;
 
-pub use scene::{Camera, Environment, Material, Mesh, Quad, WorldCamera};
+pub use prime_scene::{Camera, Environment, Material, Mesh, Quad, WorldCamera};
 
 use std::{
     cell::RefCell,
@@ -38,34 +37,80 @@ pub(crate) enum Error {
     /// 源协议、句柄或参数不符合约定。
     #[error("{0}")]
     Input(&'static str),
-    /// 无法创建批次工作池。
-    #[error("mesh 工作池：{0}")]
-    Workers(#[from] rayon::ThreadPoolBuildError),
     /// Vulkan 加载、资源或命令失败。
     #[error(transparent)]
     Gpu(#[from] gpu::Error),
     /// Streamline 初始化或全局退役失败。
     #[error(transparent)]
     Streamline(#[from] streamline::Error),
-    /// 区块窗口配置不符合引擎约定。
+    /// 区块所有者或源包失败。
     #[error(transparent)]
-    Config(#[from] chunk_manager::ConfigError),
-    /// 区块资源状态转换失败。
+    World(#[from] prime_world::Error),
+    /// Minecraft源资源、压缩palette或材质准备失败。
     #[error(transparent)]
-    Chunks(#[from] chunk_manager::StateError),
-    /// 区块调度输入无效。
+    Minecraft(#[from] prime_minecraft::Error),
+    /// 通用场景输入失败。
     #[error(transparent)]
-    Planning(#[from] chunk_manager::PlanError),
+    Scene(#[from] prime_scene::Error),
     /// 帧统计保留容量增长失败。
     #[error(transparent)]
-    Diagnostics(#[from] simple_engine::frame_loop::timing::FrameStatsError),
+    Diagnostics(#[from] frame_loop::timing::FrameStatsError),
 }
 
 struct Engine {
     scene: scene::Scene,
     gpu: gpu::Gpu,
     atlas_ready: bool,
+    catalog: prime_minecraft::Catalog,
+    pending_albedo: Option<([u32; 2], Vec<u8>)>,
+    tint_world: Option<prime_minecraft::tint::TintWorld>,
+    tint_pending: Option<TintContinuation>,
+    tint_radius: Option<u32>,
+    tint_columns: std::collections::HashSet<(i32, i32)>,
+    tint_invalidate_all: bool,
     profile: diagnostics::Profile,
+}
+
+struct TintContinuation {
+    plan: prime_minecraft::tint::TintPlan,
+    ids: Option<Vec<u32>>,
+    host: Option<Vec<u32>>,
+}
+
+impl Engine {
+    fn retire_tint_sources(&mut self) {
+        for key in self.scene.drain_retired_sources() {
+            self.tint_pending = None;
+            if let Some(world) = &mut self.tint_world {
+                world.forget_section(key);
+            }
+        }
+    }
+    fn finish_tints(&mut self) -> Result<(), Error> {
+        let Some(pending) = self.tint_pending.as_ref() else {
+            return Ok(());
+        };
+        if pending.ids.is_none() || pending.host.is_none() {
+            return Ok(());
+        }
+        let pending = self.tint_pending.take().expect("完整响应阶段");
+        let resources = self
+            .catalog
+            .tints()
+            .ok_or(Error::Input("缺少同世代tint资源"))?;
+        let colors = self
+            .tint_world
+            .as_mut()
+            .ok_or(Error::Input("biome世界源尚未准备"))?
+            .finish(
+                pending.plan,
+                resources,
+                &pending.ids.expect("已校验biome阶段"),
+                &pending.host.expect("已校验host阶段"),
+            )?;
+        self.scene.apply_tints(&colors)?;
+        Ok(())
+    }
 }
 
 static ENGINES: OnceLock<Mutex<BTreeMap<u64, Engine>>> = OnceLock::new();
@@ -205,6 +250,13 @@ pub unsafe extern "C" fn prime_create_options(
                     scene,
                     gpu,
                     atlas_ready: false,
+                    catalog: prime_minecraft::Catalog::default(),
+                    pending_albedo: None,
+                    tint_world: None,
+                    tint_pending: None,
+                    tint_radius: None,
+                    tint_columns: std::collections::HashSet::new(),
+                    tint_invalidate_all: false,
                     profile: diagnostics::Profile::default(),
                 },
             );
@@ -259,6 +311,11 @@ pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
     guarded(-1, || {
         with_engine(id, |engine| {
             engine.scene.clear();
+            engine.tint_world = None;
+            engine.tint_pending = None;
+            engine.tint_radius = None;
+            engine.tint_columns.clear();
+            engine.tint_invalidate_all = false;
             engine
                 .gpu
                 .invalidate_history(gpu::GlobalReset::WorldReplaced)?;
@@ -316,6 +373,8 @@ pub unsafe extern "C" fn prime_plan(
                 };
             }
             count = planned.len() as i32;
+            engine.retire_tint_sources();
+            engine.scene.compile_sources(&engine.catalog)?;
             Ok(())
         })?;
         Ok(count)
@@ -326,7 +385,11 @@ pub unsafe extern "C" fn prime_plan(
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_invalidate_section(id: u64, sx: i32, sy: i32, sz: i32) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| engine.scene.invalidate_section([sx, sy, sz]))
+        with_engine(id, |engine| {
+            engine.tint_columns.insert((sx, sz));
+            engine.tint_pending = None;
+            Ok(engine.scene.invalidate_section([sx, sy, sz])?)
+        })
     })
 }
 
@@ -336,6 +399,8 @@ pub extern "C" fn prime_invalidate_all(id: u64) -> i32 {
     guarded(-1, || {
         with_engine(id, |engine| {
             engine.scene.invalidate_all();
+            engine.tint_pending = None;
+            engine.tint_invalidate_all = true;
             Ok(())
         })
     })
@@ -345,7 +410,7 @@ pub extern "C" fn prime_invalidate_all(id: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| engine.scene.fail_capture(request))
+        with_engine(id, |engine| Ok(engine.scene.fail_capture(request)?))
     })
 }
 
@@ -390,6 +455,7 @@ pub unsafe extern "C" fn prime_profile(
         let output = unsafe { std::slice::from_raw_parts_mut(output, capacity) };
         let mut size = 0;
         with_engine(id, |engine| {
+            engine.profile.set_pressure(engine.scene.pressure());
             engine.profile.record(elapsed_ns, timings)?;
             size = engine.profile.write(output, columns)? as i32;
             Ok(())
@@ -405,9 +471,10 @@ pub unsafe extern "C" fn prime_profile(
 /// 每块为 `x | y<<4 | z<<8, quad_count, offset_x,offset_y,offset_z`；
 /// 每 quad 为 `ARGB, [x,y,z,u,v] × 4`。
 /// quad 坐标相对方块，UV 对应 atlas；每包 1..=64 段，可跨 region。
-/// block_count=0表示真实空section；u32::MAX表示源chunk未加载且不跟block数据。
+/// PRT3保留原始palette/storage，收到必要邻域后由Rust编译；tint通过独立批阶段补齐。
+/// 兼容PRT2中block_count=0表示真实空section；u32::MAX表示源chunk未加载。
 /// 不可用region保留显式负缓存并撤下GPU几何，加载通知后重新捕获完整region。
-/// 旧ticket回复忽略，原版面剔除在捕获边界求值。
+/// 旧ticket回复忽略，未知邻域不猜为空，失败不发布半个region。
 ///
 /// # Safety
 /// data 指向 len 字节的只读连续内存，调用期间保持活动且不被其他线程修改。
@@ -420,15 +487,24 @@ pub unsafe extern "C" fn prime_batch(id: u64, data: *const u8, len: u64) -> i32 
         }
         // SAFETY: 调用者保证整段内存只读且在调用内活动；上方限制长度。
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        with_engine(id, |engine| engine.scene.apply(bytes))
+        with_engine(id, |engine| {
+            if bytes.starts_with(&0x33545250u32.to_le_bytes()) {
+                engine.scene.apply_compact(bytes, &engine.catalog)?;
+                engine.retire_tint_sources();
+                engine.scene.compile_sources(&engine.catalog)?;
+            } else {
+                engine.scene.apply(bytes)?;
+            }
+            Ok(())
+        })
     })
 }
 
-/// 上传一代 RGBA8 atlas；UV 使用整张图归一化坐标，成功返回 0。
+/// 暂存下一代RGBA8 atlas；不改变当前可见GPU域，后续prime_sources统一准备并发布。
 ///
 /// # Safety
 /// pixels 指向 len 字节的只读连续内存。宿主已提交并确认前次 draw 完成，
-/// 当前线程独占 graphics queue；此调用可能同步提交上传命令。
+/// 当前线程独占本会话；此调用只复制借用像素，GPU提交发生在prime_sources。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prime_atlas(
     id: u64,
@@ -454,13 +530,301 @@ pub unsafe extern "C" fn prime_atlas(
         // SAFETY: 调用者保证在调用内借出的完整 atlas 内存；长度已验证。
         let bytes = unsafe { std::slice::from_raw_parts(pixels, len as usize) };
         with_engine(id, |engine| {
-            engine.gpu.set_atlas(width, height, bytes)?;
-            engine
-                .gpu
-                .invalidate_history(gpu::GlobalReset::SceneDomainReplaced)?;
-            engine.scene.clear();
+            let mut pixels = Vec::new();
+            pixels
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| Error::Input("待准备albedo容量不足"))?;
+            pixels.extend_from_slice(bytes);
+            engine.pending_albedo = Some(([width, height], pixels));
+            Ok(())
+        })
+    })
+}
+
+/// 首次加载/重载的完整PRM1资源事务；失败保留旧Catalog、世界和GPU资源域。
+/// 候选shader/SBT/材质/alias全部就绪后才发布，运行期section不得调用本入口追加资源。
+///
+/// # Safety
+/// data在调用内借出完整len字节；宿主已完成此前命令且独占graphics queue。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i32 {
+    guarded(-1, || {
+        let len = usize::try_from(len).map_err(|_| Error::Input("资源包长度越界"))?;
+        if data.is_null() || len == 0 || len > prime_minecraft::MAX_PACKET {
+            return Err(Error::Input("资源包指针或长度无效"));
+        }
+        // SAFETY: 调用者保持源包只读活动，上方校验了完整长度。
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        with_engine(id, |engine| {
+            let (extent, albedo) = engine
+                .pending_albedo
+                .as_ref()
+                .ok_or(Error::Input("源资源准备前需要stage albedo"))?;
+            let mut prepared = engine.catalog.stage_resources(bytes)?;
+            let generation = prepared.generation();
+            let world = engine.scene.stage_source_generation(generation)?;
+            {
+                let materials = prepared.material_resources(*extent, albedo)?;
+                engine.gpu.replace_resources(gpu::ResourceUpload {
+                    generation,
+                    extent: *extent,
+                    albedo,
+                    materials: materials.materials,
+                    mers: &materials.mers,
+                    auxiliary: &materials.auxiliary,
+                    emission_alias_words: &materials.emission_alias_words,
+                    light_areas: &materials.quad_areas,
+                })?;
+            }
+            prepared.commit();
+            world.commit();
+            engine.tint_world = None;
+            engine.tint_pending = None;
+            engine.tint_radius = None;
+            engine.tint_columns.clear();
+            engine.tint_invalidate_all = false;
+            engine.pending_albedo = None;
             engine.atlas_ready = true;
             Ok(())
+        })
+    })
+}
+
+/// 更新真实相机介质：0空气、1水、2岩浆，不触发资源准备或RR全局重置。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_camera_medium(id: u64, kind: u32) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| {
+            engine
+                .gpu
+                .set_initial_medium(engine.catalog.camera_medium(kind)?)?;
+            Ok(())
+        })
+    })
+}
+
+/// 纯tint/biome缓存失效，不丢弃palette/storage或重新准备全局模型资源。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_invalidate_tints(id: u64) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| {
+            engine.scene.invalidate_tints();
+            engine.tint_pending = None;
+            engine.tint_invalidate_all = true;
+            Ok(())
+        })
+    })
+}
+
+/// 接受当前世界完整PBW1原始biome调色板与seed；失败保留旧世界tint所有者。
+/// # Safety
+/// data借出len个只读字节到返回，调用者独占本会话。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_biome_world(id: u64, data: *const u8, len: u64) -> i32 {
+    guarded(-1, || {
+        let len = usize::try_from(len).map_err(|_| Error::Input("biome包长度越界"))?;
+        if data.is_null() || len == 0 || len > prime_minecraft::MAX_PACKET {
+            return Err(Error::Input("biome包指针或长度无效"));
+        }
+        // SAFETY: 长度已校验，调用者保持完整只读借用。
+        let bytes = unsafe { std::slice::from_raw_parts(data, len) };
+        with_engine(id, |engine| {
+            let resources = engine
+                .catalog
+                .tints()
+                .ok_or(Error::Input("世界biome源前需要tint资源"))?;
+            let world = prime_minecraft::tint::TintWorld::decode(bytes, resources)?;
+            engine.tint_world = Some(world);
+            engine.tint_pending = None;
+            engine.tint_radius = None;
+            engine.tint_columns.clear();
+            engine.tint_invalidate_all = false;
+            Ok(())
+        })
+    })
+}
+
+/// 完成纯Rust原版tint计划；缺少的quart与自定义回调由两个独立批阶段补齐。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_tint_begin(id: u64, radius: u32) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| {
+            if radius > 7 {
+                return Err(Error::Input("tint半径须0..=7"));
+            }
+            engine.tint_pending = None;
+            if engine.tint_radius.is_some_and(|old| old != radius) {
+                engine.scene.invalidate_tints();
+            }
+            engine.tint_radius = Some(radius);
+            if let Some(world) = engine.tint_world.as_mut()
+                && (engine.tint_invalidate_all || !engine.tint_columns.is_empty())
+            {
+                world.invalidate(engine.tint_invalidate_all, &engine.tint_columns);
+                engine.tint_columns.clear();
+                engine.tint_invalidate_all = false;
+            }
+            let requests: Vec<_> = engine.scene.tint_requests().collect();
+            if requests.is_empty() {
+                return Ok(());
+            }
+            let resources = engine
+                .catalog
+                .tints()
+                .ok_or(Error::Input("缺少全量tint recipe"))?;
+            let world = engine
+                .tint_world
+                .as_mut()
+                .ok_or(Error::Input("biome世界源尚未准备"))?;
+            let plan = world.plan(&requests, resources, radius)?;
+            let ids = plan.biome_requests().is_empty().then(Vec::new);
+            let host = plan.host_requests().is_empty().then(Vec::new);
+            engine.tint_pending = Some(TintContinuation { plan, ids, host });
+            engine.finish_tints()
+        })
+    })
+}
+
+/// 复制原始quart请求，每条24B为sectionXYZ/reserved0/mask；capacity0查询页数。
+/// # Safety
+/// 非零capacity时output借出至少capacity*24个可写字节到返回。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_biome_requests(id: u64, output: *mut u8, capacity: u32) -> i32 {
+    guarded(-1, || {
+        let mut count = 0;
+        with_engine(id, |engine| {
+            let Some(pending) = &engine.tint_pending else {
+                return Ok(());
+            };
+            let requests = pending.plan.biome_requests();
+            count = i32::try_from(requests.len()).map_err(|_| Error::Input("biome请求数量越界"))?;
+            if capacity == 0 {
+                return Ok(());
+            }
+            if output.is_null() || (capacity as usize) < requests.len() {
+                return Err(Error::Input("biome请求输出容量不足"));
+            }
+            for (index, request) in requests.iter().enumerate() {
+                let mut bytes = [0u8; 24];
+                for axis in 0..3 {
+                    bytes[axis * 4..axis * 4 + 4]
+                        .copy_from_slice(&request.section[axis].to_le_bytes());
+                }
+                bytes[16..24].copy_from_slice(&request.mask.to_le_bytes());
+                // SAFETY: 完整24B输出范围已校验，所有写入相互独立。
+                unsafe {
+                    output
+                        .add(index * 24)
+                        .copy_from_nonoverlapping(bytes.as_ptr(), 24);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(count)
+    })
+}
+
+/// 完整回填quart请求的原始biome行号，按各mask升位顺序；不由Java求最终颜色。
+/// # Safety
+/// ids借出count个小端u32；允许未对齐，到返回前保持只读活动。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_biome_samples(id: u64, ids: *const u32, count: u32) -> i32 {
+    guarded(-1, || {
+        if ids.is_null() && count != 0 {
+            return Err(Error::Input("biome响应指针为空"));
+        }
+        with_engine(id, |engine| {
+            let pending = engine
+                .tint_pending
+                .as_mut()
+                .ok_or(Error::Input("没有待续接biome计划"))?;
+            if pending.plan.biome_sample_count() != count as usize || pending.ids.is_some() {
+                return Err(Error::Input("biome响应数量不匹配或重复"));
+            }
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(count as usize)
+                .map_err(|_| Error::Input("biome响应容量不足"))?;
+            for index in 0..count as usize {
+                // SAFETY: 调用者借出完整u32数组，上方校验数量；指针可未对齐。
+                values.push(u32::from_le(unsafe { ids.add(index).read_unaligned() }));
+            }
+            pending.ids = Some(values);
+            engine.finish_tints()
+        })
+    })
+}
+
+/// 复制唯一必要tint请求，每条24B为positionXYZ/state/slot/reserved0。
+/// capacity=0只查询数量；在回填前宿主不得插入新源/资源世代修改。
+///
+/// # Safety
+/// capacity非零时output指向至少capacity*24个可写字节；借用只持续本调用。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_tint_requests(id: u64, output: *mut u8, capacity: u32) -> i32 {
+    guarded(-1, || {
+        let mut result = 0;
+        with_engine(id, |engine| {
+            let requests = engine
+                .tint_pending
+                .as_ref()
+                .map_or(&[][..], |pending| pending.plan.host_requests());
+            result = i32::try_from(requests.len()).map_err(|_| Error::Input("tint请求数量越界"))?;
+            if capacity == 0 {
+                return Ok(());
+            }
+            if output.is_null() || (capacity as usize) < requests.len() {
+                return Err(Error::Input("tint输出指针或容量无效"));
+            }
+            for (index, request) in requests.iter().enumerate() {
+                let mut bytes = [0u8; 24];
+                for axis in 0..3 {
+                    bytes[axis * 4..axis * 4 + 4]
+                        .copy_from_slice(&request.position[axis].to_le_bytes());
+                }
+                bytes[12..16].copy_from_slice(&request.state.to_le_bytes());
+                bytes[16..20].copy_from_slice(&request.slot.to_le_bytes());
+                // SAFETY: 数量和完整24B输出容量已校验，源输出不重叠。
+                unsafe {
+                    output
+                        .add(index * 24)
+                        .copy_from_nonoverlapping(bytes.as_ptr(), 24);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(result)
+    })
+}
+
+/// 完整回填上次同步请求的真实ARGB，不接受数量不足的前缀或隐式白色。
+///
+/// # Safety
+/// colors借出count个小端u32，允许未对齐；调用内不被修改，不夹入其他world变更。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_tints(id: u64, colors: *const u32, count: u32) -> i32 {
+    guarded(-1, || {
+        if colors.is_null() && count != 0 {
+            return Err(Error::Input("tint颜色指针为空"));
+        }
+        with_engine(id, |engine| {
+            let pending = engine
+                .tint_pending
+                .as_mut()
+                .ok_or(Error::Input("没有待续接host tint计划"))?;
+            if pending.plan.host_requests().len() != count as usize || pending.host.is_some() {
+                return Err(Error::Input("tint响应数量不匹配或重复"));
+            }
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(count as usize)
+                .map_err(|_| Error::Input("tint响应容量不足"))?;
+            for index in 0..count as usize {
+                // SAFETY: 调用者借出全部u32；不要求指针对齐。
+                values.push(u32::from_le(unsafe { colors.add(index).read_unaligned() }));
+            }
+            pending.host = Some(values);
+            engine.finish_tints()
         })
     })
 }
@@ -525,36 +889,42 @@ pub unsafe extern "C" fn prime_draw(
             engine.profile.update = None;
             let prepare_started = std::time::Instant::now();
             engine.scene.rebase(anchor);
-            let changed = engine.scene.prepare()?;
+            let changed = engine.scene.prepare()? || engine.gpu.scene_resources_dirty();
             engine.profile.scene[0] = elapsed_ns(prepare_started);
             if changed {
                 let scene_started = std::time::Instant::now();
-                if let Err(error) = engine.gpu.set_sections(&engine.scene) {
+                let regions: Vec<_> = engine.scene.render_regions().collect();
+                if let Err(error) = engine.gpu.set_regions(prime_scene::RenderView {
+                    generation: engine.scene.generation(),
+                    regions: &regions,
+                    anchor: engine.scene.anchor(),
+                }) {
                     engine.scene.reject()?;
                     return Err(error.into());
                 }
                 engine.scene.commit()?;
                 let timing = engine.gpu.scene_timing().expect("成功发布保存当前计时");
-                engine.profile.scene[1] =
-                    timing.geometry_ns.saturating_sub(timing.attribute_pack_ns);
-                engine.profile.scene[2] = timing.attribute_pack_ns;
+                engine.profile.scene[1] = timing
+                    .geometry_ns
+                    .saturating_sub(timing.attribute_pack_ns + timing.light_pack_ns);
+                engine.profile.scene[2] = timing.attribute_pack_ns + timing.light_pack_ns;
                 engine.profile.scene[3] = timing.acceleration_ns.saturating_sub(timing.tlas_ns);
-                engine.profile.scene[4] = timing.attribute_upload_ns;
+                engine.profile.scene[4] = timing.attribute_upload_ns + timing.light_upload_ns;
                 engine.profile.scene[5] = timing.tlas_ns;
                 engine.profile.scene[6] = elapsed_ns(scene_started).saturating_sub(
                     timing
                         .geometry_ns
                         .saturating_add(timing.acceleration_ns)
-                        .saturating_add(timing.attribute_upload_ns),
+                        .saturating_add(timing.attribute_upload_ns + timing.light_upload_ns),
                 );
                 engine.profile.update = Some(diagnostics::SceneInfo {
                     dirty_regions: timing.dirty_regions as u64,
                     instances: timing.instances as u64,
                     triangle_bytes: timing.triangle_bytes,
-                    attribute_bytes: timing.attribute_upload_bytes,
+                    attribute_bytes: timing.attribute_upload_bytes + timing.light_upload_bytes,
                     blas_wait_ns: timing.batch.submit_wait_ns,
                     tlas_ns: timing.tlas_ns,
-                    attribute_ns: timing.attribute_upload_ns,
+                    attribute_ns: timing.attribute_upload_ns + timing.light_upload_ns,
                 });
             }
             engine.gpu.draw(

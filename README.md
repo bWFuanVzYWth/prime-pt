@@ -1,79 +1,109 @@
 # Prime PT
 
-Minecraft 26.3 / Fabric 的 Prime PT 重写，参考旧 Prime PT 的代码与契约。此目录是独立 Git 仓库和 Cargo workspace，依赖上两级的 simple_engine；引擎不依赖本目录。`target/`、`run/` 和 SDK 缓存不纳入版本管理。
+Minecraft **26.3 / Fabric** 的 Prime PT 重写，复用 simple_engine 的 Slang、OpenPBR、PT、Vulkan 与重建接口。本目录是独立 Git 仓库和 Cargo workspace，依赖上两级引擎；引擎不依赖实验。开发边界见 [AGENTS.md](AGENTS.md)，实现契约以链接的 Rust API 为准。`target/`、`build/`、`run/`、SDK 与测量缓存不入库。
 
-引擎 `chunk_manager::State` 独占 CPU region 资源，只调度 LOD0；水平范围由宿主有效视距（16m chunk 列）决定，Y 覆盖世界完整高度，向外对齐世界原点的 64m region。每 region 合并4×4×4个 section，非空 region 只建立一个 BLAS。Java 每帧按 native ticket 薄捕获至多64个 section，并在每个 section 完成后检查3ms预算，未回复请求下帧保留原ID继续：转发原版模型的 quad、atlas UV、面可见性和群系 tint。Rust 在批次层调度 CPU 工作池，缓存 region 合并网格、section 范围及 revision；与 game 共用 `scene_cache` 资源事务，仅为几何变化的 region 展开三角形并重建 BLAS，以平移实例组成 TLAS。quad 属性仍全量打包上传，使用实例的属性基址直接寻址；引擎 `vulkan::native` 拥有 GPU 资源和 BLAS/TLAS，`pt::gpu::Renderer` 录制 K1→K2→K3。使用 RT Pipeline、叶子材质 callable 与 SBT；Slang 直接生成 SPIR-V。
+## 结构与数据流
 
-与 game 共用 `shaders/pt/{integrator,path_sampler,post}.slang`，包含 OpenPBR、Beer、NEE/MIS、介质更新、RR 和线性累积。`mod_scene.slang` 翻译网格、atlas、tint 与环境，源包默认 roughness=0.9、IOR=1.5 的 opaque；native quad 另可选择 roughness=0.25 的 opaque 预设，相机初始介质为空气。复用引擎 Earth 大气：太阳盘使用 NEE/MIS 和 alpha 阴影，环境来自 SkyView，主射线命中后逐样本合成 Aerial L+T。太阳盘在大气外的亮度标定沿用 game 默认 20_000；海平面对应 0.5 km，每世界单位对应 1 m，Aerial 最远 64 km。暂无局部光源和发光。默认每帧 1 spp、12 顶点。原始 PT 在视图、太阳、海平面、积分参数、mesh 或 atlas 变化时清空累积；RR 每帧重新生成当前帧 HDR，只平均本帧 SPP；SDK 独立维护时间历史。相机、FOV、太阳、积分预算、局部场景与 anchor 变化保留 RR 历史；世界或材质资源域换代显式重置，实际视图/SDK 存储替换及求值失败分别冷启动或恢复，曝光只作用于呈现。
+| workspace package | 职责与入口 |
+| --- | --- |
+| `prime_pt` | [native](native/src/lib.rs)：宿主 FFI、资源/世界事务、命令与完成边界、诊断快照 |
+| `prime_minecraft` | [minecraft](crates/minecraft/src/lib.rs)：26.3 压缩源、模型/材质准备、剔面、流体、slab 编译和原版 tint |
+| `prime_world` | [world](crates/world/src/lib.rs)：引擎 LOD0 manager、票据、源缓存、显式 CPU 调度、预算和发布 |
+| `prime_scene` | [scene](crates/scene/src/lib.rs)：宿主无关的 quad、材质身份、相机和借用渲染视图 |
+| `prime_renderer` | [renderer](crates/renderer/src/lib.rs)：Vulkan 场景缓存、资源/程序、PT/RR、曝光与呈现 |
 
-主查询 any-hit 与阴影 RayQuery 候选均以 alpha≥0.5 接受交点。atlas 使用 sRGB 格式，tint 解码后在线性空间相乘；几何点和误差界复用引擎 `geometry::triangle_point`。公共 HDR 左上原点，独立呈现阶段使用 Prime DRT、sRGB 编码和宿主 Y 翻转。
+Java 只绑定 Minecraft 类型与源字段，转发事件和宿主句柄。[SourceResources](java/src/main/java/dev/primept/SourceResources.java) 在首次加载/资源重载捕获完整注册状态、模型 DAG、剔除形状、sprite 和 tint recipe；[Capture](java/src/main/java/dev/primept/Capture.java) 运行期按 native ticket 复制真实 section 的 palette/bit storage，使用 **PRT3**，不逐 block 选择模型、剔面或展开 quad。每批至多 64 section，每完成一个 section 检查 3 ms 捕获预算，未回复 ticket 保留到后续帧。
 
-atlas 重载扫描本适配器实际使用的 LOD0 与 tint 范围，推导通用 `FlowKey`，在发布前通过 Slang 内容缓存编译 callable 并初始化 pipeline/SBT。atlas、能力证明与程序全部成功后一起替换，失败保留上一代。缓存位于 `target/shaders/`；首次加载和资源重载需要可用的 Slang 及本 checkout 的受控 shader 源码。绘制、尺寸和 TLAS 变化只重绑资源，复用现有程序；当前 base/tint 接口仍不提供额外 PBR 纹理通道。
+Rust 校验同世代资源与完整邻域后，以四层 slab 为批量内核执行模型选择、位置偏移、剔面和流体几何；工作池只由 world 调度。草、叶、干叶、水、高草、红石、藤茎等原版 tint 的 zoom、颜色表、noise 和 box blend 在 [tint](crates/minecraft/src/tint.rs) 计算，世界 seed、biome palette 与已捕获 quart 按世界缓存；Java 只回报缺失的原始 quart 身份。自定义 tint 函数保留显式批量宿主回退，结果齐备后才能发布 mesh。
+
+## 资源准备与增量更新
+
+首次加载和资源重载是完整资源准备边界。一个世代只有一个全局 Catalog，section、region 和工作线程引用稳定身份；材质范围推导、静态发光纹理 alias、Slang callable、pipeline/SBT 及设备支持的普通/SER 变体在发布前准备。运行期不按方块、区块或首次命中懒构建 alias、shader 或 SBT；缺身份/错世代显式报错。新世代全部成功后统一发布，失败保留旧世代，旧 GPU 资源按真实完成证明回收。入口见 [Catalog](crates/minecraft/src/resources.rs)、[材质准备](crates/minecraft/src/materials.rs) 和 [Gpu](crates/renderer/src/gpu.rs)。
+
+world 只使用引擎 `chunk_manager` 的 LOD0。水平目标来自宿主有效视距，覆盖完整世界高度，向 64 m region 对齐；每 region 管理 4³ 个 16 m section，一个非空 region 一个 BLAS。相机以 f64 保存绝对位置，CPU 几何/BLAS 保留 region 局部坐标，TLAS 平移减去 64 m anchor 后转 f32。移窗保留交集与有效 ticket，旧覆盖保留至新目标解析完成；未加载、真实空和预算排除有不同状态。
+
+CPU 保留 section 分片，准备视图借用旧分片和 dirty 输出，GPU 成功后移动发布，避免重复制完整 region。几何 revision 变化才重建所属 region 的 BLAS；tint/UV/材质属性变化保留 BLAS。dirty 三角输入共享一次批构建与 scratch，非空 BLAS 批有一次同步提交/完成，TLAS 按实例集合或 anchor 变化重建。每帧修改/复用前仍等待此前宿主命令完成，当前不是异步加载流水线。
+
+GPU 的 48 B/quad 属性缓冲持久保留容量：容量内只打包和映射写入变化范围，无内容变化或仅 anchor 变化不重写属性；扩容才新建缓冲并重写全部活动属性。纯属性更新保留 TLAS。活动发光 quad 按变化 region 缓存，灯集合/槽位变化时更新活动表；运行期均匀选择灯并使用实际离散 PMF，不重建全局 alias。纹理内 alias 和静态面积复用资源准备产物，过程流体的两三角面积可在 shader 计算。
+
+默认 CPU quad 逻辑预算为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**，不包含源缓存、Vec 余量、线程、驱动或 GPU 内存。超额以 [Pressure](crates/world/src/budget.rs) 区分最终容量、过渡等待和单 region 容量；必要时排除过大的 region 或提前回收远处旧域，可能出现暂时覆盖缺口，不无限重试同一失败输入。固定 manager 容量、调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
+
+## 渲染能力与边界
+
+与 game 共用引擎 `shaders/pt` 的积分器、样本身份、Beer、OpenPBR、太阳/局部发光 NEE/MIS、重建和呈现算法。材质表提供 MERS、作者法线/分布粗糙度/IOR、双面规则、玻璃/薄面、水面和水下初始介质；发光受真实 UV、tint、覆盖及发射侧约束。cutout 使用 alpha≥0.5，透射/流体不套用该二值规则；主查询与阴影 RayQuery 共用接受规则。着色法线不替代几何偏移和介质边界法线。实际源翻译见 [materials](crates/minecraft/src/materials.rs) 与 [场景 shader](crates/renderer/shaders/mod_scene.slang)。
+
+原版 PBR 使用明确 sprite 身份对应的冻结数据，并保留 [来源锁](crates/minecraft/assets/vanilla_pbr/source.lock.json) 与 [Mojang 许可声明](crates/minecraft/assets/vanilla_pbr/SOURCE-LICENSE.md)；这些资产不因代码仓库的 [LICENSE](LICENSE) 改变许可。外部 `_n`/`_s` 贴图目前未消费，资源世代准备检测到时汇总一次 WARNING；已有图片协议字段不代表支持外部 LabPBR。资源动画字段/包络准备不等于播放：**当前材质 atlas 固定准备时首帧，尚未逐 tick 同步颜色/PBR 动画**。
+
+复用 Earth 大气、太阳盘与 Aerial L+T；太阳角薄捕获自原版环境属性，海平面来自世界，仅 Overworld skybox 启用，Nether/End 暂为黑色环境。HDR 为线性 BT.709，albedo sRGB 解码后乘线性 tint，最后自动曝光/手动 EV、Prime DRT 和宿主方向呈现。
+
+当前仍有以下范围限制：
+
+- 运行普通 PT，未接 ReSTIR；**Prime 当前未启用 OMM**，主查询/阴影依赖 any-hit/RayQuery 覆盖。引擎有 OMM 能力不代表本应用已经接入。
+- 支持已识别的公共模型 DAG 和原版位置/流体规则；未知自定义模型源显式拒绝。自定义 tint 的批量回退不代表自定义模型兼容。
+- 实体、方块实体和粒子尚未接入；宿主相机、玩家状态、手部和 UI 继续使用原版路径，没有其它渲染 Mod 的兼容保证。
+- RR guide 复用引擎首命中、delta 链及反射/折射代理，但场景姿态仍按静态方块提供。粗反射运动、折射与预算终点有代理边界，不是动态物体/透明多层的完整光学运动重建。
 
 ## 构建与运行
 
-需要 Java 25、Rust、Vulkan 1.4、`VK_KHR_device_address_commands` / `deviceAddressCommands`、Slang（`SLANGC` / `VULKAN_SDK` / PATH）和支持 Vulkan RT Pipeline、RayQuery、`VK_KHR_ray_tracing_position_fetch` / `rayTracingPositionFetch`、`shaderStorageImageExtendedFormats` 的显卡。RR 另需 Windows、支持 DLSS Ray Reconstruction 的 NVIDIA GPU/驱动及 Streamline 运行时；Gradle SDK 校验任务使用 PowerShell 7 (`pwsh`)。Gradle wrapper 已包含。
+需要 Java **25**、仓库固定的 Rust nightly、Slang、PowerShell 7，以及实际支持 Vulkan **1.4** 的 loader/设备。强制能力包括 RT Pipeline、RayQuery、buffer device address、`VK_KHR_ray_tracing_position_fetch`、`VK_KHR_device_address_commands`、synchronization2 和 extended storage image formats；没有 position-fetch 顶点副本回退。逻辑设备实际启用的能力由 [Bootstrap](java/src/main/java/dev/primept/Bootstrap.java) 确认，材质 `FlowKey`/程序特化不能用物理支持代替逻辑设备能力。首次资源准备仍需可用 Slang 和本 checkout 的受控 shader 源码。
+
+RR 另需 Windows、支持 DLSS Ray Reconstruction 的 NVIDIA GPU/驱动及锁定 Streamline SDK。SDK 版本、来源/hash、部署与验证边界见引擎 [Streamline 手册](../../crates/vulkan/streamline/README.md)。
+
+从本目录执行：
 
 ```powershell
-Set-Location C:\repositories\simple_engine\experiments\prime_pt
 .\scripts\setup-streamline.ps1
-cargo test --lib
-.\gradlew.bat wireFixture
-cargo test --lib -- --ignored --skip hardware_pt_rr_full_chain --test-threads=1
-cargo test --lib gpu::smoke::hardware_pt_rr_full_chain -- --ignored --nocapture --test-threads=1
-cargo doc --no-deps
+cargo test --workspace --lib
+cargo doc --workspace --no-deps
+.\gradlew.bat check
+.\gradlew.bat compactSourceFixture modelRandomFixture tintFixture
+cargo test -p prime_minecraft --lib -- --include-ignored
 .\gradlew.bat build
 .\gradlew.bat runClient
 ```
 
-`setup-streamline.ps1` 调用引擎安装器并设置当前进程 `STREAMLINE_SDK`，默认缓存为引擎 `target/streamline-sdk`，校验签名/hash；已有副本可用 `-VerifyOnly` 核验。native 构建自动将 `sl.interposer.dll`、`sl.common.dll`、`sl.dlss_d.dll`、`nvngx_dlssd.dll` 部署到 `prime_pt.dll` 同目录。SDK bridge 由引擎 `vulkan/dlss_rr` 提供，mod 只提供应用身份和宿主适配。
+安装器默认使用引擎 `target/streamline-sdk` 并设置当前进程 `STREAMLINE_SDK`；已有 SDK 可加 `-VerifyOnly`。Slang 从配置的 `SLANGC`/`VULKAN_SDK` 或 PATH 查找，构建不下载 SDK。`runClient` 构建 release DLL 后以 Vulkan backend 启动；JAR 在 `build/libs/`，DLL 在 `target/release/prime_pt.dll`。指定 `-PnativeLibrary=绝对路径` 可复用已有 DLL，其同目录必须保留安装器部署的四个 SDK DLL 与许可。`runClient -Prr=false` 跳过早期 SDK 接入，只运行原始 PT，之后启用 RR 需要重启。游戏验收由用户执行。
 
-`runClient` 先构建 release DLL，再使用 `--graphicsBackend VULKAN` 与 `--enable-native-access=ALL-UNNAMED` 启动。JAR 位于 `build/libs/`，DLL 位于 `target/release/prime_pt.dll`；也可通过 `-PnativeLibrary=绝对路径` 指定已有 DLL，此时同目录须有上述四个 SDK DLL。`runClient -Prr=false` 完全跳过早期 SDK 接入，仅运行原始 PT；该启动开关生效后，重新启用 RR 需要重启。
+SER 在实际逻辑设备支持时默认开启，普通和 SER pipeline/SBT 在资源世代准备时一并建立，运行期只切换已准备的程序；不因偏好切换重新扫描资源、调用 Slang 或创建 SBT。缺能力时使用普通程序并记录原因。`-Pser=false` 只为尚无持久化设置的配置提供默认值。
 
-SER 默认自动检测并启用：宿主协商 `VK_EXT_ray_tracing_invocation_reorder` / `rayTracingInvocationReorder`，创建回调确认逻辑设备已启用后才使用 NV `render-ser.spv`。缺少能力时记录原因并使用普通 RT pipeline。视频设置或 `/pt ser on|off` 即时切换，偏好保存到 `ser=true|false`，不需要重启；开关不清空 PT/RR 历史。`runClient -Pser=false`（普通启动器 `-Dprimept.ser=false`）仅为缺少 `ser` 键的配置提供初始默认值，已有持久化值优先。恢复默认重新设为自动开启。设备能力始终保留，不受当前偏好影响。
+视频设置与本地 `/pt` 命令共用 `config/prime_pt.properties`，无须服务端权限；省略值查询，`/pt reset` 恢复默认：
 
-启动只创建当前选择的程序。改变 SER 偏好时同步创建另一组 pipeline/SBT，复用现有 callable SPIR-V、atlas、mesh/AS、视图图像和缓冲；不重新扫描纹理或调用 Slang。创建成功后替换，失败保留旧程序；旧命令由 Flight 保活，下一次已完成的录制边界退役。稳态只保留当前程序，切换期间短暂同时保留新旧管线/SBT 和两组描述符，不复制场景或图像。当前只有一个材质 callable，K2 在 `CallShader` 前使用无 hint 的 `ReorderThread`，不能预期所有场景都获益。运行 `cargo test --lib hardware_pt_ser_ -- --ignored --nocapture --test-threads=1` 验证真实运行时开关的 HDR/呈现（既有 PT `1e-6` scaled error 约定）、累积历史和不支持时的普通路径，检查 Vulkan validation；params/counts/prefix 保持逐位相同。本机普通程序重建也可产生至多 3 ULP 差异，不承诺 HDR 逐位相同。
-
-默认开启 Performance DLSS RR：输入宽高为输出的 1/2，放大至宿主分辨率。可选 DLAA、Quality、Balanced、Performance、Ultra Performance，具体输入尺寸由 SDK 查询并校验；关闭 RR 使用原分辨率 PT。`/pt rr` 查询请求开关与 SDK/设备就绪状态，`/pt rr on`、`/pt rr off` 即时切换；初始化/配置失败缓存原因并回退原始 PT，关闭再开启、切换档位或窗口尺寸变化可重试。每帧求值安全失败使用通用 5×5 空间滤波并重置历史，原因见 native 日志。SDK 在创建任何 Vulkan 对象之前安装，LWJGL 与 SDL3 的私有 loader 统一指向 interposer。缺少 DLL、设备能力或早期初始化失败会明确记录原因，继续原始 PT。加载 SDK 的机器即使暂时关闭 RR，也保留早期 loader 和协商的设备能力。没有 Frame Generation 或 Reflex。
-
-可选 `.\gradlew.bat streamlineFixture` 在独立进程中验证早期 bootstrap，并确认 SDL 与 LWJGL 的 `vkGetInstanceProcAddr` 地址一致；它不创建窗口或设备，需先构建 native DLL 和部署 SDK，不属于缺少 SDK 时也能运行的常规 `check`。
-
-视频设置在顶部提供恢复默认值按钮，分为“PT 渲染”（SER、RR、质量、SPP、顶点预算）和“PT 显示”（曝光），之后保留原版分栏。界面与聊天命令共用设置模型，立即保存至游戏目录的 `config/prime_pt.properties`。原有曝光和 RR 开关保留；缺少新配置时读取旧 `primary_rt.properties`，后续保存到新路径，新质量档默认为 Performance。命令在本地处理，无需服务端权限或 Fabric API，省略值表示查询；
-
-| 命令 | 可调值与默认值 |
+| 命令 | 默认与范围 |
 | --- | --- |
-| `/pt ser [on\|off]` | 默认 on，设备不支持时使用普通程序 |
-| `/pt rr [on\|off]` | 默认 on |
-| `/pt quality [档位]` | `dlaa`、`quality`、`balanced`、`performance`（默认）、`ultra_performance` |
-| `/pt ev [EV]` | [-16, 16]，允许小数，默认 0；`exposure` 为别名 |
-| `/pt spp [样本数]` | [1, 64]，默认 1；RR 下平均同一 jitter 的多个独立样本 |
-| `/pt bounces [路径顶点数]` | [1, 64]，默认 12 |
-| `/pt reset` | 恢复上述默认值 |
+| `/pt ser on\|off`、`/pt rr on\|off` | 默认 on；实际能力不足会明确回退 |
+| `/pt quality 档位` | `dlaa` / `quality` / `balanced` / `performance`（默认）/ `ultra_performance` |
+| `/pt spp 数量`、`/pt bounces 顶点数` | 默认 1 / 12，均为 1..64 |
+| `/pt ev EV` | 默认 0，-16..16；自动曝光后的补偿，`exposure` 为别名 |
 
-`/pt` 汇总当前设置。聊天框使用原版 Brigadier 提示、参数说明与 Tab 补全；本地命令树随服务器 dispatcher 更新重新接入，执行仍只在客户端处理。无效输入或保存失败保持原值；曝光 +1 EV 使亮度加倍，只影响呈现，不清空 PT 历史或重建大气。
+RR 默认 Performance，输入每轴约为输出一半，实际尺寸由 SDK 查询。**RR 不跨帧做线性样本累积**：当前帧 SPP 求均值后输入 SDK，时间历史由 SDK 独立维护。相机、FOV、太阳、积分参数、局部场景和 anchor 变化保留 RR 历史；世界/材质资源域换代显式重置，实际视图或 SDK 存储替换、求值失败分别冷启动/恢复。原始 PT 在其输入变化时清空线性累积。曝光单独适应，只影响呈现。
 
-默认自动曝光复用引擎的 GPU 对数直方图测光：两端各裁去0.5%像素，暗化／亮化分别以0.5／2秒消除90%的目标EV差值。原始PT测量未曝光的线性HDR；RR成功时测量重建后的线性HDR，求值回退时测量本帧原始HDR。手动EV作为最终曝光补偿，与自动倍率相乘后才进入Prime DRT；两者均不改变输运、线性累积或大气。曝光历史独立于PT/RR历史，相机、场景和尺寸变化继续适应，首次有效帧直接建立测光目标。测光录制并入宿主command，不增加CPU回读或逐帧GPU等待。
+SDK 在任何 Vulkan 对象前安装 interposer；初始化失败记录原因并回退原始 PT，每帧安全求值失败使用空间滤波并重置历史。没有 Frame Generation 或 Reflex。RR 测试必须独立进程运行，不能将关闭同步验证当作修复 SDK validation 错误；具体已知现象见 Streamline 手册。
 
-太阳方向薄捕获自 26.3 原版相机 `EnvironmentAttributes.SUN_ANGLE`，使用相同的 partial tick 插值；海平面来自当前世界。只在 `Skybox.OVERWORLD` 启用太阳/大气，Nether、End 和无天空维度暂为黑色环境。Java 的太阳变换、设置命令、旧配置迁移与持久化 fixture 纳入 Gradle `check`；它们不启动 Minecraft。
+## 诊断、基准与验收
 
-F3+2 使用 Prime 分项卡顿图替换左侧 FPS 图，保留右侧宿主 TPS 图。完整帧间隔、1秒窗口、P90/P99、按像素保留最长整帧和持久卡顿详情复用引擎 `frame_loop::timing`，与 game 同源。14个分项分别记录宿主等待、源/材质、规划、宿主捕获、网格编译/合并、三角编码、属性打包、BLAS构建/等待、属性分配/写入、TLAS构建/等待、场景提交/回收、native录制/SDK、宿主提交及未归因；内部场景耗时从录制总时长扣除，互不重复。选中柱或最近卡顿单独标出最大耗时项、毫秒数及整帧占比；另显示最近场景更新序号、dirty region/实例数量、三角输入和属性字节数，后者不冒充所选历史帧的规模。全部为主线程墙钟，不冒充GPU时间。属性段包含新建VkBuffer、分配内存及map/copy/unmap，没有队列提交；非空几何更新的BLAS批与TLAS各有一次同步提交/等待，计时包含主机命令资源开销。图隐藏时只维护复用数值缓冲，不格式化文本；不会增加GPU回读或等待。
+F3+2 用 Prime 分项图替换左侧 FPS 图，保留宿主 TPS 图。统计与按像素保留最长整帧的采样复用引擎 `frame_loop::timing`；14 个互斥分项覆盖等待、tint/源维护、规划/捕获、编译/三角、属性与光源打包/写入、BLAS、TLAS、发布、录制/SDK、宿主提交和未归因。最大项显示毫秒及占比，预算压力显示排除数、延后数及所需/限制容量；场景更新序号/规模明确属于最近更新，不冒充所选历史帧。全部为**主线程墙钟**，不是 GPU timestamp。图隐藏时不格式化文本；读取诊断不增加 GPU 回读/等待。入口见 [diagnostics](native/src/diagnostics.rs) 和 [FrameChart](java/src/main/java/dev/primept/FrameChart.java)。
 
-游戏手工验收：进入世界后等待附近地形出现；检查草叶 tint、树叶透明孔、负坐标附近地形、放置/破坏方块、chunk 卸载、跨 64 格边界、资源重载、窗口缩放和退出。编译与无窗口 GPU 验证不能代替游戏验收。
+CPU 同源基准无需游戏/GPU：
 
-无窗口测试覆盖主查询 cutout、RayQuery/TraceRay 的 alpha 边界一致性、纹理/tint 线性约定、宿主上下方向、跨帧样本合批、相机/太阳历史失效、太阳遮挡、天空方向、Aerial 距离和无天空维度。曝光测试覆盖正负 EV、历史连续和同一绝对样本序列的 HDR 逐字节一致，并通过借用宿主 command 的 `Recorded::encode` 路径执行。`hardware_pt_auto_exposure_` ignored测试覆盖原始PT的测光呈现、HDR不变、resize适应历史与手动EV补偿；RR完整链路先显式关闭自动曝光以保持原图像对照，末尾再启用自动曝光，验证真实RR求值后的测光状态与输出尺寸。原始 PT 测试设备强制启用 RT/RayQuery、position fetch 与 extended storage formats，不依赖 OMM；另验证非共面梯形 quad 与两个退化 quad 的几何/UV/覆盖率等价。RR 测试使用独立进程和生产 interposer 路径，实际执行重建并读回数据。
+```powershell
+New-Item -ItemType Directory -Force ../../temp | Out-Null
+$env:PRIME_WORLD_BENCH_OUTPUT = Join-Path (Resolve-Path ../..).Path "temp/prime-source-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+cargo bench -p prime_world --features test-fixtures --bench source_pipeline
+```
 
-K1 的通用接口 `pt::IPrefixGuides` 在 alpha 接受后的首个实际表面生成法线/线性粗糙度与 OpenPBR 方向 diffuse/specular albedo，并提供正 view-Z、去 jitter 的像素运动和天空投影；默认关闭不增加 game 的资源或输运成本。mod 将它们打包为 R32F depth、RG16F motion 和 RGBA16F 材质数据，使用全帧 Halton jitter 与本帧 SPP 的线性 HDR 均值输入 RR，重建后才执行曝光/DRT。specular motion 使用额外理想反射射线的局部平面代理，粗糙表面并非光学 PSR；当前只支持静态方块几何，没有透明覆盖 alpha 重建。
+[source_pipeline](crates/world/benches/source_pipeline.rs) 保存实际 PRM1/PRT3、PTR1/PBW1 输入及 hash、原始 `samples.jsonl` 和边界说明。输入覆盖空源、密集/稀疏模型、流体、tint、27 邻域与 1/8 worker 的生产 world 调度；资源字典和私有池建立在计时外，world 段包含规划、fixture 源包写入、decode、slab fork/join、合并与 CPU 提交。world 的固定 ARGB fixture 回填不含真实宿主 tint 回调成本。独立 `vanilla_tint` 段测真正 plan/finish 的冷/热缓存、radius 0/7、失效和自定义回退响应分配；两类测量不能相加冒充完整帧耗时。Java 捕获、GPU 与全局资源准备另计。
 
-## 初版边界
+GPU 场景基准需要独占设备，输出必须使用新目录：
 
-- 视距按相机所在水平列两侧的闭区间解释，region 向外对齐；Y 使用世界半开 section 高度域，不按相机高度裁掉地形。固定8192槽，目标 region 数量的两倍加64过渡余量必须能容纳，超额明确报错。移窗保留交集、有效票据和最近已解析窗口，过期中间前沿允许淘汰。未加载 section 显式回报不可用，撤下整个未闭合 region 并缓存不可用状态；加载通知触发完整64 section 重捕，真实空与不可用分开。
-- 支持公共方块模型源与位置偏移；缺少流体、实体、方块实体和粒子。动画纹理固定第一帧，资源重载重新捕获。未接入第三方自定义模型回调。
-- 原版世界提取与绘制已截断，保留相机、玩家状态、手部和 UI。宿主适配固定为 26.3；没有其它渲染 Mod 的兼容保证。
-- section 级64bit脏标记只重捕变化源，再将该 region 的保留范围与新范围合并。几何变化按 revision 复用未变 region 的 BLAS，并重建 TLAS；quad 数量或按顺序的 P48 位置位值改变才推进几何 revision，相同源包及 tint/UV 更新保留 BLAS。真正几何编辑会重建所属整个 region BLAS，不能把“只重捕一个 section”理解为“只重建一个 section”。属性按当前活动槽全量重新打包上传，尚无分段属性传输。每帧显式等待宿主提交完成，再复用单份 GPU 资源。没有异步加载或性能承诺。
-- Java 以 f64 传递绝对相机位置，CPU mesh 与 BLAS 保留 region 局部坐标；TLAS 实例平移先减去相机所在 64m 网格 anchor 再转 f32。anchor 变化保留局部 BLAS、更新 TLAS，上一帧世界相机重投影到当前 anchor，保留 RR 历史。尚未实现 Minecraft 的透射、发光或专用材质规则。
-- CPU 只保留一份 region 合并 mesh 与64个 section 范围；最多8个在途 region job 拥有阶段性脏 section 输出。变化 region 的三角输入汇入一个连续 dirty 集，由 native 批入口共用上传与 scratch、一次提交并等待。批返回后释放 CPU 三角与描述符，再打包完整属性槽，不再生成全场景位置合并副本。属性槽准备时保留旧范围，新场景成功后才回收；工作集须计入完整 dirty 集、旧/新属性缓冲、变化 BLAS、TLAS 与构建暂存。单场景最多 16M 顶点，单源包/atlas 最多 256 MiB，另受设备 storage binding 上限约束。
-- 视图保留一份 scratch，当前 opaque/air/prefix=false 的五 plane 交接为60 B/输入像素；PT 工作缓冲合计112 B/输入像素，RR 开启时另增 48 B/输入像素和 8 B/输出像素（关闭仅保留 1×1 占位），另有 SDK 自有缓存，独立于每批样本数。大气拥有固定 Earth 场与 SkyView/Aerial 缓存。宿主输出 view 只借到本帧完成，呈现 program 复用，每帧只重建绑定。
+```powershell
+$env:PRIME_PT_SCENE_BENCH_OUTPUT = "run-$((Get-Date).ToString('yyyyMMdd-HHmmss'))"
+cargo test --release -p prime_renderer --lib hardware_pt_scene_baseline -- --ignored --nocapture --test-threads=1
+```
 
-quad 取舍、逐顶点属性边界与48 B常驻属性 ABI见 `native/src/scene.rs::Quad` rustdoc；位置强制从 AS 获取，未提供无 position fetch 的回退。60 B landing 是当前调度/材质子集专门化，扩展介质、发光或 delta 前缀必须发布新的pipeline/资源 ABI。CPU section quad为96 B，dirty构建时另存48 B属性打包和72 B三角形输入；GPU常驻量不包含AS内保留的位置成本。
+[scene_bench](crates/renderer/src/scene_bench.rs) 以真实 manager ticket 驱动 1728 section/27 region，固定 64 个非空 section、98,304 quad、1024×576、1 spp、12 顶点、RR 关闭。它仍使用兼容 PRT2 合成几何输入，测 manager/GPU 更新，不能替代新 Minecraft 压缩源/slab/tint 成本。steady 同时记录 manager CPU 和 draw 完成墙钟，draw 包含主机命令资源、提交/等待及完成；不是 GPU timestamp。shader/设备准备、预热、readback 和文件写入不在 draw 内。初始化、编辑、属性写入、BLAS/TLAS和工作集有独立记录；以输出 `input.json`/`samples.jsonl` 的当前边界为准。
 
-跨语言布局和借用契约见 `native/src/lib.rs` 的导出接口 rustdoc，GPU 所有权见 `native/src/gpu.rs`，Java 捕获见 `java/src/main/java/dev/primept/Capture.java`。
+性能比较先冻结原始源码/工具/输入和可执行产物，做同版本 A/A，再比较成对样本；保存未提交修改及原始日志，阶段对照不替代原始基线。输入或计时口径不同的结果不作直接收益比较，落在漂移/噪声内的差异保持不确定。临时证据放引擎 `temp/`，不作帧率保证。
+
+无窗口 GPU 功能测试在 [gpu_smoke](crates/renderer/src/gpu_smoke.rs) 和 scene 测试中显式标记 ignored；用单一 filter、`--ignored --nocapture --test-threads=1` 运行。两个 `hardware_pt_rr_` 测试分别启动独立进程。CPU/Java fixture、编译、GPU 功能验证、性能测量和实际游戏验收分别报告。
+
+手工验收包括：进出世界、负坐标与跨 anchor 移动、远近移窗/卸载与回转、放置/破坏、草叶水色、cutout 孔洞、玻璃/水下与局部发光、预算压力、资源重载、SER/RR/画质切换、缩放窗口及退出。观察旧覆盖/失败恢复、图表耗时与日志；动画、实体等未接能力按上述边界检查。编译或离屏通过不能代替游戏验收。

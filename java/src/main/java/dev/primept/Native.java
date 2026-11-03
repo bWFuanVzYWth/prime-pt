@@ -13,7 +13,7 @@ import static java.lang.foreign.ValueLayout.*;
 /** 同步 FFM 边界；CPU 包借用到返回，宿主图像必须保活至 GPU 提交完成。 */
 final class Native implements AutoCloseable {
     private final Arena arena = Arena.ofConfined();
-    private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, failCapture, batch, atlas, draw, setSer, error;
+    private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, invalidateTints, failCapture, batch, sources, cameraMedium, tintBegin, tintRequests, tints, biomeWorld, biomeRequests, biomeSamples, atlas, draw, setSer, error;
     private final long handle;
     private boolean serRequested;
 
@@ -40,9 +40,18 @@ final class Native implements AutoCloseable {
                 ADDRESS, ADDRESS, JAVA_INT, JAVA_INT));
         invalidateSection = bind(symbols, "prime_invalidate_section", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT));
         invalidateAll = bind(symbols, "prime_invalidate_all", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
+        invalidateTints = bind(symbols,"prime_invalidate_tints",FunctionDescriptor.of(JAVA_INT,JAVA_LONG));
         failCapture = bind(symbols, "prime_fail_capture", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG));
         setSer = bind(symbols, "prime_set_ser", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
+        sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
+        cameraMedium = bind(symbols, "prime_camera_medium", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
+        tintRequests = bind(symbols,"prime_tint_requests",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
+        tints = bind(symbols,"prime_tints",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
+        tintBegin = bind(symbols,"prime_tint_begin",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,JAVA_INT));
+        biomeWorld = bind(symbols,"prime_biome_world",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_LONG));
+        biomeRequests = bind(symbols,"prime_biome_requests",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
+        biomeSamples = bind(symbols,"prime_biome_samples",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
         atlas = bind(symbols, "prime_atlas", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
         draw = bind(symbols, "prime_draw", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG,
                 JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
@@ -93,12 +102,14 @@ final class Native implements AutoCloseable {
         catch (Throwable e) { throw unchecked(e); }
     }
 
+    void invalidateTints(){try{check((int)invalidateTints.invokeExact(handle));}catch(Throwable e){throw unchecked(e);}}
+
     void failCapture(long request) {
         try { check((int) failCapture.invokeExact(handle, request)); }
         catch (Throwable e) { throw unchecked(e); }
     }
 
-    /** 宿主已完成旧提交；只有偏好改变时才重建阶段程序。 */
+    /** 宿主已完成旧提交；仅选择资源阶段已准备的SER程序。 */
     void ser(boolean requested) {
         if (serRequested == requested) return;
         try {
@@ -110,6 +121,36 @@ final class Native implements AutoCloseable {
     void batch(ByteBuffer bytes) {
         try { check((int) batch.invokeExact(handle, MemorySegment.ofBuffer(bytes), (long) bytes.remaining())); }
         catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void sources(ByteBuffer bytes) {
+        try { check((int) sources.invokeExact(handle,MemorySegment.ofBuffer(bytes),(long)bytes.remaining())); }
+        catch(Throwable e){throw unchecked(e);}
+    }
+
+    void cameraMedium(int kind) {
+        try { check((int)cameraMedium.invokeExact(handle,kind)); }
+        catch(Throwable e){throw unchecked(e);}
+    }
+
+    int tintRequests(ByteBuffer output) {
+        try {
+            int count=(int)tintRequests.invokeExact(handle,output==null?MemorySegment.NULL:MemorySegment.ofBuffer(output),output==null?0:output.remaining()/24);
+            if(count<0)throw failure();return count;
+        }catch(Throwable e){throw unchecked(e);}
+    }
+
+    void beginTints(int radius){try{check((int)tintBegin.invokeExact(handle,radius));}catch(Throwable e){throw unchecked(e);}}
+    void biomeWorld(ByteBuffer bytes){try{check((int)biomeWorld.invokeExact(handle,MemorySegment.ofBuffer(bytes),(long)bytes.remaining()));}catch(Throwable e){throw unchecked(e);}}
+    int biomeRequests(ByteBuffer output){
+        try{int count=(int)biomeRequests.invokeExact(handle,output==null?MemorySegment.NULL:MemorySegment.ofBuffer(output),output==null?0:output.remaining()/24);if(count<0)throw failure();return count;}
+        catch(Throwable e){throw unchecked(e);}
+    }
+    void biomeSamples(ByteBuffer ids){try{check((int)biomeSamples.invokeExact(handle,MemorySegment.ofBuffer(ids),ids.remaining()/4));}catch(Throwable e){throw unchecked(e);}}
+
+    void tints(ByteBuffer colors) {
+        try{check((int)tints.invokeExact(handle,MemorySegment.ofBuffer(colors),colors.remaining()/4));}
+        catch(Throwable e){throw unchecked(e);}
     }
 
     void atlas(byte[] rgba, int width, int height) {
