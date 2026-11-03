@@ -95,6 +95,8 @@ cargo bench -p prime_world --features test-fixtures --bench source_pipeline
 
 [source_pipeline](crates/world/benches/source_pipeline.rs) 保存实际 PRM1/PRT3、PTR1/PBW1 输入及 hash、原始 `samples.jsonl` 和边界说明。输入覆盖空源、密集/稀疏模型、流体、tint、27 邻域与 1/8 worker 的生产 world 调度；资源字典和私有池建立在计时外，world 段包含规划、fixture 源包写入、decode、slab fork/join、合并与 CPU 提交。world 的固定 ARGB fixture 回填不含真实宿主 tint 回调成本。独立 `vanilla_tint` 段测真正 plan/finish 的冷/热缓存、radius 0/7、失效和自定义回退响应分配；两类测量不能相加冒充完整帧耗时。Java 捕获、GPU 与全局资源准备另计。
 
+完整 world 用例每轮新建私有池；构造调用虽在计时外，worker 就绪和前一池退出未显式等待，仍可能与首波计时重叠。该用例包含冷启动影响，尤其多线程空源结果不能代替实机常驻线程池的暖测。原始漂移与输入身份须一起保留。
+
 GPU 场景基准需要独占设备，输出必须使用新目录：
 
 ```powershell
