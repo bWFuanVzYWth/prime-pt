@@ -16,6 +16,7 @@ import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 /** 只捕获引擎请求的 LOD0 section；请求和窗口资源由 native 唯一管理。 */
 final class Capture {
+    private static final long BUDGET_NS = 3_000_000;
     private final ArrayList<BlockStateModelPart> parts = new ArrayList<>();
     private final RandomSource random = RandomSource.create();
     private final BlockPos.MutableBlockPos position = new BlockPos.MutableBlockPos();
@@ -34,6 +35,8 @@ final class Capture {
             throw new IllegalArgumentException("捕获请求数量无效");
         packet.clear();
         putInt(0x32545250); putInt(count);
+        long started = System.nanoTime();
+        int completed = 0;
         for (int i = 0; i < count; i++) {
             int offset = requests.position() + i * 24;
             long id = requests.getLong(offset);
@@ -41,7 +44,11 @@ final class Capture {
                 throw new IllegalArgumentException("捕获请求 id 或 reserved 无效");
             packet.putLong(id);
             captureSection(minecraft, requests.getInt(offset + 8), requests.getInt(offset + 12), requests.getInt(offset + 16));
+            completed++;
+            // 单个宿主section求值不能中断；至少完成一个，未捕获ID下帧继续。
+            if (System.nanoTime() - started >= BUDGET_NS) break;
         }
+        packet.patchInt(4, completed);
         return packet.finish();
     }
 
@@ -51,7 +58,10 @@ final class Capture {
         putInt(0);
         if (sy < level.getMinSectionY() || sy > level.getMaxSectionY()) return;
         var chunk = level.getChunkSource().getChunk(sx, sz, ChunkStatus.FULL, false);
-        if (chunk == null) return;
+        if (chunk == null) {
+            packet.patchInt(countAt, -1);
+            return;
+        }
         var section = chunk.getSection(chunk.getSectionIndexFromSectionY(sy));
         if (section.hasOnlyAir()) return;
         int blocks = 0;

@@ -1,8 +1,9 @@
 //! 显式运行的场景收敛基线；使用真实宿主 draw，不启动 Minecraft。
 //!
-//! PRIME_PT_SCENE_BENCH_OUTPUT 指定 temp/prime-lod0-20261103 下的新目录。
-//! 真实LOD0窗口含1728个section，其中固定64个非空、98,304个quad；1024×576、1spp、12顶点、普通RT、RR关闭。
-//! steady每轮从绝对样本0开始；edit每次只替换一个section，消费生产增量场景入口。
+//! PRIME_PT_SCENE_BENCH_OUTPUT 指定 temp/prime-regions-20261104 下的新目录。
+//! 视距4、Y为[-4,8) section，向4³对齐；基准相机窗口含1728个section/27个region，
+//! 其中固定64个非空section属于同一region，共98,304个quad；1024×576、1spp、12顶点、普通RT、RR关闭。
+//! steady每轮从绝对样本0开始；edit只重捕一个section并重建所属region，消费生产增量入口。
 //! Host::render_options包含command pool/录制、参数上传、submit、queue idle及Flight完成，
 //! 是主机完成墙钟，不是GPU timestamp。plan、PRT2应答、apply、prepare/GPU/commit另行报告；
 //! manager_complete包含全部空源应答和渐进发布，不再等同旧直接apply 64 section的口径。
@@ -24,13 +25,16 @@ const ROUNDS: usize = 6;
 const FRAMES: usize = 32;
 const EDITS: usize = 8;
 const EDIT_KEY: [i32; 3] = [1, 1, 1];
+const VIEW_DISTANCE: u32 = 4;
+const MIN_SECTION_Y: i32 = -4;
+const MAX_SECTION_Y: i32 = 8;
 
 fn ns(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).expect("测量时间可用u64纳秒表示")
 }
 
 fn output_directory() -> Result<PathBuf> {
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../temp/prime-lod0-20261103");
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../temp/prime-regions-20261104");
     fs::create_dir_all(&base)?;
     let base = base.canonicalize()?;
     let value = std::env::var_os("PRIME_PT_SCENE_BENCH_OUTPUT")
@@ -46,7 +50,7 @@ fn output_directory() -> Result<PathBuf> {
         .ok_or("输出目录缺少父目录")?
         .canonicalize()?;
     if !parent.starts_with(&base) {
-        return Err("输出目录必须位于 temp/prime-lod0-20261103 内".into());
+        return Err("输出目录必须位于 temp/prime-regions-20261104 内".into());
     }
     let target = parent.join(target.file_name().ok_or("输出目录名称无效")?);
     fs::create_dir(&target)?;
@@ -178,6 +182,17 @@ struct Drive {
     blas_input_bytes: u64,
     max_blas_scratch_bytes: u64,
     max_dirty_triangle_capacity_bytes: u64,
+    geometry_ns: u64,
+    acceleration_ns: u64,
+    resources_ns: u64,
+    attribute_pack_ns: u64,
+    attribute_upload_ns: u64,
+    attribute_upload_bytes: u64,
+    dirty_regions: usize,
+    max_instances: usize,
+    tlas_ns: u64,
+    publish_ns: u64,
+    collect_ns: u64,
     packets: Vec<Vec<u8>>,
 }
 
@@ -190,7 +205,13 @@ impl Drive {
             "blas_count":self.blas_count,"blas_total_ns":self.blas_total_ns,
             "blas_submit_wait_ns":self.blas_submit_wait_ns,"blas_input_bytes":self.blas_input_bytes,
             "max_blas_scratch_bytes":self.max_blas_scratch_bytes,
-            "max_dirty_triangle_capacity_bytes":self.max_dirty_triangle_capacity_bytes})
+            "max_dirty_triangle_capacity_bytes":self.max_dirty_triangle_capacity_bytes,
+            "geometry_ns":self.geometry_ns,"acceleration_ns":self.acceleration_ns,
+            "resources_ns":self.resources_ns,"attribute_pack_ns":self.attribute_pack_ns,
+            "attribute_upload_ns":self.attribute_upload_ns,"tlas_ns":self.tlas_ns,
+            "attribute_upload_bytes":self.attribute_upload_bytes,"dirty_regions":self.dirty_regions,
+            "max_instances":self.max_instances,
+            "publish_ns":self.publish_ns,"collect_ns":self.collect_ns})
     }
 }
 
@@ -207,7 +228,9 @@ fn settle(
     for _ in 0..20_000 {
         metrics.steps += 1;
         let stage = Instant::now();
-        let requests = scene.plan(camera, 64)?.to_vec();
+        let requests = scene
+            .plan(camera, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?
+            .to_vec();
         metrics.plan_ns += ns(stage);
         metrics.requests += requests.len();
         if !requests.is_empty() {
@@ -228,7 +251,18 @@ fn settle(
             }
             metrics.gpu_scene_ns += ns(gpu_started);
             metrics.publications += 1;
-            let build = gpu.scene_build;
+            let build = gpu.scene_timing().ok_or("成功场景更新必须有计时快照")?;
+            metrics.geometry_ns += build.geometry_ns;
+            metrics.acceleration_ns += build.acceleration_ns;
+            metrics.resources_ns += build.resources_ns;
+            metrics.attribute_pack_ns += build.attribute_pack_ns;
+            metrics.attribute_upload_ns += build.attribute_upload_ns;
+            metrics.attribute_upload_bytes += build.attribute_upload_bytes;
+            metrics.dirty_regions += build.dirty_regions;
+            metrics.max_instances = metrics.max_instances.max(build.instances);
+            metrics.tlas_ns += build.tlas_ns;
+            metrics.publish_ns += build.publish_ns;
+            metrics.collect_ns += build.collect_ns;
             metrics.blas_count += build.batch.blas_count;
             metrics.blas_total_ns += build.batch.total_ns;
             metrics.blas_submit_wait_ns += build.batch.submit_wait_ns;
@@ -438,9 +472,14 @@ fn summarize(root: &Path) -> Result<Value> {
 }
 
 fn scene_build_metrics(gpu: &Gpu) -> Value {
-    let metrics = gpu.scene_build;
+    let metrics = gpu.scene_timing().expect("只在成功场景更新后读取快照");
     json!({
-        "dirty_sections":metrics.batch.blas_count,
+        "dirty_regions":metrics.dirty_regions,"instances":metrics.instances,
+        "attribute_upload_bytes":metrics.attribute_upload_bytes,
+        "geometry_ns":metrics.geometry_ns,"acceleration_ns":metrics.acceleration_ns,
+        "resources_ns":metrics.resources_ns,"attribute_pack_ns":metrics.attribute_pack_ns,
+        "attribute_upload_ns":metrics.attribute_upload_ns,"tlas_ns":metrics.tlas_ns,
+        "publish_ns":metrics.publish_ns,"collect_ns":metrics.collect_ns,
         "cpu_dirty_triangle_bytes":metrics.triangle_bytes,
         "cpu_dirty_triangle_capacity_bytes":metrics.triangle_capacity_bytes,
         "cpu_pending_capacity_bytes":metrics.pending_capacity_bytes,
@@ -496,9 +535,10 @@ fn hardware_pt_scene_baseline() -> Result {
         &root,
         "input.json",
         &json!({
-            "version":3,"scene_update":"engine chunk_manager LOD0; PRT2 tickets; staged publication; section BLAS cache",
+            "version":4,"scene_update":"engine chunk_manager LOD0 region64; PRT2 section tickets; staged region publication; region BLAS cache",
+            "view_distance":VIEW_DISTANCE,"min_section_y":MIN_SECTION_Y,"max_section_y_exclusive":MAX_SECTION_Y,
             "extent":EXTENT,"nonempty_sections":keys,"window_sections":1728,"quads":98304,
-            "edit_section":EDIT_KEY,"edit":"one cube height 1.0/1.5; replace one complete section",
+            "edit_section":EDIT_KEY,"edit":"one cube height 1.0/1.5; recapture one section; rebuild its full 64-section region BLAS",
             "initial_templates":templates,"edit_templates":edit_templates,
             "template_format":"sx/sy/sz/block_count/blocks; PRT2 request IDs/header attached at response time",
             "capture_protocol":"PRT2; every requested section answered, including 1664 empty initial resources",
@@ -509,7 +549,7 @@ fn hardware_pt_scene_baseline() -> Result {
             "rounds":ROUNDS,"steady_frames_per_round":FRAMES,"edits_per_round":EDITS,
             "boundary":"Host::render_options: command-pool creation, draw/encode, submit, queue idle, Flight completion; readback excluded",
             "scene_update_boundary":"manager_complete: plan+PRT2 packet response+apply+prepare+set_sections+commit/retire; all empty resources included; output file writes excluded",
-            "comparison_boundary":"old direct 64-section apply is a different workload; steady image/integrator inputs retained",
+            "comparison_boundary":"same 1728-section window and meshes as frozen per-section LOD0 baseline; region BLAS grouping changed; original direct 64-section apply remains a different workload",
             "steady_boundaries":"draw_complete_ns retains host draw/submit/complete only; manager_steady_ns includes real plan/prepare; frame_complete_ns includes manager and draw",
             "omissions":["Minecraft/Java capture/FFI mutex","window present","RR","GPU timestamps","process peak memory"],
             "capture":"untimed compute copy; production accumulation/counts allocation unchanged"
@@ -538,7 +578,7 @@ fn hardware_pt_scene_baseline() -> Result {
     let initial_prepare_ns = ns(start);
     let initial_scene_build = initial_drive.report();
     assert_eq!(initial_drive.requests, 1728);
-    assert_eq!(scene.entries().len(), keys.len());
+    assert_eq!(scene.entries().len(), 1, "64个非空section合并成单region");
     assert_eq!(
         scene
             .entries()
@@ -622,7 +662,9 @@ fn hardware_pt_scene_baseline() -> Result {
             let frame_started = Instant::now();
             let manager_started = Instant::now();
             assert!(
-                scene.plan(&world, 64)?.is_empty(),
+                scene
+                    .plan(&world, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?
+                    .is_empty(),
                 "稳定窗口不应请求重新捕获"
             );
             assert!(!scene.prepare()?, "稳定窗口不应重新发布GPU场景");
@@ -709,7 +751,7 @@ fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
     let mut gpu = host.gpu()?;
     gpu.set_atlas(16, 16, &atlas())?;
     let mut scene = crate::scene::Scene::new()?;
-    let keys = [[0, 0, 0], EDIT_KEY];
+    let keys = [[4, 0, 0], EDIT_KEY];
     let world = world_camera(scene_camera());
     settle(
         &mut scene,
@@ -718,26 +760,27 @@ fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
         &sources(&keys, false, 0x00bf_d9a6, false),
     )?;
     let initial: Vec<_> = gpu
-        .section_cache
+        .region_cache
         .entries()
         .iter()
         .map(|entry| entry.blas)
         .collect();
     scene.invalidate_section(EDIT_KEY)?;
-    settle(
+    let edit_drive = settle(
         &mut scene,
         &mut gpu,
         &world,
         &sources(&keys, true, 0x00bf_d9a6, false),
     )?;
     let changed: Vec<_> = gpu
-        .section_cache
+        .region_cache
         .entries()
         .iter()
         .map(|entry| entry.blas)
         .collect();
-    assert_eq!(initial[0], changed[0]);
-    assert_ne!(initial[1], changed[1]);
+    assert_eq!(edit_drive.requests, 1, "局部编辑只重捕被修改的section");
+    assert_ne!(initial[0], changed[0], "只重建被编辑的region");
+    assert_eq!(initial[1], changed[1], "保留其他region的BLAS");
     let moved = crate::scene::WorldCamera {
         origin: [world.origin[0] + 64.0, world.origin[1], world.origin[2]],
         ..world
@@ -749,7 +792,7 @@ fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
         &sources(&keys, true, 0x00bf_d9a6, false),
     )?;
     assert!(
-        gpu.section_cache
+        gpu.region_cache
             .entries()
             .iter()
             .map(|entry| entry.blas)
@@ -792,7 +835,7 @@ fn hardware_pt_section_attributes_reuse_blas_and_change_output() -> Result {
         &world,
         &sources(&[[0, 0, 0]], false, 0x00bf_d9a6, false),
     )?;
-    let initial = gpu.section_cache.entries()[0].blas;
+    let initial = gpu.region_cache.entries()[0].blas;
     let image = image(&mut gpu)?;
     let relative = world.relative(scene.anchor())?;
     let before = host.render(&mut gpu, &image, &relative)?;
@@ -803,7 +846,7 @@ fn hardware_pt_section_attributes_reuse_blas_and_change_output() -> Result {
         &world,
         &sources(&[[0, 0, 0]], false, 0x0030_e030, true),
     )?;
-    assert_eq!(gpu.section_cache.entries()[0].blas, initial);
+    assert_eq!(gpu.region_cache.entries()[0].blas, initial);
     let after = host.render(&mut gpu, &image, &relative)?;
     assert_ne!(before, after, "只更新tint/UV必须传播到实际场景属性");
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);

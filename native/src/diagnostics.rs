@@ -1,0 +1,219 @@
+//! 主线程完整帧间隔归因；统计和保峰复用引擎，宿主展示PFT2快照。
+//! AS等待、属性分配/映射写入分别计时，不伪装成GPU timestamp。
+
+use crate::Error;
+use simple_engine::frame_loop::timing::{FrameAttribution, FrameSample, FrameStats, compact_chart};
+use std::time::Duration;
+
+pub(crate) const STAGES: usize = 14;
+pub(crate) const COLUMNS: usize = 512;
+pub(crate) const HEADER: usize = 576;
+pub(crate) const BAR: usize = 120;
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SceneInfo {
+    pub dirty_regions: u64,
+    pub instances: u64,
+    pub triangle_bytes: u64,
+    pub attribute_bytes: u64,
+    pub blas_wait_ns: u64,
+    pub tlas_ns: u64,
+    pub attribute_ns: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct Profile {
+    stats: FrameStats<STAGES>,
+    sequence: u64,
+    // 规划、三角编码、属性打包、BLAS、属性分配/写入、TLAS、提交/回收。
+    pub scene: [u64; 7],
+    pub update: Option<SceneInfo>,
+    last_update: Option<(u64, SceneInfo)>,
+}
+
+impl Profile {
+    pub(crate) fn record(
+        &mut self,
+        elapsed_ns: u64,
+        mut stages: [u64; STAGES],
+    ) -> Result<(), Error> {
+        if elapsed_ns > i64::MAX as u64 {
+            return Err(Error::Input("PFT2帧间隔超过宿主有符号纳秒域"));
+        }
+        if elapsed_ns == 0 {
+            self.stats.reset_samples();
+            self.scene = [0; 7];
+            self.update = None;
+            self.last_update = None;
+            return Ok(());
+        }
+        let scene = std::mem::take(&mut self.scene);
+        let measured = scene
+            .iter()
+            .fold(0u64, |sum, value| sum.saturating_add(*value));
+        stages[11] = stages[11].saturating_sub(measured);
+        for (stage, ns) in [2, 5, 6, 7, 8, 9, 10].into_iter().zip(scene) {
+            stages[stage] = stages[stage].saturating_add(ns);
+        }
+        self.stats.record_attributed(
+            Duration::from_nanos(elapsed_ns),
+            FrameAttribution::new(stages),
+        )?;
+        self.sequence = self.sequence.saturating_add(1).min(i64::MAX as u64);
+        if let Some(update) = self.update.take()
+            && self.stats.detail().latest.is_some()
+        {
+            self.last_update = Some((self.sequence, update));
+        }
+        Ok(())
+    }
+
+    /// PFT2：192B头、三个128B详情、至多512个120B保峰柱；不持有宿主借用。
+    pub(crate) fn write(&mut self, output: &mut [u8], columns: usize) -> Result<usize, Error> {
+        if columns == 0 || columns > COLUMNS || output.len() < HEADER + columns * BAR {
+            return Err(Error::Input("PFT2输出容量或柱数无效"));
+        }
+        let mut bars = [[0.; STAGES]; COLUMNS];
+        let mut winners = [0; COLUMNS];
+        let count = compact_chart(self.stats.chart(), columns, &mut bars, &mut winners);
+        let size = HEADER + count * BAR;
+        let output = &mut output[..size];
+        output.fill(0);
+        put_u32(output, 0, 0x3254_4650);
+        put_u32(output, 4, 2);
+        put_u32(output, 8, STAGES as u32);
+        put_u32(output, 12, count as u32);
+        let snapshot = self.stats.snapshot();
+        put_u64(output, 16, snapshot.sample_count as u64);
+        put_u64(output, 24, self.sequence);
+        for (offset, value) in [32, 40, 48, 56].into_iter().zip([
+            snapshot.average_fps,
+            snapshot.mean_ms,
+            snapshot.p90_ms,
+            snapshot.p99_ms,
+        ]) {
+            put_u64(output, offset, value.to_bits());
+        }
+        let detail = self.stats.detail();
+        let mut mask = 0;
+        for (index, sample) in [detail.latest, detail.latest_stall, detail.slowest]
+            .into_iter()
+            .enumerate()
+        {
+            if let Some(sample) = sample {
+                mask |= 1 << index;
+                write_sample(output, 192 + index * 128, 16, sample);
+            }
+        }
+        put_u32(output, 88, mask);
+        if let Some((sequence, info)) = self.last_update {
+            put_u32(output, 92, 1);
+            for (index, value) in [
+                sequence,
+                info.dirty_regions,
+                info.instances,
+                info.triangle_bytes,
+                info.attribute_bytes,
+                info.blas_wait_ns,
+                info.tlas_ns,
+                info.attribute_ns,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                put_u64(output, 96 + index * 8, value);
+            }
+        }
+        for (column, index) in winners[..count].iter().copied().enumerate() {
+            let sample = self.stats.sample(index).expect("保峰索引来自同一统计窗口");
+            write_sample(output, HEADER + column * BAR, 8, sample);
+        }
+        Ok(size)
+    }
+}
+
+fn put_u32(output: &mut [u8], offset: usize, value: u32) {
+    output[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(output: &mut [u8], offset: usize, value: u64) {
+    output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_sample(output: &mut [u8], offset: usize, stages: usize, sample: FrameSample<STAGES>) {
+    put_u64(output, offset, sample.elapsed_ns);
+    for (index, value) in sample.attribution.0.into_iter().enumerate() {
+        put_u64(output, offset + stages + index * 8, value);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn word(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn nested_scene_wall_time_is_removed_from_recording_before_stacking() {
+        let mut profile = Profile {
+            scene: [10, 15, 5, 20, 5, 10, 5],
+            ..Profile::default()
+        };
+        let mut stages = [0; STAGES];
+        stages[11] = 100;
+        profile.record(200, stages).unwrap();
+        let mut bytes = vec![0; HEADER + BAR];
+        profile.write(&mut bytes, 1).unwrap();
+        let attribution: [u64; STAGES] = std::array::from_fn(|i| word(&bytes, 208 + i * 8));
+        assert_eq!(
+            attribution,
+            [0, 0, 10, 0, 0, 15, 5, 20, 5, 10, 5, 30, 0, 100]
+        );
+        assert_eq!(attribution.iter().sum::<u64>(), word(&bytes, 192));
+    }
+
+    #[test]
+    fn chart_keeps_the_exact_nanoseconds_of_the_peak_sample() {
+        let mut profile = Profile::default();
+        for ns in [1, 100_000_001, 3] {
+            profile.record(ns, [0; STAGES]).unwrap();
+        }
+        let mut bytes = vec![0; HEADER + BAR];
+        assert_eq!(profile.write(&mut bytes, 1).unwrap(), HEADER + BAR);
+        assert_eq!(word(&bytes, HEADER), 100_000_001);
+        assert_eq!(word(&bytes, HEADER + 8 + 13 * 8), 100_000_001);
+        assert_eq!(&bytes[64..88], &[0; 24]);
+    }
+
+    #[test]
+    #[ignore = "生成PFT2供Gradle frameChartFixture验证生产native writer"]
+    fn native_profile_fixture() {
+        let mut profile = Profile::default();
+        for ns in [10_000_000, 80_000_000, 12_000_000] {
+            let mut stages = [0; STAGES];
+            if ns == 80_000_000 {
+                stages[7] = 65_000_000;
+                stages[8] = 1_000_000;
+                stages[9] = 2_000_000;
+                profile.update = Some(SceneInfo {
+                    dirty_regions: 2,
+                    instances: 64,
+                    triangle_bytes: 6 * 1024 * 1024,
+                    attribute_bytes: 3 * 1024 * 1024,
+                    blas_wait_ns: 1_000_000,
+                    tlas_ns: 2_000_000,
+                    attribute_ns: 1_000_000,
+                });
+            }
+            profile.record(ns, stages).unwrap();
+        }
+        profile.stats.refresh();
+        let mut bytes = vec![0; HEADER + COLUMNS * BAR];
+        let size = profile.write(&mut bytes, 240).unwrap();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/native-frame-chart.pft");
+        std::fs::write(path, &bytes[..size]).unwrap();
+    }
+}

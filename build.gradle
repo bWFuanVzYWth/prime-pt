@@ -104,7 +104,18 @@ tasks.register('streamlineFixture', JavaExec) {
     systemProperty 'primept.native', providers.gradleProperty('nativeLibrary').getOrElse(rootProject.file('target/release/prime_pt.dll').absolutePath)
 }
 
+tasks.register('frameChartFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.FrameChartFixture'
+    jvmArgs '-Djava.awt.headless=true'
+    if (providers.gradleProperty('frameChartImage').isPresent())
+        args providers.gradleProperty('frameChartImage').get()
+    if (providers.gradleProperty('nativeFrameChart').isPresent())
+        args '--native=' + providers.gradleProperty('nativeFrameChart').get()
+}
+
 tasks.named('check') {
     dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),
-            tasks.named('videoOptionsFixture'), tasks.named('commandHintsFixture'), tasks.named('sourceChangesFixture')
+            tasks.named('videoOptionsFixture'), tasks.named('commandHintsFixture'), tasks.named('sourceChangesFixture'), tasks.named('frameChartFixture')
 }

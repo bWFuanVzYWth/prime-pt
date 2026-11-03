@@ -18,7 +18,7 @@ vulkan = { path = "../../../crates/vulkan", features = ["dlss_rr"] }
 openpbr = { path = "../../../crates/openpbr", features = ["program"] }
 shader_build = { path = "../../../crates/shader_build" }
 atmosphere = { path = "../../../crates/atmosphere", default-features = false, features = ["native"] }
-simple_engine = { path = "../../../", features = ["display", "vulkan"] }
+simple_engine = { path = "../../../", features = ["display", "frame_loop", "vulkan"] }
 
 [dev-dependencies]
 ash = { git = "https://github.com/ash-rs/ash.git", rev = "8844f6b4eefb16d08cd73c8f3d340e1ac12deb16" }

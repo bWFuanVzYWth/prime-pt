@@ -2,7 +2,7 @@
 //!
 //! 每次调用或销毁前宿主须确认前次命令完成，并在调用期间独占队列。
 //! 设备/输出导入、宿主命令编码与 引擎 SDK 求值共享同一完成边界。
-//! section局部BLAS由scene_cache独占；revision变化只重建对应BLAS，anchor只改变TLAS平移。
+//! 64m region局部BLAS由scene_cache独占；revision变化只重建对应BLAS，anchor只改变TLAS平移。
 //! 一批dirty三角输入连续收集，共享native上传与scratch并只提交等待一次；返回后释放CPU输入。
 //! 属性仍按活动槽全量重新打包上传；更新完成前保留旧资源，所有准备成功后发布。
 
@@ -61,23 +61,57 @@ struct Scene {
     quads: Buffer,
 }
 
-struct SectionGpu {
+struct RegionGpu {
     key: [i32; 3],
     revision: u64,
     range: std::ops::Range<u32>,
     blas: Option<vulkan::TriangleBlas>,
 }
 
-#[cfg(test)]
+/// 单次成功region发布的主机墙钟与工作集；三个主阶段互斥，细分字段仅作诊断。
+/// 不包含宿主旧帧完成等待，也不是GPU timestamp；失败更新不发布快照。
 #[derive(Clone, Copy, Default)]
-struct SceneBuildMetrics {
-    triangle_bytes: u64,
-    triangle_capacity_bytes: u64,
-    pending_capacity_bytes: u64,
-    input_capacity_bytes: u64,
-    attribute_capacity_bytes: u64,
-    instance_capacity_bytes: u64,
-    batch: vulkan::BuildTiming,
+pub(crate) struct SceneUpdateTiming {
+    /// 源Mesh到dirty三角/输入及属性编码；不含AS构建、属性上传和发布。
+    pub geometry_ns: u64,
+    /// BLAS与TLAS构建的主机墙钟，含同步提交与完成等待。
+    pub acceleration_ns: u64,
+    /// 属性上传及目录/场景发布；与其余两个主阶段互斥。
+    pub resources_ns: u64,
+    /// 全活动属性与TLAS实例的CPU准备，已计入geometry_ns。
+    pub attribute_pack_ns: u64,
+    /// 属性buffer分配及上传，已计入resources_ns。
+    pub attribute_upload_ns: u64,
+    /// 实际新属性Buffer的完整上传字节，含属性槽空洞与非空占位，不是容器容量。
+    pub attribute_upload_bytes: u64,
+    /// 本次重新构建的非空region数；属性刷新或纯anchor重定位为零。
+    pub dirty_regions: usize,
+    /// 本次TLAS使用的活动非空region实例数。
+    pub instances: usize,
+    /// TLAS主机墙钟，已计入acceleration_ns。
+    pub tlas_ns: u64,
+    /// 缓存和场景发布，已计入resources_ns。
+    pub publish_ns: u64,
+    /// 旧资源目录回收，已计入resources_ns。
+    pub collect_ns: u64,
+    /// dirty region三角有效字节。
+    pub triangle_bytes: u64,
+    /// dirty region三角容器容量字节。
+    pub triangle_capacity_bytes: u64,
+    /// 待回填region目录容量字节。
+    pub pending_capacity_bytes: u64,
+    /// BLAS输入描述符容量字节。
+    pub input_capacity_bytes: u64,
+    /// 全活动属性临时容量字节。
+    pub attribute_capacity_bytes: u64,
+    /// 全活动TLAS实例临时容量字节。
+    pub instance_capacity_bytes: u64,
+    /// BLAS批次细分；submit_wait_ns已包含在acceleration_ns，不另行堆叠。
+    pub batch: vulkan::BuildTiming,
+}
+
+fn elapsed_ns(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 struct View {
@@ -436,9 +470,8 @@ pub(crate) struct Gpu {
     context: Context,
     scene: Scene,
     anchor: [f64; 3],
-    section_cache: scene_cache::Cache<SectionGpu>,
-    #[cfg(test)]
-    scene_build: SceneBuildMetrics,
+    region_cache: scene_cache::Cache<RegionGpu>,
+    scene_update: Option<SceneUpdateTiming>,
     // 程序模板只保留初始空场景，不能钉住重载时完整 mesh／AS 的工作集。
     program_scene: Scene,
     atlas: Image,
@@ -589,9 +622,8 @@ impl Gpu {
             context,
             scene,
             anchor: [0.0; 3],
-            section_cache: scene_cache::Cache::new()?,
-            #[cfg(test)]
-            scene_build: SceneBuildMetrics::default(),
+            region_cache: scene_cache::Cache::new()?,
+            scene_update: None,
             program_scene,
             atlas,
             energy,
@@ -802,31 +834,46 @@ impl Gpu {
         let scene = Self::build_scene(&mut self.context, mesh)?;
         self.invalidate()?;
         self.scene = scene;
-        self.section_cache = scene_cache::Cache::new()?;
+        self.region_cache = scene_cache::Cache::new()?;
         Ok(())
     }
 
-    /// 每section复用未变BLAS；anchor只改变TLAS实例平移，不改局部顶点。
+    /// 每64m region复用未变BLAS；anchor只改变TLAS实例平移，不改局部顶点。
     /// 宿主仍在入口前完成旧命令。属性初期按活动槽全量打包上传，未宣称分段上传。
     pub(crate) fn set_sections(&mut self, source: &crate::scene::Scene) -> Result<(), Error> {
+        self.scene_update = None;
         self.complete_previous()?;
         let result = self.set_sections_inner(source);
-        self.collect_resources()?;
+        let collecting = std::time::Instant::now();
+        if let Err(error) = self.collect_resources() {
+            self.scene_update = None;
+            return Err(error);
+        }
+        if let Some(timing) = &mut self.scene_update {
+            timing.collect_ns = elapsed_ns(collecting);
+            timing.resources_ns += timing.collect_ns;
+        }
         result
     }
 
+    /// 最近一次成功场景更新的互斥主阶段及细分；新更新失败时为None。
+    /// 稳态帧未调用set_sections时不产生新样本，消费者只在实际更新的帧读取。
+    pub(crate) const fn scene_timing(&self) -> Option<SceneUpdateTiming> {
+        self.scene_update
+    }
+
     fn set_sections_inner(&mut self, source: &crate::scene::Scene) -> Result<(), Error> {
-        let mut update = self.section_cache.begin(source.entries().len())?;
+        let mut update = self.region_cache.begin(source.entries().len())?;
         let (slots, entries, _) = update.parts_mut();
         // 输入只包含dirty集；批构建完成后释放CPU三角与描述符，再准备全量属性。
-        #[cfg(test)]
-        let mut metrics = SceneBuildMetrics::default();
+        let mut metrics = SceneUpdateTiming::default();
+        let mut geometry_started = std::time::Instant::now();
         {
-            let (dirty_triangles, dirty_sections) = source.entries().try_fold(
+            let (dirty_triangles, dirty_regions) = source.entries().try_fold(
                 (0usize, 0usize),
                 |(count, sections), (key, revision, mesh)| {
                     if scene_cache::find_revision(
-                        self.section_cache.entries(),
+                        self.region_cache.entries(),
                         key,
                         revision,
                         |entry| entry.key,
@@ -848,17 +895,18 @@ impl Gpu {
                     }
                 },
             )?;
+            metrics.dirty_regions = dirty_regions;
             let mut triangles = Vec::new();
             triangles
                 .try_reserve_exact(dirty_triangles)
                 .map_err(scene_cache::Error::from)?;
             let mut pending = Vec::new();
             pending
-                .try_reserve_exact(dirty_sections)
+                .try_reserve_exact(dirty_regions)
                 .map_err(scene_cache::Error::from)?;
             for (key, revision, mesh) in source.entries() {
                 if let Some(index) = scene_cache::find_revision(
-                    self.section_cache.entries(),
+                    self.region_cache.entries(),
                     key,
                     revision,
                     |entry| entry.key,
@@ -868,10 +916,10 @@ impl Gpu {
                     continue;
                 }
                 let count = u32::try_from(mesh.quads.len())
-                    .map_err(|_| Error::Invalid("section面索引超过u32"))?;
+                    .map_err(|_| Error::Invalid("region面索引超过u32"))?;
                 let range = slots.take(count)?;
                 if range.end > (1 << 24) {
-                    return Err(Error::Invalid("section属性槽超过实例24位索引"));
+                    return Err(Error::Invalid("region属性槽超过实例24位索引"));
                 }
                 let start = triangles.len();
                 triangles.extend(mesh.quads.iter().flat_map(|quad| {
@@ -879,7 +927,7 @@ impl Gpu {
                     [[a, b, c], [a, c, d]]
                 }));
                 pending.push((entries.len(), start..triangles.len()));
-                entries.push(scene_cache::Prepared::Built(SectionGpu {
+                entries.push(scene_cache::Prepared::Built(RegionGpu {
                     key,
                     revision,
                     range,
@@ -897,18 +945,19 @@ impl Gpu {
                     opacity: None,
                 });
             }
+            metrics.geometry_ns += elapsed_ns(geometry_started);
+            let acceleration_started = std::time::Instant::now();
             let batch = self.context.triangle_blas_batch(&inputs)?;
-            #[cfg(test)]
-            {
-                metrics.triangle_bytes = std::mem::size_of_val(triangles.as_slice()) as u64;
-                metrics.triangle_capacity_bytes =
-                    (triangles.capacity() * size_of::<[[f32; 3]; 3]>()) as u64;
-                metrics.pending_capacity_bytes =
-                    (pending.capacity() * size_of::<(usize, std::ops::Range<usize>)>()) as u64;
-                metrics.input_capacity_bytes =
-                    (inputs.capacity() * size_of::<vulkan::TriangleBlasInput<'_>>()) as u64;
-                metrics.batch = batch.timing;
-            }
+            metrics.acceleration_ns += elapsed_ns(acceleration_started);
+            geometry_started = std::time::Instant::now();
+            metrics.triangle_bytes = std::mem::size_of_val(triangles.as_slice()) as u64;
+            metrics.triangle_capacity_bytes =
+                (triangles.capacity() * size_of::<[[f32; 3]; 3]>()) as u64;
+            metrics.pending_capacity_bytes =
+                (pending.capacity() * size_of::<(usize, std::ops::Range<usize>)>()) as u64;
+            metrics.input_capacity_bytes =
+                (inputs.capacity() * size_of::<vulkan::TriangleBlasInput<'_>>()) as u64;
+            metrics.batch = batch.timing;
             for ((index, _), blas) in pending.into_iter().zip(batch.blases) {
                 let scene_cache::Prepared::Built(entry) = &mut entries[index] else {
                     unreachable!("dirty输入只对应本批新建记录");
@@ -916,16 +965,18 @@ impl Gpu {
                 entry.blas = Some(blas);
             }
         }
+        metrics.geometry_ns += elapsed_ns(geometry_started);
+        let packing = std::time::Instant::now();
         let end = entries
             .iter()
-            .map(|entry| entry.get(self.section_cache.entries()).range.end)
+            .map(|entry| entry.get(self.region_cache.entries()).range.end)
             .max()
             .unwrap_or(0);
         let mut attributes = vec![[[0u32; 4]; 3]; end.max(1) as usize];
         let mut instances = Vec::with_capacity(entries.len());
         let anchor = source.anchor();
         for ((key, _, mesh), entry) in source.entries().zip(entries.iter()) {
-            let entry = entry.get(self.section_cache.entries());
+            let entry = entry.get(self.region_cache.entries());
             for (target, quad) in attributes[entry.range.start as usize..entry.range.end as usize]
                 .iter_mut()
                 .zip(&mesh.quads)
@@ -933,11 +984,11 @@ impl Gpu {
                 *target = quad.attributes();
             }
             let offset: [f32; 3] =
-                std::array::from_fn(|axis| (f64::from(key[axis]) * 16.0 - anchor[axis]) as f32);
+                std::array::from_fn(|axis| (f64::from(key[axis]) * 64.0 - anchor[axis]) as f32);
             instances.push(TriangleInstance {
                 geometry: entry
                     .blas
-                    .ok_or(Error::Invalid("批构建未完成section BLAS"))?,
+                    .ok_or(Error::Invalid("批构建未完成region BLAS"))?,
                 transform: [
                     [1., 0., 0., offset[0]],
                     [0., 1., 0., offset[1]],
@@ -946,24 +997,31 @@ impl Gpu {
                 custom_index: entry.range.start,
             });
         }
-        #[cfg(test)]
-        {
-            metrics.attribute_capacity_bytes =
-                (attributes.capacity() * size_of::<[[u32; 4]; 3]>()) as u64;
-            metrics.instance_capacity_bytes =
-                (instances.capacity() * size_of::<TriangleInstance>()) as u64;
-        }
+        metrics.attribute_capacity_bytes =
+            (attributes.capacity() * size_of::<[[u32; 4]; 3]>()) as u64;
+        metrics.instance_capacity_bytes =
+            (instances.capacity() * size_of::<TriangleInstance>()) as u64;
+        metrics.instances = instances.len();
+        metrics.attribute_pack_ns = elapsed_ns(packing);
+        metrics.geometry_ns += metrics.attribute_pack_ns;
+        let uploading = std::time::Instant::now();
         let quads = Buffer::upload(&mut self.context, bytemuck::cast_slice(&attributes))?;
+        metrics.attribute_upload_ns = elapsed_ns(uploading);
+        metrics.attribute_upload_bytes = quads.len();
+        metrics.resources_ns += metrics.attribute_upload_ns;
+        let accelerating = std::time::Instant::now();
         let top = self.context.acceleration_instances(&instances)?;
+        metrics.tlas_ns = elapsed_ns(accelerating);
+        metrics.acceleration_ns += metrics.tlas_ns;
+        let publishing = std::time::Instant::now();
         self.invalidate()?;
-        self.section_cache
+        self.region_cache
             .commit(update, |entry| entry.range.clone())?;
         self.scene = Scene { top, quads };
         self.anchor = source.anchor();
-        #[cfg(test)]
-        {
-            self.scene_build = metrics;
-        }
+        metrics.publish_ns = elapsed_ns(publishing);
+        metrics.resources_ns += metrics.publish_ns;
+        self.scene_update = Some(metrics);
 
         Ok(())
     }

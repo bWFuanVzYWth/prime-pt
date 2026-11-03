@@ -3,7 +3,8 @@
 //! Java 在渲染线程同步借出源包、atlas 与宿主 Vulkan 句柄；Rust 拥有 mesh、
 //! 工作池、BLAS/TLAS、SBT 和 pipeline。每次进入 native 前，宿主必须提交并等待
 //! 前次 native 命令完成，且独占 graphics queue。句柄不会转移设备所有权。
-//! 源包只在调用内借用；解码、验证和 CPU mesh 替换在返回前完成。
+//! 源包只在调用内借用；解码、验证与本轮section编译在返回前完成。
+//! region所需源全部就绪后才成为可发布资源，一个64m region合并4³个section。
 //! 使用 [`Quad`] 的直接寻址属性 ABI：任意四角、固定012/023、三角面退化为quad，
 //! 不要求轴对齐。位置只由 AS position fetch 提供，不保留 shader 顶点/索引副本。
 //! 宿主必须启用 [KHR position fetch] 扩展和 feature，无回退；能力边界见 [`Quad`]。
@@ -12,6 +13,7 @@
 
 #![recursion_limit = "256"]
 
+mod diagnostics;
 mod gpu;
 mod reconstruction;
 mod scene;
@@ -54,12 +56,16 @@ pub(crate) enum Error {
     /// 区块调度输入无效。
     #[error(transparent)]
     Planning(#[from] chunk_manager::PlanError),
+    /// 帧统计保留容量增长失败。
+    #[error(transparent)]
+    Diagnostics(#[from] simple_engine::frame_loop::timing::FrameStatsError),
 }
 
 struct Engine {
     scene: scene::Scene,
     gpu: gpu::Gpu,
     atlas_ready: bool,
+    profile: diagnostics::Profile,
 }
 
 static ENGINES: OnceLock<Mutex<BTreeMap<u64, Engine>>> = OnceLock::new();
@@ -199,6 +205,7 @@ pub unsafe extern "C" fn prime_create_options(
                     scene,
                     gpu,
                     atlas_ready: false,
+                    profile: diagnostics::Profile::default(),
                 },
             );
         Ok(id)
@@ -260,10 +267,12 @@ pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
     })
 }
 
-/// 为当前相机推进引擎 LOD0 窗口，返回至多 capacity 条捕获请求；失败返回 -1。
+/// 依宿主水平视距及完整世界高度推进64m LOD0窗口，返回至多capacity条待捕请求。
 ///
 /// 请求为 little-endian 的 `id:u64, sx:i32, sy:i32, sz:i32, reserved:u32=0`，每条 24B。
-/// 宿主须用 PRT2 回复，或对未完成请求调用 [`prime_fail_capture`]；窗口移动不清空场景。
+/// view_distance以16m列计；高度为半开section范围。每个region合并4³个section。
+/// 未回复请求在后续调用保持同一ID；宿主可分帧用PRT2回复，捕获失败才调用
+/// [`prime_fail_capture`]。窗口移动不清空场景，超出联合容量返回错误。
 ///
 /// # Safety
 /// camera 借出完整 WorldCamera；requests 借出 capacity*24 字节可写内存，二者不重叠。
@@ -271,6 +280,9 @@ pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
 pub unsafe extern "C" fn prime_plan(
     id: u64,
     camera: *const WorldCamera,
+    view_distance: u32,
+    min_section_y: i32,
+    max_section_y_exclusive: i32,
     requests: *mut u8,
     capacity: u32,
 ) -> i32 {
@@ -282,8 +294,13 @@ pub unsafe extern "C" fn prime_plan(
         let camera = unsafe { camera.read_unaligned() };
         let mut count = 0;
         with_engine(id, |engine| {
-            let planned: &[scene::CaptureRequest] =
-                engine.scene.plan(&camera, capacity as usize)?;
+            let planned: &[scene::CaptureRequest] = engine.scene.plan(
+                &camera,
+                view_distance,
+                min_section_y,
+                max_section_y_exclusive,
+                capacity as usize,
+            )?;
             for (index, request) in planned.iter().enumerate() {
                 let mut bytes = [0u8; 24];
                 bytes[..8].copy_from_slice(&request.id.to_le_bytes());
@@ -332,14 +349,65 @@ pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
     })
 }
 
-/// 同步消费一个 PRT2 源包；验证失败不修改 CPU 场景，成功返回 0。
+/// 记录完整宿主帧间隔并导出PFT2主线程卡顿快照；成功返回写入字节数，失败返回-1。
+///
+/// elapsed_ns=0清空滚动窗口并跳过暂停间隔，保留会话最慢记录。
+/// stages为14个little-endian u64纳秒：等待、源/材质、规划、宿主捕获、网格编译/合并、
+/// 三角编码、属性打包、BLAS准备/等待、属性分配/写入、TLAS准备/等待、场景提交/回收、
+/// native录制/SDK、宿主提交、未归因。最近场景更新规模按独立序号导出，非所选柱的规模。
+/// native场景细分从录制总耗时扣除，余量由引擎统计补齐；不提供GPU timestamp。
+/// columns为1..=512个实际图表像素列，输出容量至少576+120*columns且不超过62016。
+///
+/// # Safety
+/// stages借出至少112B只读内存，output借出capacity字节可写内存；二者不重叠，
+/// 调用期间不得并发修改。该CPU接口不改变宿主GPU完成约定。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_profile(
+    id: u64,
+    elapsed_ns: u64,
+    stages: *const u8,
+    output: *mut u8,
+    capacity: u32,
+    columns: u32,
+) -> i32 {
+    guarded(-1, || {
+        let columns = columns as usize;
+        let capacity = capacity as usize;
+        if stages.is_null()
+            || output.is_null()
+            || columns == 0
+            || columns > diagnostics::COLUMNS
+            || capacity < diagnostics::HEADER + columns * diagnostics::BAR
+            || capacity > diagnostics::HEADER + diagnostics::COLUMNS * diagnostics::BAR
+        {
+            return Err(Error::Input("PFT2指针、容量或柱数无效"));
+        }
+        let timings = std::array::from_fn(|i| {
+            // SAFETY: 调用者借出完整112B；不要求对齐。
+            u64::from_le(unsafe { stages.add(i * 8).cast::<u64>().read_unaligned() })
+        });
+        // SAFETY: 调用者独占完整可写输出，长度上限已检查。
+        let output = unsafe { std::slice::from_raw_parts_mut(output, capacity) };
+        let mut size = 0;
+        with_engine(id, |engine| {
+            engine.profile.record(elapsed_ns, timings)?;
+            size = engine.profile.write(output, columns)? as i32;
+            Ok(())
+        })?;
+        Ok(size)
+    })
+}
+
+/// 同步消费PRT2捕获包；验证失败保留已发布场景，阶段资源按region ticket保留。
 ///
 /// 所有字为 little-endian，坐标为 i32，其余整数为 u32，浮点为 f32：
 /// `magic=0x32545250, section_count`；每段为 `request_id:u64,sx,sy,sz,block_count`；
 /// 每块为 `x | y<<4 | z<<8, quad_count, offset_x,offset_y,offset_z`；
 /// 每 quad 为 `ARGB, [x,y,z,u,v] × 4`。
 /// quad 坐标相对方块，UV 对应 atlas；每包 1..=64 段，可跨 region。
-/// 空段仍是已完成的 LOD0 空资源；旧 ticket 回复忽略，原版面剔除在捕获边界求值。
+/// block_count=0表示真实空section；u32::MAX表示源chunk未加载且不跟block数据。
+/// 不可用region保留显式负缓存并撤下GPU几何，加载通知后重新捕获完整region。
+/// 旧ticket回复忽略，原版面剔除在捕获边界求值。
 ///
 /// # Safety
 /// data 指向 len 字节的只读连续内存，调用期间保持活动且不被其他线程修改。
@@ -453,13 +521,41 @@ pub unsafe extern "C" fn prime_draw(
             if !engine.atlas_ready {
                 return Err(Error::Input("draw 前需要上传 atlas"));
             }
+            engine.profile.scene = [0; 7];
+            engine.profile.update = None;
+            let prepare_started = std::time::Instant::now();
             engine.scene.rebase(anchor);
-            if engine.scene.prepare()? {
+            let changed = engine.scene.prepare()?;
+            engine.profile.scene[0] = elapsed_ns(prepare_started);
+            if changed {
+                let scene_started = std::time::Instant::now();
                 if let Err(error) = engine.gpu.set_sections(&engine.scene) {
                     engine.scene.reject()?;
                     return Err(error.into());
                 }
                 engine.scene.commit()?;
+                let timing = engine.gpu.scene_timing().expect("成功发布保存当前计时");
+                engine.profile.scene[1] =
+                    timing.geometry_ns.saturating_sub(timing.attribute_pack_ns);
+                engine.profile.scene[2] = timing.attribute_pack_ns;
+                engine.profile.scene[3] = timing.acceleration_ns.saturating_sub(timing.tlas_ns);
+                engine.profile.scene[4] = timing.attribute_upload_ns;
+                engine.profile.scene[5] = timing.tlas_ns;
+                engine.profile.scene[6] = elapsed_ns(scene_started).saturating_sub(
+                    timing
+                        .geometry_ns
+                        .saturating_add(timing.acceleration_ns)
+                        .saturating_add(timing.attribute_upload_ns),
+                );
+                engine.profile.update = Some(diagnostics::SceneInfo {
+                    dirty_regions: timing.dirty_regions as u64,
+                    instances: timing.instances as u64,
+                    triangle_bytes: timing.triangle_bytes,
+                    attribute_bytes: timing.attribute_upload_bytes,
+                    blas_wait_ns: timing.batch.submit_wait_ns,
+                    tlas_ns: timing.tlas_ns,
+                    attribute_ns: timing.attribute_upload_ns,
+                });
             }
             engine.gpu.draw(
                 command,
@@ -473,4 +569,8 @@ pub unsafe extern "C" fn prime_draw(
             Ok(())
         })
     })
+}
+
+fn elapsed_ns(started: std::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }

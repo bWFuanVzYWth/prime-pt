@@ -28,23 +28,30 @@ public final class Renderer {
     private static final ByteBuffer CAMERA = ByteBuffer.allocateDirect(72).order(ByteOrder.LITTLE_ENDIAN);
     private static final ByteBuffer REQUESTS = ByteBuffer.allocateDirect(64 * 24).order(ByteOrder.LITTLE_ENDIAN);
     private static final ByteBuffer ENVIRONMENT = ByteBuffer.allocateDirect(20).order(ByteOrder.LITTLE_ENDIAN);
+    private static final ByteBuffer STAGES = ByteBuffer.allocateDirect(FrameChart.STAGES * 8).order(ByteOrder.LITTLE_ENDIAN);
+    private static final ByteBuffer PROFILE = ByteBuffer.allocateDirect(FrameChart.CAPACITY).order(ByteOrder.LITTLE_ENDIAN);
     private static Native renderer;
     private static VulkanCommandEncoder encoder;
     private static long generation = -1;
     private static volatile boolean resetRequested;
+    private static long lastCompleted;
     private Renderer() {}
 
     /** 替代原版世界绘制；相机、手持物和 UI 继续使用宿主路径。 */
     public static void render(CameraRenderState camera, RenderTarget target) {
         var minecraft = Minecraft.getInstance();
-        if (minecraft.level == null || target.width <= 0 || target.height <= 0) return;
+        if (minecraft.level == null || target.width <= 0 || target.height <= 0) {
+            lastCompleted = 0; FrameChart.clear(); return;
+        }
         RenderSystem.assertOnRenderThread();
         var host = RenderSystem.getDevice().createCommandEncoder();
         host.clearDepthTexture(target.getDepthTexture(), 1.0);
         if (!Atlas.ready() || !CameraPacket.write(camera, CAMERA)) {
+            lastCompleted = 0; FrameChart.clear();
             host.clearColorTexture(target.getColorTexture(), new Vector4f(0.2f, 0.4f, 0.7f, 1));
             return;
         }
+        for (int i = 0; i < FrameChart.STAGES; i++) STAGES.putLong(i * 8, 0);
         if (renderer == null) {
             var backend = ((DeviceAccess) RenderSystem.getDevice()).primept$backend();
             if (!(backend instanceof VulkanDevice device))
@@ -55,11 +62,16 @@ public final class Renderer {
                     device.vkDevice().address(), device.graphicsQueue().vkQueue().address(), device.graphicsQueue().queueFamilyIndex(),
                     Bootstrap.graphicsQueueIndex(), Bootstrap.invocationReorder(device.vkDevice()), Settings.requestedSer());
         }
+        long stage = System.nanoTime();
         await();
+        STAGES.putLong(0, System.nanoTime() - stage);
+        stage = System.nanoTime();
         renderer.ser(Settings.requestedSer());
         if (CAPTURE.select(minecraft.level) || resetRequested) {
             renderer.reset();
             resetRequested = false;
+            lastCompleted = 0;
+            FrameChart.clear();
         }
         if (generation != Atlas.generation) {
             Atlas.send(renderer); generation = Atlas.generation;
@@ -72,9 +84,20 @@ public final class Renderer {
             if (change.all()) renderer.invalidateAll();
             else renderer.invalidateSection(change.x(), change.y(), change.z());
         }
-        int count = renderer.plan(CAMERA, REQUESTS);
+        STAGES.putLong(8, System.nanoTime() - stage);
+        stage = System.nanoTime();
+        int count = renderer.plan(CAMERA, minecraft.options.getEffectiveRenderDistance(),
+                minecraft.level.getMinSectionY(), minecraft.level.getMaxSectionY() + 1, REQUESTS);
+        STAGES.putLong(16, System.nanoTime() - stage);
         if (count > 0) {
-            try { renderer.batch(CAPTURE.next(minecraft, REQUESTS, count)); }
+            try {
+                stage = System.nanoTime();
+                var packet = CAPTURE.next(minecraft, REQUESTS, count);
+                STAGES.putLong(24, System.nanoTime() - stage);
+                stage = System.nanoTime();
+                renderer.batch(packet);
+                STAGES.putLong(32, System.nanoTime() - stage);
+            }
             catch (RuntimeException | Error failure) {
                 for (int i = 0; i < count; i++) {
                     try { renderer.failCapture(REQUESTS.getLong(i * 24)); }
@@ -87,13 +110,22 @@ public final class Renderer {
                 || !(target.getColorTextureView() instanceof VulkanGpuTextureView view)
                 || texture.getFormat() != GpuFormat.RGBA8_UNORM || (texture.usage() & STORAGE) == 0)
             throw new IllegalStateException("Prime PT 目标必须是支持 storage 的 RGBA8_UNORM");
+        stage = System.nanoTime();
         var command = encoder.allocateAndBeginTransientCommandBuffer();
         ENVIRONMENT.putFloat(12, Settings.exposure());
         renderer.draw(command.address(), texture.vkImage(), view.vkImageView(), target.width, target.height,
                 CAMERA, ENVIRONMENT, Settings.rr(), Settings.quality(), Settings.samples(), Settings.bounces());
         int status = VK10.vkEndCommandBuffer(command);
         if (status != VK10.VK_SUCCESS) throw new IllegalStateException("vkEndCommandBuffer: " + status);
+        STAGES.putLong(88, System.nanoTime() - stage);
+        stage = System.nanoTime();
         encoder.execute(command);
+        STAGES.putLong(96, System.nanoTime() - stage);
+        long completed = System.nanoTime();
+        long elapsed = lastCompleted == 0 || minecraft.isPaused() ? 0 : completed - lastCompleted;
+        lastCompleted = completed;
+        renderer.profile(elapsed, STAGES, PROFILE, FrameChart.columns());
+        FrameChart.update(PROFILE);
     }
 
     private static void await() {
@@ -135,5 +167,6 @@ public final class Renderer {
     public static void close() {
         if (renderer == null) return;
         await(); renderer.close(); renderer = null; generation = -1; CAPTURE.invalidate(); resetRequested = false;
+        lastCompleted = 0; FrameChart.clear();
     }
 }

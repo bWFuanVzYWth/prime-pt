@@ -1,4 +1,4 @@
-//! PRT1 源包：4³ section 原子替换；Rust 生成直接寻址 quad，AS 输入另行展开。
+//! PRT2 section捕获与64m region合批；Rust生成直接寻址quad，AS输入另行展开。
 
 use std::collections::HashSet;
 
@@ -137,7 +137,6 @@ impl Quad {
         ]
     }
 
-    #[cfg(test)]
     pub(crate) fn translate(&mut self, offset: [f32; 3]) {
         let positions = self
             .positions()
@@ -321,6 +320,7 @@ struct Block<'a> {
 struct Section<'a> {
     id: u64,
     key: [i32; 3],
+    available: bool,
     blocks: Vec<Block<'a>>,
     quads: usize,
 }
@@ -393,12 +393,23 @@ fn decode(bytes: &[u8]) -> Result<Vec<Section<'_>>, crate::Error> {
         }
         region = Some(cell);
         let blocks = reader.word()? as usize;
+        if ticketed && blocks == u32::MAX as usize {
+            sections.push(Section {
+                id,
+                key,
+                available: false,
+                blocks: Vec::new(),
+                quads: 0,
+            });
+            continue;
+        }
         if blocks > 4096 {
             return Err(crate::Error::Input("section 超过 4096 个方块"));
         }
         let mut section = Section {
             id,
             key,
+            available: true,
             blocks: Vec::with_capacity(blocks),
             quads: 0,
         };

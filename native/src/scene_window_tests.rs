@@ -3,7 +3,7 @@
 use super::*;
 
 fn blases(gpu: &Gpu) -> std::collections::BTreeMap<[i32; 3], Option<vulkan::TriangleBlas>> {
-    gpu.section_cache
+    gpu.region_cache
         .entries()
         .iter()
         .map(|entry| (entry.key, entry.blas))
@@ -11,7 +11,7 @@ fn blases(gpu: &Gpu) -> std::collections::BTreeMap<[i32; 3], Option<vulkan::Tria
 }
 
 #[test]
-#[ignore = "真实Vulkan RT；移动加载保留旧覆盖且重叠section复用BLAS，串行执行"]
+#[ignore = "真实Vulkan RT；移动加载保留旧覆盖且重叠region复用BLAS，串行执行"]
 fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result {
     let host = Host::new()?;
     let mut gpu = host.gpu()?;
@@ -41,7 +41,9 @@ fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result
     };
     let mut requests = Vec::new();
     for _ in 0..4_096 {
-        requests = scene.plan(&moved, 64)?.to_vec();
+        requests = scene
+            .plan(&moved, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?
+            .to_vec();
         if scene.prepare()? {
             if let Err(error) = gpu.set_sections(&scene) {
                 scene.reject()?;
@@ -60,12 +62,12 @@ fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result
     let shifted = blases(&gpu);
     assert_eq!(
         shifted.keys().copied().collect::<Vec<_>>(),
-        [[0, 0, 0], [8, 0, 0]]
+        [[0, 0, 0], [2, 0, 0]]
     );
     assert_eq!(
         shifted[&[0, 0, 0]],
         initial[&[0, 0, 0]],
-        "重叠section的BLAS必须保留"
+        "重叠region的BLAS必须保留"
     );
 
     // 回转重新捕获已离开的后沿，交集仍使用原BLAS，probe相机始终观察相同绝对位置。

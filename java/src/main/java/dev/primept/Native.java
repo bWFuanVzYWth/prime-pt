@@ -13,7 +13,7 @@ import static java.lang.foreign.ValueLayout.*;
 /** 同步 FFM 边界；CPU 包借用到返回，宿主图像必须保活至 GPU 提交完成。 */
 final class Native implements AutoCloseable {
     private final Arena arena = Arena.ofConfined();
-    private final MethodHandle destroy, reset, plan, invalidateSection, invalidateAll, failCapture, batch, atlas, draw, setSer, error;
+    private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, failCapture, batch, atlas, draw, setSer, error;
     private final long handle;
     private boolean serRequested;
 
@@ -34,7 +34,10 @@ final class Native implements AutoCloseable {
                         JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT));
         destroy = bind(symbols, "prime_destroy", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         reset = bind(symbols, "prime_reset", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
-        plan = bind(symbols, "prime_plan", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT));
+        plan = bind(symbols, "prime_plan", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS,
+                JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT));
+        profile = bind(symbols, "prime_profile", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG,
+                ADDRESS, ADDRESS, JAVA_INT, JAVA_INT));
         invalidateSection = bind(symbols, "prime_invalidate_section", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT));
         invalidateAll = bind(symbols, "prime_invalidate_all", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         failCapture = bind(symbols, "prime_fail_capture", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG));
@@ -61,12 +64,22 @@ final class Native implements AutoCloseable {
         try { check((int) reset.invokeExact(handle)); } catch (Throwable e) { throw unchecked(e); }
     }
 
-    int plan(ByteBuffer camera, ByteBuffer requests) {
+    int plan(ByteBuffer camera, int distance, int minSectionY, int maxSectionYExclusive, ByteBuffer requests) {
         try {
             int count = (int) plan.invokeExact(handle, MemorySegment.ofBuffer(camera),
-                    MemorySegment.ofBuffer(requests), requests.remaining() / 24);
+                    distance, minSectionY, maxSectionYExclusive, MemorySegment.ofBuffer(requests), requests.remaining() / 24);
             if (count < 0) throw failure();
             return count;
+        } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void profile(long elapsed, ByteBuffer stages, ByteBuffer output, int columns) {
+        output.clear();
+        try {
+            int size = (int) profile.invokeExact(handle, elapsed, MemorySegment.ofBuffer(stages),
+                    MemorySegment.ofBuffer(output), output.remaining(), columns);
+            if (size < 0) throw failure();
+            output.limit(size);
         } catch (Throwable e) { throw unchecked(e); }
     }
 
