@@ -251,7 +251,7 @@ impl Scene {
     }
 
     /// 在同一私有池同步编译已齐备源；每波两个section×4 slab，无嵌套调度。
-    /// 缺失halo延后，已知不可用撤销整region；每份输出受剩余payload限额约束。
+    /// 缺失halo延后，已知不可用保留旧region覆盖与负缓存；每份输出受剩余payload限额约束。
     pub fn compile_sources(&mut self, catalog: &Catalog) -> Result<(), Error> {
         if self.compact.generation == 0 {
             return Ok(());
@@ -363,7 +363,13 @@ impl Scene {
                     let outgoing = self.state.visible().any(|(_, chunk, region)| {
                         !bounds.intersects(chunk) && region.owned_quads() != 0
                     });
-                    if outgoing || self.state.retired_len() != 0 || !self.compact.tints.is_empty() {
+                    let region_required =
+                        (self.estimate_job(&self.jobs[index], &[]) + used + required) * stride;
+                    if outgoing
+                        || self.state.retired_len() != 0
+                        || !self.compact.tints.is_empty()
+                        || region_required <= self.budget.region_bytes
+                    {
                         self.blocked_quads = used + required;
                         self.pressure = Pressure {
                             kind: PressureKind::Transition,
@@ -378,7 +384,7 @@ impl Scene {
                     self.exclude_job(
                         index,
                         PressureKind::Region,
-                        (self.estimate_job(&self.jobs[index], &[]) + used + required) * stride,
+                        region_required,
                         self.budget.region_bytes,
                     )?;
                     break;

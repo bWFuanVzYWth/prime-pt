@@ -4,7 +4,7 @@
 pub struct Budget {
     /// 当前目标域全部region的最终quad payload。
     pub resident_bytes: usize,
-    /// 旧域和dirty替换部分额外保留的payload余量。
+    /// 旧域和dirty替换部分额外保留的payload余量；不足时暂停替换，不撤旧覆盖。
     pub staging_bytes: usize,
     /// 单个region可提交的payload；不能大于staging_bytes。
     pub region_bytes: usize,
@@ -28,7 +28,7 @@ pub enum PressureKind {
     None = 0,
     /// 当前目标域的已知最终payload超出常驻预算。
     Resident = 1,
-    /// 过渡联合payload等待旧域回收；未回复ticket保持有效。
+    /// 过渡联合payload等待额外容量或可安全发布的替换；未回复ticket及旧覆盖保持有效。
     Transition = 2,
     /// 单region输出超过独立region预算。
     Region = 3,
@@ -43,7 +43,7 @@ pub struct Pressure {
     pub required_bytes: usize,
     /// 对应原因的配置上限。
     pub limit_bytes: usize,
-    /// 明确因预算排除的region数量；这些不是Unavailable或空源。
+    /// 明确因预算暂缓替换的region数量；有旧mesh时仍保留它，不充当空源。
     pub excluded_regions: usize,
     /// 因等待回收暂停返回的待捕获请求数。
     pub deferred_requests: usize,

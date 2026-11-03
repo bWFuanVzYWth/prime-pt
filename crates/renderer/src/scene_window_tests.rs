@@ -51,7 +51,16 @@ fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result
             }
             scene.commit()?;
         }
-        assert_eq!(blases(&gpu), initial, "新窗口未完成时保留全部旧GPU覆盖");
+        let current = blases(&gpu);
+        assert_eq!(
+            current[&[0, 0, 0]],
+            initial[&[0, 0, 0]],
+            "需求交集始终保留旧GPU覆盖"
+        );
+        assert!(
+            current.keys().all(|key| initial.contains_key(key)),
+            "未回复源不能产生新几何"
+        );
         if !requests.is_empty() {
             break;
         }
@@ -82,6 +91,129 @@ fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result
     assert!(
         before.iter().zip(&after).all(|(&a, &b)| a.abs_diff(b) <= 1),
         "回转后的真实宿主图像未恢复相同世界覆盖"
+    );
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+fn refresh_packet(
+    requests: &[prime_world::CaptureRequest],
+    input: &Sources,
+    unavailable: Option<[i32; 3]>,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    word(&mut bytes, 0x3254_5250);
+    word(&mut bytes, requests.len() as u32);
+    for request in requests {
+        if unavailable == Some(request.section) {
+            bytes.extend_from_slice(&request.id.to_le_bytes());
+            for axis in request.section {
+                word(&mut bytes, axis as u32);
+            }
+            word(&mut bytes, u32::MAX);
+        } else {
+            bytes.extend_from_slice(&packet(std::slice::from_ref(request), input)[8..]);
+        }
+    }
+    bytes
+}
+
+fn publish_step(scene: &mut prime_world::Scene, gpu: &mut Gpu) -> Result {
+    if scene.prepare()? {
+        if let Err(error) = gpu.set_sections(scene) {
+            scene.reject()?;
+            return Err(error.into());
+        }
+        scene.commit()?;
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT；刷新缺源保留旧BLAS，候选齐备且GPU成功后无空帧替换"]
+fn hardware_pt_region_refresh_never_drops_published_cover_for_unavailable_source() -> Result {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    gpu.set_atlas(16, 16, &atlas())?;
+    let mut scene = prime_world::Scene::new()?;
+    let camera = world_camera(Camera {
+        origin: [24., 24., -12., 0.],
+        ..super::super::camera()
+    });
+    let input = sources(&[EDIT_KEY], false, 0x00bf_d9a6, false);
+    settle(&mut scene, &mut gpu, &camera, &input)?;
+    let previous = blases(&gpu);
+    let top = gpu.scene.top;
+    let attributes = gpu.scene.quads;
+    assert_eq!(previous.keys().copied().collect::<Vec<_>>(), [[0, 0, 0]]);
+
+    scene.invalidate_section(EDIT_KEY)?;
+    let mut unavailable_seen = false;
+    for _ in 0..4096 {
+        let requests = scene
+            .plan(&camera, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?
+            .to_vec();
+        unavailable_seen |= requests.iter().any(|request| request.section == EDIT_KEY);
+        if !requests.is_empty() {
+            scene.apply(&refresh_packet(&requests, &input, Some(EDIT_KEY)))?;
+        }
+        publish_step(&mut scene, &mut gpu)?;
+        assert_eq!(blases(&gpu), previous, "缺源与负缓存不得撤下已发布几何");
+        assert_eq!(gpu.scene.top, top);
+        assert_eq!(gpu.scene.quads, attributes);
+        if !scene.pending() {
+            break;
+        }
+    }
+    assert!(unavailable_seen && !scene.pending());
+
+    scene.invalidate_section(EDIT_KEY)?;
+    let edited = sources(&[EDIT_KEY], true, 0x00bf_d9a6, false);
+    let mut held = None;
+    for _ in 0..4096 {
+        let requests = scene
+            .plan(&camera, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?
+            .to_vec();
+        held = requests
+            .iter()
+            .copied()
+            .find(|request| request.section == EDIT_KEY);
+        let other: Vec<_> = requests
+            .into_iter()
+            .filter(|request| request.section != EDIT_KEY)
+            .collect();
+        if !other.is_empty() {
+            scene.apply(&packet(&other, &edited))?;
+        }
+        publish_step(&mut scene, &mut gpu)?;
+        assert_eq!(blases(&gpu), previous, "新源未回复时仍显示旧BLAS");
+        if held.is_some() {
+            break;
+        }
+    }
+    scene.apply(&packet(&[held.ok_or("刷新未请求缺失源")?], &edited))?;
+    for _ in 0..4096 {
+        let requests = scene
+            .plan(&camera, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?
+            .to_vec();
+        if !requests.is_empty() {
+            scene.apply(&packet(&requests, &edited))?;
+        }
+        publish_step(&mut scene, &mut gpu)?;
+        assert_eq!(
+            blases(&gpu).keys().copied().collect::<Vec<_>>(),
+            [[0, 0, 0]],
+            "每次提交均有完整覆盖"
+        );
+        if !scene.pending() {
+            break;
+        }
+    }
+    assert!(!scene.pending());
+    assert_ne!(
+        blases(&gpu)[&[0, 0, 0]],
+        previous[&[0, 0, 0]],
+        "完整新几何上传后才替换BLAS"
     );
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())

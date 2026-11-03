@@ -11,9 +11,9 @@ final class FrameChart {
     static final int BARS_OFFSET = HEADER_BYTES + 3 * DETAIL_BYTES;
     static final int CAPACITY = BARS_OFFSET + MAX_BARS * BAR_BYTES;
     static final String[] LABELS = {"宿主等待", "tint/源维护", "规划", "宿主捕获", "网格编译/合并", "三角编码", "属性/光源打包",
-            "BLAS构建/等待", "属性/光源写入", "TLAS构建/等待", "场景提交/回收", "录制/SDK", "宿主提交", "未归因"};
+            "BLAS构建/等待", "属性/光源写入", "TLAS构建/等待", "场景准备/提交", "录制/SDK", "宿主提交", "未归因"};
     private static final String[] SHORT_LABELS = {"等待", "tint", "规划", "捕获", "网格", "三角", "打包",
-            "BLAS", "写入", "TLAS", "回收", "录制", "提交", "未归因"};
+            "BLAS", "写入", "TLAS", "场景", "录制", "提交", "未归因"};
     static final int[] COLORS = {0xff45b59e, 0xff53c4bd, 0xff9cbbe8, 0xff5b8ff9, 0xffee5b6b,
             0xfff7a8b8, 0xff64cedd, 0xfff0ca52, 0xff90cf66, 0xfff69942, 0xffaa74dd,
             0xff7f8fff, 0xffde91c1, 0xff74808e};

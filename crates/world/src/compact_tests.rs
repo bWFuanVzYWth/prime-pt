@@ -56,6 +56,119 @@ fn publish(scene: &mut Scene, catalog: &Catalog) -> Result<(), Error> {
     Err(Error::Input("压缩源发布未收敛"))
 }
 
+fn unavailable_packet(request: CaptureRequest) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for word in [0x33545250, 1, 1, 0] {
+        bytes.extend(u32::to_le_bytes(word));
+    }
+    bytes.extend(request.id.to_le_bytes());
+    for value in request.section {
+        bytes.extend(value.to_le_bytes());
+    }
+    bytes.extend([0u8; 16]);
+    bytes
+}
+
+#[test]
+fn unavailable_halo_preserves_old_mesh_until_recovered_geometry_and_tint_are_complete()
+-> Result<(), Error> {
+    let (mut scene, catalog) = ready_tinted()?;
+    let colors = vec![0xffff0000; scene.tint_requests().len()];
+    scene.apply_tints(&colors)?;
+    publish(&mut scene, &catalog)?;
+    let handle = scene.state.find(chunk([0; 3])).unwrap();
+    let old = scene.state.resource(handle).unwrap();
+    let pointer = old.parts()[0].quads.as_ptr();
+    let revisions = (old.revision, old.content_revision);
+    scene.invalidate_section([-1, 0, 0])?;
+    let requests = scene.plan(&camera(), 0, 0, 4, 64)?.to_vec();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].section, [-1, 0, 0]);
+    scene.apply_compact(&unavailable_packet(requests[0]), &catalog)?;
+    publish(&mut scene, &catalog)?;
+    let old = scene.state.resource(handle).unwrap();
+    assert!(!old.available);
+    assert_eq!(old.parts()[0].quads.as_ptr(), pointer);
+    assert_eq!((old.revision, old.content_revision), revisions);
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+    scene.invalidate_section([-1, 0, 0])?;
+    let requests = scene.plan(&camera(), 0, 0, 4, 64)?.to_vec();
+    let records: Vec<_> = requests
+        .iter()
+        .map(|request| (request.id, request.section, Pattern::Air))
+        .collect();
+    scene.apply_compact(&fixtures::section_packet(&records), &catalog)?;
+    assert_ne!(scene.tint_requests().len(), 0);
+    assert_eq!(
+        scene
+            .render_regions()
+            .next()
+            .unwrap()
+            .mesh
+            .quads()
+            .next()
+            .unwrap()
+            .tint(),
+        [1., 0., 0.]
+    );
+    let colors = vec![0xff00ff00; scene.tint_requests().len()];
+    scene.apply_tints(&colors)?;
+    publish(&mut scene, &catalog)?;
+    assert!(scene.state.resource(handle).unwrap().available);
+    assert_eq!(
+        scene
+            .render_regions()
+            .next()
+            .unwrap()
+            .mesh
+            .quads()
+            .next()
+            .unwrap()
+            .tint(),
+        [0., 1., 0.]
+    );
+    Ok(())
+}
+
+#[test]
+fn budget_exclusion_keeps_published_partition_and_reports_the_unmet_limit() -> Result<(), Error> {
+    let (mut scene, catalog) = ready_tinted()?;
+    let colors = vec![0xff123456; scene.tint_requests().len()];
+    scene.apply_tints(&colors)?;
+    publish(&mut scene, &catalog)?;
+    let handle = scene.state.find(chunk([0; 3])).unwrap();
+    let pointer = scene.state.resource(handle).unwrap().parts()[0]
+        .quads
+        .as_ptr();
+    scene.set_budget(Budget {
+        resident_bytes: 96,
+        staging_bytes: 1537 * 96,
+        region_bytes: 96,
+    })?;
+    for _ in 0..256 {
+        scene.plan(&camera(), 0, 0, 4, 64)?;
+        scene.compile_sources(&catalog)?;
+        if scene.prepare()? {
+            scene.commit()?;
+        }
+        if scene.pressure().excluded_regions != 0 {
+            break;
+        }
+    }
+    let pressure = scene.pressure();
+    assert_eq!(pressure.excluded_regions, 1);
+    assert!(pressure.required_bytes > pressure.limit_bytes);
+    assert_eq!(
+        scene.state.resource(handle).unwrap().parts()[0]
+            .quads
+            .as_ptr(),
+        pointer
+    );
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+    assert_eq!(scene.retained_quads, 1536);
+    Ok(())
+}
+
 #[test]
 fn compact_tints_are_unique_and_geometry_waits_for_real_callback() -> Result<(), Error> {
     let (mut scene, catalog) = ready_tinted()?;
@@ -223,12 +336,6 @@ fn source_retirement_reports_evicted_domain_without_retiring_live_halo() -> Resu
         }
     }
     assert!(!scene.pending());
-    assert_eq!(
-        scene.drain_retired_sources().count(),
-        0,
-        "最近已解析旧域在切换前保留"
-    );
-    scene.plan(&camera_at(2048.), 0, 0, 4, 64)?;
     let retired: Vec<_> = scene.drain_retired_sources().collect();
     assert_eq!(retired.len(), 144);
     assert!(retired.iter().all(|key| (-1..=4).contains(&key[0])));

@@ -8,11 +8,12 @@
 //!
 //! 默认resident1GiB、staging256MiB、单region256MiB，均为96B quad逻辑payload。
 //! 源缓存、Vec余量、metadata/分配器/线程及GPU另计，不宣称RSS或显存总上限。
-//! resident/region不足形成明确BudgetExcluded并暴露Pressure，不伪装空或Unavailable；
-//! 提高预算、需求移动或其他已发布几何释放后重试。过渡压力暂停待捕前缀，优先取消
-//! 较远阶段job，必要时提前移除旧域以回收，允许暂时覆盖缺口，避免永久同ID失败。
-//! 常态保留交集ticket与最近已解析域，目标解析齐备后再撤旧覆盖。Unavailable是来源
-//! 已知不可用的负缓存，恢复通知重捕全64。固定8192节点要求两倍目标域加64可容纳。
+//! resident/region不足形成明确BudgetExcluded并暴露Pressure，Unavailable保留来源负缓存；
+//! 两者均保留已有完整覆盖，不得以空候选替换旧mesh。提高预算或来源恢复后重试。
+//! 过渡压力暂停待捕前缀，可取消未发布job；容量不足允许等待，不主动撤旧制造覆盖缺口。
+//! 相同region身份仅在新输出完整且GPU接受后替换；完全退出当前Bounds的资源可独立卸载，
+//! 不等待边缘不可用来源或整窗就绪。恢复通知重捕全64。
+//! 固定8192节点要求两倍目标域加64可容纳；已发布旧覆盖优先于收紧后的预算。
 //!
 //! 每plan最多1024个引擎步骤、8个在途region job、64条待捕，另各64失效/退役项。
 //! 8192槽prepare与预算检查、视图排序、源编译不计入cm::Budget；全部CPU阶段同步join。
@@ -92,8 +93,6 @@ pub struct Scene {
     output: Vec<CaptureRequest>,
     pool: rayon::ThreadPool,
     target: Option<Target>,
-    resolved: Option<Bounds>,
-    next_resolved: Option<Bounds>,
     height: [i32; 2],
     anchor: [f64; 3],
     next_wire: u64,
@@ -113,6 +112,7 @@ pub struct Scene {
     retired_sources: Vec<[i32; 3]>,
 }
 
+#[cfg(test)]
 fn volume(bounds: Bounds) -> usize {
     bounds
         .minimum()
@@ -195,8 +195,6 @@ impl Scene {
             output: Vec::with_capacity(REQUESTS),
             pool,
             target: None,
-            resolved: None,
-            next_resolved: None,
             height: [0, 4],
             anchor: [0.; 3],
             next_wire: 1,
@@ -237,8 +235,6 @@ impl Scene {
         self.captures.clear();
         self.output.clear();
         self.target = None;
-        self.resolved = None;
-        self.next_resolved = None;
         self.retained_quads = 0;
         self.scan = None;
         self.scan_again = false;
@@ -318,7 +314,6 @@ impl Scene {
         self.state.reconfigure(configuration(bounds, target)?)?;
         if previous_bounds != Some(bounds) {
             self.retry_excluded = Some(0);
-            let resolved = self.resolved;
             let needed: std::collections::BTreeSet<_> = self
                 .jobs
                 .iter()
@@ -332,7 +327,7 @@ impl Scene {
                             && i64::from(key[axis]) < bounds.maximum()[axis] * 4 + 1
                     })
                 };
-                let keep = fits(bounds) || resolved.is_some_and(fits) || needed.contains(key);
+                let keep = fits(bounds) || needed.contains(key);
                 if !keep {
                     retired.push(*key);
                 }
@@ -873,11 +868,12 @@ impl Scene {
             .checked_add(1)
             .ok_or(Error::Input("内容revision溢出"))?;
         let job = self.drop_job(index);
+        let old = self.state.resource(job.handle);
         let resource = RegionMesh {
-            parts: None,
-            changed: u64::MAX,
-            revision,
-            content_revision,
+            parts: old.map(|_| Box::new(std::array::from_fn(|_| Mesh::default()))),
+            changed: 0,
+            revision: old.map_or(revision, |old| old.revision),
+            content_revision: old.map_or(content_revision, |old| old.content_revision),
             available: false,
             excluded: true,
         };
@@ -901,7 +897,10 @@ impl Scene {
                 .iter()
                 .any(|(source, ticket, _)| *ticket == job.ticket && !source.available)
         {
-            return 0;
+            return self
+                .state
+                .resource(job.handle)
+                .map_or(0, |old| old.view().len());
         }
         let unchanged = self.state.resource(job.handle).map_or(0, |old| {
             old.parts()
@@ -1089,7 +1088,7 @@ impl Scene {
             let old = self.state.resource(job.handle);
             let mut resource = RegionMesh {
                 parts: Some(parts),
-                changed: if available { job.dirty } else { u64::MAX },
+                changed: if available { job.dirty } else { 0 },
                 revision: self.next_revision + offset,
                 content_revision: self.next_content + offset,
                 available,
@@ -1124,7 +1123,8 @@ impl Scene {
         }
     }
 
-    /// Remove保留最近已解析窗口，过期中间前沿允许淘汰；失败时旧GPU资源仍有效。
+    /// 同身份替换保持旧覆盖；完全退出当前Bounds的Remove独立卸载，不以整窗就绪为门限。
+    /// 来源/预算不可用仅改变等待状态，GPU接受完整候选并commit后才替换旧mesh。
     pub fn prepare(&mut self) -> Result<bool, Error> {
         let bounds = self.state.config().bounds().expect("有界region域");
         let mut index = 0;
@@ -1151,23 +1151,12 @@ impl Scene {
                 self.reject_token(patch)?;
             }
         }
-        let resolved = self
-            .state
-            .prepared_visible()
-            .filter(|(_, value, _)| bounds.intersects(*value))
-            .count()
-            == volume(bounds);
-        self.next_resolved = resolved.then_some(bounds);
         let mut index = 0;
         while index < self.removes.len() && self.pending.len() < SWITCHES {
             let Change::Remove(value) = self.removes[index].change else {
                 unreachable!("仅Remove队列");
             };
-            let protected = self.pressure.kind != PressureKind::Transition
-                && self
-                    .resolved
-                    .is_some_and(|resolved| resolved.intersects(value));
-            if resolved || !protected {
+            if !bounds.intersects(value) {
                 self.pending.push(self.removes.swap_remove(index));
             } else {
                 index += 1;
@@ -1229,9 +1218,6 @@ impl Scene {
             self.state
                 .publish_with(patch.token, 0, RegionMesh::inherit)?;
         }
-        if let Some(bounds) = self.next_resolved.take() {
-            self.resolved = Some(bounds);
-        }
         self.dirty = false;
         self.drain_retired();
         let after: usize = self
@@ -1249,7 +1235,6 @@ impl Scene {
         while let Some(patch) = self.pending.pop() {
             self.reject_token(patch)?;
         }
-        self.next_resolved = None;
         self.rebuild_view();
         Ok(())
     }

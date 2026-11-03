@@ -185,7 +185,8 @@ fn unavailable_is_a_resolved_negative_cache_distinct_from_real_empty() -> Result
 }
 
 #[test]
-fn unload_withdraws_whole_region_and_reload_recaptures_all_sections() -> Result<(), Error> {
+fn unavailable_refresh_keeps_old_region_until_a_complete_recovery_is_published() -> Result<(), Error>
+{
     let mut scene = Scene::new()?;
     let requests = one_region(&mut scene)?;
     let source = [1, 2, 3];
@@ -196,7 +197,8 @@ fn unload_withdraws_whole_region_and_reload_recaptures_all_sections() -> Result<
     let request = one_region(&mut scene)?[0];
     scene.apply(&unavailable(request))?;
     publish(&mut scene)?;
-    assert_eq!(scene.entries().count(), 0);
+    assert_eq!(scene.entries().count(), 1);
+    assert_eq!(scene.entries().next().unwrap().2.len(), 1);
     scene.invalidate_section(source)?;
     let requests = one_region(&mut scene)?;
     assert_eq!(requests.len(), 64);
@@ -301,15 +303,17 @@ fn moving_window_preserves_an_intersection_capture_ticket() -> Result<(), Error>
 }
 
 #[test]
-fn outgoing_cover_waits_for_the_new_region_window() -> Result<(), Error> {
+fn leaving_bounds_unloads_only_outgoing_cover_while_intersection_waits() -> Result<(), Error> {
     let mut scene = Scene::new()?;
     settle(&mut scene, &camera([0.; 3]))?;
     let outgoing = scene.state.find(chunk([-1, 0, 0])).unwrap();
+    let intersection = scene.state.find(chunk([0, 0, 0])).unwrap();
     let next = camera([64., 0., 0.]);
     for _ in 0..16 {
         step(&mut scene, &next, 0)?;
     }
-    assert!(scene.state.is_visible(outgoing));
+    assert!(!scene.state.is_visible(outgoing));
+    assert!(scene.state.is_visible(intersection));
     settle(&mut scene, &next)?;
     assert!(!scene.state.is_visible(outgoing));
     assert_eq!(scene.state.visible().count(), 9);
@@ -507,36 +511,49 @@ fn resident_pressure_is_observable_and_larger_budget_retries_excluded_region() -
 }
 
 #[test]
-fn transition_pressure_releases_old_domain_and_resumes_the_same_target() -> Result<(), Error> {
+fn transition_pressure_preserves_same_region_until_capacity_allows_replacement() -> Result<(), Error>
+{
     let mut scene = Scene::new()?;
+    let requests = one_region(&mut scene)?;
+    scene.apply(&selected_responses(&requests, &[[0, 0, 0], [1, 0, 0]]))?;
+    publish(&mut scene)?;
+    assert_eq!(scene.entries().next().unwrap().2.len(), 2);
+    scene.set_budget(Budget {
+        resident_bytes: 96,
+        staging_bytes: 96,
+        region_bytes: 96,
+    })?;
+    let next = camera([0.; 3]);
+    let mut pressure = false;
+    for _ in 0..CAPACITY {
+        pressure |= drive_sources(&mut scene, &next, &[[0, 0, 0]])?;
+        assert_eq!(
+            scene
+                .entries()
+                .find(|(key, _, _)| *key == [0; 3])
+                .unwrap()
+                .2
+                .len(),
+            2
+        );
+        if pressure {
+            break;
+        }
+    }
+    assert!(pressure);
+    assert!(scene.pending());
+    assert_eq!(scene.pressure().kind, PressureKind::Transition);
     scene.set_budget(Budget {
         resident_bytes: 192,
         staging_bytes: 96,
         region_bytes: 96,
     })?;
-    let old = camera([0.; 3]);
     for _ in 0..CAPACITY {
-        drive_sources(&mut scene, &old, &[[0, 0, 0], [4, 0, 0]])?;
+        drive_sources(&mut scene, &next, &[[0, 0, 0]])?;
         if !scene.pending() {
             break;
         }
     }
-    assert_eq!(
-        scene
-            .render_regions()
-            .map(|region| region.mesh.len())
-            .sum::<usize>(),
-        2
-    );
-    let next = camera([512., 0., 0.]);
-    let mut pressure = false;
-    for _ in 0..CAPACITY {
-        pressure |= drive_sources(&mut scene, &next, &[[32, 0, 0], [36, 0, 0]])?;
-        if !scene.pending() {
-            break;
-        }
-    }
-    assert!(pressure);
     assert!(!scene.pending());
     assert_eq!(scene.pressure().excluded_regions, 0);
     assert_eq!(scene.pressure().kind, PressureKind::None);
@@ -545,9 +562,9 @@ fn transition_pressure_releases_old_domain_and_resumes_the_same_target() -> Resu
             .render_regions()
             .map(|region| region.mesh.len())
             .sum::<usize>(),
-        2
+        1
     );
-    assert!(scene.retained_quads <= 3);
+    assert!(scene.retained_quads <= 4);
     Ok(())
 }
 
@@ -600,7 +617,8 @@ fn view_distance_32_finishes_resolving_with_default_budget() -> Result<(), Error
 }
 
 #[test]
-fn lowering_resident_budget_reconciles_existing_visible_geometry() -> Result<(), Error> {
+fn lowering_resident_budget_reports_pressure_without_erasing_visible_geometry() -> Result<(), Error>
+{
     let mut scene = Scene::new()?;
     let camera = camera([0.; 3]);
     let nonempty = [[0, 0, 0], [4, 0, 0]];
@@ -644,13 +662,14 @@ fn lowering_resident_budget_reconciles_existing_visible_geometry() -> Result<(),
         scene.state.retired_len(),
         scene.pressure()
     );
-    assert_eq!(scene.pressure().excluded_regions, 1);
+    assert!(scene.pressure().excluded_regions >= 1);
+    assert_eq!(scene.pressure().kind, PressureKind::Resident);
     assert_eq!(
         scene
             .render_regions()
             .map(|region| region.mesh.len())
             .sum::<usize>(),
-        1
+        2
     );
     Ok(())
 }

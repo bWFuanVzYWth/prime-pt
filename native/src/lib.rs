@@ -374,7 +374,13 @@ pub unsafe extern "C" fn prime_plan(
             }
             count = planned.len() as i32;
             engine.retire_tint_sources();
-            engine.scene.compile_sources(&engine.catalog)?;
+            let meshing = std::time::Instant::now();
+            let result = engine.scene.compile_sources(&engine.catalog);
+            engine.profile.plan_mesh_ns = engine
+                .profile
+                .plan_mesh_ns
+                .saturating_add(elapsed_ns(meshing));
+            result?;
             Ok(())
         })?;
         Ok(count)
@@ -417,10 +423,11 @@ pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
 /// 记录完整宿主帧间隔并导出PFT2主线程卡顿快照；成功返回写入字节数，失败返回-1。
 ///
 /// elapsed_ns=0清空滚动窗口并跳过暂停间隔，保留会话最慢记录。
-/// stages为14个little-endian u64纳秒：等待、源/材质、规划、宿主捕获、网格编译/合并、
+/// stages为14个little-endian u64纳秒：等待、tint/源维护、规划、宿主捕获、网格编译/合并、
 /// 三角编码、属性打包、BLAS准备/等待、属性分配/写入、TLAS准备/等待、场景提交/回收、
 /// native录制/SDK、宿主提交、未归因。最近场景更新规模按独立序号导出，非所选柱的规模。
-/// native场景细分从录制总耗时扣除，余量由引擎统计补齐；不提供GPU timestamp。
+/// plan内的同步编译从规划移到网格项；native场景细分从录制总耗时扣除，
+/// 视图准备归场景准备/提交，余量由引擎统计补齐；不提供GPU timestamp。
 /// columns为1..=512个实际图表像素列，输出容量至少576+120*columns且不超过62016。
 ///
 /// # Safety
@@ -473,7 +480,7 @@ pub unsafe extern "C" fn prime_profile(
 /// quad 坐标相对方块，UV 对应 atlas；每包 1..=64 段，可跨 region。
 /// PRT3保留原始palette/storage，收到必要邻域后由Rust编译；tint通过独立批阶段补齐。
 /// 兼容PRT2中block_count=0表示真实空section；u32::MAX表示源chunk未加载。
-/// 不可用region保留显式负缓存并撤下GPU几何，加载通知后重新捕获完整region。
+/// 不可用region保留显式负缓存和已有GPU覆盖，加载通知后重新捕获完整region。
 /// 旧ticket回复忽略，未知邻域不猜为空，失败不发布半个region。
 ///
 /// # Safety
@@ -491,7 +498,6 @@ pub unsafe extern "C" fn prime_batch(id: u64, data: *const u8, len: u64) -> i32 
             if bytes.starts_with(&0x33545250u32.to_le_bytes()) {
                 engine.scene.apply_compact(bytes, &engine.catalog)?;
                 engine.retire_tint_sources();
-                engine.scene.compile_sources(&engine.catalog)?;
             } else {
                 engine.scene.apply(bytes)?;
             }

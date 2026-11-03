@@ -25,8 +25,10 @@ pub(crate) struct SceneInfo {
 pub(crate) struct Profile {
     stats: FrameStats<STAGES>,
     sequence: u64,
-    // 规划、三角编码、属性打包、BLAS、属性分配/写入、TLAS、提交/回收。
+    // 视图准备、三角编码、属性打包、BLAS、属性分配/写入、TLAS、提交/回收。
     pub scene: [u64; 7],
+    // prime_plan内同步推进的建网属于网格项，从Java计入的规划墙钟中转移。
+    pub plan_mesh_ns: u64,
     pub update: Option<SceneInfo>,
     last_update: Option<(u64, SceneInfo)>,
     pressure: prime_world::Pressure,
@@ -66,16 +68,20 @@ impl Profile {
         if elapsed_ns == 0 {
             self.stats.reset_samples();
             self.scene = [0; 7];
+            self.plan_mesh_ns = 0;
             self.update = None;
             self.last_update = None;
             return Ok(());
         }
+        let mesh = std::mem::take(&mut self.plan_mesh_ns).min(stages[2]);
+        stages[2] -= mesh;
+        stages[4] = stages[4].saturating_add(mesh);
         let scene = std::mem::take(&mut self.scene);
         let measured = scene
             .iter()
             .fold(0u64, |sum, value| sum.saturating_add(*value));
         stages[11] = stages[11].saturating_sub(measured);
-        for (stage, ns) in [2, 5, 6, 7, 8, 9, 10].into_iter().zip(scene) {
+        for (stage, ns) in [10, 5, 6, 7, 8, 9, 10].into_iter().zip(scene) {
             stages[stage] = stages[stage].saturating_add(ns);
         }
         self.stats.record_attributed(
@@ -197,9 +203,27 @@ mod tests {
         let attribution: [u64; STAGES] = std::array::from_fn(|i| word(&bytes, 208 + i * 8));
         assert_eq!(
             attribution,
-            [0, 0, 10, 0, 0, 15, 5, 20, 5, 10, 5, 30, 0, 100]
+            [0, 0, 0, 0, 0, 15, 5, 20, 5, 10, 15, 30, 0, 100]
         );
         assert_eq!(attribution.iter().sum::<u64>(), word(&bytes, 192));
+    }
+
+    #[test]
+    fn meshing_inside_plan_moves_to_mesh_without_changing_the_frame_total() {
+        let mut profile = Profile {
+            plan_mesh_ns: 60,
+            ..Profile::default()
+        };
+        let mut stages = [0; STAGES];
+        stages[2] = 100;
+        stages[4] = 40;
+        profile.record(140, stages).unwrap();
+        let mut bytes = vec![0; HEADER + BAR];
+        profile.write(&mut bytes, 1).unwrap();
+        assert_eq!(word(&bytes, 208 + 2 * 8), 40);
+        assert_eq!(word(&bytes, 208 + 4 * 8), 100);
+        assert_eq!(word(&bytes, 192), 140);
+        assert_eq!(profile.plan_mesh_ns, 0);
     }
 
     #[test]

@@ -20,13 +20,15 @@ Rust 校验同世代资源与完整邻域后，以四层 slab 为批量内核执
 
 首次加载和资源重载是完整资源准备边界。一个世代只有一个全局 Catalog，section、region 和工作线程引用稳定身份；材质范围推导、静态发光纹理 alias、Slang callable、pipeline/SBT 及设备支持的普通/SER 变体在发布前准备。运行期不按方块、区块或首次命中懒构建 alias、shader 或 SBT；缺身份/错世代显式报错。新世代全部成功后统一发布，失败保留旧世代，旧 GPU 资源按真实完成证明回收。入口见 [Catalog](crates/minecraft/src/resources.rs)、[材质准备](crates/minecraft/src/materials.rs) 和 [Gpu](crates/renderer/src/gpu.rs)。
 
-world 只使用引擎 `chunk_manager` 的 LOD0。水平目标来自宿主有效视距，覆盖完整世界高度，向 64 m region 对齐；每 region 管理 4³ 个 16 m section，一个非空 region 一个 BLAS。相机以 f64 保存绝对位置，CPU 几何/BLAS 保留 region 局部坐标，TLAS 平移减去 64 m anchor 后转 f32。移窗保留交集与有效 ticket，旧覆盖保留至新目标解析完成；未加载、真实空和预算排除有不同状态。
+world 只使用引擎 `chunk_manager` 的 LOD0。水平目标来自宿主有效视距，覆盖完整世界高度，向 64 m region 对齐；每 region 管理 4³ 个 16 m section，一个非空 region 一个 BLAS。相机以 f64 保存绝对位置，CPU 几何/BLAS 保留 region 局部坐标，TLAS 平移减去 64 m anchor 后转 f32。移窗保留需求交集与有效 ticket，完全退出需求域的 region 独立卸载；边缘未加载源不会永久阻塞域外退休。未加载、真实空和预算排除有不同状态。
 
 CPU 保留 section 分片，准备视图借用旧分片和 dirty 输出，GPU 成功后移动发布，避免重复制完整 region。几何 revision 变化才重建所属 region 的 BLAS；tint/UV/材质属性变化保留 BLAS。dirty 三角输入共享一次批构建与 scratch，非空 BLAS 批有一次同步提交/完成，TLAS 按实例集合或 anchor 变化重建。每帧修改/复用前仍等待此前宿主命令完成，当前不是异步加载流水线。
 
+同 region 刷新遵循引擎 [State](../../crates/chunk_manager/src/lib.rs) 的无缝发布契约：源、halo、tint 或候选尚未齐备，以及预算不足、GPU 准备失败时，继续显示旧 mesh；新属性、BLAS/TLAS 和最终绘制集合准备成功后一次切换，旧资源按实际完成边界退役。未知或不可用源只能记录负缓存，不能冒充真实空网格撤下旧几何。完整编译结果确认为空时，才允许原子清除该覆盖。LOD 父子替换使用相同边界，Prime 当前仍只使用 LOD0。
+
 GPU 的 48 B/quad 属性缓冲持久保留容量：容量内只打包和映射写入变化范围，无内容变化或仅 anchor 变化不重写属性；扩容才新建缓冲并重写全部活动属性。纯属性更新保留 TLAS。活动发光 quad 按变化 region 缓存，灯集合/槽位变化时更新活动表；运行期均匀选择灯并使用实际离散 PMF，不重建全局 alias。纹理内 alias 和静态面积复用资源准备产物，过程流体的两三角面积可在 shader 计算。
 
-默认 CPU quad 逻辑预算为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**，不包含源缓存、Vec 余量、线程、驱动或 GPU 内存。超额以 [Pressure](crates/world/src/budget.rs) 区分最终容量、过渡等待和单 region 容量；必要时排除过大的 region 或提前回收远处旧域，可能出现暂时覆盖缺口，不无限重试同一失败输入。固定 manager 容量、调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
+默认 CPU quad 逻辑预算为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**，不包含源缓存、Vec 余量、线程、驱动或 GPU 内存。超额以 [Pressure](crates/world/src/budget.rs) 区分最终容量、过渡等待和单 region 容量；暂停或排除新候选时保留已有覆盖，不能靠提前撤下同一覆盖解锁容量。下调预算时已发布几何可能高于新限制，持续报告压力并阻止新增，直到预算提高或实际域外资源退休；不宣称此时已满足新上限。固定 manager 容量、调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
 
 ## 渲染能力与边界
 
@@ -81,7 +83,7 @@ SDK 在任何 Vulkan 对象前安装 interposer；初始化失败记录原因并
 
 ## 诊断、基准与验收
 
-F3+2 用 Prime 分项图替换左侧 FPS 图，保留宿主 TPS 图。统计与按像素保留最长整帧的采样复用引擎 `frame_loop::timing`；14 个互斥分项覆盖等待、tint/源维护、规划/捕获、编译/三角、属性与光源打包/写入、BLAS、TLAS、发布、录制/SDK、宿主提交和未归因。最大项显示毫秒及占比，预算压力显示排除数、延后数及所需/限制容量；场景更新序号/规模明确属于最近更新，不冒充所选历史帧。全部为**主线程墙钟**，不是 GPU timestamp。图隐藏时不格式化文本；读取诊断不增加 GPU 回读/等待。入口见 [diagnostics](native/src/diagnostics.rs) 和 [FrameChart](java/src/main/java/dev/primept/FrameChart.java)。
+F3+2 用 Prime 分项图替换左侧 FPS 图，保留宿主 TPS 图。统计与按像素保留最长整帧的采样复用引擎 `frame_loop::timing`；14 个互斥分项覆盖等待、tint/源维护、规划/捕获、编译/三角、属性与光源打包/写入、BLAS、TLAS、场景准备/提交、录制/SDK、宿主提交和未归因。`plan` 内同步推进的源编译计入网格项，视图准备归场景准备/提交；网格项也包含解码、预算核算和合并，并非纯建网内核。最大项显示毫秒及占比，预算压力显示排除数、延后数及所需/限制容量；场景更新序号/规模明确属于最近更新，不冒充所选历史帧。全部为**主线程墙钟**，不是 GPU timestamp。图隐藏时不格式化文本；读取诊断不增加 GPU 回读/等待。入口见 [diagnostics](native/src/diagnostics.rs) 和 [FrameChart](java/src/main/java/dev/primept/FrameChart.java)。
 
 CPU 同源基准无需游戏/GPU：
 
