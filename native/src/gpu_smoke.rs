@@ -1447,6 +1447,86 @@ fn finite_half_image(bytes: &[u8]) -> bool {
 }
 
 #[test]
+#[ignore = "独立进程：真实RR跨anchor与局部更新保留历史；不与其它SDK测试同进程运行"]
+fn hardware_pt_rr_rebases_history_across_local_changes() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_rr()?;
+    let mut gpu = host.gpu()?;
+    let image = Image::new(&mut gpu.context, [512, 512, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(image.into());
+    let mut mesh = Mesh::default();
+    add_quad(&mut mesh, 3.0, [0.5; 2], [0.8; 3], 10.0);
+    for quad in &mut mesh.quads {
+        quad.translate([64.0, 0.0, 0.0]);
+    }
+    gpu.set_scene(&mesh)?;
+    let mut camera = camera();
+    camera.origin[0] = 63.75;
+    let initial = Options::new(true, streamline::Quality::Dlaa, 1, 6)?;
+    host.render_options(&mut gpu, &image, &camera, Environment::default(), initial)?;
+    assert!(gpu.rr_previous.is_some(), "首帧必须实际完成RR求值");
+
+    // 只调整本地几何表示与属性；场景实际位置保持不变，前后相机跨64m网格。
+    for quad in &mut mesh.quads {
+        quad.translate([-64.0, 0.0, 0.0]);
+        quad.set_tint([0.7; 3]);
+    }
+    gpu.set_scene(&mesh)?;
+    gpu.anchor = [64.0, 0.0, 0.0];
+    camera.origin[0] = 0.25;
+    camera.right[0] *= 1.2;
+    camera.up[1] *= 1.2;
+    gpu.settings.seed += 1;
+    let options = Options::new(true, streamline::Quality::Dlaa, 1, 8)?;
+    let environment = Environment {
+        sun_direction: [0.6, 0.8, 0.0],
+        ..Environment::default()
+    };
+    let counts = Buffer::new(&mut gpu.context, 512 * 512 * 4, true)?;
+    gpu.view.as_mut().unwrap().counts = counts;
+    gpu.renderer = None;
+    host.render_options(&mut gpu, &image, &camera, environment, options)?;
+    assert!(gpu.rr_previous.is_some());
+    let view = gpu.view.as_ref().unwrap();
+    assert_eq!(view.progress.samples(), 1, "RR仍只累计本帧样本");
+    let motion = half_pixel(
+        &view.rr.images[2].download(&mut gpu.context)?,
+        [512, 512],
+        2,
+    );
+    assert!(
+        motion[0] > 20.0 && motion[0] < 100.0,
+        "局部更新/FOV/太阳/预算/seed不能抹除运动，anchor不能引入64m伪运动：{motion:?}"
+    );
+    let mut sample_counts = vec![0; counts.len() as usize];
+    counts.read(&mut gpu.context, 0, &mut sample_counts)?;
+    assert!(
+        sample_counts
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|word| u32::from_le_bytes(*word) == 1)
+    );
+
+    for event in [GlobalReset::WorldReplaced, GlobalReset::SceneDomainReplaced] {
+        gpu.invalidate_history(event)?;
+        camera.origin[0] += 0.25;
+        host.render_options(&mut gpu, &image, &camera, environment, options)?;
+        let motion = half_pixel(
+            &gpu.view.as_ref().unwrap().rr.images[2].download(&mut gpu.context)?,
+            [512, 512],
+            2,
+        );
+        assert!(
+            motion.iter().all(|value| value.abs() < 0.001),
+            "封闭全局事件必须重置guide：{motion:?}"
+        );
+    }
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "独立进程运行此 filter：early interposer + PT/guide/RR/超分/呈现完整链路"]
 fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_rr()?;

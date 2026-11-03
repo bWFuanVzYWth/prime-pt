@@ -2,8 +2,6 @@ package dev.primept;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.BitSet;
-import java.util.HashMap;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModelPart;
@@ -16,72 +14,34 @@ import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 
-/** 每帧最多一个 4³ section 源包；保留源四边形，不生成顶点或三角形。 */
+/** 只捕获引擎请求的 LOD0 section；请求和窗口资源由 native 唯一管理。 */
 final class Capture {
-    private record Cell(int x, int y, int z) {
-        int distance(Cell other) {
-            return Math.abs(x - other.x) + Math.abs(y - other.y) + Math.abs(z - other.z);
-        }
-    }
-    private final HashMap<Cell, BitSet> dirty = new HashMap<>();
     private final ArrayList<BlockStateModelPart> parts = new ArrayList<>();
     private final RandomSource random = RandomSource.create();
     private final BlockPos.MutableBlockPos position = new BlockPos.MutableBlockPos();
     private final Packet packet = new Packet();
     private ClientLevel level;
-    private Cell center;
-
-    boolean select(ClientLevel current, BlockPos camera) {
-        var next = new Cell(Math.floorDiv(camera.getX(), 64), Math.floorDiv(camera.getY(), 64), Math.floorDiv(camera.getZ(), 64));
-        if (current == level && next.equals(center)) return false;
+    boolean select(ClientLevel current) {
+        if (current == level) return false;
         level = current;
-        center = next;
-        dirty.clear();
-        for (int z = -1; z <= 1; z++) for (int y = -1; y <= 1; y++) for (int x = -1; x <= 1; x++) {
-            var sections = new BitSet(64);
-            sections.set(0, 64);
-            dirty.put(new Cell(next.x + x, next.y + y, next.z + z), sections);
-        }
         return true;
     }
 
     void invalidate() { level = null; }
 
-    void section(int sx, int sy, int sz) {
-        if (center == null) return;
-        var cell = new Cell(Math.floorDiv(sx, 4), Math.floorDiv(sy, 4), Math.floorDiv(sz, 4));
-        if (Math.abs(cell.x - center.x) > 1 || Math.abs(cell.y - center.y) > 1 || Math.abs(cell.z - center.z) > 1) return;
-        dirty.computeIfAbsent(cell, unused -> new BitSet(64))
-                .set(Math.floorMod(sx, 4) | Math.floorMod(sy, 4) << 2 | Math.floorMod(sz, 4) << 4);
-    }
-
-    void block(BlockPos pos) {
-        section(pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
-        for (var direction : Direction.values()) {
-            var neighbor = pos.relative(direction);
-            section(neighbor.getX() >> 4, neighbor.getY() >> 4, neighbor.getZ() >> 4);
-        }
-    }
-
-    void column(int x, int z) {
-        if (center == null) return;
-        for (int y = (center.y - 1) * 4; y < (center.y + 2) * 4; y++) {
-            section(x, y, z);
-            section(x - 1, y, z); section(x + 1, y, z);
-            section(x, y, z - 1); section(x, y, z + 1);
-        }
-    }
-
-    ByteBuffer next(Minecraft minecraft) {
-        if (dirty.isEmpty()) return null;
-        Cell selected = null;
-        for (var cell : dirty.keySet())
-            if (selected == null || cell.distance(center) < selected.distance(center)) selected = cell;
-        var sections = dirty.remove(selected);
+    ByteBuffer next(Minecraft minecraft, ByteBuffer requests, int count) {
+        if (count < 1 || count > 64 || requests.remaining() < count * 24)
+            throw new IllegalArgumentException("捕获请求数量无效");
         packet.clear();
-        putInt(0x31545250); putInt(sections.cardinality());
-        for (int index = sections.nextSetBit(0); index >= 0; index = sections.nextSetBit(index + 1))
-            captureSection(minecraft, selected.x * 4 + (index & 3), selected.y * 4 + (index >> 2 & 3), selected.z * 4 + (index >> 4));
+        putInt(0x32545250); putInt(count);
+        for (int i = 0; i < count; i++) {
+            int offset = requests.position() + i * 24;
+            long id = requests.getLong(offset);
+            if (id == 0 || requests.getInt(offset + 20) != 0)
+                throw new IllegalArgumentException("捕获请求 id 或 reserved 无效");
+            packet.putLong(id);
+            captureSection(minecraft, requests.getInt(offset + 8), requests.getInt(offset + 12), requests.getInt(offset + 16));
+        }
         return packet.finish();
     }
 

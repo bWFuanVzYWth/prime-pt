@@ -13,7 +13,7 @@ import static java.lang.foreign.ValueLayout.*;
 /** 同步 FFM 边界；CPU 包借用到返回，宿主图像必须保活至 GPU 提交完成。 */
 final class Native implements AutoCloseable {
     private final Arena arena = Arena.ofConfined();
-    private final MethodHandle destroy, reset, batch, atlas, draw, setSer, error;
+    private final MethodHandle destroy, reset, plan, invalidateSection, invalidateAll, failCapture, batch, atlas, draw, setSer, error;
     private final long handle;
     private boolean serRequested;
 
@@ -34,6 +34,10 @@ final class Native implements AutoCloseable {
                         JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT));
         destroy = bind(symbols, "prime_destroy", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         reset = bind(symbols, "prime_reset", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
+        plan = bind(symbols, "prime_plan", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, ADDRESS, JAVA_INT));
+        invalidateSection = bind(symbols, "prime_invalidate_section", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT));
+        invalidateAll = bind(symbols, "prime_invalidate_all", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
+        failCapture = bind(symbols, "prime_fail_capture", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG));
         setSer = bind(symbols, "prime_set_ser", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         atlas = bind(symbols, "prime_atlas", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
@@ -55,6 +59,30 @@ final class Native implements AutoCloseable {
 
     void reset() {
         try { check((int) reset.invokeExact(handle)); } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    int plan(ByteBuffer camera, ByteBuffer requests) {
+        try {
+            int count = (int) plan.invokeExact(handle, MemorySegment.ofBuffer(camera),
+                    MemorySegment.ofBuffer(requests), requests.remaining() / 24);
+            if (count < 0) throw failure();
+            return count;
+        } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void invalidateSection(int x, int y, int z) {
+        try { check((int) invalidateSection.invokeExact(handle, x, y, z)); }
+        catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void invalidateAll() {
+        try { check((int) invalidateAll.invokeExact(handle)); }
+        catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void failCapture(long request) {
+        try { check((int) failCapture.invokeExact(handle, request)); }
+        catch (Throwable e) { throw unchecked(e); }
     }
 
     /** 宿主已完成旧提交；只有偏好改变时才重建阶段程序。 */

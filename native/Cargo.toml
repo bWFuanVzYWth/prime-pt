@@ -11,6 +11,7 @@ camera = { path = "../../../crates/camera" }
 thiserror = "2"
 rayon = "1.12"
 scene_cache = { path = "../../../crates/scene_cache" }
+chunk_manager = { path = "../../../crates/chunk_manager" }
 bytemuck = { version = "1", features = ["derive"] }
 pt = { path = "../../../crates/pt", features = ["vulkan"] }
 vulkan = { path = "../../../crates/vulkan", features = ["dlss_rr"] }

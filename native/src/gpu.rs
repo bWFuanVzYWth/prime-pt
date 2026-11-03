@@ -10,6 +10,9 @@ use crate::scene::{Camera, Environment, Mesh};
 use crate::{reconstruction::CameraFrame, streamline};
 #[path = "exposure.rs"]
 mod exposure;
+#[path = "history.rs"]
+mod history;
+pub(crate) use history::GlobalReset;
 use pt::gpu::{Programs, Renderer};
 use vulkan::{
     AccelerationStructure, TriangleInstance,
@@ -432,6 +435,7 @@ pub(crate) struct Gpu {
     rr_quality: streamline::Quality,
     context: Context,
     scene: Scene,
+    anchor: [f64; 3],
     section_cache: scene_cache::Cache<SectionGpu>,
     #[cfg(test)]
     scene_build: SceneBuildMetrics,
@@ -584,6 +588,7 @@ impl Gpu {
             rr_quality: streamline::Quality::Performance,
             context,
             scene,
+            anchor: [0.0; 3],
             section_cache: scene_cache::Cache::new()?,
             #[cfg(test)]
             scene_build: SceneBuildMetrics::default(),
@@ -680,13 +685,22 @@ impl Gpu {
         Ok(())
     }
 
+    /// 资源变化后重绑阶段并重启静态PT积分；RR重投影与曝光适应继续使用已接受历史。
     fn invalidate(&mut self) -> Result<(), Error> {
         self.complete_previous()?;
         self.renderer = None;
-        self.rr_previous = None;
         if let Some(view) = &mut self.view {
             view.progress.reset();
         }
+        Ok(())
+    }
+
+    /// 调用者确认整个历史域失效；普通section、相机、照明和积分设置变化不调用。
+    /// 保留曝光适应状态；入口仍要求宿主先完成旧命令并独占队列。
+    pub(crate) fn invalidate_history(&mut self, reason: GlobalReset) -> Result<(), Error> {
+        self.invalidate()?;
+        history::record_global(reason, self.rr_previous.is_some());
+        self.rr_previous = None;
         Ok(())
     }
 
@@ -945,6 +959,7 @@ impl Gpu {
         self.section_cache
             .commit(update, |entry| entry.range.clone())?;
         self.scene = Scene { top, quads };
+        self.anchor = source.anchor();
         #[cfg(test)]
         {
             self.scene_build = metrics;
@@ -1096,6 +1111,20 @@ impl Gpu {
                     || (rr_enabled && view.quality != self.rr_quality)
             }) || (rr_enabled && self.rr_runtime.is_none())
             {
+                let storage_event = match &self.view {
+                    None => history::StorageEvent::Initial,
+                    Some(view) if view.output_extent != extent => {
+                        history::StorageEvent::ExtentChanged
+                    }
+                    Some(view) if view.rr_enabled != rr_enabled => {
+                        history::StorageEvent::ReconstructionChanged
+                    }
+                    Some(view) if rr_enabled && view.quality != self.rr_quality => {
+                        history::StorageEvent::QualityChanged
+                    }
+                    Some(_) => history::StorageEvent::RuntimeRecreated,
+                };
+                let history_valid = self.rr_previous.is_some();
                 // configure 与替换前，入口契约已确认前次 evaluate 完成。
                 let input = if rr_enabled {
                     if self.rr_runtime.is_none() {
@@ -1118,21 +1147,14 @@ impl Gpu {
                     self.rr_quality,
                     self.view.as_ref().map(|view| &view.display),
                 )?);
+                history::record_storage(storage_event, history_valid);
                 self.rr_previous = None;
                 self.renderer = None;
             }
             if self.renderer.is_none() {
                 self.renderer = Some(self.create_renderer()?);
             }
-            let current =
-                CameraFrame::new(camera).map_err(|_| Error::Invalid("RR 相机投影无效"))?;
-            if self
-                .rr_previous
-                .as_ref()
-                .is_some_and(|previous| !current.history_compatible(previous))
-            {
-                self.rr_previous = None;
-            }
+            let current = CameraFrame::new(camera, self.anchor)?;
             let view = self.view.as_mut().unwrap();
             let extent = view.extent;
             let vectors = [camera.origin, camera.forward, camera.right, camera.up];
@@ -1204,7 +1226,7 @@ impl Gpu {
                 self.rr_previous
                     .as_ref()
                     .unwrap_or(&current)
-                    .camera_words()
+                    .camera_words(self.anchor)?
                     .map(f32::to_bits),
             );
             words.extend([view.output_extent[0], view.output_extent[1], 0, 0]);
@@ -1336,9 +1358,6 @@ impl Gpu {
             .view
             .as_ref()
             .is_some_and(|view| view.output_extent != extent);
-        if self.settings.max_vertices != options.bounces {
-            self.rr_previous = None;
-        }
         self.settings.samples = options.samples;
         self.settings.max_vertices = options.bounces;
         self.rr_quality = options.quality;
@@ -1390,8 +1409,7 @@ impl Gpu {
                 self.encode_recordings(std::mem::take(&mut recordings), command)?;
             }
             if rr {
-                let current =
-                    CameraFrame::new(camera).map_err(|_| Error::Invalid("RR 相机投影无效"))?;
+                let current = CameraFrame::new(camera, self.anchor)?;
                 let reset = self.rr_previous.is_none();
                 let view = self.view.as_ref().unwrap();
                 let frame = current.frame(
@@ -1405,13 +1423,14 @@ impl Gpu {
                     )?,
                     self.rr_previous.as_ref().unwrap_or(&current),
                     view.rr.resources(&self.context)?,
-                );
+                )?;
                 let evaluated = match unsafe { self.rr_runtime.as_mut().unwrap().evaluate(&frame) }
                 {
                     Ok(()) => true,
                     Err(error) if error.unsafe_recording() => return Err(error.source.into()),
                     Err(error) => {
                         eprintln!("RR 本帧回退：{error}");
+                        history::record_recovery(self.rr_previous.is_some());
                         false
                     }
                 };

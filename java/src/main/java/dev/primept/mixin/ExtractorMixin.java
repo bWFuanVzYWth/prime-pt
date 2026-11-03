@@ -32,14 +32,14 @@ abstract class ExtractorMixin {
 
     @Inject(method = "setSectionDirty(IIIZ)V", at = @At("HEAD"), cancellable = true)
     private void primept$dirty(int x, int y, int z, boolean playerChanged, CallbackInfo callback) {
-        Renderer.section(x, y, z);
+        Renderer.section(level, x, y, z);
         callback.cancel();
     }
 
     @Inject(method = "allChanged", at = @At("HEAD"), cancellable = true)
     private void primept$invalidate(CallbackInfo callback) {
         if (level != null) level.clearTintCaches();
-        Renderer.reset();
+        Renderer.invalidate(level);
         callback.cancel();
     }
 

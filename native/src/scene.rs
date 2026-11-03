@@ -1,7 +1,10 @@
 //! PRT1 源包：4³ section 原子替换；Rust 生成直接寻址 quad，AS 输入另行展开。
 
-use rayon::prelude::*;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
+
+#[path = "chunks.rs"]
+mod chunks;
+pub(crate) use chunks::{CaptureRequest, Scene};
 
 pub(crate) const MAX_PACKET: usize = 256 * 1024 * 1024;
 const MAX_VERTICES: usize = 16 * 1024 * 1024;
@@ -308,6 +311,7 @@ impl Environment {
     }
 }
 
+#[derive(Clone)]
 struct Block<'a> {
     local: [u32; 3],
     offset: [f32; 3],
@@ -315,6 +319,7 @@ struct Block<'a> {
 }
 
 struct Section<'a> {
+    id: u64,
     key: [i32; 3],
     blocks: Vec<Block<'a>>,
     quads: usize,
@@ -349,8 +354,10 @@ fn decode(bytes: &[u8]) -> Result<Vec<Section<'_>>, crate::Error> {
         return Err(crate::Error::Input("源包超过 256 MiB"));
     }
     let mut reader = Reader { bytes, offset: 0 };
-    if reader.word()? != 0x3154_5250 {
-        return Err(crate::Error::Input("需要 PRT1 源包"));
+    let magic = reader.word()?;
+    let ticketed = magic == 0x3254_5250;
+    if !ticketed && !(cfg!(test) && magic == 0x3154_5250) {
+        return Err(crate::Error::Input("需要带捕获id的PRT2源包"));
     }
     let count = reader.word()? as usize;
     if count == 0 || count > 64 {
@@ -358,9 +365,20 @@ fn decode(bytes: &[u8]) -> Result<Vec<Section<'_>>, crate::Error> {
     }
     let mut sections = Vec::with_capacity(count);
     let mut keys = HashSet::with_capacity(count);
+    let mut ids = HashSet::with_capacity(count);
     let mut region = None;
     let mut total_quads = 0usize;
     for _ in 0..count {
+        let id = if ticketed {
+            let lower = u64::from(reader.word()?);
+            let id = lower | (u64::from(reader.word()?) << 32);
+            if id == 0 || !ids.insert(id) {
+                return Err(crate::Error::Input("捕获id为零或重复"));
+            }
+            id
+        } else {
+            0
+        };
         let key = [
             reader.word()? as i32,
             reader.word()? as i32,
@@ -370,7 +388,7 @@ fn decode(bytes: &[u8]) -> Result<Vec<Section<'_>>, crate::Error> {
             return Err(crate::Error::Input("section 坐标越界或重复"));
         }
         let cell = key.map(|v| v.div_euclid(4));
-        if region.is_some_and(|v| v != cell) {
+        if !ticketed && region.is_some_and(|v| v != cell) {
             return Err(crate::Error::Input("section 不属于同一 4³ region"));
         }
         region = Some(cell);
@@ -379,6 +397,7 @@ fn decode(bytes: &[u8]) -> Result<Vec<Section<'_>>, crate::Error> {
             return Err(crate::Error::Input("section 超过 4096 个方块"));
         }
         let mut section = Section {
+            id,
             key,
             blocks: Vec::with_capacity(blocks),
             quads: 0,
@@ -457,142 +476,6 @@ fn compile(section: &Section<'_>) -> Mesh {
         }
     }
     mesh
-}
-
-/// section 缓存拥有 CPU mesh；工作池只在批次层调度，内核没有嵌套调度。
-pub(crate) struct Scene {
-    sections: BTreeMap<[i32; 3], SectionMesh>,
-    pool: rayon::ThreadPool,
-    anchor: [f64; 3],
-    next_revision: u64,
-    pub(crate) dirty: bool,
-}
-
-struct SectionMesh {
-    mesh: Mesh,
-    // 仅有序quad数量/P48位置位值变化分配新世代；属性更新不改变BLAS身份。
-    revision: u64,
-}
-
-impl Scene {
-    pub(crate) fn new() -> Result<Self, crate::Error> {
-        let threads = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(8);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("prt-mesh-{i}"))
-            .build()?;
-        Ok(Self {
-            sections: BTreeMap::new(),
-            pool,
-            anchor: [0.0; 3],
-            next_revision: 1,
-            dirty: true,
-        })
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.sections.clear();
-        self.dirty = true;
-    }
-
-    pub(crate) fn rebase(&mut self, anchor: [f64; 3]) {
-        if self.anchor != anchor {
-            self.anchor = anchor;
-            self.dirty = true;
-        }
-    }
-
-    pub(crate) fn apply(&mut self, bytes: &[u8]) -> Result<(), crate::Error> {
-        let sources = decode(bytes)?;
-        let incoming = sources.iter().map(|s| s.quads).sum::<usize>();
-        let replaced = sources
-            .iter()
-            .filter_map(|s| self.sections.get(&s.key))
-            .map(|m| m.mesh.quads.len())
-            .sum::<usize>();
-        let current = self
-            .sections
-            .values()
-            .map(|m| m.mesh.quads.len())
-            .sum::<usize>();
-        if current - replaced + incoming > MAX_VERTICES / 4 {
-            return Err(crate::Error::Input("场景几何超过 16M 顶点预算"));
-        }
-        let sections = &self.sections;
-        let build = |source: &Section<'_>| {
-            let mesh = compile(source);
-            let revision = sections
-                .get(&source.key)
-                .filter(|old| {
-                    old.mesh.quads.len() == mesh.quads.len()
-                        && old
-                            .mesh
-                            .quads
-                            .iter()
-                            .zip(&mesh.quads)
-                            .all(|(old, new)| old.blocks[3..] == new.blocks[3..])
-                })
-                .map_or(0, |old| old.revision);
-            SectionMesh { mesh, revision }
-        };
-        let meshes: Vec<_> = if sources.len() < 4 || incoming < 1024 {
-            sources.iter().map(build).collect()
-        } else {
-            self.pool
-                .install(|| sources.par_iter().map(build).collect())
-        };
-        let fresh = meshes
-            .iter()
-            .filter(|entry| !entry.mesh.quads.is_empty() && entry.revision == 0)
-            .count();
-        let next_revision = self
-            .next_revision
-            .checked_add(fresh as u64)
-            .ok_or(crate::Error::Input("section revision溢出"))?;
-        for (source, mut entry) in sources.into_iter().zip(meshes) {
-            if entry.mesh.quads.is_empty() {
-                self.sections.remove(&source.key);
-            } else {
-                if entry.revision == 0 {
-                    entry.revision = self.next_revision;
-                    self.next_revision += 1;
-                }
-                self.sections.insert(source.key, entry);
-            }
-        }
-        self.next_revision = next_revision;
-        self.dirty = true;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn merge(&self) -> Mesh {
-        let mut result = Mesh {
-            quads: Vec::with_capacity(self.sections.values().map(|m| m.mesh.quads.len()).sum()),
-        };
-        for (key, mesh) in &self.sections {
-            let offset =
-                std::array::from_fn(|i| (f64::from(key[i]) * 16.0 - self.anchor[i]) as f32);
-            result.quads.extend(mesh.mesh.quads.iter().map(|quad| {
-                let mut quad = *quad;
-                quad.translate(offset);
-                quad
-            }));
-        }
-        result
-    }
-
-    pub(crate) const fn anchor(&self) -> [f64; 3] {
-        self.anchor
-    }
-
-    pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = ([i32; 3], u64, &Mesh)> {
-        self.sections
-            .iter()
-            .map(|(&key, entry)| (key, entry.revision, &entry.mesh))
-    }
 }
 
 #[cfg(test)]
@@ -766,5 +649,25 @@ mod tests {
             [128.0 / 255.0, 192.0 / 255.0, 64.0 / 255.0]
         );
         assert_eq!(mesh.quads.len(), 1);
+    }
+
+    #[test]
+    #[ignore = "先运行Gradle wireFixture，生成生产Java writer的PRT2源包"]
+    fn java_ticketed_source_packet_preserves_wire_identity_and_geometry() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/java-source.prt2");
+        let bytes = std::fs::read(path).expect("请先运行 .\\gradlew.bat wireFixture");
+        let sources = decode(&bytes).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, 0x0102_0304_0506_0708);
+        assert_eq!(sources[0].key, [-4, 0, 0]);
+        let mesh = compile(&sources[0]);
+        assert_eq!(mesh.quads.len(), 1);
+        assert_eq!(mesh.quads[0].positions()[0], [1.375, 2.5, 3.125]);
+        assert_eq!(mesh.quads[0].uv()[0], [0.25, 0.5]);
+        assert_eq!(
+            mesh.quads[0].tint(),
+            [128.0 / 255.0, 192.0 / 255.0, 64.0 / 255.0]
+        );
     }
 }

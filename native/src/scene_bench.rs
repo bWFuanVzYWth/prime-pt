@@ -1,11 +1,11 @@
 //! 显式运行的场景收敛基线；使用真实宿主 draw，不启动 Minecraft。
 //!
-//! PRIME_PT_SCENE_BENCH_OUTPUT 指定 temp/render-convergence-20261103 下的新目录。
-//! 固定64个section、98,304个quad、1024×576、1spp、12顶点、普通RT、RR关闭。
+//! PRIME_PT_SCENE_BENCH_OUTPUT 指定 temp/prime-lod0-20261103 下的新目录。
+//! 真实LOD0窗口含1728个section，其中固定64个非空、98,304个quad；1024×576、1spp、12顶点、普通RT、RR关闭。
 //! steady每轮从绝对样本0开始；edit每次只替换一个section，消费生产增量场景入口。
 //! Host::render_options包含command pool/录制、参数上传、submit、queue idle及Flight完成，
-//! 是主机完成墙钟，不是GPU timestamp。source apply、merge和set_scene分别报告；
-//! set_scene_complete计入set_sections的全量属性打包/上传、局部BLAS/TLAS构建与等待和回收。
+//! 是主机完成墙钟，不是GPU timestamp。plan、PRT2应答、apply、prepare/GPU/commit另行报告；
+//! manager_complete包含全部空源应答和渐进发布，不再等同旧直接apply 64 section的口径。
 //! 设备/初始场景/Slang编译/预热、reset、全部readback和文件写入不在draw计时内。
 //! 工作buffer保持生产DeviceLocal分配，捕获使用计时外compute逐位复制，不改热路径布局。
 
@@ -30,8 +30,7 @@ fn ns(start: Instant) -> u64 {
 }
 
 fn output_directory() -> Result<PathBuf> {
-    let base =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../temp/render-convergence-20261103");
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../temp/prime-lod0-20261103");
     fs::create_dir_all(&base)?;
     let base = base.canonicalize()?;
     let value = std::env::var_os("PRIME_PT_SCENE_BENCH_OUTPUT")
@@ -47,7 +46,7 @@ fn output_directory() -> Result<PathBuf> {
         .ok_or("输出目录缺少父目录")?
         .canonicalize()?;
     if !parent.starts_with(&base) {
-        return Err("输出目录必须位于 temp/render-convergence-20261103 内".into());
+        return Err("输出目录必须位于 temp/prime-lod0-20261103 内".into());
     }
     let target = parent.join(target.file_name().ok_or("输出目录名称无效")?);
     fs::create_dir(&target)?;
@@ -72,59 +71,51 @@ fn word(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
-fn source(keys: &[[i32; 3]], edited: bool) -> Vec<u8> {
-    source_attributes(keys, edited, 0x00bf_d9a6, false)
-}
-
-fn source_attributes(keys: &[[i32; 3]], edited: bool, tint: u32, mirror_uv: bool) -> Vec<u8> {
+fn section_body(key: [i32; 3], edited: bool, tint: u32, mirror_uv: bool) -> Vec<u8> {
     let mut bytes = Vec::new();
-    word(&mut bytes, 0x3154_5250);
-    word(&mut bytes, keys.len() as u32);
-    for &key in keys {
-        for axis in key {
-            word(&mut bytes, axis as u32);
-        }
-        word(&mut bytes, 256);
-        for y in 0..4 {
-            for z in 0..8 {
-                for x in 0..8 {
-                    let local = (x * 2) | ((y * 4) << 4) | ((z * 2) << 8);
-                    word(&mut bytes, local);
-                    word(&mut bytes, 6);
-                    for _ in 0..3 {
-                        word(&mut bytes, 0);
+    for axis in key {
+        word(&mut bytes, axis as u32);
+    }
+    word(&mut bytes, 256);
+    for y in 0..4 {
+        for z in 0..8 {
+            for x in 0..8 {
+                let local = (x * 2) | ((y * 4) << 4) | ((z * 2) << 8);
+                word(&mut bytes, local);
+                word(&mut bytes, 6);
+                for _ in 0..3 {
+                    word(&mut bytes, 0);
+                }
+                let h = if edited && key == EDIT_KEY && local == 0 {
+                    1.5
+                } else {
+                    1.0
+                };
+                let faces = [
+                    [[0., 0., 0.], [0., 0., 1.], [0., h, 1.], [0., h, 0.]],
+                    [[1., 0., 1.], [1., 0., 0.], [1., h, 0.], [1., h, 1.]],
+                    [[0., 0., 1.], [0., 0., 0.], [1., 0., 0.], [1., 0., 1.]],
+                    [[0., h, 0.], [0., h, 1.], [1., h, 1.], [1., h, 0.]],
+                    [[1., 0., 0.], [0., 0., 0.], [0., h, 0.], [1., h, 0.]],
+                    [[0., 0., 1.], [1., 0., 1.], [1., h, 1.], [0., h, 1.]],
+                ];
+                let cutout = (x + z + y) % 8 == 0;
+                let u = if cutout {
+                    [0.501, 0.999]
+                } else {
+                    [0.001, 0.499]
+                };
+                let mut uv = [[u[0], 0.001], [u[1], 0.001], [u[1], 0.999], [u[0], 0.999]];
+                if mirror_uv {
+                    for corner in &mut uv {
+                        corner[0] = u[0] + u[1] - corner[0];
                     }
-                    let h = if edited && key == EDIT_KEY && local == 0 {
-                        1.5
-                    } else {
-                        1.0
-                    };
-                    let faces = [
-                        [[0., 0., 0.], [0., 0., 1.], [0., h, 1.], [0., h, 0.]],
-                        [[1., 0., 1.], [1., 0., 0.], [1., h, 0.], [1., h, 1.]],
-                        [[0., 0., 1.], [0., 0., 0.], [1., 0., 0.], [1., 0., 1.]],
-                        [[0., h, 0.], [0., h, 1.], [1., h, 1.], [1., h, 0.]],
-                        [[1., 0., 0.], [0., 0., 0.], [0., h, 0.], [1., h, 0.]],
-                        [[0., 0., 1.], [1., 0., 1.], [1., h, 1.], [0., h, 1.]],
-                    ];
-                    let cutout = (x + z + y) % 8 == 0;
-                    let u = if cutout {
-                        [0.501, 0.999]
-                    } else {
-                        [0.001, 0.499]
-                    };
-                    let mut uv = [[u[0], 0.001], [u[1], 0.001], [u[1], 0.999], [u[0], 0.999]];
-                    if mirror_uv {
-                        for corner in &mut uv {
-                            corner[0] = u[0] + u[1] - corner[0];
-                        }
-                    }
-                    for face in faces {
-                        word(&mut bytes, tint);
-                        for (position, uv) in face.into_iter().zip(uv) {
-                            for value in position.into_iter().chain(uv) {
-                                word(&mut bytes, f32::to_bits(value));
-                            }
+                }
+                for face in faces {
+                    word(&mut bytes, tint);
+                    for (position, uv) in face.into_iter().zip(uv) {
+                        for value in position.into_iter().chain(uv) {
+                            word(&mut bytes, f32::to_bits(value));
                         }
                     }
                 }
@@ -132,6 +123,131 @@ fn source_attributes(keys: &[[i32; 3]], edited: bool, tint: u32, mirror_uv: bool
         }
     }
     bytes
+}
+
+type Sources = std::collections::BTreeMap<[i32; 3], Vec<u8>>;
+
+fn sources(keys: &[[i32; 3]], edited: bool, tint: u32, mirror_uv: bool) -> Sources {
+    keys.iter()
+        .map(|&key| (key, section_body(key, edited, tint, mirror_uv)))
+        .collect()
+}
+
+fn packet(requests: &[crate::scene::CaptureRequest], sources: &Sources) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    word(&mut bytes, 0x3254_5250);
+    word(&mut bytes, requests.len() as u32);
+    for request in requests {
+        let key = request.section;
+        bytes.extend_from_slice(&request.id.to_le_bytes());
+        if let Some(body) = sources.get(&key) {
+            bytes.extend_from_slice(body);
+        } else {
+            for axis in key {
+                word(&mut bytes, axis as u32);
+            }
+            word(&mut bytes, 0);
+        }
+    }
+    bytes
+}
+
+fn world_camera(camera: Camera) -> crate::scene::WorldCamera {
+    crate::scene::WorldCamera {
+        origin: std::array::from_fn(|i| f64::from(camera.origin[i])),
+        forward: camera.forward,
+        right: camera.right,
+        up: camera.up,
+    }
+}
+
+#[derive(Default)]
+struct Drive {
+    plan_ns: u64,
+    packet_ns: u64,
+    apply_ns: u64,
+    prepare_publish_ns: u64,
+    gpu_scene_ns: u64,
+    total_ns: u64,
+    steps: usize,
+    requests: usize,
+    publications: usize,
+    blas_count: usize,
+    blas_total_ns: u64,
+    blas_submit_wait_ns: u64,
+    blas_input_bytes: u64,
+    max_blas_scratch_bytes: u64,
+    max_dirty_triangle_capacity_bytes: u64,
+    packets: Vec<Vec<u8>>,
+}
+
+impl Drive {
+    fn report(&self) -> Value {
+        json!({"plan_ns":self.plan_ns,"packet_response_ns":self.packet_ns,
+            "apply_ns":self.apply_ns,"prepare_publish_ns":self.prepare_publish_ns,
+            "gpu_scene_ns":self.gpu_scene_ns,"manager_complete_ns":self.total_ns,
+            "steps":self.steps,"capture_requests":self.requests,"publications":self.publications,
+            "blas_count":self.blas_count,"blas_total_ns":self.blas_total_ns,
+            "blas_submit_wait_ns":self.blas_submit_wait_ns,"blas_input_bytes":self.blas_input_bytes,
+            "max_blas_scratch_bytes":self.max_blas_scratch_bytes,
+            "max_dirty_triangle_capacity_bytes":self.max_dirty_triangle_capacity_bytes})
+    }
+}
+
+// 与生产相同的plan→PRT2应答→prepare→GPU准备→commit；空section同样经过manager。
+fn settle(
+    scene: &mut crate::scene::Scene,
+    gpu: &mut Gpu,
+    camera: &crate::scene::WorldCamera,
+    sources: &Sources,
+) -> Result<Drive> {
+    let started = Instant::now();
+    let mut metrics = Drive::default();
+    scene.rebase(camera.anchor()?);
+    for _ in 0..20_000 {
+        metrics.steps += 1;
+        let stage = Instant::now();
+        let requests = scene.plan(camera, 64)?.to_vec();
+        metrics.plan_ns += ns(stage);
+        metrics.requests += requests.len();
+        if !requests.is_empty() {
+            let stage = Instant::now();
+            let bytes = packet(&requests, sources);
+            metrics.packet_ns += ns(stage);
+            let stage = Instant::now();
+            scene.apply(&bytes)?;
+            metrics.apply_ns += ns(stage);
+            metrics.packets.push(bytes);
+        }
+        let stage = Instant::now();
+        if scene.prepare()? {
+            let gpu_started = Instant::now();
+            if let Err(error) = gpu.set_sections(scene) {
+                scene.reject()?;
+                return Err(error.into());
+            }
+            metrics.gpu_scene_ns += ns(gpu_started);
+            metrics.publications += 1;
+            let build = gpu.scene_build;
+            metrics.blas_count += build.batch.blas_count;
+            metrics.blas_total_ns += build.batch.total_ns;
+            metrics.blas_submit_wait_ns += build.batch.submit_wait_ns;
+            metrics.blas_input_bytes += build.batch.input_bytes;
+            metrics.max_blas_scratch_bytes = metrics
+                .max_blas_scratch_bytes
+                .max(build.batch.scratch_bytes);
+            metrics.max_dirty_triangle_capacity_bytes = metrics
+                .max_dirty_triangle_capacity_bytes
+                .max(build.triangle_capacity_bytes);
+            scene.commit()?;
+        }
+        metrics.prepare_publish_ns += ns(stage);
+        if !scene.pending() {
+            metrics.total_ns = ns(started);
+            return Ok(metrics);
+        }
+    }
+    Err("真实LOD0窗口未在有界迭代内收敛".into())
 }
 
 fn atlas() -> Vec<u8> {
@@ -354,11 +470,23 @@ fn hardware_pt_scene_baseline() -> Result {
             }
         }
     }
-    let initial = source(&keys, false);
-    let edits = [source(&[EDIT_KEY], false), source(&[EDIT_KEY], true)];
+    let initial = sources(&keys, false, 0x00bf_d9a6, false);
+    let edits = [
+        sources(&[EDIT_KEY], false, 0x00bf_d9a6, false),
+        sources(&[EDIT_KEY], true, 0x00bf_d9a6, false),
+    ];
     let atlas = atlas();
     let camera = scene_camera();
     camera.validate()?;
+    let world = world_camera(camera);
+    let mut templates = Vec::new();
+    for (&key, bytes) in &initial {
+        templates.push(json!({"section":key,"body":save(&root, &format!("initial-{}-{}-{}.section", key[0], key[1], key[2]), bytes)?}));
+    }
+    let edit_templates = [
+        save(&root, "edit-0.section", &edits[0][&EDIT_KEY])?,
+        save(&root, "edit-1.section", &edits[1][&EDIT_KEY])?,
+    ];
     let environment = Environment {
         sea_level: 0.,
         ..Environment::default()
@@ -368,17 +496,21 @@ fn hardware_pt_scene_baseline() -> Result {
         &root,
         "input.json",
         &json!({
-            "version":2,"scene_update":"section revision cache; full attribute upload","extent":EXTENT,"sections":keys,"quads":98304,
+            "version":3,"scene_update":"engine chunk_manager LOD0; PRT2 tickets; staged publication; section BLAS cache",
+            "extent":EXTENT,"nonempty_sections":keys,"window_sections":1728,"quads":98304,
             "edit_section":EDIT_KEY,"edit":"one cube height 1.0/1.5; replace one complete section",
-            "initial":save(&root,"initial.prt",&initial)?,
-            "edit_packets":[save(&root,"edit-0.prt",&edits[0])?,save(&root,"edit-1.prt",&edits[1])?],
+            "initial_templates":templates,"edit_templates":edit_templates,
+            "template_format":"sx/sy/sz/block_count/blocks; PRT2 request IDs/header attached at response time",
+            "capture_protocol":"PRT2; every requested section answered, including 1664 empty initial resources",
             "atlas":save(&root,"atlas.rgba8",&atlas)?,"atlas_extent":[16,16],
             "camera":{"origin":camera.origin,"forward":camera.forward,"right":camera.right,"up":camera.up},
             "environment":{"sun_direction":environment.sun_direction,"sea_level":environment.sea_level,"exposure_ev":environment.exposure_ev},
             "integrator":{"samples":1,"max_vertices":12,"seed":0,"max_dielectric_events":128,"rr":false,"ser":false},
             "rounds":ROUNDS,"steady_frames_per_round":FRAMES,"edits_per_round":EDITS,
             "boundary":"Host::render_options: command-pool creation, draw/encode, submit, queue idle, Flight completion; readback excluded",
-            "scene_update_boundary":"source apply + set_sections(full attributes/upload/dirty BLAS/TLAS wait/invalidate/collect); merge_ns=0",
+            "scene_update_boundary":"manager_complete: plan+PRT2 packet response+apply+prepare+set_sections+commit/retire; all empty resources included; output file writes excluded",
+            "comparison_boundary":"old direct 64-section apply is a different workload; steady image/integrator inputs retained",
+            "steady_boundaries":"draw_complete_ns retains host draw/submit/complete only; manager_steady_ns includes real plan/prepare; frame_complete_ns includes manager and draw",
             "omissions":["Minecraft/Java capture/FFI mutex","window present","RR","GPU timestamps","process peak memory"],
             "capture":"untimed compute copy; production accumulation/counts allocation unchanged"
         }),
@@ -398,16 +530,32 @@ fn hardware_pt_scene_baseline() -> Result {
     let mut gpu = host.gpu()?;
     gpu.settings = pt::Settings::default();
     let mut scene = crate::scene::Scene::new()?;
-    scene.apply(&initial)?;
     let start = Instant::now();
     gpu.set_atlas(16, 16, &atlas)?;
     let initial_atlas_ns = ns(start);
-    let scene_started = Instant::now();
-    gpu.set_sections(&scene)?;
-    let initial_scene_complete_ns = ns(scene_started);
+    let initial_drive = settle(&mut scene, &mut gpu, &world, &initial)?;
+    let initial_scene_complete_ns = initial_drive.gpu_scene_ns;
     let initial_prepare_ns = ns(start);
-    let initial_scene_build = scene_build_metrics(&gpu);
-    scene.dirty = false;
+    let initial_scene_build = initial_drive.report();
+    assert_eq!(initial_drive.requests, 1728);
+    assert_eq!(scene.entries().len(), keys.len());
+    assert_eq!(
+        scene
+            .entries()
+            .map(|(_, _, mesh)| mesh.quads.len())
+            .sum::<usize>(),
+        98304
+    );
+    let mut capture_packets = Vec::new();
+    for (index, bytes) in initial_drive.packets.iter().enumerate() {
+        capture_packets.push(save(&root, &format!("initial-packet-{index}.prt2"), bytes)?);
+    }
+    save_json(
+        &root,
+        "initial-capture.json",
+        &json!({"packets":capture_packets,"manager":initial_scene_build}),
+    )?;
+    let camera = world.relative(scene.anchor())?;
     let image = Image::new(
         &mut gpu.context,
         [EXTENT[0], EXTENT[1], 1],
@@ -471,13 +619,23 @@ fn hardware_pt_scene_baseline() -> Result {
     for round in 0..ROUNDS {
         gpu.view.as_mut().ok_or("视图缺失")?.progress.reset();
         for frame in 0..FRAMES {
+            let frame_started = Instant::now();
+            let manager_started = Instant::now();
+            assert!(
+                scene.plan(&world, 64)?.is_empty(),
+                "稳定窗口不应请求重新捕获"
+            );
+            assert!(!scene.prepare()?, "稳定窗口不应重新发布GPU场景");
+            let manager_steady_ns = ns(manager_started);
             let start = Instant::now();
             host.render_options(&mut gpu, &image, &camera, environment, options)?;
             let draw_complete_ns = ns(start);
+            let frame_complete_ns = ns(frame_started);
             record(
                 &mut raw,
                 &json!({"case":"steady","round":round,"frame":frame,
-                "first_sample":frame,"samples":1,"draw_complete_ns":draw_complete_ns}),
+                "first_sample":frame,"samples":1,"draw_complete_ns":draw_complete_ns,
+                "manager_steady_ns":manager_steady_ns,"frame_complete_ns":frame_complete_ns}),
             )?;
         }
         captures.push(capture.save(
@@ -488,30 +646,38 @@ fn hardware_pt_scene_baseline() -> Result {
             FRAMES as u32,
         )?);
     }
-    // 单section更新与生产共用set_sections；编辑前的源包构造不计时。
+    // 编辑同样请求真实刷新ticket；PRT2响应、空源与全部manager调度计入完整准备。
     for round in 0..ROUNDS {
         for edit in 0..EDITS {
             let variant = (edit + 1) % 2;
             let started = Instant::now();
-            scene.apply(&edits[variant])?;
-            let apply_ns = ns(started);
+            scene.invalidate_section(EDIT_KEY)?;
+            let manager = settle(&mut scene, &mut gpu, &world, &edits[variant])?;
+            let apply_ns = manager.apply_ns;
             let merge_ns = 0u64;
-            let stage = Instant::now();
-            gpu.set_sections(&scene)?;
-            let set_scene_complete_ns = ns(stage);
-            scene.dirty = false;
+            let set_scene_complete_ns = manager.gpu_scene_ns;
             let prepare_complete_ns = ns(started);
+            assert_eq!(manager.requests, 1);
+            assert_eq!(manager.blas_count, 1);
             let stage = Instant::now();
             host.render_options(&mut gpu, &image, &camera, environment, options)?;
             let draw_complete_ns = ns(stage);
             let update_draw_complete_ns = ns(started);
+            let mut packets = Vec::new();
+            for (index, bytes) in manager.packets.iter().enumerate() {
+                packets.push(save(
+                    &root,
+                    &format!("edit-{round}-{edit}-packet-{index}.prt2"),
+                    bytes,
+                )?);
+            }
             record(
                 &mut raw,
                 &json!({"case":"single_section_edit","round":round,"edit":edit,
                 "variant":variant,"first_sample":0,"samples":1,"apply_ns":apply_ns,
                 "merge_ns":merge_ns,"set_scene_complete_ns":set_scene_complete_ns,
                 "prepare_complete_ns":prepare_complete_ns,"draw_complete_ns":draw_complete_ns,
-                "update_draw_complete_ns":update_draw_complete_ns,"scene_build":scene_build_metrics(&gpu)}),
+                "update_draw_complete_ns":update_draw_complete_ns,"manager":manager.report(),"packets":packets,"scene_build":scene_build_metrics(&gpu)}),
             )?;
         }
         captures.push(capture.save(&mut gpu, &image, &root, &format!("edit-{round}"), 1)?);
@@ -537,22 +703,33 @@ fn hardware_pt_scene_baseline() -> Result {
 }
 
 #[test]
-#[ignore = "真实Vulkan RT；验证局部更新与anchor重定位的BLAS消费者"]
+#[ignore = "真实Vulkan RT；manager刷新与anchor重定位保留未变BLAS"]
 fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
     let host = Host::new()?;
     let mut gpu = host.gpu()?;
     gpu.set_atlas(16, 16, &atlas())?;
     let mut scene = crate::scene::Scene::new()?;
-    scene.apply(&source(&[[0, 0, 0], EDIT_KEY], false))?;
-    gpu.set_sections(&scene)?;
+    let keys = [[0, 0, 0], EDIT_KEY];
+    let world = world_camera(scene_camera());
+    settle(
+        &mut scene,
+        &mut gpu,
+        &world,
+        &sources(&keys, false, 0x00bf_d9a6, false),
+    )?;
     let initial: Vec<_> = gpu
         .section_cache
         .entries()
         .iter()
         .map(|entry| entry.blas)
         .collect();
-    scene.apply(&source(&[EDIT_KEY], true))?;
-    gpu.set_sections(&scene)?;
+    scene.invalidate_section(EDIT_KEY)?;
+    settle(
+        &mut scene,
+        &mut gpu,
+        &world,
+        &sources(&keys, true, 0x00bf_d9a6, false),
+    )?;
     let changed: Vec<_> = gpu
         .section_cache
         .entries()
@@ -561,8 +738,16 @@ fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
         .collect();
     assert_eq!(initial[0], changed[0]);
     assert_ne!(initial[1], changed[1]);
-    scene.rebase([64., 0., 0.]);
-    gpu.set_sections(&scene)?;
+    let moved = crate::scene::WorldCamera {
+        origin: [world.origin[0] + 64.0, world.origin[1], world.origin[2]],
+        ..world
+    };
+    settle(
+        &mut scene,
+        &mut gpu,
+        &moved,
+        &sources(&keys, true, 0x00bf_d9a6, false),
+    )?;
     assert!(
         gpu.section_cache
             .entries()
@@ -571,9 +756,9 @@ fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
             .eq(changed)
     );
     let image = image(&mut gpu)?;
-    let mut camera = scene_camera();
-    camera.origin[0] -= 64.;
+    let camera = world.relative(scene.anchor())?;
     let local = host.render(&mut gpu, &image, &camera)?;
+    // 独立全局合批仅作结果oracle，所有被测增量准备均经过manager ticket。
     gpu.set_scene(&scene.merge())?;
     let reference = host.render(&mut gpu, &image, &camera)?;
     assert!(
@@ -581,35 +766,49 @@ fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
             .iter()
             .zip(&reference)
             .all(|(&a, &b)| a.abs_diff(b) <= 1),
-        "局部BLAS实例与原全局合批的宿主图像不等价"
+        "manager局部BLAS实例与独立全局合批的宿主图像不等价"
     );
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
 
 #[test]
-#[ignore = "真实Vulkan RT；材质属性更新保持BLAS且必须影响实际宿主图像"]
+#[ignore = "真实Vulkan RT；manager属性刷新保持BLAS且改变宿主输出"]
 fn hardware_pt_section_attributes_reuse_blas_and_change_output() -> Result {
     let host = Host::new()?;
     let mut gpu = host.gpu()?;
     gpu.set_atlas(16, 16, &atlas())?;
     let mut scene = crate::scene::Scene::new()?;
-    scene.apply(&source(&[[0, 0, 0]], false))?;
-    gpu.set_sections(&scene)?;
-    let initial = gpu.section_cache.entries()[0].blas;
-    let image = image(&mut gpu)?;
     let camera = Camera {
         origin: [8., 8., -12., 0.],
         forward: [0., 0., 1., 0.],
         right: [0.8, 0., 0., 0.],
         up: [0., 0.8, 0., 0.],
     };
-    let before = host.render(&mut gpu, &image, &camera)?;
-    scene.apply(&source_attributes(&[[0, 0, 0]], false, 0x0030_e030, true))?;
-    gpu.set_sections(&scene)?;
+    let world = world_camera(camera);
+    settle(
+        &mut scene,
+        &mut gpu,
+        &world,
+        &sources(&[[0, 0, 0]], false, 0x00bf_d9a6, false),
+    )?;
+    let initial = gpu.section_cache.entries()[0].blas;
+    let image = image(&mut gpu)?;
+    let relative = world.relative(scene.anchor())?;
+    let before = host.render(&mut gpu, &image, &relative)?;
+    scene.invalidate_section([0, 0, 0])?;
+    settle(
+        &mut scene,
+        &mut gpu,
+        &world,
+        &sources(&[[0, 0, 0]], false, 0x0030_e030, true),
+    )?;
     assert_eq!(gpu.section_cache.entries()[0].blas, initial);
-    let after = host.render(&mut gpu, &image, &camera)?;
+    let after = host.render(&mut gpu, &image, &relative)?;
     assert_ne!(before, after, "只更新tint/UV必须传播到实际场景属性");
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
+
+#[path = "scene_window_tests.rs"]
+mod window_tests;

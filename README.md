@@ -2,9 +2,9 @@
 
 Minecraft 26.3 / Fabric 的 Prime PT 重写，参考旧 Prime PT 的代码与契约。此目录是独立 Git 仓库和 Cargo workspace，依赖上两级的 simple_engine；引擎不依赖本目录。`target/`、`run/` 和 SDK 缓存不纳入版本管理。
 
-Java 每帧薄捕获一个 4×4×4 section region（64³ 方块）：转发原版模型的 quad、atlas UV、面可见性和群系 tint。Rust 在批次层调度 CPU 工作池，缓存 section 局部网格及 revision；与 game 共用 `scene_cache` 资源事务，仅为变化 section 展开三角形并重建 BLAS，以平移实例组成 TLAS。quad 属性仍全量打包上传，使用实例的属性基址直接寻址；引擎 `vulkan::native` 拥有 GPU 资源和 BLAS/TLAS，`pt::gpu::Renderer` 录制 K1→K2→K3。使用 RT Pipeline、叶子材质 callable 与 SBT；Slang 直接生成 SPIR-V。
+引擎 `chunk_manager::State` 独占 CPU section 资源，只调度 LOD0；Java 每帧按 native ticket 薄捕获至多 64 个 section：转发原版模型的 quad、atlas UV、面可见性和群系 tint。Rust 在批次层调度 CPU 工作池，缓存 section 局部网格及 revision；与 game 共用 `scene_cache` 资源事务，仅为变化 section 展开三角形并重建 BLAS，以平移实例组成 TLAS。quad 属性仍全量打包上传，使用实例的属性基址直接寻址；引擎 `vulkan::native` 拥有 GPU 资源和 BLAS/TLAS，`pt::gpu::Renderer` 录制 K1→K2→K3。使用 RT Pipeline、叶子材质 callable 与 SBT；Slang 直接生成 SPIR-V。
 
-与 game 共用 `shaders/pt/{integrator,path_sampler,post}.slang`，包含 OpenPBR、Beer、NEE/MIS、介质更新、RR 和线性累积。`mod_scene.slang` 翻译网格、atlas、tint 与环境，源包默认 roughness=0.9、IOR=1.5 的 opaque；native quad 另可选择 roughness=0.25 的 opaque 预设，相机初始介质为空气。复用引擎 Earth 大气：太阳盘使用 NEE/MIS 和 alpha 阴影，环境来自 SkyView，主射线命中后逐样本合成 Aerial L+T。太阳盘在大气外的亮度标定沿用 game 默认 20_000；海平面对应 0.5 km，每世界单位对应 1 m，Aerial 最远 64 km。暂无局部光源和发光。默认每帧 1 spp、12 顶点。原始 PT 在视图、太阳、海平面、积分参数、mesh 或 atlas 变化时清空累积；RR 使用独立帧历史，普通相机与太阳运动保持历史，尺寸/投影、瞬移、场景、开关和求值失败重置，曝光只作用于呈现。
+与 game 共用 `shaders/pt/{integrator,path_sampler,post}.slang`，包含 OpenPBR、Beer、NEE/MIS、介质更新、RR 和线性累积。`mod_scene.slang` 翻译网格、atlas、tint 与环境，源包默认 roughness=0.9、IOR=1.5 的 opaque；native quad 另可选择 roughness=0.25 的 opaque 预设，相机初始介质为空气。复用引擎 Earth 大气：太阳盘使用 NEE/MIS 和 alpha 阴影，环境来自 SkyView，主射线命中后逐样本合成 Aerial L+T。太阳盘在大气外的亮度标定沿用 game 默认 20_000；海平面对应 0.5 km，每世界单位对应 1 m，Aerial 最远 64 km。暂无局部光源和发光。默认每帧 1 spp、12 顶点。原始 PT 在视图、太阳、海平面、积分参数、mesh 或 atlas 变化时清空累积；RR 每帧重新生成当前帧 HDR，只平均本帧 SPP；SDK 独立维护时间历史。相机、FOV、太阳、积分预算、局部场景与 anchor 变化保留 RR 历史；世界或材质资源域换代显式重置，实际视图/SDK 存储替换及求值失败分别冷启动或恢复，曝光只作用于呈现。
 
 主查询 any-hit 与阴影 RayQuery 候选均以 alpha≥0.5 接受交点。atlas 使用 sRGB 格式，tint 解码后在线性空间相乘；几何点和误差界复用引擎 `geometry::triangle_point`。公共 HDR 左上原点，独立呈现阶段使用 Prime DRT、sRGB 编码和宿主 Y 翻转。
 
@@ -64,11 +64,11 @@ K1 的通用接口 `pt::IPrefixGuides` 在 alpha 接受后的首个实际表面�
 
 ## 初版边界
 
-- 维护相机周围 3³ regions（192³ 方块）的窗口；跨 region 清空并分帧重捕，加载期间会有空缺。block、chunk 和 tint 变化会使对应 section 失效。
+- 引擎区块管理器维护相机周围 12³ 个 LOD0 section（192³ 方块），窗口按 64m 网格移动；不请求更高 LOD。移窗保留交集与最近一次完整窗口的旧覆盖，分帧捕获新前沿，就绪后才移除旧覆盖；连续瞬移可淘汰过期的未完成前沿。block/chunk 变化局部失效，tint 刷新分步重捕；未加载 section 作为已完成空源，加载通知再使其失效。
 - 支持公共方块模型源与位置偏移；缺少流体、实体、方块实体和粒子。动画纹理固定第一帧，资源重载重新捕获。未接入第三方自定义模型回调。
 - 原版世界提取与绘制已截断，保留相机、玩家状态、手部和 UI。宿主适配固定为 26.3；没有其它渲染 Mod 的兼容保证。
 - 几何变化按 revision 复用未变 section 的 BLAS，并重建 TLAS；quad 数量或按顺序的 P48 位置位值改变才推进几何 revision，相同源包及 tint/UV 更新保留 BLAS。属性按当前活动槽全量重新打包上传，尚无分段属性传输。每帧显式等待宿主提交完成，再复用单份 GPU 资源。没有异步加载或性能承诺。
-- Java 以 f64 传递绝对相机位置，CPU mesh 与 BLAS 保留 section 局部坐标；TLAS 实例平移先减去相机所在 64m 网格 anchor 再转 f32。anchor 变化保留局部 BLAS、更新 TLAS 并重置图像历史。尚未实现 Minecraft 的透射、发光或专用材质规则。
+- Java 以 f64 传递绝对相机位置，CPU mesh 与 BLAS 保留 section 局部坐标；TLAS 实例平移先减去相机所在 64m 网格 anchor 再转 f32。anchor 变化保留局部 BLAS、更新 TLAS，上一帧世界相机重投影到当前 anchor，保留 RR 历史。尚未实现 Minecraft 的透射、发光或专用材质规则。
 - CPU 保留 section mesh；变化 section 的三角输入汇入一个连续 dirty 集，由 native 批入口共用上传与 scratch、一次提交并等待。批返回后释放 CPU 三角与描述符，再打包完整属性槽，不再生成全场景位置合并副本。属性槽准备时保留旧范围，新场景成功后才回收；工作集须计入完整 dirty 集、旧/新属性缓冲、变化 BLAS、TLAS 与构建暂存。单场景最多 16M 顶点，单源包/atlas 最多 256 MiB，另受设备 storage binding 上限约束。
 - 视图保留一份 scratch，当前 opaque/air/prefix=false 的五 plane 交接为60 B/输入像素；PT 工作缓冲合计112 B/输入像素，RR 开启时另增 48 B/输入像素和 8 B/输出像素（关闭仅保留 1×1 占位），另有 SDK 自有缓存，独立于每批样本数。大气拥有固定 Earth 场与 SkyView/Aerial 缓存。宿主输出 view 只借到本帧完成，呈现 program 复用，每帧只重建绑定。
 

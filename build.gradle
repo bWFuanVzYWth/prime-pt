@@ -90,6 +90,12 @@ tasks.register('commandHintsFixture', JavaExec) {
     mainClass = 'dev.primept.CommandHintsFixture'
 }
 
+tasks.register('sourceChangesFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.SourceChangesFixture'
+}
+
 tasks.register('streamlineFixture', JavaExec) {
     dependsOn fixtureClasses
     classpath = sourceSets.fixture.runtimeClasspath
@@ -100,5 +106,5 @@ tasks.register('streamlineFixture', JavaExec) {
 
 tasks.named('check') {
     dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),
-            tasks.named('videoOptionsFixture'), tasks.named('commandHintsFixture')
+            tasks.named('videoOptionsFixture'), tasks.named('commandHintsFixture'), tasks.named('sourceChangesFixture')
 }

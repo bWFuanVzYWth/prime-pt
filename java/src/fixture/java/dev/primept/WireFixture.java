@@ -12,8 +12,14 @@ import org.joml.Vector3f;
 /** 以真实源 quad 和生产 writer 生成跨 Java/Rust fixture，不初始化游戏或 GPU。 */
 final class WireFixture {
     public static void main(String[] arguments) throws Exception {
+        write(Path.of(arguments[0]), false);
+        write(Path.of(arguments[0] + "2"), true);
+    }
+
+    private static void write(Path output, boolean ticketed) throws Exception {
         var packet = new Packet();
-        packet.putInt(0x31545250); packet.putInt(1);
+        packet.putInt(ticketed ? 0x32545250 : 0x31545250); packet.putInt(1);
+        if (ticketed) packet.putLong(0x0102030405060708L);
         packet.putInt(-4); packet.putInt(0); packet.putInt(0); packet.putInt(1);
         packet.putInt(1 | 2 << 4 | 3 << 8); packet.putInt(1);
         packet.putFloat(0.25f); packet.putFloat(0.5f); packet.putFloat(-0.125f);
@@ -22,7 +28,6 @@ final class WireFixture {
                 UVPair.pack(0.25f, 0.5f), UVPair.pack(0.75f, 0.5f),
                 UVPair.pack(0.75f, 1), UVPair.pack(0.25f, 1), Direction.NORTH, null);
         packet.quad(source, 0xff80c040);
-        var output = Path.of(arguments[0]);
         Files.createDirectories(output.toAbsolutePath().getParent());
         try (var file = FileChannel.open(output, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE)) {
             var bytes = packet.finish();

@@ -1,5 +1,6 @@
-//! Mod 的历史策略与 Streamline 常量；相机数学和 Halton 序列由引擎维护。
-//! 历史仅在成功录制后由 renderer 接受；尺寸/场景改变和 SDK 状态由上层决定 reset。
+//! 世界位姿与 Streamline 常量；相机数学和 Halton 序列由引擎维护。
+//! 接受的前帧保存绝对位置，每帧先转到当前anchor，再生成shader与SDK的前后投影。
+//! 相机运动、FOV和anchor变化不自行宣布整个历史域失效，重置事件由GPU所有者决定。
 
 use crate::{scene::Camera, streamline};
 use camera::{Frame, Jitter, Projection, Relative};
@@ -10,53 +11,47 @@ const FAR: f32 = 1_000_000.0;
 /// 已校验相机及固定 SDK 深度范围；不持有 SDK 或图像资源。
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CameraFrame {
-    camera: Relative,
+    world: Frame,
     projection: Projection,
+    anchor: [f64; 3],
 }
 
 impl CameraFrame {
-    /// 将 Mod 半视锥输入交给引擎归一化；世界已由场景转换到相同锚点。
-    pub(crate) fn new(camera: &Camera) -> Result<Self, crate::Error> {
-        camera.validate()?;
+    /// 从当前anchor下的追踪相机保存世界位姿；不丢失旧帧使用的投影。
+    pub(crate) fn new(camera: &Camera, anchor: [f64; 3]) -> Result<Self, camera::Error> {
+        if !camera.origin.iter().all(|value| value.is_finite())
+            || !anchor.iter().all(|value| value.is_finite())
+        {
+            return Err(camera::Error::Position);
+        }
+        camera.validate().map_err(|_| camera::Error::Basis)?;
         let xyz = |v: [f32; 4]| [v[0], v[1], v[2]];
-        let camera = Frame::from_scaled(
-            xyz(camera.origin).map(f64::from),
+        let world = Frame::from_scaled(
+            std::array::from_fn(|axis| anchor[axis] + f64::from(camera.origin[axis])),
             xyz(camera.forward),
             xyz(camera.right),
             xyz(camera.up),
-        )
-        .and_then(|frame| frame.relative([0.0; 3]))
-        .map_err(crate::gpu::Error::from)?;
-        let projection = Projection::new(camera.tangent(), camera.aspect(), NEAR, FAR)
-            .map_err(crate::gpu::Error::from)?;
-        Ok(Self { camera, projection })
+        )?;
+        let relative = world.relative(anchor)?;
+        let projection = Projection::new(relative.tangent(), relative.aspect(), NEAR, FAR)?;
+        Ok(Self {
+            world,
+            projection,
+            anchor,
+        })
     }
 
-    /// 与 `geometry::Camera` 的四个 float4 一致，不含 jitter。
-    pub(crate) const fn camera_words(self) -> [f32; 16] {
-        self.camera.words()
+    fn relative(self, anchor: [f64; 3]) -> Result<Relative, camera::Error> {
+        self.world.relative(anchor)
     }
 
-    /// Mod 的切镜策略；容忍归一化舍入，普通局部移动保留历史。
-    pub(crate) fn history_compatible(self, previous: &Self) -> bool {
-        let same_projection = |a: f32, b: f32| (a - b).abs() <= a.abs().max(b.abs()) * 1e-4;
-        let displacement: [f32; 3] =
-            std::array::from_fn(|i| self.camera.position()[i] - previous.camera.position()[i]);
-        let distance_squared = displacement.iter().map(|v| v * v).sum::<f32>();
-        let direction_dot = self
-            .camera
-            .forward()
-            .into_iter()
-            .zip(previous.camera.forward())
-            .map(|(a, b)| a * b)
-            .sum::<f32>();
-        same_projection(self.camera.tangent(), previous.camera.tangent())
-            && same_projection(self.camera.aspect(), previous.camera.aspect())
-            && distance_squared <= 16.0 * 16.0
-            && direction_dot >= 0.5
+    /// 与 `geometry::Camera` 的四个float4一致；前帧也必须使用本帧anchor，不含jitter。
+    pub(crate) fn camera_words(self, anchor: [f64; 3]) -> Result<[f32; 16], camera::Error> {
+        Ok(self.relative(anchor)?.words())
     }
 
-    /// SDK jitter 为实际输入像素中心偏移的负值；reset 不引用失效历史。
+    /// SDK jitter 为实际输入像素中心偏移的负值；reset不引用失效历史。
+    /// 前后位姿都使用构造本帧时的anchor，避免调用者混用旧帧坐标系。
     pub(crate) fn frame(
         self,
         command: u64,
@@ -65,35 +60,35 @@ impl CameraFrame {
         jitter: [f32; 2],
         previous: &Self,
         images: [streamline::Resource; 9],
-    ) -> streamline::Frame {
+    ) -> Result<streamline::Frame, camera::Error> {
         let previous = if reset { self } else { *previous };
-        streamline::Frame {
+        let current_camera = self.relative(self.anchor)?;
+        let previous_camera = previous.relative(self.anchor)?;
+        Ok(streamline::Frame {
             command,
             index,
             reset: u32::from(reset),
             jitter: jitter.map(|v| -v),
             near_plane: self.projection.near(),
             far_plane: self.projection.far(),
-            fov: 2.0 * self.camera.tangent().atan(),
-            aspect: self.camera.aspect(),
-            position: self.camera.position(),
-            up: self.camera.up(),
-            right: self.camera.right(),
-            forward: self.camera.forward(),
-            world_to_view: self.camera.world_to_view().to_array(),
-            view_to_world: self.camera.view_to_world().to_array(),
+            fov: 2.0 * current_camera.tangent().atan(),
+            aspect: current_camera.aspect(),
+            position: current_camera.position(),
+            up: current_camera.up(),
+            right: current_camera.right(),
+            forward: current_camera.forward(),
+            world_to_view: current_camera.world_to_view().to_array(),
+            view_to_world: current_camera.view_to_world().to_array(),
             view_to_clip: self.projection.view_to_clip().to_array(),
             clip_to_view: self.projection.clip_to_view().to_array(),
-            clip_to_previous: self
-                .camera
-                .clip_to(self.projection, previous.camera, previous.projection)
+            clip_to_previous: current_camera
+                .clip_to(self.projection, previous_camera, previous.projection)
                 .to_array(),
-            previous_to_clip: previous
-                .camera
-                .clip_to(previous.projection, self.camera, self.projection)
+            previous_to_clip: previous_camera
+                .clip_to(previous.projection, current_camera, self.projection)
                 .to_array(),
             images,
-        }
+        })
     }
 }
 
@@ -124,16 +119,18 @@ mod tests {
 
     #[test]
     fn sdk_receives_negative_input_pixel_jitter_and_unjittered_projection() {
-        let camera = CameraFrame::new(&camera()).unwrap();
+        let camera = CameraFrame::new(&camera(), [0.; 3]).unwrap();
         let jitter = jitter(3, 960, 1920).unwrap();
-        let frame = camera.frame(
-            1,
-            3,
-            false,
-            jitter,
-            &camera,
-            [streamline::Resource::default(); 9],
-        );
+        let frame = camera
+            .frame(
+                1,
+                3,
+                false,
+                jitter,
+                &camera,
+                [streamline::Resource::default(); 9],
+            )
+            .unwrap();
         assert_eq!(frame.jitter, jitter.map(|v| -v));
         assert_eq!(
             frame.view_to_clip,
@@ -144,18 +141,20 @@ mod tests {
 
     #[test]
     fn reset_uses_current_camera_for_both_clip_transforms() {
-        let current = CameraFrame::new(&camera()).unwrap();
+        let current = CameraFrame::new(&camera(), [0.; 3]).unwrap();
         let mut source = camera();
         source.origin[0] += 8.;
-        let previous = CameraFrame::new(&source).unwrap();
-        let frame = current.frame(
-            1,
-            3,
-            true,
-            [0.; 2],
-            &previous,
-            [streamline::Resource::default(); 9],
-        );
+        let previous = CameraFrame::new(&source, [0.; 3]).unwrap();
+        let frame = current
+            .frame(
+                1,
+                3,
+                true,
+                [0.; 2],
+                &previous,
+                [streamline::Resource::default(); 9],
+            )
+            .unwrap();
         for matrix in [frame.clip_to_previous, frame.previous_to_clip] {
             for (i, value) in matrix.into_iter().enumerate() {
                 assert!((value - f32::from(i / 4 == i % 4)).abs() < 3e-4);
@@ -164,36 +163,79 @@ mod tests {
     }
 
     #[test]
-    fn local_camera_motion_keeps_mod_history() {
-        let previous = CameraFrame::new(&camera()).unwrap();
-        let mut source = camera();
-        source.origin[0] += 2.;
-        let (sine, cosine) = 0.1f32.sin_cos();
-        source.forward = [2. * sine, 0., -2. * cosine, 0.];
-        source.right = [3. * cosine, 0., 3. * sine, 0.];
-        assert!(
-            CameraFrame::new(&source)
-                .unwrap()
-                .history_compatible(&previous)
-        );
+    fn anchor_crossing_preserves_world_motion_in_shader_and_sdk() {
+        for boundary in [-64.0, 64.0] {
+            let previous_anchor = [boundary - 64.0, 0.0, 0.0];
+            let current_anchor = [boundary, 0.0, 0.0];
+            let mut source = Camera {
+                origin: [63.75, 0.0, 0.0, 0.0],
+                forward: [0.0, 0.0, 1.0, 0.0],
+                right: [1.0, 0.0, 0.0, 0.0],
+                up: [0.0, 1.0, 0.0, 0.0],
+            };
+            let previous = CameraFrame::new(&source, previous_anchor).unwrap();
+            source.origin[0] = 0.25;
+            let current = CameraFrame::new(&source, current_anchor).unwrap();
+            assert_eq!(previous.camera_words(current_anchor).unwrap()[0], -0.25);
+            let frame = current
+                .frame(
+                    1,
+                    1,
+                    false,
+                    [0.0; 2],
+                    &previous,
+                    [streamline::Resource::default(); 9],
+                )
+                .unwrap();
+            assert_eq!(frame.reset, 0);
+            assert_eq!(frame.position, [0.25, 0.0, 0.0]);
+            let current_clip = current
+                .projection
+                .view_to_clip()
+                .transform([0.0, 0.0, 10.0, 1.0]);
+            let previous_clip = transform(frame.clip_to_previous, current_clip);
+            // 移动0.5m、前方10m、tan(FOV/2)=1，上一帧NDC x应为0.05。
+            assert!((previous_clip[0] / previous_clip[3] - 0.05).abs() < 1e-5);
+        }
     }
 
     #[test]
-    fn mod_projection_changes_and_camera_cuts_drop_history() {
-        let previous = CameraFrame::new(&camera()).unwrap();
-        let mut fov = camera();
-        fov.up[1] *= 1.1;
-        let mut teleport = camera();
-        teleport.origin[0] += 100.;
-        let mut reverse = camera();
-        reverse.forward[2] *= -1.;
-        reverse.right[0] *= -1.;
-        for source in [fov, teleport, reverse] {
-            assert!(
-                !CameraFrame::new(&source)
-                    .unwrap()
-                    .history_compatible(&previous)
-            );
-        }
+    fn projection_change_uses_the_accepted_previous_projection() {
+        let mut source = Camera {
+            origin: [0.0; 4],
+            forward: [0.0, 0.0, 1.0, 0.0],
+            right: [1.0, 0.0, 0.0, 0.0],
+            up: [0.0, 1.0, 0.0, 0.0],
+        };
+        let previous = CameraFrame::new(&source, [0.; 3]).unwrap();
+        source.right[0] = 2.0;
+        source.up[1] = 2.0;
+        let current = CameraFrame::new(&source, [0.; 3]).unwrap();
+        let frame = current
+            .frame(
+                1,
+                1,
+                false,
+                [0.0; 2],
+                &previous,
+                [streamline::Resource::default(); 9],
+            )
+            .unwrap();
+        let current_clip = current
+            .projection
+            .view_to_clip()
+            .transform([1.0, 0.0, 10.0, 1.0]);
+        let previous_clip = transform(frame.clip_to_previous, current_clip);
+        assert_eq!(frame.reset, 0);
+        assert!((previous_clip[0] / previous_clip[3] - 0.1).abs() < 1e-5);
+        assert!((current_clip[0] / current_clip[3] - 0.05).abs() < 1e-5);
+    }
+
+    fn transform(matrix: [f32; 16], point: [f32; 4]) -> [f32; 4] {
+        std::array::from_fn(|column| {
+            (0..4)
+                .map(|row| point[row] * matrix[row * 4 + column])
+                .sum()
+        })
     }
 }

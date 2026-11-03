@@ -45,6 +45,15 @@ pub(crate) enum Error {
     /// Streamline 初始化或全局退役失败。
     #[error(transparent)]
     Streamline(#[from] streamline::Error),
+    /// 区块窗口配置不符合引擎约定。
+    #[error(transparent)]
+    Config(#[from] chunk_manager::ConfigError),
+    /// 区块资源状态转换失败。
+    #[error(transparent)]
+    Chunks(#[from] chunk_manager::StateError),
+    /// 区块调度输入无效。
+    #[error(transparent)]
+    Planning(#[from] chunk_manager::PlanError),
 }
 
 struct Engine {
@@ -234,25 +243,103 @@ pub unsafe extern "C" fn prime_destroy(id: u64) -> i32 {
     })
 }
 
-/// 清空 CPU section；下次 draw 替换 GPU 场景，atlas 保留。
+/// 切换世界域，取消旧捕获并清空场景与重建历史；atlas 保留。
+///
+/// # Safety
+/// 宿主已提交并确认此会话全部旧命令完成；调用线程独占会话与 graphics queue。
 #[unsafe(no_mangle)]
-pub extern "C" fn prime_reset(id: u64) -> i32 {
+pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
     guarded(-1, || {
         with_engine(id, |engine| {
             engine.scene.clear();
+            engine
+                .gpu
+                .invalidate_history(gpu::GlobalReset::WorldReplaced)?;
             Ok(())
         })
     })
 }
 
-/// 同步消费一个 PRT1 源包；验证失败不修改 CPU 场景，成功返回 0。
+/// 为当前相机推进引擎 LOD0 窗口，返回至多 capacity 条捕获请求；失败返回 -1。
+///
+/// 请求为 little-endian 的 `id:u64, sx:i32, sy:i32, sz:i32, reserved:u32=0`，每条 24B。
+/// 宿主须用 PRT2 回复，或对未完成请求调用 [`prime_fail_capture`]；窗口移动不清空场景。
+///
+/// # Safety
+/// camera 借出完整 WorldCamera；requests 借出 capacity*24 字节可写内存，二者不重叠。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_plan(
+    id: u64,
+    camera: *const WorldCamera,
+    requests: *mut u8,
+    capacity: u32,
+) -> i32 {
+    guarded(-1, || {
+        if camera.is_null() || requests.is_null() || capacity == 0 || capacity > 64 {
+            return Err(Error::Input("捕获请求指针或容量无效"));
+        }
+        // SAFETY: 调用者借出完整相机，不要求对齐。
+        let camera = unsafe { camera.read_unaligned() };
+        let mut count = 0;
+        with_engine(id, |engine| {
+            let planned: &[scene::CaptureRequest] =
+                engine.scene.plan(&camera, capacity as usize)?;
+            for (index, request) in planned.iter().enumerate() {
+                let mut bytes = [0u8; 24];
+                bytes[..8].copy_from_slice(&request.id.to_le_bytes());
+                for axis in 0..3 {
+                    bytes[8 + axis * 4..12 + axis * 4]
+                        .copy_from_slice(&request.section[axis].to_le_bytes());
+                }
+                // SAFETY: plan 返回条数不超过 capacity；调用者提供完整可写输出。
+                unsafe {
+                    requests
+                        .add(index * 24)
+                        .copy_from_nonoverlapping(bytes.as_ptr(), 24)
+                };
+            }
+            count = planned.len() as i32;
+            Ok(())
+        })?;
+        Ok(count)
+    })
+}
+
+/// 失效一个已保留 section 的捕获源，旧可见资源保留到替换成功；未知 section 忽略。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_invalidate_section(id: u64, sx: i32, sy: i32, sz: i32) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| engine.scene.invalidate_section([sx, sy, sz]))
+    })
+}
+
+/// 将全部已知源排入分步刷新；不清空可见场景或 RR 历史。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_invalidate_all(id: u64) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| {
+            engine.scene.invalidate_all();
+            Ok(())
+        })
+    })
+}
+
+/// 标记一次宿主捕获失败；过期请求忽略，仍需要的 section 可在之后重试。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| engine.scene.fail_capture(request))
+    })
+}
+
+/// 同步消费一个 PRT2 源包；验证失败不修改 CPU 场景，成功返回 0。
 ///
 /// 所有字为 little-endian，坐标为 i32，其余整数为 u32，浮点为 f32：
-/// `magic=0x31545250, section_count`；每段为 `sx,sy,sz,block_count`；
+/// `magic=0x32545250, section_count`；每段为 `request_id:u64,sx,sy,sz,block_count`；
 /// 每块为 `x | y<<4 | z<<8, quad_count, offset_x,offset_y,offset_z`；
 /// 每 quad 为 `ARGB, [x,y,z,u,v] × 4`。
-/// quad 坐标相对方块，UV 对应 atlas；段坐标按 div_euclid(4) 属于同一 region。
-/// 每包 1..=64 段，空段删除旧 mesh；未列出的段保留。原版面剔除在捕获边界求值。
+/// quad 坐标相对方块，UV 对应 atlas；每包 1..=64 段，可跨 region。
+/// 空段仍是已完成的 LOD0 空资源；旧 ticket 回复忽略，原版面剔除在捕获边界求值。
 ///
 /// # Safety
 /// data 指向 len 字节的只读连续内存，调用期间保持活动且不被其他线程修改。
@@ -300,6 +387,10 @@ pub unsafe extern "C" fn prime_atlas(
         let bytes = unsafe { std::slice::from_raw_parts(pixels, len as usize) };
         with_engine(id, |engine| {
             engine.gpu.set_atlas(width, height, bytes)?;
+            engine
+                .gpu
+                .invalidate_history(gpu::GlobalReset::SceneDomainReplaced)?;
+            engine.scene.clear();
             engine.atlas_ready = true;
             Ok(())
         })
@@ -313,7 +404,7 @@ pub unsafe extern "C" fn prime_atlas(
 /// STORAGE 图像，尺寸匹配，入口/出口布局均为 GENERAL（RenderPearl 26.3 约定）。
 /// 输出第 0 行对应宿主画面底部；相机 up 保持世界向上的视锥向量。
 /// camera 指向一份活动的 72B [`WorldCamera`]；函数返回后借用结束。
-/// 场景和相机统一在 64m 网格 anchor 下计算，重定位会重建场景并重置图像历史。
+/// 场景和相机统一在 64m 网格 anchor 下计算；重定位保留 BLAS 与 RR 世界空间历史。
 /// environment 指向一份活动的 [`Environment`]；曝光只影响呈现，零太阳禁用大气。
 /// rr=0 使用原始累积，rr=1 使用已完成早期 SDK 接入的 RR；其余值拒绝。
 /// quality=0..=4 对应 DLAA/Quality/Balanced/Performance/UltraPerformance；SDK 决定输入尺寸。
@@ -363,9 +454,12 @@ pub unsafe extern "C" fn prime_draw(
                 return Err(Error::Input("draw 前需要上传 atlas"));
             }
             engine.scene.rebase(anchor);
-            if engine.scene.dirty {
-                engine.gpu.set_sections(&engine.scene)?;
-                engine.scene.dirty = false;
+            if engine.scene.prepare()? {
+                if let Err(error) = engine.gpu.set_sections(&engine.scene) {
+                    engine.scene.reject()?;
+                    return Err(error.into());
+                }
+                engine.scene.commit()?;
             }
             engine.gpu.draw(
                 command,
