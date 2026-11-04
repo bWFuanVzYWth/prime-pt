@@ -8,6 +8,8 @@ repositories { mavenCentral() }
 dependencies {
     minecraft 'com.mojang:minecraft:26.3'
     implementation 'net.fabricmc:fabric-loader:0.19.5'
+    // 26.3 的 Fabric API 0.161.0+26.3 资源加载模块将 Mod 的 assets 加入客户端资源栈。
+    include(implementation('net.fabricmc.fabric-api:fabric-resource-loader-v1:3.0.4+fcdff87f5d'))
 }
 sourceSets.main.java.srcDirs = ['java/src/main/java']
 sourceSets.main.resources.srcDirs = ['java/src/main/resources']
@@ -84,6 +86,13 @@ tasks.register('videoOptionsFixture', JavaExec) {
     mainClass = 'dev.primept.VideoOptionsFixture'
 }
 
+tasks.register('settingsLanguageFixture', JavaExec) {
+    dependsOn fixtureClasses, tasks.named('jar')
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.SettingsLanguageFixture'
+    args tasks.named('jar').flatMap { it.archiveFile }.get().asFile.absolutePath
+}
+
 tasks.register('commandHintsFixture', JavaExec) {
     dependsOn fixtureClasses
     classpath = sourceSets.fixture.runtimeClasspath
@@ -117,7 +126,8 @@ tasks.register('frameChartFixture', JavaExec) {
 
 tasks.named('check') {
     dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),
-            tasks.named('videoOptionsFixture'), tasks.named('commandHintsFixture'), tasks.named('sourceChangesFixture'), tasks.named('frameChartFixture')
+            tasks.named('videoOptionsFixture'), tasks.named('settingsLanguageFixture'), tasks.named('commandHintsFixture'),
+            tasks.named('sourceChangesFixture'), tasks.named('frameChartFixture')
 }
 
 // 不启动客户端；由26.3真实原版代码生成Rust数学对照。

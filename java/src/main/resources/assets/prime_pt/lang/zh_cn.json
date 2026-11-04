@@ -2,7 +2,7 @@
   "primept.settings.reset": "恢复 PT 默认设置",
   "primept.settings.render": "PT 渲染",
   "primept.settings.ser": "Shader Execution Reordering",
-  "primept.settings.ser.tooltip": "自动检测设备能力，支持时默认启用 SER。可即时关闭或重新开启，无需重启；切换时创建对应管线，保留采样历史。\n命令：/pt ser on|off",
+  "primept.settings.ser.tooltip": "自动检测设备能力，支持时默认启用 SER。切换使用预先准备的管线，并保留采样历史。\n命令：/pt ser on|off",
   "primept.settings.rr": "DLSS Ray Reconstruction",
   "primept.settings.rr.tooltip": "使用 DLSS RR 降噪并按所选质量档重建画面。关闭或不可用时使用原生分辨率 PT。\n命令：/pt rr on|off",
   "primept.settings.quality": "DLSS 质量",
@@ -18,9 +18,9 @@
   "primept.settings.bounces.tooltip": "每条路径最多 1–64 个顶点，包括主命中；最后一个顶点仍计算直接光与自发光。\n命令：/pt bounces 1..64",
   "primept.settings.display": "PT 显示",
   "primept.settings.lighting": "PT 光照",
-  "primept.settings.latitude": "观测纬度（度）",
+  "primept.settings.latitude": "观测纬度",
   "primept.settings.latitude.tooltip": "正值为北纬，负值为南纬。纬度决定太阳的高度和日出日落方向。",
-  "primept.settings.solar_longitude": "太阳黄经（度）",
+  "primept.settings.solar_longitude": "太阳黄经",
   "primept.settings.solar_longitude.tooltip": "北半球 0° 为春分，90° 为夏至，180° 为秋分，270° 为冬至。",
   "primept.settings.update_budget": "场景更新额度",
   "primept.settings.update_budget.tooltip": "按工作量分配捕获、建网和场景发布。平稳档减少同帧的区块更新量，吞吐档加快区块加载。",
@@ -28,6 +28,6 @@
   "primept.settings.update_budget.balanced": "均衡",
   "primept.settings.update_budget.throughput": "吞吐",
   "primept.settings.exposure": "曝光",
-  "primept.settings.exposure.tooltip": "在 RR 之后、显示映射之前调整亮度。+1 EV 将亮度加倍。滑条步长 0.25 EV；打开设置保留命令输入的精确值。\n命令：/pt exposure -16..16",
+  "primept.settings.exposure.tooltip": "在 RR 之后、显示映射之前调整亮度。+1 EV 将亮度加倍。滑块按 0.25 EV 步进，拖动时预览数值，松开后保存。打开设置保留命令输入的精确值。\n命令：/pt exposure -16..16",
   "primept.settings.save_failed": "PT 设置保存失败"
 }

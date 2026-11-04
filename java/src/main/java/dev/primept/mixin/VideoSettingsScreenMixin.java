@@ -44,4 +44,9 @@ public abstract class VideoSettingsScreenMixin extends OptionsSubScreen {
     private void primept$tick(CallbackInfo callback) {
         if (primept$options != null) primept$options.tick();
     }
+
+    @Inject(method = "onClose()V", at = @At("HEAD"), cancellable = true)
+    private void primept$commitSliders(CallbackInfo callback) {
+        if (primept$options != null && !primept$options.applyPendingSliders()) callback.cancel();
+    }
 }
