@@ -33,29 +33,36 @@ static EMPTY: State = State {
     leaves: Vec::new(),
 };
 
-fn height(state: &State) -> f32 {
+const fn amount(state: &State) -> i32 {
     if state.fluid_kind == 0 {
-        0.
+        0
+    } else if state.level == 0 {
+        8
     } else {
-        (if state.level == 0 { 8 } else { state.level }) as f32 / 9.
+        state.level as i32
     }
 }
 
-fn corner(center: f32, a: f32, b: f32, diagonal: f32) -> f32 {
-    if a >= 1. || b >= 1. {
+const fn height(state: &State) -> f32 {
+    amount(state) as f32 / 9.
+}
+
+fn corner(center: i32, a: i32, b: i32, diagonal: i32) -> f32 {
+    if center == 9 || a == 9 || b == 9 {
         return 1.;
     }
-    let mut total = 0.;
-    let mut weight = 0.;
-    let mut add = |v: f32| {
-        if v >= 0. {
-            let w = if v >= 0.8 { 10. } else { 1. };
+    // 高度单位为九分之一格。整数累加使相邻方块共享角的高度与枚举顺序无关。
+    let mut total = 0;
+    let mut weight = 0;
+    let mut add = |v| {
+        if v >= 0 {
+            let w = if v >= 8 { 10 } else { 1 };
             total += v * w;
             weight += w;
         }
     };
-    if a > 0. || b > 0. {
-        if diagonal >= 1. {
+    if a > 0 || b > 0 {
+        if diagonal == 9 {
             return 1.;
         }
         add(diagonal);
@@ -63,15 +70,20 @@ fn corner(center: f32, a: f32, b: f32, diagonal: f32) -> f32 {
     add(center);
     add(b);
     add(a);
-    if weight == 0. { 0. } else { total / weight }
+    total as f32 / (weight * 9) as f32
 }
 
 fn flow_angle(flow: [f64; 2]) -> Option<f32> {
     (flow != [0.; 2]).then(|| flow[1].atan2(flow[0]) as f32 - std::f32::consts::FRAC_PI_2)
 }
 
-fn occluded(catalog: &Catalog, state: &State, face: usize, height: f32) -> bool {
-    let id = state.faces[face];
+// direction 从流体指向被测格。检查自身容器时反向传入，以读取容器朝外的面。
+fn occluded(catalog: &Catalog, state: &State, direction: usize, height: f32) -> bool {
+    if direction == 1 && height < 1. {
+        return false;
+    }
+    let id = state.faces[direction ^ 1];
+    let height = if direction < 2 { 1. } else { height };
     if id == 1 {
         return height <= 1.;
     }
@@ -149,24 +161,33 @@ pub(crate) fn emit(
     ];
     let neighbors = directions.map(|[x, y, z]| get(x, y, z));
     let kind = state.fluid_kind;
+    // 光栅避重叠偏移会断开暴露在空气中的岩浆壳。接触其它几何时仍保留偏移。
+    let inset = |direction| {
+        let neighbor: &State = neighbors[direction];
+        if kind == 2 && neighbor.flags & 1 != 0 {
+            0.
+        } else {
+            0.001
+        }
+    };
     let mut enabled = std::array::from_fn::<_, 6, _>(|face| {
         neighbors[face].fluid_kind != kind && (face == 1 || !occluded(catalog, state, face ^ 1, 1.))
     });
-    enabled[0] &= !occluded(catalog, neighbors[0], 0, 0.8888889);
+    enabled[0] &= !occluded(catalog, neighbors[0], 0, 1.);
     let samples = std::array::from_fn::<_, 9, _>(|i| {
         let x = i as i32 % 3 - 1;
         let z = i as i32 / 3 - 1;
         let s = get(x, 0, z);
         if s.fluid_kind == kind {
             if get(x, 1, z).fluid_kind == kind {
-                1.
+                9
             } else {
-                height(s)
+                amount(s)
             }
         } else if s.flags & 32 != 0 {
-            -1.
+            -1
         } else {
-            0.
+            0
         }
     });
     let mut flow = [0f64; 2];
@@ -211,7 +232,7 @@ pub(crate) fn emit(
         1,
         heights.into_iter().fold(1., f32::min),
     );
-    let bottom = if enabled[0] { 0.001 } else { 0. };
+    let bottom = if enabled[0] { inset(0) } else { 0. };
     let mut emit =
         |positions: [[f32; 3]; 4], uv: [[f32; 2]; 4], which: usize| -> Result<(), Error> {
             let sprite = source.sprites[which];
@@ -255,8 +276,9 @@ pub(crate) fn emit(
             Ok(())
         };
     if enabled[1] {
+        let top_inset = inset(1);
         for h in &mut heights {
-            *h -= 0.001;
+            *h -= top_inset;
         }
         let (uv, sprite) = if let Some(angle) = flow_angle(flow) {
             let (s, c) = angle.sin_cos();
@@ -297,10 +319,10 @@ pub(crate) fn emit(
         )?;
     }
     for (direction, a, b, x0, z0, x1, z1) in [
-        (2, 0, 3, 0., 0.001, 1., 0.001),
-        (3, 2, 1, 1., 0.999, 0., 0.999),
-        (4, 1, 0, 0.001, 1., 0.001, 0.),
-        (5, 3, 2, 0.999, 0., 0.999, 1.),
+        (2, 0, 3, 0., 0., 1., 0.),
+        (3, 2, 1, 1., 1., 0., 1.),
+        (4, 1, 0, 0., 1., 0., 0.),
+        (5, 3, 2, 1., 0., 1., 1.),
     ] {
         let (ha, hb) = (heights[a], heights[b]);
         if !enabled[direction] || occluded(catalog, neighbors[direction], direction, ha.max(hb)) {
@@ -308,12 +330,16 @@ pub(crate) fn emit(
         }
         let overlay = source.sprites[2] != 0 && neighbors[direction].flags & 64 != 0;
         let sprite = if overlay { 2 } else { 1 };
+        let [dx, _, dz] = directions[direction];
+        let side_inset = inset(direction);
+        let dx = dx as f32 * side_inset;
+        let dz = dz as f32 * side_inset;
         emit(
             [
-                [x0, ha, z0],
-                [x1, hb, z1],
-                [x1, bottom, z1],
-                [x0, bottom, z0],
+                [x0 - dx, ha, z0 - dz],
+                [x1 - dx, hb, z1 - dz],
+                [x1 - dx, bottom, z1 - dz],
+                [x0 - dx, bottom, z0 - dz],
             ],
             [
                 [0., (1. - ha) * 0.5],
@@ -331,9 +357,49 @@ pub(crate) fn emit(
 mod tests {
     use super::flow_angle;
     use crate::{
-        Catalog, Neighbor, Neighborhood, compile_section_slab, decode_sections,
+        Catalog, Neighbor, Neighborhood, SectionStorage, compile_section_slab, decode_sections,
         fixtures::{self, Pattern},
     };
+
+    #[test]
+    fn stacked_lava_exposes_a_closed_shell_across_slab_boundaries() {
+        let mut catalog = fixtures::catalog().unwrap();
+        catalog.states.get_mut(&3).unwrap().fluid_kind = 2;
+        catalog.fluids.get_mut(&1).unwrap().tinted = false;
+        let mut words = vec![0; 64];
+        for y in [3, 4] {
+            let index = (y * 16 + 8) * 16 + 8;
+            words[index / 64] |= 1 << (index % 64);
+        }
+        let storage = SectionStorage::new(1, vec![0, 3], words).unwrap();
+        let mut sections = [Neighbor::Empty; 27];
+        sections[13] = Neighbor::Available(&storage);
+        let neighborhood = Neighborhood {
+            key: [0; 3],
+            generation: catalog.generation(),
+            sections,
+        };
+        let mut edges = std::collections::BTreeMap::new();
+        let mut face_count = 0;
+        for first_y in [0, 4] {
+            for quad in compile_section_slab(&catalog, &neighborhood, first_y)
+                .unwrap()
+                .mesh
+                .quads
+            {
+                face_count += 1;
+                let corners = quad.positions().map(|p| p.map(f32::to_bits));
+                for i in 0..4 {
+                    let mut edge = [corners[i], corners[(i + 1) % 4]];
+                    edge.sort_unstable();
+                    *edges.entry(edge).or_insert(0) += 1;
+                }
+            }
+        }
+        assert_eq!(face_count, 10);
+        assert!(edges.values().all(|&incidents| incidents == 2));
+    }
+
     #[test]
     fn falling_vertical_normalization_does_not_change_uv_direction_or_still_selection() {
         assert_eq!(flow_angle([0., 0.]), None);
