@@ -26,7 +26,7 @@ public final class Renderer {
     private static final SourceChanges CHANGES = new SourceChanges();
     private static final ByteBuffer CAMERA = ByteBuffer.allocateDirect(72).order(ByteOrder.LITTLE_ENDIAN);
     private static final ByteBuffer REQUESTS = ByteBuffer.allocateDirect(64 * 24).order(ByteOrder.LITTLE_ENDIAN);
-    private static final ByteBuffer ENVIRONMENT = ByteBuffer.allocateDirect(20).order(ByteOrder.LITTLE_ENDIAN);
+    private static final ByteBuffer ENVIRONMENT = ByteBuffer.allocateDirect(EnvironmentPacket.BYTES).order(ByteOrder.LITTLE_ENDIAN);
     private static final ByteBuffer STAGES = ByteBuffer.allocateDirect(FrameChart.STAGES * 8).order(ByteOrder.LITTLE_ENDIAN);
     private static final ByteBuffer PROFILE = ByteBuffer.allocateDirect(FrameChart.CAPACITY).order(ByteOrder.LITTLE_ENDIAN);
     private static Native renderer;
@@ -125,7 +125,7 @@ public final class Renderer {
             throw new IllegalStateException("Prime PT 目标必须是支持 storage 的 RGBA8_UNORM");
         stage = System.nanoTime();
         var command = encoder.allocateAndBeginTransientCommandBuffer();
-        ENVIRONMENT.putFloat(12, Settings.exposure());
+        ENVIRONMENT.putFloat(EnvironmentPacket.EXPOSURE_OFFSET, Settings.exposure());
         renderer.draw(command.address(), texture.vkImage(), view.vkImageView(), target.width, target.height,
                 CAMERA, ENVIRONMENT, Settings.rr(), Settings.quality(), Settings.samples(), Settings.bounces());
         int status = VK10.vkEndCommandBuffer(command);
@@ -144,6 +144,7 @@ public final class Renderer {
     private static void prepareFrame(Minecraft minecraft, UpdateBudget updateBudget) {
         long stage = System.nanoTime();
         renderer.updateBudget(updateBudget);
+        renderer.updateSolarOrbit(Settings.solar());
         if(biomeWorld!=minecraft.level){renderer.biomeWorld(SourceResources.prepared().biomes.world(minecraft.level));biomeWorld=minecraft.level;}
         var invalidations=CHANGES.batch(minecraft.level,1024);
         if(invalidations!=null){renderer.invalidateBatch(invalidations);CHANGES.accepted();}

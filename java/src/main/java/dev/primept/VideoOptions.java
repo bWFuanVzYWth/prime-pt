@@ -20,7 +20,7 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, DISPLAY, EXPOSURE }
+    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, LATITUDE, SOLAR_LONGITUDE, DISPLAY, EXPOSURE }
 
     @FunctionalInterface
     interface Action { void run() throws IOException; }
@@ -103,6 +103,11 @@ public final class VideoOptions {
                         });
                 list.addBig(updateBudget);
             }
+            case LIGHTING -> list.addHeader(text("lighting"));
+            case LATITUDE -> addSlider("latitude", -90, 90, 1,
+                    () -> Settings.solar().latitude(), value -> Settings.setSolarLatitude((int)value), false);
+            case SOLAR_LONGITUDE -> addSlider("solar_longitude", 0, 359, 1,
+                    () -> Settings.solar().longitude(), value -> Settings.setSolarLongitude((int)value), false);
             case DISPLAY -> list.addHeader(text("display"));
             case EXPOSURE -> addSlider("exposure", Settings.MIN_EV, Settings.MAX_EV, 0.25,
                     Settings::exposure, value -> Settings.setExposure((float)value), true);

@@ -708,6 +708,7 @@ dependencies = [
 name = "prime_pt"
 version = "0.1.0"
 dependencies = [
+ "atmosphere",
  "frame_loop",
  "prime_minecraft",
  "prime_renderer",

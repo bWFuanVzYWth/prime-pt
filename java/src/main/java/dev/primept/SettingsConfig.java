@@ -15,7 +15,7 @@ final class SettingsConfig {
     static final int MIN_BOUNCES = 1, MAX_BOUNCES = 64;
 
     private record Values(float ev, boolean rr, Quality quality, int samples, int bounces, boolean ser,
-                          UpdateBudget updateBudget) {
+                          UpdateBudget updateBudget, SolarSettings solar) {
         private Values {
             if (!Float.isFinite(ev) || ev < MIN_EV || ev > MAX_EV)
                 throw new IllegalArgumentException("曝光必须为 [-16, 16] 内的有限 EV");
@@ -26,7 +26,8 @@ final class SettingsConfig {
         }
     }
 
-    private static final Values DEFAULTS = new Values(0, true, Quality.PERFORMANCE, 1, 12, true, UpdateBudget.BALANCED);
+    private static final Values DEFAULTS = new Values(0, true, Quality.PERFORMANCE, 1, 12, true,
+            UpdateBudget.BALANCED, SolarSettings.DEFAULT);
     private final Path file;
     private Values values = DEFAULTS;
 
@@ -36,7 +37,7 @@ final class SettingsConfig {
 
     SettingsConfig(Path file, boolean defaultSer) {
         this.file = file;
-        values = new Values(0, true, Quality.PERFORMANCE, 1, 12, defaultSer, UpdateBudget.BALANCED);
+        values = new Values(0, true, Quality.PERFORMANCE, 1, 12, defaultSer, UpdateBudget.BALANCED, SolarSettings.DEFAULT);
         Path source = file;
         if (!Files.exists(source) && source.getFileName().toString().equals("prime_pt.properties"))
             source = file.resolveSibling("primary_rt.properties");
@@ -48,7 +49,9 @@ final class SettingsConfig {
                     parseBoolean(properties, "rr", true), Quality.parse(properties.getProperty("quality", "performance")),
                     Integer.parseInt(properties.getProperty("samples", "1")),
                     Integer.parseInt(properties.getProperty("bounces", "12")), parseBoolean(properties, "ser", defaultSer),
-                    UpdateBudget.parse(properties.getProperty("update_budget", "balanced")));
+                    UpdateBudget.parse(properties.getProperty("update_budget", "balanced")),
+                    new SolarSettings(Integer.parseInt(properties.getProperty("astronomy.latitude_degrees", "30")),
+                            Integer.parseInt(properties.getProperty("astronomy.solar_longitude_degrees", "0"))));
         } catch (IOException | IllegalArgumentException error) {
             System.getLogger("prime_pt").log(System.Logger.Level.WARNING, "PT 配置无效，使用默认值", error);
         }
@@ -61,33 +64,38 @@ final class SettingsConfig {
     int samples() { return values.samples; }
     int bounces() { return values.bounces; }
     UpdateBudget updateBudget() { return values.updateBudget; }
+    SolarSettings solar() { return values.solar; }
 
     void setExposure(float ev) throws IOException {
-        store(new Values(ev, values.rr, values.quality, values.samples, values.bounces, values.ser, values.updateBudget));
+        store(new Values(ev, values.rr, values.quality, values.samples, values.bounces, values.ser, values.updateBudget, values.solar));
     }
 
     void setRequestedRr(boolean rr) throws IOException {
-        store(new Values(values.ev, rr, values.quality, values.samples, values.bounces, values.ser, values.updateBudget));
+        store(new Values(values.ev, rr, values.quality, values.samples, values.bounces, values.ser, values.updateBudget, values.solar));
     }
 
     void setRequestedSer(boolean ser) throws IOException {
-        store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, ser, values.updateBudget));
+        store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, ser, values.updateBudget, values.solar));
     }
 
     void setQuality(Quality quality) throws IOException {
-        store(new Values(values.ev, values.rr, quality, values.samples, values.bounces, values.ser, values.updateBudget));
+        store(new Values(values.ev, values.rr, quality, values.samples, values.bounces, values.ser, values.updateBudget, values.solar));
     }
 
     void setSamples(int samples) throws IOException {
-        store(new Values(values.ev, values.rr, values.quality, samples, values.bounces, values.ser, values.updateBudget));
+        store(new Values(values.ev, values.rr, values.quality, samples, values.bounces, values.ser, values.updateBudget, values.solar));
     }
 
     void setBounces(int bounces) throws IOException {
-        store(new Values(values.ev, values.rr, values.quality, values.samples, bounces, values.ser, values.updateBudget));
+        store(new Values(values.ev, values.rr, values.quality, values.samples, bounces, values.ser, values.updateBudget, values.solar));
     }
 
     void setUpdateBudget(UpdateBudget budget) throws IOException {
-        store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser, budget));
+        store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser, budget, values.solar));
+    }
+
+    void setSolar(SolarSettings solar) throws IOException {
+        store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser, values.updateBudget, solar));
     }
 
     void reset() throws IOException { store(DEFAULTS); }
@@ -188,7 +196,9 @@ final class SettingsConfig {
         try {
             Files.writeString(temporary, "exposure_ev=" + next.ev + "\nrr=" + next.rr
                     + "\nquality=" + next.quality.key() + "\nsamples=" + next.samples + "\nbounces=" + next.bounces
-                    + "\nser=" + next.ser + "\nupdate_budget=" + next.updateBudget.key + "\n");
+                    + "\nser=" + next.ser + "\nupdate_budget=" + next.updateBudget.key
+                    + "\nastronomy.latitude_degrees=" + next.solar.latitude()
+                    + "\nastronomy.solar_longitude_degrees=" + next.solar.longitude() + "\n");
             replace(temporary, target);
             values = next;
         } finally { Files.deleteIfExists(temporary); }

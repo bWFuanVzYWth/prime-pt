@@ -25,6 +25,7 @@ public final class Settings {
     public static int samples() { return Holder.CONFIG.samples(); }
     public static int bounces() { return Holder.CONFIG.bounces(); }
     static UpdateBudget updateBudget() { return Holder.CONFIG.updateBudget(); }
+    static SolarSettings solar() { return Holder.CONFIG.solar(); }
     static boolean rr() { return requestedRr() && StreamlineBootstrap.available(); }
 
     /** 保存成功后才发布新值；输入无效抛出 IllegalArgumentException，IO 失败抛出 IOException。 */
@@ -35,6 +36,12 @@ public final class Settings {
     public static void setSamples(int value) throws IOException { Holder.CONFIG.setSamples(value); }
     public static void setBounces(int value) throws IOException { Holder.CONFIG.setBounces(value); }
     static void setUpdateBudget(UpdateBudget value) throws IOException { Holder.CONFIG.setUpdateBudget(value); }
+    static void setSolarLatitude(int value) throws IOException {
+        Holder.CONFIG.setSolar(new SolarSettings(value, solar().longitude()));
+    }
+    static void setSolarLongitude(int value) throws IOException {
+        Holder.CONFIG.setSolar(new SolarSettings(solar().latitude(), value));
+    }
     public static void reset() throws IOException { Holder.CONFIG.reset(); }
 
     public static String rrStatus() { return StreamlineBootstrap.status(); }

@@ -17,6 +17,8 @@ final class Native implements AutoCloseable {
     private final long handle;
     private final MethodHandle setUpdateBudget;
     private UpdateBudget updateBudget;
+    private final MethodHandle setSolarOrbit;
+    private SolarSettings solar;
     private boolean serRequested;
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex) {
@@ -47,6 +49,7 @@ final class Native implements AutoCloseable {
         failCapture = bind(symbols, "prime_fail_capture", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG));
         setSer = bind(symbols, "prime_set_ser", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         setUpdateBudget = bind(symbols, "prime_set_update_budget", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
+        setSolarOrbit = bind(symbols, "prime_set_solar_orbit", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT));
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         cameraMedium = bind(symbols, "prime_camera_medium", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
@@ -82,6 +85,14 @@ final class Native implements AutoCloseable {
         try {
             check((int) setUpdateBudget.invokeExact(handle, next.wireId));
             updateBudget = next;
+        } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void updateSolarOrbit(SolarSettings next) {
+        if (next.equals(solar)) return;
+        try {
+            check((int) setSolarOrbit.invokeExact(handle, next.latitude(), next.longitude()));
+            solar = next;
         } catch (Throwable e) { throw unchecked(e); }
     }
 

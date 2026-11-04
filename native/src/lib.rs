@@ -16,10 +16,13 @@
 
 mod changes;
 mod diagnostics;
+mod frame_environment;
+use atmosphere::SolarOrbit;
 use prime_renderer as gpu;
 use prime_renderer::streamline;
 use prime_world as scene;
 
+pub use frame_environment::FrameEnvironment;
 pub use prime_scene::{Camera, Environment, Material, Mesh, Quad, WorldCamera};
 
 use std::{
@@ -57,6 +60,9 @@ pub(crate) enum Error {
     /// 帧统计保留容量增长失败。
     #[error(transparent)]
     Diagnostics(#[from] frame_loop::timing::FrameStatsError),
+    /// 观测者、太阳黄经或时角输入无效。
+    #[error(transparent)]
+    Solar(#[from] atmosphere::SolarOrbitError),
 }
 
 struct Engine {
@@ -71,6 +77,7 @@ struct Engine {
     tint_radius: Option<u32>,
     tint_columns: std::collections::HashSet<(i32, i32)>,
     tint_invalidate_all: bool,
+    solar_orbit: SolarOrbit,
     profile: diagnostics::Profile,
 }
 
@@ -280,6 +287,7 @@ pub unsafe extern "C" fn prime_create_options(
                     tint_radius: None,
                     tint_columns: std::collections::HashSet::new(),
                     tint_invalidate_all: false,
+                    solar_orbit: SolarOrbit::default(),
                     profile: diagnostics::Profile::default(),
                 },
             );
@@ -365,6 +373,20 @@ pub extern "C" fn prime_set_update_budget(id: u64, preset: u32) -> i32 {
                 publish_attribute_quads,
                 ..engine.scene.work_budget()
             });
+            Ok(())
+        })
+    })
+}
+
+/// 更新会话的观测纬度（−90..=90°）和太阳黄经（0..=359°）。
+/// 成功返回 0。句柄或观测参数无效时返回 -1，保持原轨迹。
+/// 纯 CPU 设置，与 GPU 完成和世界切换独立。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_set_solar_orbit(id: u64, latitude: i32, ecliptic_longitude: u32) -> i32 {
+    guarded(-1, || {
+        let orbit = SolarOrbit::from_degrees(latitude, ecliptic_longitude)?;
+        with_engine(id, |engine| {
+            engine.solar_orbit = orbit;
             Ok(())
         })
     })
@@ -940,7 +962,7 @@ pub unsafe extern "C" fn prime_tints(id: u64, colors: *const u32, count: u32) ->
 /// 输出第 0 行对应宿主画面底部；相机 up 保持世界向上的视锥向量。
 /// camera 指向一份活动的 72B [`WorldCamera`]；函数返回后借用结束。
 /// 场景和相机统一在 64m 网格 anchor 下计算；重定位保留 BLAS 与 RR 世界空间历史。
-/// environment 指向一份活动的 [`Environment`]；曝光只影响呈现，零太阳禁用大气。
+/// environment 指向一份活动的 16B [`FrameEnvironment`]。曝光只影响呈现。
 /// rr=0 使用原始累积，rr=1 使用已完成早期 SDK 接入的 RR；其余值拒绝。
 /// quality=0..=4 对应 DLAA/Quality/Balanced/Performance/UltraPerformance；SDK 决定输入尺寸。
 /// samples=1..=64；RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为路径顶点预算。
@@ -955,7 +977,7 @@ pub unsafe extern "C" fn prime_draw(
     width: u32,
     height: u32,
     camera: *const WorldCamera,
-    environment: *const Environment,
+    environment: *const FrameEnvironment,
     rr: u32,
     quality: u32,
     samples: u32,
@@ -975,9 +997,8 @@ pub unsafe extern "C" fn prime_draw(
         let source = unsafe { camera.read_unaligned() };
         let anchor = source.anchor()?;
         let camera = source.relative(anchor)?;
-        // SAFETY: 调用者借出完整 Environment；不要求源指针对齐。
-        let mut environment = unsafe { environment.read_unaligned() }.validated()?;
-        environment.sea_level = (f64::from(environment.sea_level) - anchor[1]) as f32;
+        // SAFETY: 调用者借出完整帧环境包，不要求源指针对齐。
+        let source_environment = unsafe { environment.read_unaligned() };
         let options = gpu::Options::new(
             rr != 0,
             streamline::Quality::try_from(quality)?,
@@ -985,6 +1006,7 @@ pub unsafe extern "C" fn prime_draw(
             bounces,
         )?;
         with_engine(id, |engine| {
+            let environment = source_environment.resolve(engine.solar_orbit, anchor[1])?;
             if !engine.atlas_ready {
                 return Err(Error::Input("draw 前需要上传 atlas"));
             }

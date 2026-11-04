@@ -13,6 +13,7 @@ final class ExposureFixture {
         sharedModel(file);
         rejectedInputs(file);
         migration(file);
+        solarSettings(file);
         serDefaults(file);
         failedSave(file);
         Files.deleteIfExists(file);
@@ -109,6 +110,18 @@ final class ExposureFixture {
         require(new SettingsConfig(file, false).ser(), "已保存开启值优先于启动默认值");
         config.command("pt reset");
         require(new SettingsConfig(file, false).ser(), "恢复默认写回自动开启，不沿用旧启动默认值");
+    }
+
+    private static void solarSettings(Path file) throws Exception {
+        var config = new SettingsConfig(file);
+        require(config.solar().equals(SolarSettings.DEFAULT), "旧配置使用默认纬度和黄经");
+        var solstice = new SolarSettings(-45, 270);
+        config.setSolar(solstice);
+        config.setExposure(1);
+        var saved = new SettingsConfig(file);
+        require(saved.solar().equals(solstice), "其它设置保存时保留太阳轨迹参数");
+        saved.reset();
+        require(new SettingsConfig(file).solar().equals(SolarSettings.DEFAULT), "恢复旧 Prime 的太阳默认值");
     }
 
     private static void failedSave(Path file) throws Exception {

@@ -38,7 +38,7 @@ CPU quad 逻辑预算初始为 resident **1 GiB**、staging **256 MiB**、单 re
 
 原版 PBR 使用明确 sprite 身份对应的冻结数据，并保留 [来源锁](crates/minecraft/assets/vanilla_pbr/source.lock.json) 与 [Mojang 许可声明](crates/minecraft/assets/vanilla_pbr/SOURCE-LICENSE.md)；这些资产不因代码仓库的 [LICENSE](LICENSE) 改变许可。外部 `_n`/`_s` 贴图目前未消费，资源世代准备检测到时汇总一次 WARNING；已有图片协议字段不代表支持外部 LabPBR。资源动画字段/包络准备不等于播放：**当前材质 atlas 固定准备时首帧，尚未逐 tick 同步颜色/PBR 动画**。
 
-复用 Earth 大气、太阳盘与 Aerial L+T；太阳角薄捕获自原版环境属性，海平面来自世界，仅 Overworld skybox 启用，Nether/End 暂为黑色环境。HDR 为线性 BT.709，albedo sRGB 解码后乘线性 tint，最后自动曝光/手动 EV、Prime DRT 和宿主方向呈现。
+复用 Earth 大气、太阳盘与 Aerial L+T。原版环境属性提供插值时角，世界提供海平面。引擎大气模块的 `SolarOrbit` 按旧 Prime 的纬度、太阳黄经和地轴倾角计算实际太阳方向。视频设置的「PT 光照」默认北纬 30°、黄经 0°（春分），可单独调整纬度和季节。Overworld skybox 启用大气，Nether/End 暂为黑色环境。HDR 为线性 BT.709，albedo sRGB 解码后乘线性 tint，最后自动曝光/手动 EV、Prime DRT 和宿主方向呈现。
 
 当前仍有以下范围限制：
 

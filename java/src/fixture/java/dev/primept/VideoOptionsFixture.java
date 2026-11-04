@@ -19,8 +19,9 @@ final class VideoOptionsFixture {
         require(Arrays.asList(VideoOptions.Row.values()).equals(List.of(
                 VideoOptions.Row.RESET, VideoOptions.Row.RENDER, VideoOptions.Row.SER, VideoOptions.Row.RR,
                 VideoOptions.Row.QUALITY, VideoOptions.Row.SAMPLES, VideoOptions.Row.BOUNCES,
-                VideoOptions.Row.UPDATE_BUDGET, VideoOptions.Row.DISPLAY, VideoOptions.Row.EXPOSURE)),
-                "恢复默认置顶；渲染、显示分栏中的控件恰好各出现一次");
+                VideoOptions.Row.UPDATE_BUDGET, VideoOptions.Row.LIGHTING, VideoOptions.Row.LATITUDE,
+                VideoOptions.Row.SOLAR_LONGITUDE, VideoOptions.Row.DISPLAY, VideoOptions.Row.EXPOSURE)),
+                "恢复默认置顶，渲染、光照和显示分栏的控件各出现一次");
     }
 
     private static void preciseExposure() {

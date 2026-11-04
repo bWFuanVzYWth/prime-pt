@@ -13,6 +13,7 @@ prime_renderer = { path = "../crates/renderer" }
 prime_minecraft = { path = "../crates/minecraft" }
 thiserror = "2"
 frame_loop = { path = "../../../crates/frame_loop" }
+atmosphere = { path = "../../../crates/atmosphere", default-features = false }
 
 
 [lints.rust]
