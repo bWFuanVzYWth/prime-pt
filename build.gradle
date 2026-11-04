@@ -25,13 +25,25 @@ tasks.withType(JavaCompile).configureEach {
     options.release = 25
     options.encoding = 'UTF-8'
 }
+def nativeProfile = providers.gradleProperty('nativeProfile').getOrElse('release-lto')
+if (!(nativeProfile in ['release-lto', 'release'])) {
+    throw new GradleException('nativeProfile 须为 release-lto 或 release')
+}
+def cargoTargetDir = providers.environmentVariable('CARGO_TARGET_DIR')
+        .map { rootProject.file(it) }.getOrElse(rootProject.file('target'))
+def nativeOutputDir = new File(cargoTargetDir, nativeProfile)
+def nativeDll = new File(nativeOutputDir, 'prime_pt.dll')
+def nativeLibraryOverride = providers.gradleProperty('nativeLibrary')
+def nativeLibraryPath = nativeLibraryOverride.map { rootProject.file(it).absolutePath }
+        .getOrElse(nativeDll.absolutePath)
+
 loom {
     runs {
         client {
             client()
             runDir = 'run'
             vmArgs '--enable-native-access=ALL-UNNAMED'
-            vmArgs "-Dprimept.native=${providers.gradleProperty('nativeLibrary').getOrElse(rootProject.file('target/release/prime_pt.dll').absolutePath)}"
+            vmArgs "-Dprimept.native=${nativeLibraryPath}"
             vmArgs "-Dprimept.rr=${providers.gradleProperty('rr').getOrElse('true')}"
             if (providers.gradleProperty('ser').isPresent())
                 vmArgs "-Dprimept.ser=${providers.gradleProperty('ser').get()}"
@@ -49,10 +61,29 @@ tasks.register('buildNative', Exec) {
     dependsOn tasks.named('verifyStreamline')
     workingDir rootDir
     environment 'STREAMLINE_SDK', streamlineSdk
-    commandLine 'cargo', 'build', '--release', '--locked', '--manifest-path', 'native/Cargo.toml'
+    environment 'CARGO_TARGET_DIR', cargoTargetDir.absolutePath
+    def args = ['cargo', 'build', '--profile', nativeProfile, '--locked', '--manifest-path', 'native/Cargo.toml']
+    if (gradle.startParameter.offline) args.add('--offline')
+    commandLine args
 }
 tasks.named('runClient') {
-    if (!providers.gradleProperty('nativeLibrary').isPresent()) dependsOn tasks.named('buildNative')
+    if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
+}
+
+tasks.register('buildRelease') {
+    dependsOn tasks.named('build'), tasks.named('buildNative')
+    doLast {
+        def artifacts = [tasks.named('jar').get().archiveFile.get().asFile, nativeDll]
+        artifacts += ['sl.interposer.dll', 'sl.common.dll', 'sl.dlss_d.dll', 'nvngx_dlssd.dll',
+                'NVIDIA-Streamline.txt', 'streamline-licenses.md', 'nvngx_dlss.license.txt']
+                .collect { new File(nativeOutputDir, it) }
+        for (def artifact : artifacts) {
+            if (!artifact.isFile() || artifact.length() == 0) {
+                throw new GradleException("缺少构建产物 ${artifact.absolutePath}")
+            }
+            logger.lifecycle(artifact.absolutePath)
+        }
+    }
 }
 tasks.register('wireFixture', JavaExec) {
     dependsOn fixtureClasses
@@ -107,10 +138,11 @@ tasks.register('sourceChangesFixture', JavaExec) {
 
 tasks.register('streamlineFixture', JavaExec) {
     dependsOn fixtureClasses
+    if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
     classpath = sourceSets.fixture.runtimeClasspath
     mainClass = 'dev.primept.StreamlineFixture'
     jvmArgs '--enable-native-access=ALL-UNNAMED', '-Dorg.lwjgl.vulkan.explicitInit=true'
-    systemProperty 'primept.native', providers.gradleProperty('nativeLibrary').getOrElse(rootProject.file('target/release/prime_pt.dll').absolutePath)
+    systemProperty 'primept.native', nativeLibraryPath
 }
 
 tasks.register('frameChartFixture', JavaExec) {
@@ -154,8 +186,9 @@ tasks.register('modelRandomFixture', JavaExec) {
 
 tasks.register('nativeBatchFixture', JavaExec) {
     dependsOn fixtureClasses
+    if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
     classpath = sourceSets.fixture.runtimeClasspath
     mainClass = 'dev.primept.NativeBatchFixture'
     jvmArgs '--enable-native-access=ALL-UNNAMED'
-    systemProperty 'primept.native', providers.gradleProperty('nativeLibrary').getOrElse(rootProject.file('target/release/prime_pt.dll').absolutePath)
+    systemProperty 'primept.native', nativeLibraryPath
 }

@@ -62,13 +62,17 @@ cargo doc --workspace --no-deps
 .\gradlew.bat check
 .\gradlew.bat compactSourceFixture modelRandomFixture tintFixture
 cargo test -p prime_minecraft --lib -- --include-ignored
-.\gradlew.bat build
+.\scripts\build-release.ps1
 .\gradlew.bat runClient
 ```
 
-安装器默认使用引擎 `target/streamline-sdk` 并设置当前进程 `STREAMLINE_SDK`；已有 SDK 可加 `-VerifyOnly`。Slang 从配置的 `SLANGC`/`VULKAN_SDK` 或 PATH 查找，构建不下载 SDK。`runClient` 构建 release DLL 后以 Vulkan backend 启动；JAR 在 `build/libs/`，DLL 在 `target/release/prime_pt.dll`。指定 `-PnativeLibrary=绝对路径` 可复用已有 DLL，其同目录必须保留安装器部署的四个 SDK DLL 与许可。`runClient -Prr=false` 跳过早期 SDK 接入，只运行原始 PT，之后启用 RR 需要重启。游戏验收由用户执行。
+安装器默认使用引擎 `target/streamline-sdk` 并设置当前进程 `STREAMLINE_SDK`。已有 SDK 可加 `-VerifyOnly`。Slang 从配置的 `SLANGC`、`VULKAN_SDK` 或 PATH 查找。`build-release.ps1` 校验已安装的 SDK，构建 `build/libs/` 下的 JAR 和 `target/release-lto/prime_pt.dll`，并列出 DLL 同目录的 Streamline 运行库与许可。`-Offline` 同时传给 Gradle 和 Cargo。默认 `release-lto` 使用 fat LTO，构建期和资源准备时编译的 Slang SPIR-V 均使用 `-g0`。
+
+`runClient` 使用同一 `release-lto` DLL 并以 Vulkan backend 启动，native 和 Streamline 夹具也默认使用该产物。指定 `-PnativeProfile=release` 可选择保留 Slang 调试信息的诊断构建。指定 `-PnativeLibrary=绝对路径` 可在 `runClient` 和 native 夹具复用已有 DLL，其同目录须包含 SDK 运行库与许可。`runClient -Prr=false` 跳过早期 SDK 接入并运行原始 PT。之后启用 RR 需要重启。游戏验收由用户执行。
 
 SER 在实际逻辑设备支持时默认开启，普通和 SER pipeline/SBT 在资源世代准备时一并建立，运行期只切换已准备的程序；不因偏好切换重新扫描资源、调用 Slang 或创建 SBT。缺能力时使用普通程序并记录原因。`-Pser=false` 只为尚无持久化设置的配置提供默认值。
+
+Vulkan 驱动管线快照保存在 `target/pipeline-cache`，资源世代发布和会话退出时保存。缺失、损坏或设备驱动不匹配时使用空缓存。Slang 编译缓存独立保存在 `target/shaders`。
 
 视频设置与本地 `/pt` 命令共用 `config/prime_pt.properties`，无须服务端权限；省略值查询，`/pt reset` 恢复默认：
 
@@ -78,6 +82,8 @@ SER 在实际逻辑设备支持时默认开启，普通和 SER pipeline/SBT 在�
 | `/pt quality 档位` | `dlaa` / `quality` / `balanced` / `performance`（默认）/ `ultra_performance` |
 | `/pt spp 数量`、`/pt bounces 顶点数` | 默认 1 / 12，均为 1..64 |
 | `/pt ev EV` | 默认 0，-16..16；自动曝光后的补偿，`exposure` 为别名 |
+
+「PT 显示」中的自动曝光强度默认 65%。它按比例应用测光目标 EV，0% 关闭自动调节。手动 EV 独立叠加。Prime DRT 的饱和度补偿、色相补偿和压缩起点默认分别为 5%、75% 和 0.4，调整只作用于呈现。
 
 视频设置中的「区块更新」按下表分配工作量。大于配额的单个 region 可单独发布，以保证大 region 仍能完成。常驻内存额度独立设置。
 

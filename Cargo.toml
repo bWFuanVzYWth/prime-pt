@@ -5,3 +5,10 @@ members = ["native", "crates/scene", "crates/world", "crates/renderer", "crates/
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = 0
+strip = "symbols"
