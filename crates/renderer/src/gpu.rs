@@ -17,6 +17,7 @@ mod materials;
 #[path = "region_match.rs"]
 mod region_match;
 use crate::{reconstruction::CameraFrame, streamline};
+use std::path::{Path, PathBuf};
 #[path = "exposure.rs"]
 mod exposure;
 #[path = "history.rs"]
@@ -670,6 +671,7 @@ pub struct Gpu {
     view: Option<View>,
     program_view: View,
     compiler: shader_build::RuntimeCompiler,
+    shader_source: PathBuf,
     generation: Option<MaterialGeneration>,
     renderer: Option<Renderer>,
     flights: Vec<Flight>,
@@ -728,10 +730,13 @@ impl Gpu {
                 queue_index,
                 false,
                 true,
+                None,
             )
         }
     }
 
+    /// `runtime_root` 指向已提取并校验的发行资源。开发宿主传 `None`，使用源码树与本机 Slang。
+    /// 发行资源的两套 shader 源码在会话期间保持有效，派生缓存写入同根 `cache/`。
     /// # Safety
     /// 句柄属于同一活动设备，已启用 RT pipeline、RayQuery、device address 与 position fetch；family/index
     /// 对应借出的 queue。宿主独占 queue，并在每次调用和销毁前等待前次命令完成。
@@ -747,7 +752,35 @@ impl Gpu {
         queue_index: u32,
         invocation_reorder: bool,
         ser_requested: bool,
+        runtime_root: Option<&Path>,
     ) -> Result<Self, Error> {
+        let (cache, prime_shaders, engine_shaders) = if let Some(root) = runtime_root {
+            (
+                root.join("cache"),
+                root.join("shaders/prime"),
+                root.join("shaders/engine"),
+            )
+        } else {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            (
+                root.join("../../target"),
+                root.join("shaders"),
+                root.join("../../../../shaders"),
+            )
+        };
+        let includes = [prime_shaders.as_path(), engine_shaders.as_path()];
+        let shader_cache = cache.join("shaders");
+        let compiler = if let Some(root) = runtime_root {
+            shader_build::RuntimeCompiler::from_executable(
+                &root.join("slang/slangc.exe"),
+                shader_cache,
+                &includes,
+                &[],
+            )?
+        } else {
+            shader_build::RuntimeCompiler::new(shader_cache, &includes, &[])?
+        };
+        let shader_source = prime_shaders.join("primary.slang");
         let raw = RawDevice {
             instance,
             physical_device: physical,
@@ -765,8 +798,7 @@ impl Gpu {
         };
         // SAFETY: 外部生命周期由导出会话契约维持；本对象不销毁宿主句柄。
         let mut context = unsafe { Context::from_raw(raw)? };
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        context.enable_pipeline_cache(&root.join("../../target/pipeline-cache"));
+        context.enable_pipeline_cache(&cache.join("pipeline-cache"));
         let attribute_slots =
             context.max_storage_buffer_range() / size_of::<[[u32; 4]; 3]>() as u32;
         let attribute_slot_limit = attribute_slots
@@ -804,11 +836,6 @@ impl Gpu {
         let solar = atmosphere.parameters().solar_irradiance_rgb();
         // 旧 Prime 的太阳基准是大气外法向辐照度 Y=8，太阳盘辐亮度由 shader 推导。
         let solar_y = 0.262_700_2 * solar[0] + 0.677_998_07 * solar[1] + 0.059_301_715 * solar[2];
-        let compiler = shader_build::RuntimeCompiler::new(
-            root.join("../../target/shaders"),
-            &[&root.join("shaders"), &root.join("../../../../shaders")],
-            &[],
-        )?;
         let program_view = View::new_scaled(
             &mut context,
             [1, 1],
@@ -868,6 +895,7 @@ impl Gpu {
             view: None,
             program_view,
             compiler,
+            shader_source,
             generation: None,
             renderer: None,
             flights: Vec::new(),
@@ -1204,7 +1232,6 @@ impl Gpu {
         if flows.len() != definitions.len() {
             return Err(Error::Invalid("材质Flow与输入定义数量不匹配"));
         }
-        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/primary.slang");
         let hit = materials::hit_features(definitions);
         let coverage = format!("-DPRIMEPT_COVERAGE_MASK={}", hit.coverage);
         let lights = if flows.iter().any(|flow| flow.emits()) {
@@ -1220,7 +1247,8 @@ impl Gpu {
                 .zip(definitions)
                 .map(|(flow, definition)| (flow, materials::variant(flow, definition))),
             openpbr::program::Template {
-                source: source
+                source: self
+                    .shader_source
                     .to_str()
                     .ok_or(Error::Invalid("shader路径不是UTF-8"))?,
                 entry: "shade_opaque",

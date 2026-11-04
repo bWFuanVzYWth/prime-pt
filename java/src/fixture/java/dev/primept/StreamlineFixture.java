@@ -9,10 +9,13 @@ import com.mojang.renderpearl.backend.vulkan.VulkanPhysicalDevice;
 import com.mojang.renderpearl.backend.vulkan.init.FeatureSet;
 import java.util.Set;
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
 
 /** 无窗口验证 early interposer、Vulkan 1.4 与宿主真实 feature 创建链。 */
 final class StreamlineFixture {
     public static void main(String[] arguments) throws Exception {
+        if (arguments.length == 1 && arguments[0].equals("--bundled"))
+            NativeRuntime.locateBundled(Path.of(".primept/runtime"));
         StreamlineBootstrap.install();
         require(StreamlineBootstrap.installed(), StreamlineBootstrap.status());
         StreamlineBootstrap.configureSdl();

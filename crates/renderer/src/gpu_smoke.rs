@@ -372,6 +372,7 @@ impl Host {
                     0,
                     true,
                     requested,
+                    None,
                 )?
             } else {
                 Gpu::attach(

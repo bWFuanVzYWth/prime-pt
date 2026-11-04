@@ -1,3 +1,7 @@
+import java.security.DigestInputStream
+import java.security.MessageDigest
+import java.util.HexFormat
+
 plugins {
     id 'net.fabricmc.fabric-loom' version '1.18.1'
 }
@@ -36,6 +40,9 @@ def nativeDll = new File(nativeOutputDir, 'prime_pt.dll')
 def nativeLibraryOverride = providers.gradleProperty('nativeLibrary')
 def nativeLibraryPath = nativeLibraryOverride.map { rootProject.file(it).absolutePath }
         .getOrElse(nativeDll.absolutePath)
+def slangVersion = new groovy.json.JsonSlurper().parse(rootProject.file('../../scripts/tools.json')).slang.version
+def pinnedSlang = rootProject.file("../../target/tools/slang/${slangVersion}/windows-x86_64/bin/slangc.exe")
+def slangCompiler = providers.environmentVariable('SLANGC').map { rootProject.file(it) }.getOrElse(pinnedSlang)
 
 loom {
     runs {
@@ -62,6 +69,7 @@ tasks.register('buildNative', Exec) {
     workingDir rootDir
     environment 'STREAMLINE_SDK', streamlineSdk
     environment 'CARGO_TARGET_DIR', cargoTargetDir.absolutePath
+    if (slangCompiler.isFile()) environment 'SLANGC', slangCompiler.absolutePath
     def args = ['cargo', 'build', '--profile', nativeProfile, '--locked', '--manifest-path', 'native/Cargo.toml']
     if (gradle.startParameter.offline) args.add('--offline')
     commandLine args
@@ -70,20 +78,114 @@ tasks.named('runClient') {
     if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
 }
 
-tasks.register('buildRelease') {
-    dependsOn tasks.named('build'), tasks.named('buildNative')
-    doLast {
-        def artifacts = [tasks.named('jar').get().archiveFile.get().asFile, nativeDll]
-        artifacts += ['sl.interposer.dll', 'sl.common.dll', 'sl.dlss_d.dll', 'nvngx_dlssd.dll',
-                'NVIDIA-Streamline.txt', 'streamline-licenses.md', 'nvngx_dlss.license.txt']
-                .collect { new File(nativeOutputDir, it) }
-        for (def artifact : artifacts) {
-            if (!artifact.isFile() || artifact.length() == 0) {
-                throw new GradleException("缺少构建产物 ${artifact.absolutePath}")
+def vcFiles = ['msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll']
+def latestCrt = { candidates ->
+    candidates.findAll { directory ->
+        directory.name ==~ /Microsoft\.VC\d+\.CRT/ && vcFiles.every { new File(directory, it).isFile() }
+    }.max { directory -> directory.parentFile.parentFile.name.tokenize('.').collect { it.padLeft(8, '0') }.join('.') }
+}
+def vcRedistDir = providers.gradleProperty('vcRedistDir').map { rootProject.file(it) }
+        .orElse(providers.environmentVariable('VCToolsRedistDir').map {
+            latestCrt(new File(rootProject.file(it), 'x64').listFiles() ?: [])
+        }).orElse(providers.provider {
+            def installer = providers.environmentVariable('ProgramFiles(x86)').orNull
+            def vswhere = installer == null ? null : new File(installer, 'Microsoft Visual Studio/Installer/vswhere.exe')
+            if (vswhere?.isFile()) {
+                def paths = providers.exec {
+                    commandLine vswhere, '-latest', '-products', '*', '-requires',
+                            'Microsoft.VisualStudio.Component.VC.Tools.x86.x64', '-utf8',
+                            '-find', 'VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT/msvcp140.dll'
+                }.standardOutput.asText.get().readLines()
+                def directory = latestCrt(paths.findAll { !it.isBlank() }.collect { new File(it).parentFile })
+                if (directory != null) return directory
             }
-            logger.lifecycle(artifact.absolutePath)
-        }
+            throw new GradleException('未找到 MSVC x64 CRT 可再发行目录，请用 -PvcRedistDir 指向 Microsoft.VC*.CRT')
+        })
+def nativeFiles = ['prime_pt.dll', 'sl.interposer.dll', 'sl.common.dll', 'sl.dlss_d.dll', 'nvngx_dlssd.dll',
+        'NVIDIA-Streamline.txt', 'streamline-licenses.md', 'nvngx_dlss.license.txt']
+def slangFiles = ['slangc.exe', 'slang-compiler.dll', 'slang-glslang.dll']
+def slangDistribution = slangCompiler.parentFile.parentFile
+def runtimeDirectory = layout.buildDirectory.dir('prime-runtime/windows-x86_64')
+def runtimeEntry = 'META-INF/primept/windows-x86_64'
+def bundleRuntime = tasks.register('bundleRuntime', Sync) {
+    dependsOn tasks.named('buildNative')
+    into runtimeDirectory
+    includeEmptyDirs = false
+    duplicatesStrategy = DuplicatesStrategy.FAIL
+    from(nativeOutputDir) { include nativeFiles }
+    from(vcRedistDir) { include vcFiles }
+    from(slangCompiler.parentFile) {
+        include slangFiles
+        into 'slang'
     }
+    // Slang 子进程从 exe 同目录加载其 CRT，与 Java 进程预加载的副本隔离。
+    from(vcRedistDir) {
+        include vcFiles
+        into 'slang'
+    }
+    from(slangDistribution) {
+        include 'LICENSE', 'LICENSES/**', 'third-party-notices/**'
+        into 'slang'
+    }
+    from('crates/renderer/shaders') {
+        include '**/*.slang'
+        into 'shaders/prime'
+    }
+    from('../../shaders') {
+        include '**/*.slang'
+        into 'shaders/engine'
+    }
+    doLast {
+        def directory = runtimeDirectory.get().asFile
+        def required = nativeFiles + vcFiles + (slangFiles + vcFiles).collect { 'slang/' + it } +
+                ['slang/LICENSE', 'shaders/prime/primary.slang', 'shaders/engine/pt/scene.slang']
+        for (def path : required) {
+            def file = new File(directory, path)
+            if (!file.isFile() || file.length() == 0) throw new GradleException("发行运行时缺少 ${path}")
+        }
+        for (def path : ['slang/LICENSES', 'slang/third-party-notices']) {
+            if (fileTree(new File(directory, path)).empty) throw new GradleException("发行运行时缺少 ${path}")
+        }
+        def prefix = directory.toPath()
+        def files = fileTree(directory).matching { exclude 'manifest.sha256' }.files.collectEntries {
+            [(prefix.relativize(it.toPath()).toString().replace('\\', '/')): it]
+        }.sort()
+        def manifest = new File(directory, 'manifest.sha256')
+        manifest.setText(files.collect { path, file ->
+            def hash = MessageDigest.getInstance('SHA-256')
+            file.withInputStream { new DigestInputStream(it, hash).transferTo(OutputStream.nullOutputStream()) }
+            HexFormat.of().formatHex(hash.digest()) + '  ' + path + '\n'
+        }.join(), 'UTF-8')
+    }
+}
+tasks.named('jar') {
+    dependsOn bundleRuntime
+    from(runtimeDirectory) { into runtimeEntry }
+    into('META-INF/licenses/prime-pt') {
+        from('LICENSE', 'NOTICE')
+        from('licenses') { into 'licenses' }
+        from('crates/minecraft/assets/vanilla_pbr/SOURCE-LICENSE.md') { into 'vanilla_pbr' }
+    }
+    into('META-INF/licenses/simple-engine') {
+        from('../../LICENSE', '../../NOTICE', '../../THIRD_PARTY_NOTICES.md')
+        from('../../LICENSES') { into 'LICENSES' }
+        from(files('../../shaders/restir_pt/NOTICE.md', '../../shaders/restir_pt/LICENSE.txt')) { into 'shaders/restir_pt' }
+    }
+}
+def releaseJar = tasks.named('jar').flatMap { it.archiveFile }
+def bundledRuntimeFixture = tasks.register('bundledRuntimeFixture', JavaExec) {
+    dependsOn fixtureClasses, tasks.named('jar')
+    classpath = files(sourceSets.fixture.output, releaseJar)
+    mainClass = 'dev.primept.BundledRuntimeFixture'
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    workingDir layout.buildDirectory
+    environment.remove('SLANGC')
+    environment.remove('VULKAN_SDK')
+    args rootProject.file('target/单包 runtime fixture').absolutePath
+}
+tasks.register('buildRelease') {
+    dependsOn tasks.named('build'), bundledRuntimeFixture
+    doLast { logger.lifecycle(releaseJar.get().asFile.absolutePath) }
 }
 tasks.register('wireFixture', JavaExec) {
     dependsOn fixtureClasses
@@ -138,11 +240,21 @@ tasks.register('sourceChangesFixture', JavaExec) {
 
 tasks.register('streamlineFixture', JavaExec) {
     dependsOn fixtureClasses
-    if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
-    classpath = sourceSets.fixture.runtimeClasspath
+    if (providers.gradleProperty('bundledRuntime').getOrElse('false').toBoolean()) {
+        dependsOn tasks.named('jar')
+        classpath = files(sourceSets.fixture.runtimeClasspath - sourceSets.main.output, releaseJar)
+        workingDir rootProject.file('target/bundled-streamline-fixture')
+        doFirst { workingDir.mkdirs() }
+        args '--bundled'
+        environment.remove('SLANGC')
+        environment.remove('VULKAN_SDK')
+    } else {
+        if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
+        classpath = sourceSets.fixture.runtimeClasspath
+        systemProperty 'primept.native', nativeLibraryPath
+    }
     mainClass = 'dev.primept.StreamlineFixture'
     jvmArgs '--enable-native-access=ALL-UNNAMED', '-Dorg.lwjgl.vulkan.explicitInit=true'
-    systemProperty 'primept.native', nativeLibraryPath
 }
 
 tasks.register('frameChartFixture', JavaExec) {

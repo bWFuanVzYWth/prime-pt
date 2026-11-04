@@ -4,7 +4,6 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.FunctionDescriptor;
 import java.lang.foreign.Linker;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -39,12 +38,13 @@ public final class StreamlineBootstrap {
             return;
         }
         try {
-            var library = Path.of(System.getProperty("primept.native")).toAbsolutePath();
+            var location = NativeRuntime.locate();
+            var library = location.library();
             interposer = library.resolveSibling("sl.interposer.dll");
             for (String name : new String[] {"sl.interposer.dll", "sl.common.dll", "sl.dlss_d.dll", "nvngx_dlssd.dll"})
                 if (!Files.isRegularFile(library.resolveSibling(name)))
                     throw new IllegalStateException("缺少 " + library.resolveSibling(name));
-            var symbols = SymbolLookup.libraryLookup(library, Arena.global());
+            var symbols = NativeRuntime.open(location, Arena.global());
             var linker = Linker.nativeLinker();
             error = linker.downcallHandle(symbols.find("prime_error").orElseThrow(), FunctionDescriptor.of(ADDRESS));
             var bootstrap = linker.downcallHandle(symbols.find("prime_streamline_bootstrap").orElseThrow(), FunctionDescriptor.of(JAVA_INT));

@@ -7,7 +7,6 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.nio.ByteBuffer;
-import java.nio.file.Path;
 import static java.lang.foreign.ValueLayout.*;
 
 /** 同步 FFM 边界；CPU 包借用到返回，宿主图像必须保活至 GPU 提交完成。 */
@@ -34,7 +33,13 @@ final class Native implements AutoCloseable {
     }
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex, boolean ser, boolean requested) {
-        var symbols = SymbolLookup.libraryLookup(Path.of(System.getProperty("primept.native")), arena);
+        SymbolLookup symbols;
+        try {
+            symbols = NativeRuntime.open(NativeRuntime.locate(), arena);
+        } catch (RuntimeException | Error failure) {
+            arena.close();
+            throw failure;
+        }
         var create = ser
                 ? bind(symbols, "prime_create_options", FunctionDescriptor.of(JAVA_LONG,
                         JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT))

@@ -17,6 +17,7 @@
 mod changes;
 mod diagnostics;
 mod frame_environment;
+mod runtime;
 use atmosphere::SolarOrbit;
 use prime_renderer as gpu;
 use prime_renderer::streamline;
@@ -45,6 +46,12 @@ pub(crate) enum Error {
     /// Vulkan 加载、资源或命令失败。
     #[error(transparent)]
     Gpu(#[from] gpu::Error),
+    /// 发行版原生工具或 shader 源路径无法访问。
+    #[error("发行资源 {path}：{source}")]
+    RuntimePath {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
     /// Streamline 初始化或全局退役失败。
     #[error(transparent)]
     Streamline(#[from] streamline::Error),
@@ -185,6 +192,31 @@ pub extern "C" fn prime_error() -> *const c_char {
     LAST_ERROR.with(|slot| slot.borrow().as_ptr())
 }
 
+/// 在首次尝试创建会话前配置发行资源根目录。路径为 UTF-8 绝对路径，不含终止符。
+/// 成功返回 0，重复指定同一目录也成功。配置固定到 DLL 卸载，失败返回 -1 并保留诊断。
+/// 宿主须保持该目录下的编译器和 shader 源有效，缓存写入同根 `cache/`。
+///
+/// # Safety
+/// 调用者借出 `len` 字节的有效只读连续内存，直至调用返回。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_set_runtime_root(data: *const u8, len: u64) -> i32 {
+    guarded(-1, || {
+        // Windows 长路径最多 32767 个 UTF-16 单元；四倍为 UTF-8 的保守上界。
+        if data.is_null() || !(1..=4 * 32767).contains(&len) {
+            return Err(Error::Input("发行资源路径指针或长度无效"));
+        }
+        // SAFETY: 内存有效性由宿主保证，长度已限制在 isize::MAX 内。
+        let bytes = unsafe { std::slice::from_raw_parts(data, len as usize) };
+        let path =
+            std::str::from_utf8(bytes).map_err(|_| Error::Input("发行资源路径不是 UTF-8"))?;
+        if path.contains('\0') {
+            return Err(Error::Input("发行资源路径包含 NUL"));
+        }
+        runtime::configure(std::path::Path::new(path))?;
+        Ok(0)
+    })
+}
+
 /// 在宿主创建 Vulkan instance/device 前安装 Streamline；失败返回 -1 并保留来源。
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_streamline_bootstrap() -> i32 {
@@ -260,6 +292,7 @@ pub unsafe extern "C" fn prime_create_options(
                 queue_index,
                 flags & 1 != 0,
                 flags & 2 == 0,
+                runtime::root(),
             )?
         };
         // 属性槽按二次幂增长，额外留四分之一给空洞及过渡范围。
