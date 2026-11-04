@@ -174,9 +174,7 @@ impl Scene {
             }));
             old.fragment_quads(replaced)
         });
-        job.pending_tints -= self
-            .compact
-            .cancel_fragments(ticket, mask, job.interactive)?;
+        self.compact.cancel_fragments(job, mask)?;
         self.compact.todo.remove(&work);
         let mut discarded = 0;
         job.sections.retain(|(fragment, mesh)| {
@@ -192,7 +190,6 @@ impl Scene {
             .retain(|patch| !mask.contains(patch.fragment()));
         job.color_updates
             .retain(|entry| !mask.contains(entry.fragment));
-        job.pending_tint_mask = change_runtime::subtract(job.pending_tint_mask, mask);
         job.tint_mask = change_runtime::subtract(job.tint_mask, mask);
         job.compiled = change_runtime::subtract(job.compiled, mask);
         job.verify = change_runtime::subtract(job.verify, mask);

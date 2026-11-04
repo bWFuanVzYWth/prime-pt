@@ -65,6 +65,10 @@ pub struct WorkBudget {
     pub planner_visits: usize,
     /// 最多准备并发布的 region 变化数量。
     pub publications: usize,
+    /// 几何发布批次允许重建的 quad 数，单个超额 region 单独推进。
+    pub publish_geometry_quads: usize,
+    /// 属性发布批次允许写入的 quad 数，单个超额 region 单独推进。
+    pub publish_attribute_quads: usize,
     /// 源就绪、颜色续接、通知/失效和退休各队列每轮的独立推进额度。
     pub maintenance: usize,
 }
@@ -75,6 +79,8 @@ impl Default for WorkBudget {
             mesh_slabs: 128,
             planner_visits: 1024,
             publications: 64,
+            publish_geometry_quads: 131_072,
+            publish_attribute_quads: 262_144,
             maintenance: 256,
         }
     }

@@ -1,6 +1,7 @@
 //! 变化批先验证再排队；真实block依赖只在world传播一次。
 use super::*;
 use crate::SourceChange;
+use crate::store::SourceDelta;
 
 #[derive(Default)]
 pub(super) struct TintSweep {
@@ -157,7 +158,7 @@ impl Scene {
 
     pub(super) fn process_changes(&mut self) -> Result<(), Error> {
         self.progress.raw_invalidations += std::mem::take(&mut self.pending_raw);
-        let mut sources = BTreeMap::<[i32; 3], ([u8; 3], [u8; 3])>::new();
+        let mut sources = std::collections::BTreeSet::new();
         let mut tint_all = false;
         let mut biome_columns = std::collections::BTreeSet::new();
         for _ in 0..self.work_budget.maintenance {
@@ -165,13 +166,8 @@ impl Scene {
                 break;
             };
             match change {
-                SourceChange::BlockRange {
-                    section,
-                    minimum,
-                    maximum,
-                } => merge_range(&mut sources, section, minimum, maximum),
-                SourceChange::SectionSource(section) => {
-                    merge_range(&mut sources, section, [0; 3], [16; 3])
+                SourceChange::BlockRange { section, .. } | SourceChange::SectionSource(section) => {
+                    sources.insert(section);
                 }
                 SourceChange::ColumnSource {
                     x,
@@ -182,13 +178,11 @@ impl Scene {
                     biome,
                 } => {
                     if geometry {
-                        for key in self
-                            .compact
-                            .store
-                            .keys_in_column(x, z, minimum_y, maximum_y)
-                        {
-                            merge_range(&mut sources, key, [0; 3], [16; 3]);
-                        }
+                        sources.extend(
+                            self.compact
+                                .store
+                                .keys_in_column(x, z, minimum_y, maximum_y),
+                        );
                     }
                     if biome {
                         biome_columns.insert((x, z));
@@ -210,11 +204,11 @@ impl Scene {
         self.progress.unique_invalidations +=
             sources.len() + biome_columns.len() + usize::from(tint_all);
         let source_changed = !sources.is_empty();
-        for (source, (minimum, maximum)) in sources {
+        for source in sources {
             if self.compact.generation != 0 {
                 self.compact.refresh_source(source)?;
-            } else {
-                self.dirty_source_output(source, minimum, maximum)?;
+            } else if let Some(handle) = self.state.find(chunk(region(source))) {
+                self.invalidate_fragments(handle, fragments(1 << slot(source)), false)?;
             }
         }
         if tint_all {
@@ -232,56 +226,38 @@ impl Scene {
         Ok(())
     }
 
-    pub(super) fn dirty_source_output(
-        &mut self,
-        source: [i32; 3],
-        minimum: [u8; 3],
-        maximum: [u8; 3],
-    ) -> Result<(), Error> {
-        self.dirty_source_output_with_priority(source, minimum, maximum, false)
-    }
-
-    pub(super) fn dirty_source_output_with_priority(
-        &mut self,
-        source: [i32; 3],
-        minimum: [u8; 3],
-        maximum: [u8; 3],
-        interactive: bool,
-    ) -> Result<(), Error> {
-        if self.compact.generation == 0 {
-            if let Some(handle) = self.state.find(chunk(region(source))) {
-                self.invalidate_fragments(handle, fragments(1 << slot(source)), false)?;
-            }
-            return Ok(());
-        }
-        let mut regions = BTreeMap::<[i32; 3], FragmentMask>::new();
-        for dependency in prime_minecraft::dependent_slabs(source, minimum, maximum)? {
-            if dependency.section[1] < self.height[0] || dependency.section[1] >= self.height[1] {
-                continue;
-            }
-            if dependency.section != source
-                && matches!(
-                    self.compact.store.lookup(dependency.section),
-                    crate::store::SourceState::Air
-                )
+    pub(super) fn dirty_source_outputs(&mut self, deltas: &[SourceDelta]) -> Result<(), Error> {
+        // 同包源已共同发布；先合并每个region的片段并集，再撤销对应候选。
+        let mut regions = BTreeMap::<[i32; 3], ([u64; 4], bool)>::new();
+        for delta in deltas {
+            let Some(range) = delta.changed else { continue };
+            for dependency in
+                prime_minecraft::dependent_slabs(delta.key, range.min, range.max_exclusive)?
             {
-                // 已确认空的中心无需相邻源；它自己的实际变化仍走完整失效。
-                continue;
-            }
-            let region = region(dependency.section);
-            let mask = regions.entry(region).or_default();
-            let section = slot(dependency.section);
-            for slab in 0..4 {
-                if dependency.slabs & (1 << slab) != 0 {
-                    mask.set(section * 4 + slab)?;
+                if dependency.section[1] < self.height[0] || dependency.section[1] >= self.height[1]
+                {
+                    continue;
                 }
+                if dependency.section != delta.key
+                    && matches!(
+                        self.compact.store.lookup(dependency.section),
+                        crate::store::SourceState::Air
+                    )
+                {
+                    // 已确认空的中心无需相邻源；它自己的实际变化仍走完整失效。
+                    continue;
+                }
+                let (words, interactive) = regions.entry(region(dependency.section)).or_default();
+                let fragment = slot(dependency.section) * 4;
+                words[fragment / 64] |= u64::from(dependency.slabs) << (fragment % 64);
+                *interactive |= delta.interactive;
             }
         }
-        for (key, mask) in regions {
+        for (key, (words, interactive)) in regions {
             if let Some(handle) = self.state.find(chunk(key)) {
                 self.invalidate_fragments(
                     handle,
-                    mask,
+                    FragmentMask::from_words(words),
                     interactive && self.state.is_visible(handle),
                 )?;
             }
@@ -323,12 +299,8 @@ impl Scene {
                 // 待建网片段会读取本次接受的源，尚无输出需要丢弃。
                 return Ok(());
             }
-            let cancelled_tints =
-                self.compact
-                    .cancel_fragments(ticket, mask, self.jobs[index].interactive)?;
             let job = &mut self.jobs[index];
-            job.pending_tints -= cancelled_tints;
-            job.pending_tint_mask = subtract(job.pending_tint_mask, mask);
+            self.compact.cancel_fragments(job, mask)?;
             job.sections.retain(|(fragment, mesh)| {
                 if mask.contains(*fragment) {
                     self.ledger.owned -= mesh.quads.len();
@@ -347,11 +319,9 @@ impl Scene {
             job.verify = subtract(job.verify, mask);
             job.finished = subtract(job.finished, mask);
             job.unavailable &= !affected;
-            job.dirty = fragment_sections(job.changed);
-            job.received = 0;
-            for section in 0..64 {
-                refresh_received(job, section);
-            }
+            job.dirty |= affected;
+            // 每个受影响section至少有一个片段刚失效；其余section保持完成位。
+            job.received &= !affected;
             self.progress.cancelled_slabs += mask.iter().count();
             if self.compact.generation != 0 {
                 self.compact.register(&self.jobs[index])?;
@@ -505,8 +475,7 @@ impl Scene {
                 return Ok(());
             }
             job.tint_mask = union(job.tint_mask, mask);
-            job.pending_tints -= self.compact.cancel_tints(job.ticket, mask);
-            job.pending_tint_mask = subtract(job.pending_tint_mask, mask);
+            self.compact.cancel_tints(job, mask);
             job.tint_patches
                 .retain(|patch| !mask.contains(patch.fragment()));
             job.color_updates
@@ -529,14 +498,6 @@ impl Scene {
     }
 }
 
-pub(super) fn refresh_received(job: &mut RegionJob, section: usize) {
-    if (section * 4..section * 4 + 4)
-        .all(|fragment| !job.changed.contains(fragment) || job.finished.contains(fragment))
-    {
-        job.received |= (1 << section) & job.dirty;
-    }
-}
-
 pub(super) fn union(a: FragmentMask, b: FragmentMask) -> FragmentMask {
     FragmentMask::from_words(std::array::from_fn(|word| {
         a.words()[word] | b.words()[word]
@@ -553,19 +514,4 @@ fn validate_section(key: [i32; 3]) -> Result<(), Error> {
     } else {
         Ok(())
     }
-}
-fn merge_range(
-    map: &mut BTreeMap<[i32; 3], ([u8; 3], [u8; 3])>,
-    key: [i32; 3],
-    minimum: [u8; 3],
-    maximum: [u8; 3],
-) {
-    map.entry(key)
-        .and_modify(|(low, high)| {
-            for axis in 0..3 {
-                low[axis] = low[axis].min(minimum[axis]);
-                high[axis] = high[axis].max(maximum[axis]);
-            }
-        })
-        .or_insert((minimum, maximum));
 }

@@ -18,7 +18,7 @@ pub(crate) struct SceneInfo {
     pub instances: u64,
     pub triangle_bytes: u64,
     pub attribute_bytes: u64,
-    pub blas_wait_ns: u64,
+    pub as_wait_ns: u64,
     pub tlas_ns: u64,
     pub attribute_ns: u64,
 }
@@ -27,7 +27,7 @@ pub(crate) struct SceneInfo {
 pub(crate) struct Profile {
     stats: FrameStats<STAGES>,
     sequence: u64,
-    // 视图准备、三角编码、属性打包、BLAS、属性分配/写入、TLAS、提交/回收。
+    // 视图准备、三角编码、属性打包、AS与共同等待、属性分配/写入、TLAS准备、提交/回收。
     pub scene: [u64; 7],
     // prime_plan内同步推进的建网属于网格项，从Java计入的规划墙钟中转移。
     pub plan_mesh_ns: u64,
@@ -182,7 +182,7 @@ impl Profile {
                 info.instances,
                 info.triangle_bytes,
                 info.attribute_bytes,
-                info.blas_wait_ns,
+                info.as_wait_ns,
                 info.tlas_ns,
                 info.attribute_ns,
             ]
@@ -301,7 +301,7 @@ mod tests {
                     instances: 64,
                     triangle_bytes: 6 * 1024 * 1024,
                     attribute_bytes: 3 * 1024 * 1024,
-                    blas_wait_ns: 1_000_000,
+                    as_wait_ns: 1_000_000,
                     tlas_ns: 2_000_000,
                     attribute_ns: 1_000_000,
                 });

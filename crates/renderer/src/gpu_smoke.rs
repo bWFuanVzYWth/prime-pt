@@ -957,7 +957,7 @@ fn hardware_pt_ray_query_alpha() -> Result<(), Box<dyn std::error::Error>> {
         descriptors.resize(36, Binding::StorageBuffer(output));
         descriptors.push(Binding::StorageBuffer(gpu.scene.instance_quad_bases));
         let bindings = Bindings::new(&mut gpu.context, &descriptors)?;
-        let programs = programs(&[], false);
+        let programs = programs(&[], false, gpu.generation.as_ref().unwrap().hit);
         let reference = vulkan::native::RayTracingPipeline::new(
             &mut gpu.context,
             bindings,

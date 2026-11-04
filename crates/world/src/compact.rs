@@ -186,7 +186,7 @@ impl Sources {
         }
         Ok(())
     }
-    pub(super) fn forget_job(&mut self, ticket: Ticket) {
+    pub(super) fn forget_job(&mut self, ticket: Ticket, has_tints: bool) {
         if let Some(groups) = self.registrations.remove(&ticket) {
             for (_, group) in groups {
                 self.store.forget(group);
@@ -204,16 +204,20 @@ impl Sources {
                 }
             }
         }
-        self.tints.retain(|tint| tint.ticket != ticket);
-        self.prune_tints();
+        if has_tints {
+            let before = self.tints.len();
+            self.tints.retain(|tint| tint.ticket != ticket);
+            if self.tints.len() != before {
+                self.prune_tints();
+            }
+        }
     }
     pub(super) fn cancel_fragments(
         &mut self,
-        ticket: Ticket,
+        job: &mut RegionJob,
         mask: FragmentMask,
-        interactive: bool,
-    ) -> Result<usize, Error> {
-        if let Some(groups) = self.registrations.get(&ticket) {
+    ) -> Result<(), Error> {
+        if let Some(groups) = self.registrations.get(&job.ticket) {
             for fragment in mask.iter() {
                 if let Some(&group) = groups.get(&(fragment / 4)) {
                     let work = WorkId {
@@ -225,28 +229,27 @@ impl Sources {
                         self.capacity_index[usize::from(lane)].remove(&(required, work));
                     }
                     self.minimums.remove(&work);
-                    self.todo.insert(group, interactive)?;
+                    self.todo.insert(group, job.interactive)?;
                 }
             }
         }
-        let before = self.tints.len();
-        self.tints
-            .retain(|tint| tint.ticket != ticket || !mask.contains(tint.fragment));
-        let cancelled = before - self.tints.len();
-        if cancelled != 0 {
-            self.prune_tints();
-        }
-        Ok(cancelled)
+        self.cancel_tints(job, mask);
+        Ok(())
     }
-    pub(super) fn cancel_tints(&mut self, ticket: Ticket, mask: FragmentMask) -> usize {
+    pub(super) fn cancel_tints(&mut self, job: &mut RegionJob, mask: FragmentMask) {
+        let remaining = change_runtime::subtract(job.pending_tint_mask, mask);
+        if remaining == job.pending_tint_mask {
+            return;
+        }
         let before = self.tints.len();
         self.tints
-            .retain(|tint| tint.ticket != ticket || !mask.contains(tint.fragment));
+            .retain(|tint| tint.ticket != job.ticket || !mask.contains(tint.fragment));
         let cancelled = before - self.tints.len();
+        job.pending_tints -= cancelled;
+        job.pending_tint_mask = remaining;
         if cancelled != 0 {
             self.prune_tints();
         }
-        cancelled
     }
     pub(super) fn register(&mut self, job: &RegionJob) -> Result<(), Error> {
         // 同一ticket的dirty只取并集，分组仅在整job退休时删除；数量相等即已注册完整。
@@ -298,7 +301,7 @@ impl Sources {
         self.indices.insert(request, index);
         index
     }
-    pub(super) fn prune_tints(&mut self) {
+    fn prune_tints(&mut self) {
         if self.tints.is_empty() {
             self.queries.clear();
             self.indices.clear();
@@ -317,6 +320,9 @@ impl Sources {
                 self.queries[count] = self.queries[index];
                 count += 1;
             }
+        }
+        if count == self.queries.len() {
+            return;
         }
         self.queries.truncate(count);
         self.indices.clear();
@@ -509,20 +515,13 @@ impl Scene {
         let deltas = self.compact.store.accept_batch(accepted)?;
         self.captures
             .retain(|capture| !tickets.contains(&capture.wire.id));
-        for delta in deltas {
+        for delta in &deltas {
             if let Some(probe) = self.compact.probes.remove(&delta.key) {
                 self.compact.store.forget(probe);
                 self.compact.probe_spatial.remove(delta.key);
             }
-            if let Some(range) = delta.changed {
-                self.dirty_source_output_with_priority(
-                    delta.key,
-                    range.min,
-                    range.max_exclusive,
-                    delta.interactive,
-                )?;
-            }
         }
+        self.dirty_source_outputs(&deltas)?;
         self.compile_sources(catalog)
     }
     /// 持久来源按完整输入键去重后的颜色请求；原版与必要自定义回调共同续接。

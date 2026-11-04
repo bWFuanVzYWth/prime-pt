@@ -30,6 +30,39 @@ fn main() -> Result<(), shader_build::Error> {
             },
         })
         .collect();
+    for (output, args) in [
+        (
+            "anyhit-cutout.spv",
+            &["-fp-mode", "precise", "-DPRIMEPT_COVERAGE_MASK=8"][..],
+        ),
+        (
+            "anyhit-front.spv",
+            &["-fp-mode", "precise", "-DPRIMEPT_COVERAGE_MASK=32"][..],
+        ),
+    ] {
+        recipes.push(Recipe {
+            source: "shaders/primary.slang",
+            entry: "primary_anyhit",
+            stage: "anyhit",
+            output,
+            target: Target::Spirv("spirv_1_4"),
+            args,
+        });
+    }
+    recipes.push(Recipe {
+        source: "shaders/primary.slang",
+        entry: "primary_closesthit",
+        stage: "closesthit",
+        output: "closesthit-flat.spv",
+        target: Target::Spirv("spirv_1_4"),
+        args: &[
+            "-fp-mode",
+            "precise",
+            "-capability",
+            "spvRayTracingPositionFetchKHR",
+            "-DPRIMEPT_AUTHORED_NORMAL=0",
+        ],
+    });
     recipes.push(Recipe {
         source: "shaders/primary.slang",
         entry: "render_main",

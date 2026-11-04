@@ -91,44 +91,32 @@ public final class Renderer {
         }
         for (int i = 0; i < FrameChart.STAGES; i++) STAGES.putLong(i * 8, 0);
         if(renderer==null)throw new IllegalStateException("首次资源加载尚未准备Prime资源所有者");
+        var updateBudget = Settings.updateBudget();
+        boolean resetWorld = CAPTURE.select(minecraft.level) || resetRequested;
+        long started = System.nanoTime();
+        try (var fence = encoder.createFence()) {
+            encoder.submit();
+            long submitting = System.nanoTime() - started;
+            try {
+                // 同一帧内先推进纯CPU阶段。重置、程序切换和绘制才消费GPU完成保证。
+                if (!resetWorld) prepareFrame(minecraft, updateBudget);
+            } finally {
+                long waiting = System.nanoTime();
+                if (!fence.awaitCompletion(5_000_000_000L)) throw fenceTimeout();
+                STAGES.putLong(0, submitting + System.nanoTime() - waiting);
+            }
+        }
         long stage = System.nanoTime();
-        await();
-        STAGES.putLong(0, System.nanoTime() - stage);
-        stage = System.nanoTime();
         renderer.ser(Settings.requestedSer());
-        if (CAPTURE.select(minecraft.level) || resetRequested) {
+        if (resetWorld) {
             renderer.reset();
             biomeWorld=null;
             resetRequested = false;
             lastCompleted = 0;
             FrameChart.clear();
         }
-        if(biomeWorld!=minecraft.level){renderer.biomeWorld(SourceResources.prepared().biomes.world(minecraft.level));biomeWorld=minecraft.level;}
-        var invalidations=CHANGES.batch(minecraft.level,1024);
-        if(invalidations!=null){renderer.invalidateBatch(invalidations);CHANGES.accepted();}
-        STAGES.putLong(8, System.nanoTime() - stage);
-        stage = System.nanoTime();
-        int count = renderer.plan(CAMERA, minecraft.options.getEffectiveRenderDistance(),
-                minecraft.level.getMinSectionY(), minecraft.level.getMaxSectionY() + 1, REQUESTS);
-        STAGES.putLong(16, System.nanoTime() - stage);
-        if (count > 0) {
-            try {
-                stage = System.nanoTime();
-                var packet = CAPTURE.next(minecraft, REQUESTS, count);
-                STAGES.putLong(24, System.nanoTime() - stage);
-                stage = System.nanoTime();
-                renderer.batch(packet);
-                STAGES.putLong(32, System.nanoTime() - stage);
-            }
-            catch (RuntimeException | Error failure) {
-                for (int i = 0; i < count; i++) {
-                    try { renderer.failCapture(REQUESTS.getLong(i * 24)); }
-                    catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
-                }
-                throw failure;
-            }
-        }
-        long tintStarted=System.nanoTime();completeTints(minecraft);STAGES.putLong(8,STAGES.getLong(8)+System.nanoTime()-tintStarted);
+        STAGES.putLong(8, STAGES.getLong(8) + System.nanoTime() - stage);
+        if (resetWorld) prepareFrame(minecraft, updateBudget);
         int medium=switch(minecraft.gameRenderer.mainCamera().getFluidInCamera()){case WATER->1;case LAVA->2;default->0;};
         renderer.cameraMedium(medium);
         if (!(target.getColorTexture() instanceof VulkanGpuTexture texture)
@@ -152,12 +140,48 @@ public final class Renderer {
         if(renderer.profile(elapsed, STAGES, PROFILE, FrameChart.takeColumns())>0)FrameChart.update(PROFILE);
     }
 
+    /** 仅更新 CPU 世界、捕获票据和 tint 候选，不访问 GPU 所有者。 */
+    private static void prepareFrame(Minecraft minecraft, UpdateBudget updateBudget) {
+        long stage = System.nanoTime();
+        renderer.updateBudget(updateBudget);
+        if(biomeWorld!=minecraft.level){renderer.biomeWorld(SourceResources.prepared().biomes.world(minecraft.level));biomeWorld=minecraft.level;}
+        var invalidations=CHANGES.batch(minecraft.level,1024);
+        if(invalidations!=null){renderer.invalidateBatch(invalidations);CHANGES.accepted();}
+        STAGES.putLong(8, STAGES.getLong(8) + System.nanoTime() - stage);
+        stage = System.nanoTime();
+        REQUESTS.clear().limit(updateBudget.captures * 24);
+        int count = renderer.plan(CAMERA, minecraft.options.getEffectiveRenderDistance(),
+                minecraft.level.getMinSectionY(), minecraft.level.getMaxSectionY() + 1, REQUESTS);
+        STAGES.putLong(16, System.nanoTime() - stage);
+        if (count > 0) {
+            try {
+                stage = System.nanoTime();
+                var packet = CAPTURE.next(minecraft, REQUESTS, count);
+                STAGES.putLong(24, System.nanoTime() - stage);
+                stage = System.nanoTime();
+                renderer.batch(packet);
+                STAGES.putLong(32, System.nanoTime() - stage);
+            }
+            catch (RuntimeException | Error failure) {
+                for (int i = 0; i < count; i++) {
+                    try { renderer.failCapture(REQUESTS.getLong(i * 24)); }
+                    catch (RuntimeException | Error cleanup) { failure.addSuppressed(cleanup); }
+                }
+                throw failure;
+            }
+        }
+        long tintStarted=System.nanoTime();completeTints(minecraft);STAGES.putLong(8,STAGES.getLong(8)+System.nanoTime()-tintStarted);
+    }
+
     private static void await() {
         try (var fence = encoder.createFence()) {
             encoder.submit();
-            if (!fence.awaitCompletion(5_000_000_000L))
-                throw new IllegalStateException("Prime PT 宿主 GPU 提交未完成；资源保留到进程退出");
+            if (!fence.awaitCompletion(5_000_000_000L)) throw fenceTimeout();
         }
+    }
+
+    private static IllegalStateException fenceTimeout() {
+        return new IllegalStateException("Prime PT 宿主 GPU 提交未完成，资源保留到进程退出");
     }
 
     /** 世界替换延迟到下次 render 的完成边界处理。 */

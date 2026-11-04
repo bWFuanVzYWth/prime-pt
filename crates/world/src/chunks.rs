@@ -130,7 +130,7 @@ pub struct Scene {
     interactive_jobs: usize,
     recovered: BTreeMap<[i32; 3], PartialRegion>,
     candidate_sources: BTreeMap<[i32; 3], Vec<([i32; 3], crate::store::SourceStamp)>>,
-    candidate_epochs: BTreeMap<[i32; 3], u64>,
+    candidate_epochs: BTreeMap<[i32; 3], (u64, bool)>,
     input_epoch: Option<u64>,
     masks: BTreeMap<[i32; 3], Dirty>,
     captures: Vec<PendingCapture>,
@@ -153,6 +153,9 @@ pub struct Scene {
     retirement_remaining: usize,
     tint_remaining: usize,
     publication_remaining: usize,
+    publication_retry: [Option<Change>; 2],
+    publication_work: [usize; 2],
+    prepared_publication_work: [usize; 2],
     ready_used: usize,
     tint_used: usize,
     retirement_used: usize,
@@ -300,6 +303,9 @@ impl Scene {
             retirement_remaining: WorkBudget::default().maintenance,
             tint_remaining: WorkBudget::default().maintenance,
             publication_remaining: WorkBudget::default().publications,
+            publication_retry: [None; 2],
+            publication_work: [0; 2],
+            prepared_publication_work: [0; 2],
             ready_used: 0,
             tint_used: 0,
             retirement_used: 0,
@@ -350,6 +356,7 @@ impl Scene {
         self.state = state;
         self.batch.clear();
         self.pending.clear();
+        self.publication_retry = [None; 2];
         self.removes.clear();
         self.view.clear();
         self.jobs.clear();
@@ -572,11 +579,7 @@ impl Scene {
 
     fn drop_job(&mut self, index: usize) -> RegionJob {
         let job = self.remove_job(index);
-        self.compact.forget_job(job.ticket);
-        self.compact
-            .tints
-            .retain(|pending| pending.ticket != job.ticket);
-        self.compact.prune_tints();
+        self.compact.forget_job(job.ticket, job.pending_tints != 0);
         self.release_captures(job.ticket);
         self.ledger.owned -= job
             .sections
@@ -881,6 +884,7 @@ impl Scene {
                 Err(error) => return Err(error.into()),
             }
         }
+        self.reserve_publication_retry(bounds)?;
         let hold_edit_slot = self.interactive_jobs != 0 && self.turn % 4 != 0;
         let result = cm::plan(
             &mut self.state,
@@ -891,6 +895,7 @@ impl Scene {
                 switches: self
                     .publication_remaining
                     .min(SWITCHES)
+                    .saturating_sub(self.pending.len())
                     .saturating_sub(usize::from(hold_edit_slot)),
             },
             &mut self.batch,
@@ -1369,11 +1374,7 @@ impl Scene {
             }
             let job = self.remove_job(index);
             let source_stamps = self.compact.job_sources(job.ticket);
-            self.compact.forget_job(job.ticket);
-            self.compact
-                .tints
-                .retain(|pending| pending.ticket != job.ticket);
-            self.compact.prune_tints();
+            self.compact.forget_job(job.ticket, job.pending_tints != 0);
             self.release_captures(job.ticket);
             let partial = job
                 .sections
@@ -1450,7 +1451,8 @@ impl Scene {
                 self.ledger.owned -= rejected.resource.owned_quads();
             } else {
                 self.install_candidate_sources(job.region, source_stamps);
-                self.candidate_epochs.insert(job.region, job.epoch);
+                self.candidate_epochs
+                    .insert(job.region, (job.epoch, job.interactive));
             }
             self.refresh_ledger(job.handle);
             self.refresh_tint_index(job.handle);

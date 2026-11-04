@@ -71,6 +71,49 @@ impl<'a> Iterator for Regions<'a> {
 impl ExactSizeIterator for Regions<'_> {}
 
 impl Scene {
+    fn publication_class(&self, change: Change) -> usize {
+        usize::from(match change {
+            Change::Activate(value) | Change::Replace(value) => self
+                .candidate_epochs
+                .get(&key(value))
+                .is_some_and(|&(_, edit)| edit),
+            _ => false,
+        })
+    }
+
+    pub(super) fn reserve_publication_retry(&mut self, bounds: Bounds) -> Result<(), Error> {
+        if self.publication_remaining == 0 {
+            return Ok(());
+        }
+        let class = usize::from(!self.turn.is_multiple_of(4));
+        let Some(change) = self.publication_retry[class].take() else {
+            return Ok(());
+        };
+        let (value, replace) = match change {
+            Change::Activate(value) => (value, false),
+            Change::Replace(value) => (value, true),
+            _ => unreachable!("只重试候选覆盖"),
+        };
+        if !bounds.intersects(value) || self.publication_class(change) != class {
+            return Ok(());
+        }
+        let Some(handle) = self.state.find(value) else {
+            return Ok(());
+        };
+        let patch = if replace {
+            self.state.prepare_replace(handle)
+        } else {
+            self.state.prepare_activate(handle)
+        };
+        match patch {
+            Ok(patch) => self.pending.push(patch),
+            Err(cm::StateError::RetirementFull) => self.publication_retry[class] = Some(change),
+            Err(cm::StateError::PendingPatch | cm::StateError::Transition) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(())
+    }
+
     pub(super) fn cancel_returned_removals(&mut self, bounds: Bounds) -> Result<(), Error> {
         // 返回需求域的区块在规划前解除卸载锁，无需等待发布额度。
         let mut at = 0;
@@ -143,15 +186,35 @@ impl Scene {
 
     /// 借助区块管理器准备已获常驻准入且依赖仍有效的实际覆盖变化。
     ///
-    /// 缺源片段继承旧网格，容量等待保持已发布覆盖；实际退出需求域的资源独立卸载。
+    /// 缺源片段继承旧网格，容量和发布额度等待保持已发布覆盖，实际退出需求域的资源独立卸载。
+    /// 多数轮先处理编辑候选，每四轮先处理普通候选。每类首个因工作量等待的候选
+    /// 在该类优先轮有专用重试名额。单个超额 region 可独立发布。
     /// 宿主从准备视图建立 GPU 候选，期间保持世界输入和规划静止，随后调用
     /// [`Self::commit`] 或 [`Self::reject`] 结束本次事务。
     pub fn prepare(&mut self) -> Result<bool, Error> {
         let bounds = self.state.config().bounds().expect("有界region域");
-        let mut at = 0;
-        while at < self.pending.len() {
+        if self.pending.len() > 1 {
+            let edit_first = !self.turn.is_multiple_of(4);
+            let epochs = &self.candidate_epochs;
+            self.pending.sort_by_key(|patch| {
+                let interactive = match patch.change {
+                    Change::Activate(value) | Change::Replace(value) => {
+                        epochs.get(&key(value)).is_some_and(|&(_, edit)| edit)
+                    }
+                    _ => false,
+                };
+                interactive != edit_first
+            });
+        }
+        let limit = [
+            self.work_budget.publish_geometry_quads,
+            self.work_budget.publish_attribute_quads,
+        ];
+        let mut used = self.publication_work;
+        let mut accepted = 0;
+        for at in 0..self.pending.len() {
             let patch = self.pending[at];
-            let valid = at < self.publication_remaining
+            let valid = accepted < self.publication_remaining
                 && self.state.validate_patch(patch.token).is_ok()
                 && match patch.change {
                     Change::Activate(value) | Change::Replace(value) => {
@@ -159,7 +222,7 @@ impl Scene {
                             && self
                                 .candidate_epochs
                                 .get(&key(value))
-                                .is_none_or(|epoch| self.input_epoch == Some(*epoch))
+                                .is_none_or(|&(epoch, _)| self.input_epoch == Some(epoch))
                             && self
                                 .candidate_sources
                                 .get(&key(value))
@@ -174,13 +237,35 @@ impl Scene {
                     }
                     _ => false,
                 };
-            if valid {
-                at += 1;
+            let work = if valid {
+                let value = match patch.change {
+                    Change::Activate(value) | Change::Replace(value) => value,
+                    _ => unreachable!("只计有效覆盖"),
+                };
+                self.publication_cost(value)
             } else {
-                let patch = self.pending.swap_remove(at);
+                [0; 2]
+            };
+            let next = std::array::from_fn(|i| used[i].saturating_add(work[i]));
+            // 零成本变化与独立超额首项均可推进，超额首项之后只接受零成本项。
+            let enabled = (0..2).all(|i| work[i] == 0 || limit[i] != 0);
+            if valid
+                && enabled
+                && (work == [0; 2] || used == [0; 2] || (0..2).all(|i| next[i] <= limit[i]))
+            {
+                used = next;
+                self.pending.swap(accepted, at);
+                accepted += 1;
+            } else {
+                if valid && enabled {
+                    let class = self.publication_class(patch.change);
+                    self.publication_retry[class].get_or_insert(patch.change);
+                }
                 self.reject_token(patch)?;
             }
         }
+        self.pending.truncate(accepted);
+        self.prepared_publication_work = used;
         let mut at = 0;
         while at < self.removes.len() && self.pending.len() < self.publication_remaining {
             let patch = self.removes[at];
@@ -200,6 +285,35 @@ impl Scene {
         Ok(self.dirty)
     }
 
+    fn publication_cost(&self, value: Chunk) -> [usize; 2] {
+        let handle = self.state.find(value).expect("已准备的节点仍保活");
+        let candidate = self
+            .state
+            .prepared_resource(handle)
+            .expect("已准备的候选仍保活");
+        let old = self
+            .state
+            .resource(handle)
+            .filter(|_| self.state.is_visible(handle));
+        if old.is_none_or(|old| old.revision != candidate.revision) {
+            return [candidate.len(); 2];
+        }
+        let old = old.expect("相同几何必有旧覆盖");
+        if old.content_revision == candidate.content_revision {
+            return [0; 2];
+        }
+        let mesh = candidate.over(old);
+        if mesh.attribute_only() {
+            [
+                0,
+                mesh.attribute_ranges().map(|range| range.quads.len()).sum(),
+            ]
+        } else {
+            // 普通材质替换可能使原不透明BLAS需要覆盖判断，预留完整几何额度。
+            [candidate.len(); 2]
+        }
+    }
+
     /// GPU接受后发布；此时释放被替换网格的常驻份额并使符合额度的等待项可重试。
     /// 宿主须在本次 [`Self::prepare`] 后保持输入静止，并确认旧 GPU 消费已完成。
     /// 资源转移和目录发布已预留容量，不分配、不复制Quad或统计全cut。
@@ -208,6 +322,7 @@ impl Scene {
         for patch in &self.pending {
             self.state.validate_patch(patch.token)?;
         }
+        self.publication_work = self.prepared_publication_work;
         while let Some(patch) = self.pending.pop() {
             self.state
                 .publish_with(patch.token, 0, RegionMesh::inherit)?;

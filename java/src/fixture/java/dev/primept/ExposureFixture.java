@@ -22,7 +22,8 @@ final class ExposureFixture {
     private static void defaults(Path file) {
         var config = new SettingsConfig(file);
         require(config.rr() && config.quality() == Quality.PERFORMANCE && config.ev() == 0
-                && config.samples() == 1 && config.bounces() == 12 && config.ser(), "默认开启 SER、Performance RR、0 EV、1 SPP、12 顶点");
+                && config.samples() == 1 && config.bounces() == 12 && config.ser()
+                && config.updateBudget() == UpdateBudget.BALANCED, "默认开启 SER、Performance RR、0 EV、1 SPP、12 顶点和平衡更新");
     }
 
     private static void commandBoundary(Path file) {
@@ -41,9 +42,11 @@ final class ExposureFixture {
         config.setBounces(8);
         config.setRequestedRr(false);
         config.setRequestedSer(false);
+        config.setUpdateBudget(UpdateBudget.SMOOTH);
         var saved = new SettingsConfig(file);
         require(saved.ev() == -2.5f && saved.quality() == Quality.BALANCED && saved.samples() == 3
-                && saved.bounces() == 8 && !saved.rr() && !saved.ser(), "界面 setter 同时持久化全部设置");
+                && saved.bounces() == 8 && !saved.rr() && !saved.ser()
+                && saved.updateBudget() == UpdateBudget.SMOOTH, "界面 setter 同时持久化全部设置");
         require(saved.command("pt ev").contains("-2.5") && saved.command("pt quality").contains("balanced")
                 && saved.command("pt spp").contains("3") && saved.command("pt bounces").contains("8")
                 && saved.command("pt rr").contains("off") && saved.command("pt ser").contains("off"),
@@ -56,7 +59,8 @@ final class ExposureFixture {
         saved.command("pt ser on");
         var changed = new SettingsConfig(file);
         require(changed.ev() == 1 && changed.quality() == Quality.QUALITY && changed.samples() == 5
-                && changed.bounces() == 16 && changed.rr() && changed.ser(), "命令写入与界面 setter 保持一致");
+                && changed.bounces() == 16 && changed.rr() && changed.ser()
+                && changed.updateBudget() == UpdateBudget.SMOOTH, "命令写入与界面 setter 保持一致");
         changed.command("pt reset");
         defaults(file);
     }

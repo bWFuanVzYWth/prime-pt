@@ -323,6 +323,57 @@ fn hardware_pt_incremental_attributes_keep_storage_and_tlas()
 }
 
 #[test]
+#[ignore = "真实Vulkan RT；扩容保留旧属性槽，只写入新增region"]
+fn hardware_pt_attribute_growth_keeps_existing_gpu_bytes() -> Result<(), Box<dyn std::error::Error>>
+{
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    upload(
+        &mut gpu,
+        &[MaterialDefinition::default(); 2],
+        &[],
+        &[[u32::MAX, 0, 0, 0]; 2],
+    )?;
+    let mesh = scene();
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    let old = gpu.scene.quads;
+    let offset = u64::from(gpu.region_cache.entries()[0].range.start) * 48;
+    let mut before = [0u8; 96];
+    old.read(&mut gpu.context, offset, &mut before)?;
+    let extra = Mesh {
+        quads: vec![mesh.quads[0]; 4096],
+    };
+    gpu.set_regions(RenderView {
+        generation: gpu.resource_generation,
+        anchor: [0.; 3],
+        regions: &[
+            RenderRegion {
+                key: [0; 3],
+                geometry_revision: 1,
+                content_revision: 1,
+                mesh: (&mesh).into(),
+            },
+            RenderRegion {
+                key: [1, 0, 0],
+                geometry_revision: 1,
+                content_revision: 1,
+                mesh: (&extra).into(),
+            },
+        ],
+    })?;
+    assert_ne!(gpu.scene.quads, old);
+    let mut after = [0u8; 96];
+    gpu.scene.quads.read(&mut gpu.context, offset, &mut after)?;
+    assert_eq!(after, before);
+    assert_eq!(
+        gpu.scene_timing().unwrap().attribute_upload_bytes,
+        4096 * 48 + 8
+    );
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan RT；看不到灯的接收面通过NEE变亮，单/双面发光遵守同一PDF"]
 fn hardware_pt_emissive_quad_lights_the_receiver_from_the_correct_side()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -629,6 +680,60 @@ fn hardware_pt_bilateral_distinct_materials_select_the_visible_front()
         "背面应为绿材质：{:?}",
         center(&back)
     );
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT；仅更换材质即恢复覆盖测试，区域内不透明几何仍可见"]
+fn hardware_pt_region_material_change_restores_cutout_coverage()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    let mut red = MaterialDefinition {
+        emission: [1., 0., 0., 10.],
+        ..Default::default()
+    };
+    red.control[2] = 0;
+    let mut green = red;
+    green.emission = [0., 1., 0., 10.];
+    let mut cutout = red;
+    cutout.control[2] = MaterialDefinition::CUTOUT;
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [1, 1],
+        albedo: &[255, 255, 255, 0],
+        materials: &[red, green, cutout],
+        mers: &[0, 0, 242, 0],
+        auxiliary: &[128, 128, 0, 85],
+        emission_alias_words: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]; 3],
+    })?;
+    let quad = |z, material| {
+        Quad::with_material(
+            [[-2., -2., z], [-2., 2., z], [2., 2., z], [2., -2., z]],
+            [[0.5; 2]; 4],
+            [1.; 3],
+            MaterialId::new(material),
+        )
+    };
+    let mut mesh = Mesh {
+        quads: vec![quad(4., 0), quad(5., 1)],
+    };
+    let environment = Environment {
+        sun_direction: [0.; 3],
+        ..Default::default()
+    };
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    assert!(gpu.region_cache.entries()[0].opaque);
+    let before = host.render_environment(&mut gpu, &image, &camera(), environment)?;
+    mesh.quads[0] = quad(4., 2);
+    publish(&mut gpu, &mesh, 1, 2, [0.; 3])?;
+    assert!(!gpu.region_cache.entries()[0].opaque);
+    let after = host.render_environment(&mut gpu, &image, &camera(), environment)?;
+    assert!(u16::from(center(&before)[0]) > u16::from(center(&before)[1]) + 20);
+    assert!(u16::from(center(&after)[1]) > u16::from(center(&after)[0]) + 20);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

@@ -12,7 +12,7 @@ Minecraft **26.3 / Fabric** 的 Prime PT 重写，复用 simple_engine 的 Slang
 | `prime_scene` | [scene](crates/scene/src/lib.rs)：宿主无关的 quad、材质身份、相机和借用渲染视图 |
 | `prime_renderer` | [renderer](crates/renderer/src/lib.rs)：Vulkan 场景缓存、资源/程序、PT/RR、曝光与呈现 |
 
-Java 只绑定 Minecraft 类型与源字段，转发事件和宿主句柄。[SourceResources](java/src/main/java/dev/primept/SourceResources.java) 在首次加载/资源重载捕获完整注册状态、模型 DAG、剔除形状、sprite 和 tint recipe；[Capture](java/src/main/java/dev/primept/Capture.java) 运行期按 native ticket 复制真实 section 的 palette/bit storage，使用 **PRT3**，不逐 block 选择模型、剔面或展开 quad。每批至多 64 section，每完成一个 section 检查 3 ms 捕获预算，未回复 ticket 保留到后续帧。
+Java 只绑定 Minecraft 类型与源字段，转发事件和宿主句柄。[SourceResources](java/src/main/java/dev/primept/SourceResources.java) 在首次加载或资源重载时捕获注册状态、模型 DAG、剔除形状、sprite 和 tint recipe。[Capture](java/src/main/java/dev/primept/Capture.java) 按 native ticket 批量复制真实 section 的 palette 和 bit storage，使用 **PRT3**。每批按所选档位捕获至多 16、32 或 64 个 section。
 
 宿主变化由单一真实来源回调捕获，按世界、列、section 范围合并后以 PDI1 批量转发；几何、源替换、biome 和颜色失效分开处理，失败保留未确认批次。资源重载走独立世代事务。入口见 [SourceChanges](java/src/main/java/dev/primept/SourceChanges.java) 与 [变化包边界](native/src/changes.rs)。
 
@@ -20,15 +20,15 @@ Rust 校验同世代资源与完整邻域后，以四层 slab 为批量内核执
 
 ## 资源准备与增量更新
 
-首次加载和资源重载是完整资源准备边界。一个世代只有一个全局 Catalog，section、region 和工作线程引用稳定身份；材质范围推导、静态发光纹理 alias、Slang callable、pipeline/SBT 及设备支持的普通/SER 变体在发布前准备。运行期不按方块、区块或首次命中懒构建 alias、shader 或 SBT；缺身份/错世代显式报错。新世代全部成功后统一发布，失败保留旧世代，旧 GPU 资源按真实完成证明回收。入口见 [Catalog](crates/minecraft/src/resources.rs)、[材质准备](crates/minecraft/src/materials.rs) 和 [Gpu](crates/renderer/src/gpu.rs)。
+首次加载和资源重载是完整资源准备边界。一个世代只有一个全局 Catalog，section、region 和工作线程引用稳定身份。材质范围推导、静态发光纹理 alias、Slang callable、pipeline/SBT 及设备支持的普通/SER 变体在发布前准备。callable 按 OpenPBR 控制流及贴图、法线、透射和发射能力去重，整个世代的命中程序按覆盖、法线和光源能力裁剪。缺身份或错世代显式报错。新世代准备完成后统一发布，失败保留旧世代，旧 GPU 资源按实际完成保证回收。入口见 [Catalog](crates/minecraft/src/resources.rs)、[材质准备](crates/minecraft/src/materials.rs) 和 [Gpu](crates/renderer/src/gpu.rs)。
 
 world 只使用引擎 `chunk_manager` 的 LOD0。水平目标来自宿主有效视距，覆盖完整世界高度，向 64 m region 对齐；每 region 管理 4³ 个 16 m section，一个非空 region 一个 BLAS。相机以 f64 保存绝对位置，CPU 几何/BLAS 保留 region 局部坐标，TLAS 平移减去 64 m anchor 后转 f32。移窗保留需求交集与有效 ticket，完全退出需求域的 region 独立卸载；边缘未加载源不会永久阻塞域外退休。未加载、真实空和预算排除有不同状态。
 
-CPU 以四层 slab 持有独立输出，一个 section 的四个内核共享只读邻域，直接生成 region 局部坐标。准备视图借用旧片段和变化输出，GPU 成功后移动发布，避免 section 拼接、坐标二次平移和完整 region 复制。持久 tint 绑定引用资源世代内稳定配方身份，纯颜色刷新借用旧几何并提交属性范围。几何 revision 变化才重建所属 region 的 BLAS；tint/UV/材质属性变化保留 BLAS。dirty 三角输入共享一次批构建与 scratch，非空 BLAS 批有一次同步提交/完成，TLAS 按实例集合或 anchor 变化重建。每帧修改/复用前仍等待此前宿主命令完成，当前不是异步加载流水线。
+CPU 以四层 slab 持有独立输出，一个 section 的四个内核共享只读邻域，直接生成 region 局部坐标。准备视图借用旧片段和变化输出，GPU 成功后移动发布。持久 tint 绑定引用资源世代内稳定配方身份，纯颜色刷新借用旧几何并提交属性范围。几何 revision 变化或旧不透明 BLAS 新增覆盖判断需求时重建所属 region 的 BLAS。BLAS 批与依赖它的 TLAS 共享一次提交和完成等待。宿主上一批 GPU 使用完成后才修改映射和复用资源。
 
 同 region 刷新遵循引擎 [State](../../crates/chunk_manager/src/lib.rs) 的无缝发布契约。压缩源明确未加载时，只保留受影响 section 的旧片段，同批其余已就绪片段可以发布；来源恢复后重试受影响的 section。只有确认为空的编译结果才能清除旧覆盖。新属性、BLAS/TLAS 和最终绘制集合准备成功后一次切换，旧资源按实际完成边界退役。LOD 父子替换使用相同边界，Prime 当前仍只使用 LOD0。
 
-GPU 的 48 B/quad 属性缓冲持久保留容量。容量内只打包和映射写入变化范围，扩容才重写全部活动属性。TLAS 实例记录紧凑编号，着色器通过单独的 region 表读取 32 位属性起点。纯属性更新保留 TLAS 和 region 表，anchor 变化只更新 TLAS。活动发光 quad 使用稳定数据槽、紧凑活动选择表和反查索引；颜色刷新不扫描灯，灯集合/槽位变化只准备变化行，增长时才完整重建容量表；运行期均匀选择灯并使用实际离散 PMF，不重建全局 alias。纹理内 alias 和静态面积复用资源准备产物，过程流体的两三角面积可在 shader 计算。
+GPU 的 48 B/quad 属性缓冲持久保留容量。CPU 只打包和写入变化范围，扩容时由 GPU 同步复制要继承的旧前缀。TLAS 实例记录紧凑编号，着色器通过单独的 region 表读取 32 位属性起点。纯 tint 保留 TLAS 和 region 表，anchor 变化只更新 TLAS。活动发光 quad 使用稳定数据槽、紧凑活动选择表和反查索引，颜色刷新不扫描灯，灯集合或槽位变化只准备变化行，增长时完整重建容量表。运行期均匀选择灯并使用实际离散 PMF。纹理内 alias 和静态面积复用资源准备产物，过程流体的两三角面积可在 shader 计算。
 
 CPU quad 逻辑预算初始为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**。宿主视距从 16 增至 32 时，常驻上限按每格 64 MiB 提高，最高 **2 GiB**，增量受 GPU 属性缓冲槽数约束。会话内只调高此上限，窗口缩小时按实际退出范围回收资源。逻辑预算只计 quad payload。超额以 [Pressure](crates/world/src/budget.rs) 区分常驻容量、过渡等待和单 region 容量。manager 从实际占用按需扩容；显式 [WorkBudget](crates/world/src/budget.rs) 在一次 plan 开始的推进轮中约束内核、规划访问、发布及维护，后续源包和颜色回填共享剩余额度。调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
 
@@ -42,7 +42,7 @@ CPU quad 逻辑预算初始为 resident **1 GiB**、staging **256 MiB**、单 re
 
 当前仍有以下范围限制：
 
-- 运行普通 PT，未接 ReSTIR；**Prime 当前未启用 OMM**，主查询/阴影依赖 any-hit/RayQuery 覆盖。引擎有 OMM 能力不代表本应用已经接入。
+- 运行普通 PT，未接 ReSTIR。整区都无需覆盖判断时使用 Vulkan opaque 几何，含镂空或单面材质的混合 region 通过 any-hit 和 RayQuery 执行覆盖判断。Prime 当前未启用 OMM。
 - 支持已识别的公共模型 DAG 和原版位置/流体规则；未知自定义模型源显式拒绝。自定义 tint 的批量回退不代表自定义模型兼容。
 - 实体、方块实体和粒子尚未接入；宿主相机、玩家状态、手部和 UI 继续使用原版路径，没有其它渲染 Mod 的兼容保证。
 - RR guide 复用引擎首命中、delta 链及反射/折射代理，但场景姿态仍按静态方块提供。粗反射运动、折射与预算终点有代理边界，不是动态物体/透明多层的完整光学运动重建。
@@ -78,6 +78,14 @@ SER 在实际逻辑设备支持时默认开启，普通和 SER pipeline/SBT 在�
 | `/pt quality 档位` | `dlaa` / `quality` / `balanced` / `performance`（默认）/ `ultra_performance` |
 | `/pt spp 数量`、`/pt bounces 顶点数` | 默认 1 / 12，均为 1..64 |
 | `/pt ev EV` | 默认 0，-16..16；自动曝光后的补偿，`exposure` 为别名 |
+
+视频设置中的「区块更新」按下表分配工作量。大于配额的单个 region 可单独发布，以保证大 region 仍能完成。常驻内存额度独立设置。
+
+| 档位 | 捕获 section | 建网 slab | 几何 quad | 属性 quad |
+| --- | ---: | ---: | ---: | ---: |
+| 平稳 | 16 | 48 | 65,536 | 131,072 |
+| 平衡（默认） | 32 | 96 | 131,072 | 262,144 |
+| 吞吐 | 64 | 128 | 262,144 | 524,288 |
 
 RR 默认 Performance，输入每轴约为输出一半，实际尺寸由 SDK 查询。**RR 不跨帧做线性样本累积**：当前帧 SPP 求均值后输入 SDK，时间历史由 SDK 独立维护。相机、FOV、太阳、积分参数、局部场景和 anchor 变化保留 RR 历史；世界/材质资源域换代显式重置，实际视图或 SDK 存储替换、求值失败分别冷启动/恢复。原始 PT 在其输入变化时清空线性累积。曝光单独适应，只影响呈现。
 

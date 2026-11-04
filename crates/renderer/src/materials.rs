@@ -2,6 +2,65 @@
 use crate::gpu::Error;
 use prime_scene::MaterialDefinition;
 
+/// 只有这些覆盖规则会拒绝硬件三角候选；透明度和光学透射彼此独立。
+pub(super) const fn tests_coverage(definition: &MaterialDefinition) -> bool {
+    coverage_flags(definition) != 0
+}
+
+const fn coverage_flags(definition: &MaterialDefinition) -> u32 {
+    definition.control[2] & (MaterialDefinition::CUTOUT | MaterialDefinition::FRONT_ONLY)
+}
+
+/// 资源世代内命中阶段可能用到的材质能力。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct HitFeatures {
+    pub coverage: u32,
+    pub authored_normals: bool,
+}
+
+pub(super) fn hit_features(definitions: &[MaterialDefinition]) -> HitFeatures {
+    let mut features = HitFeatures {
+        coverage: 0,
+        authored_normals: false,
+    };
+    for definition in definitions {
+        features.coverage |= coverage_flags(definition);
+        features.authored_normals |=
+            definition.control[3] & MaterialDefinition::AUTHORED_NORMAL != 0;
+    }
+    features
+}
+
+pub(super) const fn emission_sides(material: &MaterialDefinition) -> u32 {
+    if material.control[2] & MaterialDefinition::FRONT_ONLY != 0 {
+        material.control[1] & 1
+    } else {
+        material.control[1]
+    }
+}
+
+/// `mod_materials.slang` 的场景材质能力位。只影响分支，相同路径仍共享数值参数表。
+pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinition) -> u32 {
+    let flags = material.control[2];
+    let maps = flags & (MaterialDefinition::MERS | MaterialDefinition::AUXILIARY);
+    let normal = if (maps & MaterialDefinition::AUXILIARY) != 0 {
+        (material.control[3] & MaterialDefinition::AUTHORED_NORMAL) << 3
+    } else {
+        0
+    };
+    let emission = if flow.bits() & openpbr::FlowKey::EMISSION != 0 {
+        let sides = emission_sides(material);
+        if sides == 0 {
+            0
+        } else {
+            (sides << 4) | (flags & MaterialDefinition::TEXTURED_EMISSION)
+        }
+    } else {
+        0
+    };
+    maps | normal | emission | ((material.control[0] & 3) << 6)
+}
+
 pub(super) fn defaults() -> Vec<MaterialDefinition> {
     let rough = MaterialDefinition::default();
     let mut smooth = rough;
@@ -20,36 +79,38 @@ pub(super) fn colors(pixels: &[u8]) -> Result<[openpbr::resource::ColorRanges; 2
     Ok([scan(Coverage::Opaque)?, scan(Coverage::AlphaAtLeast(0.5))?])
 }
 
-pub(super) fn map_ranges(mers: &[u8]) -> Result<[openpbr::Range; 3], Error> {
+#[derive(Clone, Copy)]
+pub(super) struct MapRanges {
+    roughness: openpbr::Range,
+    metalness: openpbr::Range,
+    subsurface: openpbr::Range,
+    emission: openpbr::Range,
+}
+
+pub(super) fn map_ranges(mers: &[u8]) -> Result<MapRanges, Error> {
     let unit = openpbr::Range::new(0., 1.)?;
-    let mut scans = [openpbr::RangeScan::new(); 3];
+    let mut scans = [openpbr::RangeScan::new(); 4];
     for pixel in mers.as_chunks::<4>().0 {
-        let r = f32::from(pixel[2]) / 255.;
-        for (scan, value) in
-            scans
-                .iter_mut()
-                .zip([r, f32::from(pixel[0]) / 255., f32::from(pixel[3]) / 255.])
-        {
-            scan.extend(&[value])?;
+        for (scan, value) in scans.iter_mut().zip(pixel) {
+            scan.extend(&[f32::from(*value) / 255.])?;
         }
     }
-    Ok(if mers.is_empty() {
-        [unit; 3]
-    } else {
-        let mut ranges = [unit; 3];
-        for (target, scan) in ranges.iter_mut().zip(scans) {
-            *target = scan.finish().unwrap_or(unit);
-        }
-        ranges
+    let [metalness, emission, roughness, subsurface] =
+        scans.map(|scan| scan.finish().unwrap_or(unit));
+    Ok(MapRanges {
+        roughness,
+        metalness,
+        subsurface,
+        emission,
     })
 }
 
 pub(super) fn flows(
     colors: [openpbr::resource::ColorRanges; 2],
     definitions: &[MaterialDefinition],
-    textured: [openpbr::Range; 3],
+    textured: MapRanges,
 ) -> Result<Vec<openpbr::FlowKey>, Error> {
-    use openpbr::resource::MaterialBinding;
+    use openpbr::resource::{ColorRanges, MaterialBinding};
     use openpbr::{InterfaceIor, MaterialRanges, Range};
     if definitions.is_empty() || definitions.iter().any(|m| !m.valid()) {
         return Err(Error::Invalid("材质表为空或字段不符合OpenPBR输入域"));
@@ -66,7 +127,7 @@ pub(super) fn flows(
             // shader将aux分布与roughness合成；未分析局部aux范围时保留全部连续/离散支持。
             Range::new(0., 1.)?
         } else if texture {
-            textured[0]
+            textured.roughness
         } else {
             Range::point(definition.base_roughness[3])?
         };
@@ -76,22 +137,36 @@ pub(super) fn flows(
             MaterialRanges::opaque(
                 roughness,
                 if texture {
-                    textured[1]
+                    textured.metalness
                 } else {
                     Range::point(definition.surface[1])?
                 },
                 if texture {
-                    textured[2]
+                    textured.subsurface
                 } else {
                     Range::point(definition.surface[2])?
                 },
             )?
         };
-        let emission = definition.emission[3] > 0.
-            && (definition.emission[..3].iter().any(|&v| v > 0.)
-                || definition.control[2] & MaterialDefinition::TEXTURED_EMISSION != 0);
         let colors = colors[usize::from(definition.control[2] & MaterialDefinition::CUTOUT != 0)];
-        flows.push(MaterialBinding::new(ranges, colors, InterfaceIor::UNKNOWN, emission)?.flow());
+        let reaches_rgb = |factor: &[f32]| {
+            factor
+                .iter()
+                .zip(colors.rgb())
+                .any(|(&value, range)| value > 0. && range.max() > 0.)
+        };
+        let emission = emission_sides(definition) != 0
+            && definition.emission[3] > 0.
+            && reaches_rgb(&definition.emission[..3])
+            && (definition.control[2] & MaterialDefinition::TEXTURED_EMISSION == 0
+                || textured.emission.max() > 0.);
+        // 只证明零域，正值保留整个原范围，避免在此处重复着色器舍入规则。
+        let base = if reaches_rgb(&definition.base_roughness[..3]) {
+            colors
+        } else {
+            ColorRanges::constant([0.; 3])?
+        };
+        flows.push(MaterialBinding::new(ranges, base, InterfaceIor::UNKNOWN, emission)?.flow());
     }
     Ok(flows)
 }
@@ -99,6 +174,26 @@ pub(super) fn flows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn black_mers_emission_excludes_the_light_path() {
+        let mut material = MaterialDefinition {
+            emission: [1.; 4],
+            ..Default::default()
+        };
+        material.control[2] |= MaterialDefinition::TEXTURED_EMISSION;
+        let colors = colors(&[255; 4]).unwrap();
+        let flow = |emission| {
+            flows(
+                colors,
+                &[material],
+                map_ranges(&[0, emission, 255, 0]).unwrap(),
+            )
+            .unwrap()[0]
+        };
+        assert!(!flow(0).emits());
+        assert!(flow(255).emits());
+    }
 
     #[test]
     fn normal_distribution_keeps_continuous_reflection_in_the_program_support() {

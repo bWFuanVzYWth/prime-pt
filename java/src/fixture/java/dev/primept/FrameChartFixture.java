@@ -25,12 +25,12 @@ final class FrameChartFixture {
             var nativeBounds = new Bounds(520, 360);
             require(FrameChart.ready() && FrameChart.paint(nativeBounds, 0, 520, 360, -1, -1), "接受真实 native producer 输出");
             require(nativeBounds.labels.stream().anyMatch(line -> line.contains("最近卡顿 80.00ms"))
-                    && nativeBounds.labels.stream().anyMatch(line -> line.contains("BLAS构建/等待")
+                    && nativeBounds.labels.stream().anyMatch(line -> line.contains("AS构建/等待")
                     && line.contains("81.3%") && line.contains("65.00ms")), "native 峰值、最大项与占比跨语言一致");
             require(nativeBounds.labels.stream().anyMatch(line -> line.contains("最近场景更新 #2"))
                     && nativeBounds.labels.stream().anyMatch(line -> line.contains("脏区2") && line.contains("实例64") && line.contains("6.00MiB"))
                     && nativeBounds.labels.stream().anyMatch(line -> line.contains("场景写入3.00MiB") && line.contains("1.00ms"))
-                    && nativeBounds.labels.stream().anyMatch(line -> line.contains("BLAS提交/等待 1.00ms") && line.contains("TLAS 2.00ms")),
+                    && nativeBounds.labels.stream().anyMatch(line -> line.contains("AS提交/等待 1.00ms") && line.contains("TLAS准备 2.00ms")),
                     "真实场景规模与主机子段独立显示");
             require(nativeBounds.labels.stream().anyMatch(line -> line.contains("目标缺源90段")
                     && line.contains("在途14区") && line.contains("待回复7请求")), "源状态跨语言一致");
@@ -50,7 +50,7 @@ final class FrameChartFixture {
         require(sink.labels.stream().anyMatch(line -> line.contains("主线程墙钟，含等待")), "明确 CPU 时钟域");
         require(sink.labels.stream().anyMatch(line -> line.contains("GPU 时间未采集")), "无查询不伪造 GPU 时间");
         require(sink.labels.stream().anyMatch(line -> line.contains("最近卡顿 80.00ms"))
-                && sink.labels.stream().anyMatch(line -> line.contains("BLAS构建/等待") && line.contains("81.3%") && line.contains("65.00ms")),
+                && sink.labels.stream().anyMatch(line -> line.contains("AS构建/等待") && line.contains("81.3%") && line.contains("65.00ms")),
                 "卡顿直接显示最大项及整帧占比");
         require(sink.labels.stream().anyMatch(line -> line.contains("最近场景更新 #302")), "场景输入明确标记独立更新序号");
         require(sink.labels.stream().anyMatch(line->line.contains("建网 3/8 slab")&&line.contains("待编12"))
@@ -62,11 +62,11 @@ final class FrameChartFixture {
         var hover = new Bounds(520, 360);
         FrameChart.paint(hover, 0, 520, 360, 177, 160);
         require(hover.labels.stream().anyMatch(line -> line.contains("选中 80.00ms"))
-                && hover.labels.stream().anyMatch(line -> line.contains("BLAS构建/等待") && line.contains("75.0%") && line.contains("60.00ms")),
+                && hover.labels.stream().anyMatch(line -> line.contains("AS构建/等待") && line.contains("75.0%") && line.contains("60.00ms")),
                 "悬停展示该柱的完整真实样本归因");
         var narrow = new Bounds(160, 200);
         require(FrameChart.paint(narrow, 0, 160, 200, -1, -1), "小窗口有界");
-        require(narrow.labels.stream().anyMatch(line -> line.contains("BLAS 81.3%") && line.contains("65.00ms")),
+        require(narrow.labels.stream().anyMatch(line -> line.contains("AS 81.3%") && line.contains("65.00ms")),
                 "窄GUI仍直接显示最大项及占比");
         require(narrow.labels.stream().anyMatch(line->line.contains("建网3/8 待编12")),"窄GUI保留本轮建网预算和ready队列");
         require(narrow.labels.stream().anyMatch(line -> line.contains("缺源77段 任务11 捕获3")), "窄GUI保留当前源状态");
@@ -96,7 +96,7 @@ final class FrameChartFixture {
         var preserved = new Bounds(520, 360);
         FrameChart.paint(preserved, 0, 520, 360, -1, -1);
         require(FrameChart.ready() && preserved.labels.stream().anyMatch(line -> line.contains("最近卡顿 80.00ms"))
-                && preserved.labels.stream().anyMatch(line -> line.contains("BLAS构建/等待") && line.contains("65.00ms")),
+                && preserved.labels.stream().anyMatch(line -> line.contains("AS构建/等待") && line.contains("65.00ms")),
                 "非法输入保留上一已校验副本");
         packet = snapshot(240); FrameChart.update(packet);
         if (image != null) render(image);

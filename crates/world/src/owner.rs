@@ -204,6 +204,8 @@ impl Scene {
         self.retirement_remaining = self.work_budget.maintenance;
         self.tint_remaining = self.work_budget.maintenance;
         self.publication_remaining = self.work_budget.publications;
+        self.publication_work = [0; 2];
+        self.prepared_publication_work = [0; 2];
         self.ready_used = 0;
         self.tint_used = 0;
         self.retirement_used = 0;

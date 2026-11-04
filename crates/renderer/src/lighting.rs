@@ -4,7 +4,7 @@ mod registry;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use prime_scene::{MaterialDefinition, RenderChange, RenderRegion, RenderView};
+use prime_scene::{RenderChange, RenderRegion, RenderView};
 
 use crate::gpu::Error;
 use registry::{Record, Registry, Writer, reserved};
@@ -452,13 +452,6 @@ fn each_light(
         }
     }
     Ok(())
-}
-
-pub(super) fn emitting(material: &MaterialDefinition) -> bool {
-    material.control[1] != 0
-        && material.emission[3] > 0.0
-        && (material.emission[..3].iter().any(|&v| v > 0.0)
-            || material.control[2] & MaterialDefinition::TEXTURED_EMISSION != 0)
 }
 
 fn degenerate(p: [[f32; 3]; 4]) -> bool {

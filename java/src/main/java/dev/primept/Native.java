@@ -15,6 +15,8 @@ final class Native implements AutoCloseable {
     private final Arena arena = Arena.ofConfined();
     private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, invalidateTints, invalidateBatch, failCapture, batch, sources, cameraMedium, tintBegin, tintRequests, tints, biomeWorld, biomeRequests, biomeSamples, atlas, draw, setSer, error;
     private final long handle;
+    private final MethodHandle setUpdateBudget;
+    private UpdateBudget updateBudget;
     private boolean serRequested;
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex) {
@@ -44,6 +46,7 @@ final class Native implements AutoCloseable {
         invalidateBatch=bind(symbols,"prime_invalidate_batch",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_LONG));
         failCapture = bind(symbols, "prime_fail_capture", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG));
         setSer = bind(symbols, "prime_set_ser", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
+        setUpdateBudget = bind(symbols, "prime_set_update_budget", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         cameraMedium = bind(symbols, "prime_camera_medium", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
@@ -72,6 +75,14 @@ final class Native implements AutoCloseable {
 
     void reset() {
         try { check((int) reset.invokeExact(handle)); } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void updateBudget(UpdateBudget next) {
+        if (updateBudget == next) return;
+        try {
+            check((int) setUpdateBudget.invokeExact(handle, next.wireId));
+            updateBudget = next;
+        } catch (Throwable e) { throw unchecked(e); }
     }
 
     int plan(ByteBuffer camera, int distance, int minSectionY, int maxSectionYExclusive, ByteBuffer requests) {

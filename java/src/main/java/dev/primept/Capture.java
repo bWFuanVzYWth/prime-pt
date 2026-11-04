@@ -8,7 +8,6 @@ import net.minecraft.world.level.chunk.status.ChunkStatus;
 
 /** 仅转发请求section的原始palette/storage；不逐block选择模型、剔面或展开quad。 */
 final class Capture {
-    private static final long BUDGET_NS=3_000_000;
     private final Packet packet=new Packet();
     private ClientLevel level;
     private SourceResources resources;
@@ -22,7 +21,6 @@ final class Capture {
         if(count<1||count>64||requests.remaining()<count*24)throw new IllegalArgumentException("捕获请求数量无效");
         resources=SourceResources.prepared();
         packet.clear();packet.putInt(0x33545250);packet.putInt(count);packet.putLong(resources.generation);
-        long started=System.nanoTime();int completed=0;
         for(int i=0;i<count;i++){
             int at=requests.position()+i*24;long id=requests.getLong(at);
             if(id==0||requests.getInt(at+20)!=0)throw new IllegalArgumentException("捕获票据无效");
@@ -34,11 +32,8 @@ final class Capture {
                 if(chunk==null){for(int word=0;word<4;word++)packet.putInt(0);}
                 else resources.section(packet,chunk.getSection(chunk.getSectionIndexFromSectionY(sy)));
             }
-            completed++;
-            // 压缩复制以一个section为最小单元，未回复ticket由world下帧重放。
-            if(System.nanoTime()-started>=BUDGET_NS)break;
         }
-        packet.patchInt(4,completed);return packet.finish();
+        return packet.finish();
     }
 
     ByteBuffer tints(Minecraft minecraft,ByteBuffer requests,int count){

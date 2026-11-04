@@ -2,6 +2,12 @@
 module mod_materials;
 import pt.scene;
 import bsdf.openpbr.api;
+import bsdf.openpbr.flow;
+
+#ifndef PRIMEPT_COVERAGE_MASK
+#define PRIMEPT_COVERAGE_MASK 40u
+#endif
+public static const uint COVERAGE_MASK = PRIMEPT_COVERAGE_MASK;
 
 [[vk::binding(1, 0)]]
 public StructuredBuffer<uint4> quads;
@@ -48,8 +54,7 @@ public float2 material_uv(uint primitive, float2 barycentrics)
     uv += (second ? uv23.zw : uv23.xy) * bary.z;
     return uv;
 }
-/// 保留旧共享tint的FP32插值顺序；覆盖alpha不乘tint。
-public float4 material_texel(uint primitive, float2 barycentrics)
+float4 sample_tinted_texel(uint primitive, float2 barycentrics, float2 uv)
 {
     float3 bary = float3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
     float3 shared_tint = asfloat(quads[(primitive >> 1) * 3u + 2u].xyz);
@@ -57,28 +62,41 @@ public float4 material_texel(uint primitive, float2 barycentrics)
     tint += shared_tint * bary.x;
     tint += shared_tint * bary.y;
     tint += shared_tint * bary.z;
-    float4 value = atlas.SampleLevel(atlas_sampler, material_uv(primitive, barycentrics), 0);
+    float4 value = atlas.SampleLevel(atlas_sampler, uv, 0);
     return float4(value.xyz * material_linear(saturate(tint)), value.w);
+}
+/// 保留旧共享tint的FP32插值顺序；覆盖alpha不乘tint。
+public float4 material_texel(uint primitive, float2 barycentrics)
+{
+    return sample_tinted_texel(primitive, barycentrics, material_uv(primitive, barycentrics));
 }
 /// CUTOUT来自实际源layer；opaque/透射界面不将alpha误解释为二值孔洞。
 public bool material_accepts(uint primitive, float2 bary, bool front)
 {
-    ModMaterial material = materials[material_id(primitive)];
-    if ((material.control.z & 32u) != 0 && !front)
+    uint flags = materials[material_id(primitive)].control.z & COVERAGE_MASK;
+    if ((flags & 32u) != 0 && !front)
         return false;
-    return (material.control.z & 8u) == 0 || material_texel(primitive, bary).a >= 0.5;
+    return (flags & 8u) == 0 ||
+           atlas.SampleLevel(atlas_sampler, material_uv(primitive, bary), 0).a >= 0.5;
+}
+bool emits_on_side(ModMaterial material, bool front)
+{
+    uint side = front ? 1u : 2u;
+    return (material.control.y & side) != 0 && material.emission.w > 0 &&
+           ((material.control.z & 32u) == 0 || front);
 }
 public float3 material_emission(uint primitive, float2 bary, bool front)
 {
     ModMaterial material = materials[material_id(primitive)];
-    uint side = front ? 1u : 2u;
-    if ((material.control.y & side) == 0 || material.emission.w <= 0 ||
-        !material_accepts(primitive, bary, front))
+    if (!emits_on_side(material, front))
         return 0;
-    float3 result =
-        material.emission.xyz * material.emission.w * material_texel(primitive, bary).xyz;
+    float2 uv = material_uv(primitive, bary);
+    float4 texel = sample_tinted_texel(primitive, bary, uv);
+    if ((material.control.z & 8u) != 0 && texel.a < 0.5)
+        return 0;
+    float3 result = material.emission.xyz * material.emission.w * texel.xyz;
     if ((material.control.z & 4u) != 0)
-        result *= mers_atlas.SampleLevel(atlas_sampler, material_uv(primitive, bary), 0).y;
+        result *= mers_atlas.SampleLevel(atlas_sampler, uv, 0).y;
     return result;
 }
 float2 normal_sign(float2 value)
@@ -100,8 +118,9 @@ public float3 decode_shading_normal(uint packed)
         normal.xy = (1.0 - abs(normal.yx)) * normal_sign(normal.xy);
     return normalize(normal);
 }
-/// e1/e2为实际三角形的world边；几何法线和offset原样保留，只编码独立着色法线。
-public uint mapped_shading_normal(uint primitive, float2 bary, float3 e1, float3 e2, float3 normal)
+/// 只有显式法线贴图需要变换三角形边；几何法线和offset原样保留。
+public uint mapped_shading_normal(uint primitive, float2 bary, float3 local_e1, float3 local_e2,
+                                  float3x3 object_to_world, float3 normal)
 {
     ModMaterial material = materials[material_id(primitive)];
     if ((material.control.w & 1u) == 0)
@@ -114,6 +133,8 @@ public uint mapped_shading_normal(uint primitive, float2 bary, float3 e1, float3
     float determinant = du.x * dv.y - du.y * dv.x;
     if (determinant == 0 || !isfinite(determinant))
         return encode_shading_normal(normal);
+    float3 e1 = mul(object_to_world, local_e1);
+    float3 e2 = mul(object_to_world, local_e2);
     float3 tangent = (e1 * dv.y - e2 * du.y) / determinant;
     float3 bitangent = (e2 * du.x - e1 * dv.x) / determinant;
     tangent -= normal * dot(normal, tangent);
@@ -129,32 +150,53 @@ public uint mapped_shading_normal(uint primitive, float2 bary, float3 e1, float3
     return encode_shading_normal(
         normalize(tangent * local.x + bitangent * local.y + normal * local.z));
 }
-public pt::SurfaceMaterial resolve_material(pt::Hit hit, float4 incident)
+// 低8位与 materials::variant 同步。通用 guide 根据当前命中读取相同信息。
+uint material_variant(ModMaterial material)
+{
+    uint flags = material.control.z;
+    uint sides = (flags & 32u) != 0 ? material.control.y & 1u : material.control.y;
+    uint emission = material.emission.w > 0 ? (sides << 4u) | (flags & 4u) : 0;
+    return (flags & 3u) | ((material.control.w & 1u) << 3u) | emission |
+           ((material.control.x & 3u) << 6u);
+}
+
+/// 消费已通过覆盖测试的命中；callable 的 Flow 和 variant 都在资源准备时特化。
+public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant)
 {
     uint primitive = hit.identity.x;
     ModMaterial material = materials[material_id(primitive)];
+    uint mask = variant == ~0u ? material_variant(material) : variant;
     pt::SurfaceMaterial result = {};
-    result.pbr.base_roughness =
-        float4(hit.texel.xyz * material.base_roughness.xyz, material.base_roughness.w);
+    result.pbr.base_roughness.w = material.base_roughness.w;
+    if ((flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
+                 openpbr::FLOW_CONDUCTOR_REFLECTION)) != 0)
+        result.pbr.base_roughness.xyz = hit.texel.xyz * material.base_roughness.xyz;
     result.pbr.surface = material.surface;
-    result.pbr.control.x = material.control.x & 3u;
-    float2 uv = material_uv(primitive, asfloat(hit.identity.yz));
+    result.pbr.control.x = (mask >> 6u) & 3u;
+    bool emits = (flow & openpbr::FLOW_EMISSION) != 0 &&
+                 ((mask & 48u) == 48u || ((mask & 16u) != 0 && hit.front) ||
+                  ((mask & 32u) != 0 && !hit.front));
+    bool textured_emission = emits && (mask & 4u) != 0;
+    float2 uv = 0;
+    if ((mask & 3u) != 0 || textured_emission)
+        uv = material_uv(primitive, asfloat(hit.identity.yz));
     float4 mers = float4(material.surface.y, 0, material.base_roughness.w, material.surface.z);
-    if ((material.control.z & 1u) != 0)
-    {
+    if ((mask & 1u) != 0 || textured_emission)
         mers = mers_atlas.SampleLevel(atlas_sampler, uv, 0);
+    if ((mask & 1u) != 0)
+    {
         result.pbr.base_roughness.w = mers.z;
         result.pbr.surface.y = mers.x;
         result.pbr.surface.z = mers.w;
     }
     float4 medium = material.extinction;
-    if ((material.control.z & 2u) != 0)
+    if ((mask & 2u) != 0)
     {
         float4 auxiliary = aux_atlas.SampleLevel(atlas_sampler, uv, 0);
         float ior = 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) / 255.0);
         result.pbr.surface.x = ior;
         medium.x = ior;
-        if ((material.control.w & 1u) != 0)
+        if ((mask & 8u) != 0)
         {
             float alpha = result.pbr.base_roughness.w * result.pbr.base_roughness.w;
             float distribution = auxiliary.z * auxiliary.z;
@@ -163,9 +205,14 @@ public pt::SurfaceMaterial resolve_material(pt::Hit hit, float4 incident)
             result.normal = decode_shading_normal(hit.identity.w);
         }
     }
-    bool thin = (material.control.x & 2u) != 0;
+    bool thin = (mask & 128u) != 0;
     result.transmitted = thin || hit.front ? medium : float4(1, 0, 0, 0);
-    result.emission = material_emission(primitive, asfloat(hit.identity.yz), hit.front);
+    if (emits)
+    {
+        result.emission = material.emission.xyz * material.emission.w * hit.texel.xyz;
+        if (textured_emission)
+            result.emission *= mers.y;
+    }
     result.boundary_filter = 1;
     return result;
 }

@@ -177,6 +177,7 @@ struct RegionGpu {
     revision: u64,
     range: std::ops::Range<u32>,
     blas: Option<vulkan::TriangleBlas>,
+    opaque: bool,
 }
 
 /// 单次成功region发布的主机墙钟与工作集；三个主阶段互斥，细分字段仅作诊断。
@@ -197,6 +198,8 @@ pub struct SceneUpdateTiming {
     pub attribute_upload_ns: u64,
     /// 实际写入的变化属性和实例基址字节，按活动范围计量。
     pub attribute_upload_bytes: u64,
+    /// 属性缓冲扩容时设备内保留的前缀字节，独立于宿主写入字节。
+    pub attribute_copy_bytes: u64,
     /// 活动光源注册及其目录编码的CPU准备，已计入geometry_ns。
     pub light_pack_ns: u64,
     /// 活动光源buffer分配/写入，已计入resources_ns；静态alias不在此路径构建。
@@ -207,8 +210,10 @@ pub struct SceneUpdateTiming {
     pub dirty_regions: usize,
     /// 本次TLAS使用的活动非空region实例数。
     pub instances: usize,
-    /// TLAS主机墙钟，已计入acceleration_ns。
+    /// TLAS准备的主机墙钟，已计入acceleration_ns。
     pub tlas_ns: u64,
+    /// 加速结构共同提交与完成等待，已计入acceleration_ns。
+    pub as_submit_wait_ns: u64,
     /// 缓存和场景发布，已计入resources_ns。
     pub publish_ns: u64,
     /// 旧资源目录回收，已计入resources_ns。
@@ -225,7 +230,7 @@ pub struct SceneUpdateTiming {
     pub attribute_capacity_bytes: u64,
     /// 全活动TLAS实例临时容量字节。
     pub instance_capacity_bytes: u64,
-    /// BLAS批次细分；submit_wait_ns已包含在acceleration_ns，不另行堆叠。
+    /// BLAS批次细分；submit_wait_ns包含BLAS和TLAS的共同等待，已计入acceleration_ns。
     pub batch: vulkan::BuildTiming,
 }
 
@@ -507,7 +512,11 @@ fn shader(spirv: &'static [u8], entry: &'static std::ffi::CStr) -> RayShader<'st
     RayShader { spirv, entry }
 }
 
-fn programs<'a>(callables: &'a [RayShader<'a>], invocation_reorder: bool) -> Programs<'a> {
+fn programs<'a>(
+    callables: &'a [RayShader<'a>],
+    invocation_reorder: bool,
+    hit: materials::HitFeatures,
+) -> Programs<'a> {
     Programs {
         prefix: shader(
             include_bytes!(concat!(env!("OUT_DIR"), "/prefix.spv")),
@@ -526,13 +535,27 @@ fn programs<'a>(callables: &'a [RayShader<'a>], invocation_reorder: bool) -> Pro
             c"primary_miss",
         ),
         closest_hit: shader(
-            include_bytes!(concat!(env!("OUT_DIR"), "/closesthit.spv")),
+            if hit.authored_normals {
+                include_bytes!(concat!(env!("OUT_DIR"), "/closesthit.spv"))
+            } else {
+                include_bytes!(concat!(env!("OUT_DIR"), "/closesthit-flat.spv"))
+            },
             c"primary_closesthit",
         ),
-        any_hit: Some(shader(
-            include_bytes!(concat!(env!("OUT_DIR"), "/anyhit.spv")),
-            c"primary_anyhit",
-        )),
+        any_hit: (hit.coverage != 0).then(|| {
+            shader(
+                match hit.coverage {
+                    MaterialDefinition::CUTOUT => {
+                        include_bytes!(concat!(env!("OUT_DIR"), "/anyhit-cutout.spv"))
+                    }
+                    MaterialDefinition::FRONT_ONLY => {
+                        include_bytes!(concat!(env!("OUT_DIR"), "/anyhit-front.spv"))
+                    }
+                    _ => include_bytes!(concat!(env!("OUT_DIR"), "/anyhit.spv")),
+                },
+                c"primary_anyhit",
+            )
+        }),
         callables,
         post: shader(
             include_bytes!(concat!(env!("OUT_DIR"), "/post.spv")),
@@ -543,7 +566,8 @@ fn programs<'a>(callables: &'a [RayShader<'a>], invocation_reorder: bool) -> Pro
 
 // 每代 atlas、能力证明和已初始化程序一起发布；旧命令通过 Flight 保活旧绑定。
 struct MaterialGeneration {
-    programs: openpbr::program::ProgramSet,
+    programs: openpbr::program::ProgramSet<(openpbr::FlowKey, u32)>,
+    hit: materials::HitFeatures,
     regular: Renderer,
     reordered: Option<Renderer>,
 }
@@ -624,10 +648,11 @@ pub struct Gpu {
     atlas: Image,
     atlas_colors: [openpbr::resource::ColorRanges; 2],
     material_gpu: MaterialGpu,
+    material_coverage: Vec<bool>,
     light_sides: Vec<u32>,
     has_emission: bool,
     light_areas: Vec<[u32; 4]>,
-    map_ranges: [openpbr::Range; 3],
+    map_ranges: materials::MapRanges,
     resource_generation: u64,
     lighting: lighting::Lighting,
     lighting_gpu: LightingGpu,
@@ -813,6 +838,7 @@ impl Gpu {
             atlas,
             atlas_colors: materials::colors(&[255; 4])?,
             material_gpu,
+            material_coverage: definitions.iter().map(materials::tests_coverage).collect(),
             light_areas: vec![[u32::MAX, 0, 0, 0]; definitions.len()],
             light_sides: vec![0; definitions.len()],
             has_emission: false,
@@ -985,6 +1011,7 @@ impl Gpu {
         self.atlas = atlas;
         self.atlas_colors = colors;
         self.material_gpu = resources;
+        self.material_coverage = definitions.iter().map(materials::tests_coverage).collect();
         self.generation = Some(generation);
         Ok(())
     }
@@ -1028,27 +1055,32 @@ impl Gpu {
             }
             let region_cache = scene_cache::Cache::new()?;
             let lighting = lighting::Lighting::new()?;
+            let definitions = source.materials;
+            let colors = materials::colors(source.albedo)?;
+            let ranges = materials::map_ranges(source.mers)?;
+            let flows = materials::flows(colors, definitions, ranges)?;
             let mut light_sides = Vec::new();
             light_sides
                 .try_reserve_exact(source.materials.len())
                 .map_err(scene_cache::Error::from)?;
-            light_sides.extend(source.materials.iter().map(|m| {
-                if lighting::emitting(m) {
-                    m.control[1]
+            light_sides.extend(definitions.iter().zip(&flows).map(|(m, flow)| {
+                if flow.emits() {
+                    materials::emission_sides(m)
                 } else {
                     0
                 }
             }));
             let has_emission = light_sides.iter().any(|&side| side != 0);
-            let definitions = source.materials;
+            let mut material_coverage = Vec::new();
+            material_coverage
+                .try_reserve_exact(definitions.len())
+                .map_err(scene_cache::Error::from)?;
+            material_coverage.extend(definitions.iter().map(materials::tests_coverage));
             let mut light_areas = Vec::new();
             light_areas
                 .try_reserve_exact(source.light_areas.len())
                 .map_err(scene_cache::Error::from)?;
             light_areas.extend_from_slice(source.light_areas);
-            let colors = materials::colors(source.albedo)?;
-            let ranges = materials::map_ranges(source.mers)?;
-            let flows = materials::flows(colors, definitions, ranges)?;
             let extent = [source.extent[0], source.extent[1], 1];
             let atlas = Image::new(&mut self.context, extent, ImageFormat::Rgba8Srgb)?;
             atlas.upload(&mut self.context, source.albedo)?;
@@ -1087,6 +1119,7 @@ impl Gpu {
             self.atlas = atlas;
             self.atlas_colors = colors;
             self.material_gpu = resources;
+            self.material_coverage = material_coverage;
             self.light_sides = light_sides;
             self.has_emission = has_emission;
             self.region_cache = region_cache;
@@ -1119,9 +1152,20 @@ impl Gpu {
             return Err(Error::Invalid("材质Flow与输入定义数量不匹配"));
         }
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders/primary.slang");
-        let programs = openpbr::program::ProgramSet::compile(
+        let hit = materials::hit_features(definitions);
+        let coverage = format!("-DPRIMEPT_COVERAGE_MASK={}", hit.coverage);
+        let lights = if flows.iter().any(|flow| flow.emits()) {
+            "-DPRIMEPT_LIGHT_MASK=3"
+        } else {
+            "-DPRIMEPT_LIGHT_MASK=1"
+        };
+        let programs = openpbr::program::ProgramSet::compile_variants(
             &self.compiler,
-            flows.iter().copied(),
+            flows
+                .iter()
+                .copied()
+                .zip(definitions)
+                .map(|(flow, definition)| (flow, materials::variant(flow, definition))),
             openpbr::program::Template {
                 source: source
                     .to_str()
@@ -1129,7 +1173,7 @@ impl Gpu {
                 entry: "shade_opaque",
                 output: "flow.spv",
                 target: shader_build::Target::Spirv("spirv_1_4"),
-                args: &["-fp-mode", "precise"],
+                args: &["-fp-mode", "precise", lights, &coverage],
             },
         )?;
         let mut rows = Vec::new();
@@ -1156,7 +1200,7 @@ impl Gpu {
         let same_code = self
             .generation
             .as_ref()
-            .is_some_and(|previous| programs.same_code(&previous.programs));
+            .is_some_and(|previous| hit == previous.hit && programs.same_code(&previous.programs));
         let callables: Vec<_> = programs
             .artifacts()
             .iter()
@@ -1175,7 +1219,7 @@ impl Gpu {
         } else {
             Renderer::new(
                 &mut self.context,
-                self::programs(&callables, false),
+                self::programs(&callables, false, hit),
                 trace,
                 post,
                 [1, 1],
@@ -1191,7 +1235,7 @@ impl Gpu {
                 } else {
                     Renderer::new(
                         &mut self.context,
-                        self::programs(&callables, true),
+                        self::programs(&callables, true, hit),
                         trace,
                         post,
                         [1, 1],
@@ -1205,6 +1249,7 @@ impl Gpu {
             resources,
             MaterialGeneration {
                 programs,
+                hit,
                 regular,
                 reordered,
             },
@@ -1311,11 +1356,28 @@ impl Gpu {
             self.scene_update = Some(metrics);
             return Ok(());
         }
-        let matches = region_match::regions(
+        let mut matches = region_match::regions(
             source.regions,
             self.region_cache.entries(),
             &self.attribute_revisions,
         )?;
+        // 同一几何版本可以更换材质。颜色补丁不影响覆盖，其余属性更新只有在旧 BLAS
+        // 跳过覆盖时才需要检查是否仍可复用。非 opaque 的旧 BLAS 对所有材质都正确。
+        for (region, matched) in source.regions.iter().zip(&mut matches) {
+            if matched.attributes_dirty
+                && !region.mesh.attribute_only()
+                && matched
+                    .reuse
+                    .is_some_and(|i| self.region_cache.entries()[i].opaque)
+                && region.mesh.quads().any(|quad| {
+                    self.material_coverage
+                        .get(quad.material_id().index() as usize)
+                        .is_none_or(|&coverage| coverage)
+                })
+            {
+                matched.reuse = None;
+            }
+        }
         let mut update = self.region_cache.begin(source.regions.len())?;
         let (slots, entries, _) = update.parts_mut();
         let started = std::time::Instant::now();
@@ -1356,10 +1418,16 @@ impl Gpu {
                 return Err(Error::Invalid("region属性槽超过设备缓冲容量"));
             }
             let start = triangles.len();
+            let mut opaque = true;
             for quad in region.mesh.quads() {
-                if !quad.valid() || quad.material_id().index() as usize >= self.light_sides.len() {
+                let coverage = self
+                    .material_coverage
+                    .get(quad.material_id().index() as usize)
+                    .ok_or(Error::Invalid("构建AS前quad记录或材质身份无效"))?;
+                if !quad.valid() {
                     return Err(Error::Invalid("构建AS前quad记录或材质身份无效"));
                 }
+                opaque &= !coverage;
                 let [a, b, c, d] = quad.positions();
                 triangles.extend([[a, b, c], [a, c, d]]);
             }
@@ -1369,22 +1437,20 @@ impl Gpu {
                 revision: region.geometry_revision,
                 range,
                 blas: None,
+                opaque,
             }));
         }
+        let same_acceleration = same_geometry && pending.is_empty();
         metrics.dirty_regions = pending.len();
         let inputs: Vec<_> = pending
             .iter()
-            .map(|(_, range)| vulkan::TriangleBlasInput {
+            .map(|(index, range)| vulkan::TriangleBlasInput {
                 triangles: &triangles[range.clone()],
-                opaque: false,
+                opaque: entries[*index].get(self.region_cache.entries()).opaque,
                 opacity: None,
             })
             .collect();
         metrics.geometry_ns = elapsed_ns(started);
-        let started = std::time::Instant::now();
-        let batch = self.context.triangle_blas_batch(&inputs)?;
-        metrics.acceleration_ns = elapsed_ns(started);
-        metrics.batch = batch.timing;
         metrics.triangle_bytes = size_of_val(triangles.as_slice()) as u64;
         metrics.triangle_capacity_bytes =
             (triangles.capacity() * size_of::<[[f32; 3]; 3]>()) as u64;
@@ -1392,12 +1458,59 @@ impl Gpu {
             (pending.capacity() * size_of::<(usize, std::ops::Range<usize>)>()) as u64;
         metrics.input_capacity_bytes =
             (inputs.capacity() * size_of::<vulkan::TriangleBlasInput<'_>>()) as u64;
-        for ((index, _), blas) in pending.iter().zip(batch.blases) {
-            let scene_cache::Prepared::Built(entry) = &mut entries[*index] else {
-                unreachable!("dirty输入对应新记录");
-            };
-            entry.blas = Some(blas);
-        }
+        let top = if !same_acceleration || source.anchor != self.anchor {
+            let packing = std::time::Instant::now();
+            let mut instances = Vec::new();
+            instances
+                .try_reserve_exact(entries.len())
+                .map_err(scene_cache::Error::from)?;
+            let mut next_blas = 0;
+            for (index, entry) in entries.iter().enumerate() {
+                let built = matches!(entry, scene_cache::Prepared::Built(_));
+                let entry = entry.get(self.region_cache.entries());
+                let geometry = if built {
+                    let geometry = vulkan::BatchBlas::New(next_blas);
+                    next_blas += 1;
+                    geometry
+                } else {
+                    vulkan::BatchBlas::Existing(
+                        entry.blas.ok_or(Error::Invalid("未完成region BLAS"))?,
+                    )
+                };
+                let offset: [f32; 3] = std::array::from_fn(|axis| {
+                    (f64::from(entry.key[axis]) * 64.0 - source.anchor[axis]) as f32
+                });
+                instances.push(TriangleInstance {
+                    geometry,
+                    transform: [
+                        [1., 0., 0., offset[0]],
+                        [0., 1., 0., offset[1]],
+                        [0., 0., 1., offset[2]],
+                    ],
+                    custom_index: index as u32,
+                });
+            }
+            metrics.instance_capacity_bytes =
+                (instances.capacity() * size_of::<TriangleInstance<vulkan::BatchBlas>>()) as u64;
+            metrics.attribute_pack_ns = elapsed_ns(packing);
+            let accelerating = std::time::Instant::now();
+            let batch = self.context.triangle_scene_batch(&inputs, &instances)?;
+            metrics.acceleration_ns = elapsed_ns(accelerating);
+            metrics.tlas_ns = batch.tlas_prepare_ns;
+            metrics.as_submit_wait_ns = batch.blas.timing.submit_wait_ns;
+            if !inputs.is_empty() {
+                metrics.batch = batch.blas.timing;
+            }
+            for ((index, _), blas) in pending.iter().zip(batch.blas.blases) {
+                let scene_cache::Prepared::Built(entry) = &mut entries[*index] else {
+                    unreachable!("dirty输入对应新记录");
+                };
+                entry.blas = Some(blas);
+            }
+            batch.top
+        } else {
+            self.scene.top
+        };
         drop(inputs);
         drop(triangles);
         drop(pending);
@@ -1415,12 +1528,11 @@ impl Gpu {
             .zip(entries.iter())
             .zip(&matches)
             .filter(|((_, e), matched)| {
-                grow || matches!(e, scene_cache::Prepared::Built(_)) || matched.attributes_dirty
+                matches!(e, scene_cache::Prepared::Built(_)) || matched.attributes_dirty
             })
             .try_fold(0usize, |n, ((r, e), _)| {
-                let partial = !grow
-                    && !matches!(e, scene_cache::Prepared::Built(_))
-                    && r.mesh.attribute_only();
+                let partial =
+                    !matches!(e, scene_cache::Prepared::Built(_)) && r.mesh.attribute_only();
                 let count = if partial {
                     r.mesh
                         .attribute_ranges()
@@ -1435,14 +1547,13 @@ impl Gpu {
             .try_reserve_exact(dirty_count)
             .map_err(scene_cache::Error::from)?;
         let mut ranges = Vec::with_capacity(source.regions.len());
-        let mut instances = Vec::with_capacity(source.regions.len());
         let mut versions = Vec::with_capacity(source.regions.len());
         for ((region, entry), matched) in source.regions.iter().zip(entries.iter()).zip(&matches) {
             let built = matches!(entry, scene_cache::Prepared::Built(_));
             let entry = entry.get(self.region_cache.entries());
-            let dirty = grow || built || matched.attributes_dirty;
+            let dirty = built || matched.attributes_dirty;
             if dirty {
-                if !grow && !built && region.mesh.attribute_only() {
+                if !built && region.mesh.attribute_only() {
                     for patch in region.mesh.attribute_ranges() {
                         let start = attributes.len();
                         attributes.extend(patch.attributes());
@@ -1468,36 +1579,11 @@ impl Gpu {
                 }
             }
             versions.push((region.key, region.content_revision));
-            if !same_geometry || source.anchor != self.anchor {
-                let offset: [f32; 3] = std::array::from_fn(|axis| {
-                    (f64::from(region.key[axis]) * 64.0 - source.anchor[axis]) as f32
-                });
-                instances.push(TriangleInstance {
-                    geometry: entry.blas.ok_or(Error::Invalid("未完成region BLAS"))?,
-                    transform: [
-                        [1., 0., 0., offset[0]],
-                        [0., 1., 0., offset[1]],
-                        [0., 0., 1., offset[2]],
-                    ],
-                    custom_index: instances.len() as u32,
-                });
-            }
         }
         metrics.attribute_capacity_bytes =
             (attributes.capacity() * size_of::<[[u32; 4]; 3]>()) as u64;
-        metrics.instance_capacity_bytes =
-            (instances.capacity() * size_of::<TriangleInstance>()) as u64;
-        metrics.attribute_pack_ns = elapsed_ns(packing);
+        metrics.attribute_pack_ns += elapsed_ns(packing);
         metrics.geometry_ns += metrics.attribute_pack_ns;
-        let accelerating = std::time::Instant::now();
-        let top = if !same_geometry || source.anchor != self.anchor {
-            let top = self.context.acceleration_instances(&instances)?;
-            metrics.tlas_ns = elapsed_ns(accelerating);
-            top
-        } else {
-            self.scene.top
-        };
-        metrics.acceleration_ns += metrics.tlas_ns;
         let light_started = std::time::Instant::now();
         let bases: Vec<_> = entries
             .iter()
@@ -1538,13 +1624,35 @@ impl Gpu {
                 .max(4096)
                 .checked_next_power_of_two()
                 .ok_or(Error::Invalid("属性容量溢出"))?;
-            Buffer::mapped_device_local(&mut self.context, u64::from(capacity) * 48)?
+            let buffer = Buffer::mapped_device_local(&mut self.context, u64::from(capacity) * 48)?;
+            // 旧槽只复制需继承的前缀，完整替换的槽由后续属性写入覆盖。
+            let retained_end = source
+                .regions
+                .iter()
+                .zip(entries.iter())
+                .zip(&matches)
+                .filter(|((region, entry), matched)| {
+                    !matches!(entry, scene_cache::Prepared::Built(_))
+                        && (!matched.attributes_dirty || region.mesh.attribute_only())
+                })
+                .map(|((_, entry), _)| entry.get(self.region_cache.entries()).range.end)
+                .max()
+                .unwrap_or(0);
+            if retained_end != 0 {
+                metrics.attribute_copy_bytes = u64::from(retained_end) * 48;
+                self.scene.quads.copy_prefix_to(
+                    &mut self.context,
+                    &buffer,
+                    metrics.attribute_copy_bytes,
+                )?;
+            }
+            buffer
         } else {
             self.scene.quads
         };
         let mut allocation_ns = if grow { elapsed_ns(uploading) } else { 0 };
         // 实例身份只引用同序目录；属性槽可独立扩展。anchor变化和纯属性更新复用目录。
-        let base_write = (!same_geometry && !bases.is_empty())
+        let base_write = (!same_acceleration && !bases.is_empty())
             .then(|| (0, bytemuck::cast_slice(bases.as_slice())));
         let instance_quad_bases = if let Some((_, bytes)) = base_write
             && (bytes.len() as u64 > self.scene.instance_quad_bases.len()

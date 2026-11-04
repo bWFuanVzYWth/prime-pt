@@ -13,6 +13,12 @@ import bsdf.openpbr.flow;
 #ifndef OPENPBR_FLOW
 #define OPENPBR_FLOW 131
 #endif
+#ifndef PRIMEPT_LIGHT_MASK
+#define PRIMEPT_LIGHT_MASK 3
+#endif
+#ifndef PRIMEPT_AUTHORED_NORMAL
+#define PRIMEPT_AUTHORED_NORMAL 1
+#endif
 
 [[vk::binding(7, 0)]]
 RWStructuredBuffer<float4> output_image;
@@ -136,10 +142,11 @@ void primary_closesthit(inout TracePayload payload,
            c = HitTriangleVertexPosition(2);
     payload.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
                                                WorldToObject3x4());
-    float3 edge1 = mul((float3x3)ObjectToWorld3x4(), b - a);
-    float3 edge2 = mul((float3x3)ObjectToWorld3x4(), c - a);
-    payload.shading_normal = mapped_shading_normal(payload.primitive, payload.bary, edge1, edge2,
-                                                   payload.surface.normal);
+    payload.shading_normal = 0;
+    if (PRIMEPT_AUTHORED_NORMAL != 0)
+        payload.shading_normal =
+            mapped_shading_normal(payload.primitive, payload.bary, b - a, c - a,
+                                  (float3x3)ObjectToWorld3x4(), payload.surface.normal);
 }
 
 void store_landing(uint pixel, pt::TransportCall data)
@@ -252,5 +259,6 @@ void render_main()
 void shade_opaque(inout pt::TransportCall data)
 {
     ModScene provider;
-    pt::process_flow<OPENPBR_FLOW, ModScene, 3>(provider, data, settings(parameters[0]));
+    pt::process_flow<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(provider, data,
+                                                                 settings(parameters[0]));
 }

@@ -14,6 +14,10 @@ import atmosphere.parameters;
 import atmosphere.sampling;
 import color.primaries;
 
+#ifndef OPENPBR_VARIANT
+#define OPENPBR_VARIANT 0xffffffffu
+#endif
+
 [[vk::binding(0, 0)]]
 public RaytracingAccelerationStructure scene;
 [[vk::binding(4, 0)]]
@@ -90,7 +94,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public pt::SurfaceMaterial guide_material(pt::Hit hit, float4 incident)
     {
-        return resolve(hit, 0, incident);
+        return resolve_material(hit, ~openpbr::FLOW_EMISSION, ~0u);
     }
 
     public bool intersect(float3 origin, float3 direction, out pt::Hit hit)
@@ -103,7 +107,6 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         if (payload.primitive == 0xffffffffu)
             return false;
         hit.surface = payload.surface;
-        uint base = (payload.primitive >> 1) * 3;
         hit.identity = uint4(payload.primitive, asuint(payload.bary), payload.shading_normal);
         hit.capability = 0;
         hit.distance = payload.distance;
@@ -133,16 +136,12 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public pt::SurfaceMaterial resolve(pt::Hit hit, uint capability, float4 incident)
     {
-        return resolve_material(hit, incident);
+        return resolve_material(hit, ~0u, ~0u);
     }
 
     public pt::SurfaceMaterial resolve_flow(pt::Hit hit, uint flow, float4 incident)
     {
-        pt::SurfaceMaterial material = resolve(hit, 0, incident);
-        if ((flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
-                     openpbr::FLOW_CONDUCTOR_REFLECTION)) == 0)
-            material.pbr.base_roughness.xyz = 0;
-        return material;
+        return resolve_material(hit, flow, OPENPBR_VARIANT);
     }
 
     public openpbr::Energy energy()
@@ -190,6 +189,13 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
     {
         RayDesc ray = { connection.origin, connection.t_min, connection.direction,
                         connection.t_max };
+        if (COVERAGE_MASK == 0)
+        {
+            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE> opaque;
+            opaque.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
+            opaque.Proceed();
+            return opaque.CommittedStatus() != COMMITTED_NOTHING;
+        }
         RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
         query.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
         while (query.Proceed())

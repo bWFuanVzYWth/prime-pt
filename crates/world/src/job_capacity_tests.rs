@@ -60,6 +60,37 @@ fn drive_capacity_scene(
 }
 
 #[test]
+fn oversized_geometry_candidates_publish_one_at_a_time_after_resume() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    scene.set_work_budget(WorkBudget {
+        publish_geometry_quads: 0,
+        ..WorkBudget::default()
+    });
+    let sources = |key: [i32; 3]| {
+        Some(if matches!(key, [0, 0, 0] | [4, 0, 0]) {
+            Pattern::Sparse
+        } else {
+            Pattern::Air
+        })
+    };
+    for _ in 0..32 {
+        step_capacity_scene(&mut scene, &catalog, 4, sources)?;
+    }
+    assert_eq!(scene.render_regions().len(), 0);
+    scene.set_work_budget(WorkBudget {
+        publish_geometry_quads: 128,
+        ..WorkBudget::default()
+    });
+    for expected in [1, 2] {
+        step_capacity_scene(&mut scene, &catalog, 4, sources)?;
+        assert_eq!(scene.render_regions().len(), expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn shrinking_a_published_region_can_reduce_existing_resident_overage() -> Result<(), Error> {
     let catalog = fixtures::catalog()?;
     let mut scene = Scene::with_threads(1)?;

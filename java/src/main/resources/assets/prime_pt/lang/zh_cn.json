@@ -17,6 +17,11 @@
   "primept.settings.bounces": "路径顶点预算",
   "primept.settings.bounces.tooltip": "每条路径最多 1–64 个顶点，包括主命中；最后一个顶点仍计算直接光与自发光。\n命令：/pt bounces 1..64",
   "primept.settings.display": "PT 显示",
+  "primept.settings.update_budget": "场景更新额度",
+  "primept.settings.update_budget.tooltip": "按工作量分配捕获、建网和场景发布。平稳档减少同帧的区块更新量，吞吐档加快区块加载。",
+  "primept.settings.update_budget.smooth": "平稳",
+  "primept.settings.update_budget.balanced": "均衡",
+  "primept.settings.update_budget.throughput": "吞吐",
   "primept.settings.exposure": "曝光",
   "primept.settings.exposure.tooltip": "在 RR 之后、显示映射之前调整亮度。+1 EV 将亮度加倍。滑条步长 0.25 EV；打开设置保留命令输入的精确值。\n命令：/pt exposure -16..16",
   "primept.settings.save_failed": "PT 设置保存失败"

@@ -13,6 +13,10 @@ fn camera() -> WorldCamera {
 }
 
 fn ready_tinted() -> Result<(Scene, Catalog), Error> {
+    ready_tinted_with_neighbour(Pattern::Air)
+}
+
+fn ready_tinted_with_neighbour(neighbour: Pattern) -> Result<(Scene, Catalog), Error> {
     let catalog = fixtures::catalog()?;
     let mut scene = Scene::new()?;
     scene.source_generation(catalog.generation())?;
@@ -25,10 +29,10 @@ fn ready_tinted() -> Result<(Scene, Catalog), Error> {
                     (
                         request.id,
                         request.section,
-                        if request.section == [0; 3] {
-                            Pattern::Tinted
-                        } else {
-                            Pattern::Air
+                        match request.section {
+                            [0, 0, 0] => Pattern::Tinted,
+                            [1, 0, 0] => neighbour,
+                            _ => Pattern::Air,
                         },
                     )
                 })
@@ -54,6 +58,39 @@ fn publish(scene: &mut Scene, catalog: &Catalog) -> Result<(), Error> {
         }
     }
     Err(Error::Input("压缩源发布未收敛"))
+}
+
+#[test]
+fn overlapping_source_deltas_dirty_exact_region_fragments() -> Result<(), Error> {
+    use crate::store::{LocalRange, SourceDelta};
+
+    let (mut scene, catalog) = ready_tinted_with_neighbour(Pattern::Dense)?;
+    let colors = vec![0xffff_ffff; scene.tint_requests().len()];
+    scene.apply_tints(&colors)?;
+    publish(&mut scene, &catalog)?;
+    scene.dirty_source_outputs(&[
+        SourceDelta {
+            key: [0, 0, 0],
+            changed: Some(LocalRange {
+                min: [15, 4, 1],
+                max_exclusive: [16, 5, 2],
+            }),
+            interactive: false,
+        },
+        SourceDelta {
+            key: [1, 0, 0],
+            changed: Some(LocalRange {
+                min: [0, 7, 1],
+                max_exclusive: [1, 8, 2],
+            }),
+            interactive: true,
+        },
+    ])?;
+
+    let dirty = scene.masks[&[0; 3]];
+    assert_eq!(dirty.mask.words(), [0b0111, 0b0111, 0, 0]);
+    assert!(dirty.interactive);
+    Ok(())
 }
 
 #[test]

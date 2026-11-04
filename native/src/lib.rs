@@ -1,8 +1,9 @@
 //! Minecraft 26.3 的引擎 PT 场景适配实验。
 //!
 //! Java 在渲染线程同步借出源包、atlas 与宿主 Vulkan 句柄；Rust 拥有 mesh、
-//! 工作池、BLAS/TLAS、SBT 和 pipeline。每次进入 native 前，宿主必须提交并等待
-//! 前次 native 命令完成，且独占 graphics queue。句柄不会转移设备所有权。
+//! 工作池、BLAS/TLAS、SBT 和 pipeline。操作 GPU 所有者前，宿主必须提交并等待
+//! 前次 native 命令完成，且独占 graphics queue。纯 CPU 场景阶段可在等待前推进。
+//! 句柄不会转移设备所有权。
 //! 源包只在调用内借用；palette/资源字典解码成自持输入，section编译及tint续接分阶段发布。
 //! 一个64m region合并4³个section；缺源section保留旧片段，已完成片段可发布。
 //! 使用 [`Quad`] 的直接寻址属性 ABI：任意四角、固定012/023、三角面退化为quad，
@@ -341,6 +342,29 @@ pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
             engine
                 .gpu
                 .invalidate_history(gpu::GlobalReset::WorldReplaced)?;
+            Ok(())
+        })
+    })
+}
+
+/// 选择场景更新的确定性工作额度；0平稳、1均衡、2吞吐，其他值拒绝。
+/// 只影响后续建网和发布，捕获上限由宿主通过 [`prime_plan`] 的容量传入。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_set_update_budget(id: u64, preset: u32) -> i32 {
+    guarded(-1, || {
+        let (mesh_slabs, publish_geometry_quads, publish_attribute_quads) = match preset {
+            0 => (48, 65_536, 131_072),
+            1 => (96, 131_072, 262_144),
+            2 => (128, 262_144, 524_288),
+            _ => return Err(Error::Input("未知场景更新档位")),
+        };
+        with_engine(id, |engine| {
+            engine.scene.set_work_budget(scene::WorkBudget {
+                mesh_slabs,
+                publish_geometry_quads,
+                publish_attribute_quads,
+                ..engine.scene.work_budget()
+            });
             Ok(())
         })
     })
@@ -1011,8 +1035,10 @@ pub unsafe extern "C" fn prime_draw(
                     dirty_regions: timing.dirty_regions as u64,
                     instances: timing.instances as u64,
                     triangle_bytes: timing.triangle_bytes,
-                    attribute_bytes: timing.attribute_upload_bytes + timing.light_upload_bytes,
-                    blas_wait_ns: timing.batch.submit_wait_ns,
+                    attribute_bytes: timing.attribute_upload_bytes
+                        + timing.attribute_copy_bytes
+                        + timing.light_upload_bytes,
+                    as_wait_ns: timing.as_submit_wait_ns,
                     tlas_ns: timing.tlas_ns,
                     attribute_ns: timing.attribute_upload_ns + timing.light_upload_ns,
                 });

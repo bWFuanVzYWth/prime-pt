@@ -661,27 +661,8 @@ fn difference(
     }
     let old = page.storage.get(&slot).expect("旧非air数据保留到差分完成");
     let next = next.expect("已处理Unavailable");
-    if old == next {
-        return None;
-    }
-    let mut min = [16; 3];
-    let mut max_exclusive = [0; 3];
-    let mut changed = false;
-    for index in 0..4096 {
-        if old.state(index) != next.state(index) {
-            changed = true;
-            let local = [
-                (index & 15) as u8,
-                (index >> 8) as u8,
-                ((index >> 4) & 15) as u8,
-            ];
-            for axis in 0..3 {
-                min[axis] = min[axis].min(local[axis]);
-                max_exclusive[axis] = max_exclusive[axis].max(local[axis] + 1);
-            }
-        }
-    }
-    changed.then_some(LocalRange { min, max_exclusive })
+    old.changed_bounds(next)
+        .map(|(min, max_exclusive)| LocalRange { min, max_exclusive })
 }
 
 #[cfg(test)]

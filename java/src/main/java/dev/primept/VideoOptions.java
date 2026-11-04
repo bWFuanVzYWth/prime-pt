@@ -20,7 +20,7 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, DISPLAY, EXPOSURE }
+    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, DISPLAY, EXPOSURE }
 
     @FunctionalInterface
     interface Action { void run() throws IOException; }
@@ -35,6 +35,7 @@ public final class VideoOptions {
     private CycleButton<Boolean> rr;
     private CycleButton<Boolean> ser;
     private CycleButton<Quality> quality;
+    private CycleButton<UpdateBudget> updateBudget;
 
     private VideoOptions(OptionsList list, Screen screen, Runnable rebuild) {
         this.list = list;
@@ -91,6 +92,17 @@ public final class VideoOptions {
                     Settings::samples, value -> Settings.setSamples((int)value), false);
             case BOUNCES -> addSlider("bounces", Settings.MIN_BOUNCES, Settings.MAX_BOUNCES, 1,
                     Settings::bounces, value -> Settings.setBounces((int)value), false);
+            case UPDATE_BUDGET -> {
+                updateBudget = CycleButton.builder(
+                                (UpdateBudget value) -> text("update_budget." + value.key), Settings.updateBudget())
+                        .withValues(List.of(UpdateBudget.values()))
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("update_budget.tooltip")))
+                        .create(0, 0, 310, 20, text("update_budget"), (button, value) -> {
+                            change(() -> Settings.setUpdateBudget(value));
+                            button.setValue(Settings.updateBudget());
+                        });
+                list.addBig(updateBudget);
+            }
             case DISPLAY -> list.addHeader(text("display"));
             case EXPOSURE -> addSlider("exposure", Settings.MIN_EV, Settings.MAX_EV, 0.25,
                     Settings::exposure, value -> Settings.setExposure((float)value), true);
@@ -125,6 +137,7 @@ public final class VideoOptions {
         if (ser.getValue() != Settings.requestedSer()) ser.setValue(Settings.requestedSer());
         if (rr.getValue() != Settings.requestedRr()) rr.setValue(Settings.requestedRr());
         if (quality.getValue() != Settings.quality()) quality.setValue(Settings.quality());
+        if (updateBudget.getValue() != Settings.updateBudget()) updateBudget.setValue(Settings.updateBudget());
         for (var slider : sliders) slider.sync();
     }
 

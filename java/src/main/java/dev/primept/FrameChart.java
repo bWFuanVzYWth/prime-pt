@@ -11,9 +11,9 @@ final class FrameChart {
     static final int BARS_OFFSET = HEADER_BYTES + 3 * DETAIL_BYTES;
     static final int CAPACITY = BARS_OFFSET + MAX_BARS * BAR_BYTES;
     static final String[] LABELS = {"宿主等待", "tint/源维护", "规划", "宿主捕获", "网格编译/合并", "三角编码", "属性/光源打包",
-            "BLAS构建/等待", "属性/光源写入", "TLAS构建/等待", "场景准备/提交", "录制/SDK", "宿主提交", "未归因"};
+            "AS构建/等待", "属性/光源写入", "TLAS准备", "场景准备/提交", "录制/SDK", "宿主提交", "未归因"};
     private static final String[] SHORT_LABELS = {"等待", "tint", "规划", "捕获", "网格", "三角", "打包",
-            "BLAS", "写入", "TLAS", "场景", "录制", "提交", "未归因"};
+            "AS", "写入", "TLAS", "场景", "录制", "提交", "未归因"};
     static final int[] COLORS = {0xff45b59e, 0xff53c4bd, 0xff9cbbe8, 0xff5b8ff9, 0xffee5b6b,
             0xfff7a8b8, 0xff64cedd, 0xfff0ca52, 0xff90cf66, 0xfff69942, 0xffaa74dd,
             0xff7f8fff, 0xffde91c1, 0xff74808e};
@@ -24,7 +24,7 @@ final class FrameChart {
     private static double averageFps, meanMs, p90Ms, p99Ms;
     private static boolean gpuAvailable, sceneAvailable;
     private static long sceneSequence, dirtyRegions, instances, triangleBytes, attributeBytes;
-    private static long blasSubmitWaitNs, tlasNs, attributeWriteNs;
+    private static long asSubmitWaitNs, tlasNs, attributeWriteNs;
     private static int pressureKind, excludedRegions;
     private static long requiredBytes, limitBytes, deferredRequests;
     private static final long[] WORK = new long[19];
@@ -45,7 +45,7 @@ final class FrameChart {
         averageFps = 0; meanMs = 0; p90Ms = 0; p99Ms = 0;
         gpuAvailable = false; gpuSequence = 0; gpuNs = 0;
         sceneAvailable = false; sceneSequence = 0; dirtyRegions = 0; instances = 0;
-        triangleBytes = 0; attributeBytes = 0; blasSubmitWaitNs = 0; tlasNs = 0; attributeWriteNs = 0;
+        triangleBytes = 0; attributeBytes = 0; asSubmitWaitNs = 0; tlasNs = 0; attributeWriteNs = 0;
         pressureKind = 0; excludedRegions = 0; requiredBytes = 0; limitBytes = 0; deferredRequests = 0;
         java.util.Arrays.fill(WORK,0);snapshotRequested=false;
     }
@@ -56,7 +56,7 @@ final class FrameChart {
      * 隐藏时此入口只更新复用数组和数值；文本格式化留到可见的 paint。
      * header 0/4/8/12 为 magic/version/stages/bars，16/24 为样本数/序号，
      * 32..56 为 FPS/mean/P90/P99 的 f64，64 为 GPU valid，72/80 为序号/ns，88 为 detail mask。
-     * 92 为 scene valid，96..152 为场景序号、dirty/instance 数、三角/属性字节与 BLAS提交等待/TLAS/属性写入纳秒。
+     * 92 为 scene valid，96..152 为场景序号、dirty/instance 数、三角/属性字节及 AS 等待、TLAS 准备、属性写入纳秒。
      * 场景字段属于最近一次更新，不与选中帧绑定。v3在160/164保存CPU压力原因/排除region数，
      * 168/176/184保存需要字节/预算字节/延后请求数；压力属于当前状态。
      * 192起保存16项工作计数，320/328/336为需求域中已确认缺源的段、在途任务和已签发待回复捕获。
@@ -107,7 +107,7 @@ final class FrameChart {
         sceneAvailable = scene != 0; sceneSequence = source.getLong(96);
         dirtyRegions = source.getLong(104); instances = source.getLong(112);
         triangleBytes = source.getLong(120); attributeBytes = source.getLong(128);
-        blasSubmitWaitNs = source.getLong(136); tlasNs = source.getLong(144); attributeWriteNs = source.getLong(152);
+        asSubmitWaitNs = source.getLong(136); tlasNs = source.getLong(144); attributeWriteNs = source.getLong(152);
         pressureKind = source.getInt(160); excludedRegions = source.getInt(164);
         requiredBytes = source.getLong(168); limitBytes = source.getLong(176); deferredRequests = source.getLong(184);
         for(int field=0;field<WORK.length;field++)WORK[field]=source.getLong(192+field*8);
@@ -222,8 +222,7 @@ final class FrameChart {
                     left, sceneTop + 11, graphWidth, 0xffc2cad6);
             text(surface, format("场景写入%s · %.2fms", bytes(attributeBytes), attributeWriteNs / 1_000_000.0),
                     left, sceneTop + 22, graphWidth, COLORS[8]);
-            text(surface, compact ? format("BLAS等 %.1f · TLAS %.1f ms", blasSubmitWaitNs / 1_000_000.0, tlasNs / 1_000_000.0)
-                    : format("BLAS提交/等待 %.2fms · TLAS %.2fms", blasSubmitWaitNs / 1_000_000.0, tlasNs / 1_000_000.0),
+            text(surface, format("AS提交/等待 %.2fms · TLAS准备 %.2fms", asSubmitWaitNs / 1_000_000.0, tlasNs / 1_000_000.0),
                     left, sceneTop + 33, graphWidth, 0xffc2cad6);
         }
         int workTop=sceneTop+sceneHeight;

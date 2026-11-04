@@ -70,6 +70,72 @@ impl SectionStorage {
         })
     }
 
+    /// 比较同一资源世代的状态ID，返回实际变化的最小半开包围盒，坐标顺序为[x, y, z]。
+    /// palette顺序、重复ID或未使用的填充位不构成状态变化；完全等价时返回None。
+    pub fn changed_bounds(&self, next: &Self) -> Option<([u8; 3], [u8; 3])> {
+        const FULL: ([u8; 3], [u8; 3]) = ([0; 3], [16; 3]);
+        match (self.uniform_state(), next.uniform_state()) {
+            (Some(old), Some(new)) => return (old != new).then_some(FULL),
+            (Some(id), None) if !next.palette.is_empty() && !next.palette.contains(&id) => {
+                return Some(FULL);
+            }
+            (None, Some(id)) if !self.palette.is_empty() && !self.palette.contains(&id) => {
+                return Some(FULL);
+            }
+            _ => {}
+        }
+        let mut min = [16; 3];
+        let mut max_exclusive = [0; 3];
+        let mut include = |index: usize| {
+            let position = [
+                (index & 15) as u8,
+                (index >> 8) as u8,
+                ((index >> 4) & 15) as u8,
+            ];
+            for axis in 0..3 {
+                min[axis] = min[axis].min(position[axis]);
+                max_exclusive[axis] = max_exclusive[axis].max(position[axis] + 1);
+            }
+        };
+        let same_index_layout = self.bits == next.bits
+            && self.palette.is_empty() == next.palette.is_empty()
+            && (self.palette.starts_with(&next.palette) || next.palette.starts_with(&self.palette));
+        if same_index_layout {
+            if self.words == next.words {
+                return None;
+            }
+            let bits = self.bits as usize;
+            let per_word = 64 / bits;
+            let mask = (1u64 << bits) - 1;
+            for (word, (&old, &new)) in self.words.iter().zip(&next.words).enumerate() {
+                let start = word * per_word;
+                let mut changed = old ^ new;
+                while changed != 0 {
+                    let field = changed.trailing_zeros() as usize / bits;
+                    let index = start + field;
+                    if field >= per_word || index >= 4096 {
+                        break;
+                    }
+                    let shift = field * bits;
+                    if self.palette.is_empty()
+                        || self.palette[((old >> shift) & mask) as usize]
+                            != next.palette[((new >> shift) & mask) as usize]
+                    {
+                        include(index);
+                    }
+                    changed &= !(mask << shift);
+                }
+            }
+        } else {
+            for index in 0..4096 {
+                if self.state(index) != next.state(index) {
+                    include(index);
+                }
+            }
+        }
+        (min[0] < 16).then_some((min, max_exclusive))
+    }
+
     /// 实际拥有的有效源字节，不含容器元数据或保留容量。
     pub fn source_bytes(&self) -> usize {
         self.palette.len() * 4 + self.words.len() * 8
@@ -169,6 +235,42 @@ mod tests {
         let storage = SectionStorage::new(5, palette, words).unwrap();
         assert!((0..4096).all(|i| storage.state(i) == Some(100 + (i % 19) as u32)));
         assert_eq!(storage.state(4096), None);
+    }
+
+    #[test]
+    fn changed_bounds_ignore_packed_padding_and_equivalent_palette_slots() {
+        let old_words = vec![0; 4096usize.div_ceil(12)];
+        let mut new_words = old_words.clone();
+        new_words[0] = (1 << 55) | (15 << 60);
+        new_words[1] = 1 | (2 << 20);
+        *new_words.last_mut().unwrap() = u64::MAX << 20;
+        let old = SectionStorage::new(5, vec![71, 91, 71], old_words).unwrap();
+        let new = SectionStorage::new(5, vec![71, 91, 71], new_words).unwrap();
+        assert_eq!(old.changed_bounds(&new), Some(([11, 0, 0], [13, 1, 1])));
+    }
+
+    #[test]
+    fn changed_bounds_compare_ids_across_palette_layouts() {
+        let old = SectionStorage::new(1, vec![71, 91], vec![1; 64]).unwrap();
+        let mut new_words = vec![0x5555_5555_5555_5555; 128];
+        for word in new_words.iter_mut().step_by(2) {
+            *word &= !1;
+        }
+        let equivalent = SectionStorage::new(2, vec![91, 71], new_words.clone()).unwrap();
+        assert_eq!(old.changed_bounds(&equivalent), None);
+        new_words[0] &= !(1 << 2);
+        let changed = SectionStorage::new(2, vec![91, 71], new_words).unwrap();
+        assert_eq!(old.changed_bounds(&changed), Some(([1, 0, 0], [2, 1, 1])));
+    }
+
+    #[test]
+    fn changed_bounds_accept_new_entries_in_same_width_palette() {
+        let old_words = vec![0; 256];
+        let mut new_words = old_words.clone();
+        new_words[255] = 2 << 60;
+        let old = SectionStorage::new(4, vec![71, 91], old_words).unwrap();
+        let new = SectionStorage::new(4, vec![71, 91, 101], new_words).unwrap();
+        assert_eq!(old.changed_bounds(&new), Some(([15; 3], [16; 3])));
     }
 
     #[test]

@@ -24,6 +24,7 @@ public final class Settings {
     public static Quality quality() { return Holder.CONFIG.quality(); }
     public static int samples() { return Holder.CONFIG.samples(); }
     public static int bounces() { return Holder.CONFIG.bounces(); }
+    static UpdateBudget updateBudget() { return Holder.CONFIG.updateBudget(); }
     static boolean rr() { return requestedRr() && StreamlineBootstrap.available(); }
 
     /** 保存成功后才发布新值；输入无效抛出 IllegalArgumentException，IO 失败抛出 IOException。 */
@@ -33,6 +34,7 @@ public final class Settings {
     public static void setQuality(Quality value) throws IOException { Holder.CONFIG.setQuality(value); }
     public static void setSamples(int value) throws IOException { Holder.CONFIG.setSamples(value); }
     public static void setBounces(int value) throws IOException { Holder.CONFIG.setBounces(value); }
+    static void setUpdateBudget(UpdateBudget value) throws IOException { Holder.CONFIG.setUpdateBudget(value); }
     public static void reset() throws IOException { Holder.CONFIG.reset(); }
 
     public static String rrStatus() { return StreamlineBootstrap.status(); }
