@@ -38,7 +38,8 @@ impl Scene {
         if let Some(index) = self.job_index(ticket)
             && !self.jobs[index].tint_mask.is_empty()
         {
-            self.tint_jobs.insert(ticket)?;
+            self.tint_jobs
+                .insert(ticket, self.jobs[index].interactive)?;
         }
         Ok(())
     }
@@ -51,6 +52,7 @@ impl Scene {
         let handle = job.handle;
         self.job_tickets.insert(ticket, index);
         self.job_handles.insert(handle, index);
+        self.interactive_jobs += usize::from(job.interactive);
         self.jobs.push(job);
         if self.compact.generation != 0
             && let Err(error) = self.compact.register(&self.jobs[index])
@@ -65,6 +67,8 @@ impl Scene {
     }
     pub(super) fn remove_job(&mut self, index: usize) -> RegionJob {
         let job = self.jobs.swap_remove(index);
+        self.interactive_jobs -= usize::from(job.interactive);
+        self.capacity.release_staging(job.ticket);
         self.job_tickets.remove(&job.ticket);
         self.job_handles.remove(&job.handle);
         self.completion_jobs.remove(&job.handle.slot());
@@ -76,18 +80,7 @@ impl Scene {
         job
     }
     pub(super) fn remove_candidate_sources(&mut self, region: [i32; 3]) {
-        if let Some(sources) = self.candidate_sources.remove(&region) {
-            for (source, _) in sources {
-                let dependents = self
-                    .candidate_dependents
-                    .get_mut(&source)
-                    .expect("候选反向边存在");
-                dependents.remove(&region);
-                if dependents.is_empty() {
-                    self.candidate_dependents.remove(&source);
-                }
-            }
-        }
+        self.candidate_sources.remove(&region);
         self.candidate_epochs.remove(&region);
     }
 
@@ -96,33 +89,7 @@ impl Scene {
         region: [i32; 3],
         sources: Vec<([i32; 3], crate::store::SourceStamp)>,
     ) {
-        self.remove_candidate_sources(region);
-        for &(source, _) in &sources {
-            self.candidate_dependents
-                .entry(source)
-                .or_default()
-                .insert(region);
-        }
         self.candidate_sources.insert(region, sources);
-    }
-
-    pub(super) fn rebind_candidate_source(
-        &mut self,
-        source: [i32; 3],
-        stamp: crate::store::SourceStamp,
-    ) {
-        if let Some(regions) = self.candidate_dependents.get(&source) {
-            for region in regions {
-                let sources = self
-                    .candidate_sources
-                    .get_mut(region)
-                    .expect("候选正向边存在");
-                let at = sources
-                    .binary_search_by_key(&source, |(source, _)| *source)
-                    .expect("候选源有序唯一");
-                sources[at].1 = stamp;
-            }
-        }
     }
 
     pub(super) fn invalidate_input_epoch(&mut self) {
@@ -165,7 +132,15 @@ impl Scene {
             return;
         };
         let current = self.state.resource(handle);
-        let next = self.state.replacement(handle).or(current);
+        let replacement = self.state.replacement(handle);
+        let next = replacement.or(current);
+        let visible = self.state.is_visible(handle);
+        let published = if visible {
+            current.map_or(0, RegionMesh::len)
+        } else {
+            0
+        };
+        let candidate = if visible { replacement } else { current };
         let projected =
             if let Some(job) = self.handle_job_index(handle).map(|index| &self.jobs[index]) {
                 if self.compact.generation == 0 && job.unavailable != 0 {
@@ -184,6 +159,10 @@ impl Scene {
             Contribution {
                 handle,
                 projected,
+                published,
+                reserved_growth: candidate
+                    .map_or(0, RegionMesh::len)
+                    .saturating_sub(published),
                 excluded: next.is_some_and(|resource| resource.excluded),
                 unavailable_sections: next.map_or(0, |resource| {
                     resource.missing_sections.count_ones() as usize

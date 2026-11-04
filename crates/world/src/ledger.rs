@@ -7,6 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) struct Contribution {
     pub handle: Handle,
     pub projected: usize,
+    pub published: usize,
+    pub reserved_growth: usize,
     pub excluded: bool,
     pub unavailable_sections: usize,
 }
@@ -15,6 +17,8 @@ pub(crate) struct Contribution {
 pub(crate) struct Ledger {
     pub owned: usize,
     projected: usize,
+    published: usize,
+    reserved_growth: usize,
     excluded: usize,
     unavailable_sections: usize,
     bounds: Option<Bounds>,
@@ -30,6 +34,10 @@ impl Ledger {
 
     pub const fn projected(&self) -> usize {
         self.projected
+    }
+
+    pub const fn resident(&self) -> usize {
+        self.published + self.reserved_growth
     }
 
     pub const fn excluded(&self) -> usize {
@@ -57,6 +65,8 @@ impl Ledger {
         if let Some(previous) = self.records.insert(key, value) {
             if self.bounds.is_some_and(|bounds| contains(bounds, key)) {
                 self.projected -= previous.projected;
+                self.published -= previous.published;
+                self.reserved_growth -= previous.reserved_growth;
                 self.excluded -= usize::from(previous.excluded);
                 self.unavailable_sections -= previous.unavailable_sections;
             }
@@ -65,6 +75,8 @@ impl Ledger {
         }
         if self.bounds.is_some_and(|bounds| contains(bounds, key)) {
             self.projected += value.projected;
+            self.published += value.published;
+            self.reserved_growth += value.reserved_growth;
             self.excluded += usize::from(value.excluded);
             self.unavailable_sections += value.unavailable_sections;
         }
@@ -83,6 +95,8 @@ impl Ledger {
         self.spatial.remove(key);
         if self.bounds.is_some_and(|bounds| contains(bounds, key)) {
             self.projected -= previous.projected;
+            self.published -= previous.published;
+            self.reserved_growth -= previous.reserved_growth;
             self.excluded -= usize::from(previous.excluded);
             self.unavailable_sections -= previous.unavailable_sections;
         }
@@ -105,6 +119,8 @@ impl Ledger {
                 for key in self.spatial.keys(edge) {
                     let value = self.records[&key];
                     self.projected -= value.projected;
+                    self.published -= value.published;
+                    self.reserved_growth -= value.reserved_growth;
                     self.excluded -= usize::from(value.excluded);
                     self.unavailable_sections -= value.unavailable_sections;
                 }
@@ -113,6 +129,8 @@ impl Ledger {
                 for key in self.spatial.keys(edge) {
                     let value = self.records[&key];
                     self.projected += value.projected;
+                    self.published += value.published;
+                    self.reserved_growth += value.reserved_growth;
                     self.excluded += usize::from(value.excluded);
                     self.unavailable_sections += value.unavailable_sections;
                 }
@@ -121,6 +139,8 @@ impl Ledger {
             for key in self.spatial.keys(bounds) {
                 let value = self.records[&key];
                 self.projected += value.projected;
+                self.published += value.published;
+                self.reserved_growth += value.reserved_growth;
                 self.excluded += usize::from(value.excluded);
                 self.unavailable_sections += value.unavailable_sections;
             }

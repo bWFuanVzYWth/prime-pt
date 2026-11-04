@@ -89,6 +89,10 @@ impl<K: Copy + Eq + Hash> ReadyQueue<K> {
         self.order.values()
     }
 
+    pub fn contains(&self, work: &K) -> bool {
+        self.by_work.contains_key(work)
+    }
+
     pub const fn len(&self) -> usize {
         self.order.len()
     }

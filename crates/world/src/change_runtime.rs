@@ -24,7 +24,10 @@ impl TintSweep {
 }
 
 impl Scene {
-    /// 整批验证后入队；`plan` 按本轮维护额度消费，旧发布覆盖始终有效。
+    /// 整批验证后撤销受影响的捕获票据，再记录维护与局部写入意图。
+    ///
+    /// `plan` 按维护额度推进；实际源差分决定建网范围。通知暂时使该源不可用于新候选，
+    /// 旧发布覆盖仍有效。按世界世代交付通知，GPU 准备与 `commit` 之间保持输入静止。
     pub fn apply_changes(&mut self, changes: &[SourceChange]) -> Result<(), Error> {
         for change in changes {
             match *change {
@@ -66,9 +69,14 @@ impl Scene {
             .checked_add(changes.len())
             .ok_or(Error::Input("通知数量溢出"))?;
         let mut keys = std::collections::BTreeSet::new();
+        let mut edits = std::collections::BTreeSet::new();
         for &change in changes {
             match change {
-                SourceChange::BlockRange { section, .. } | SourceChange::SectionSource(section) => {
+                SourceChange::BlockRange { section, .. } => {
+                    keys.insert(section);
+                    edits.insert(section);
+                }
+                SourceChange::SectionSource(section) => {
                     keys.insert(section);
                 }
                 SourceChange::ColumnSource {
@@ -99,7 +107,8 @@ impl Scene {
                 _ => {}
             }
         }
-        if self.compact.generation != 0 {
+        let resync = changes.contains(&SourceChange::SourceOverflow);
+        if self.compact.generation != 0 && !resync {
             self.compact
                 .store
                 .invalidate_batch(&keys.iter().copied().collect::<Vec<_>>())?;
@@ -116,14 +125,33 @@ impl Scene {
                 }
             }
         }
-        if changes.contains(&SourceChange::SourceOverflow) {
-            self.invalidate_input_epoch();
-            self.compact.clear(self.compact.generation);
-            self.captures.clear();
+        if resync {
+            self.invalidate_all();
         }
+        self.edit_sources.extend(edits);
         self.pending_raw = next_raw;
-        self.queued_changes.extend(changes.iter().copied());
+        self.queued_changes.extend(
+            changes
+                .iter()
+                .copied()
+                .filter(|change| *change != SourceChange::SourceOverflow),
+        );
         self.planner_pending |= !changes.is_empty();
+        Ok(())
+    }
+
+    pub(super) fn prioritize_edit_sources(&mut self, camera: &WorldCamera) -> Result<(), Error> {
+        let center = camera.origin.map(|axis| (axis / 16.0).floor() as i32);
+        while let Some(&section) = self.edit_sources.first() {
+            if self.compact.generation != 0
+                && section[1] >= self.height[0]
+                && section[1] < self.height[1]
+                && (0..3).all(|axis| center[axis].abs_diff(section[axis]) <= 2)
+            {
+                self.compact.refresh_edit(section)?;
+            }
+            self.edit_sources.pop_first();
+        }
         Ok(())
     }
 
@@ -171,6 +199,7 @@ impl Scene {
                 }
                 SourceChange::WorldTint => tint_all = true,
                 SourceChange::SourceOverflow => {
+                    self.invalidations.clear();
                     self.invalidations
                         .extend(self.state.occupied().map(|(handle, _)| handle));
                     self.scan = (!self.invalidations.is_empty()).then_some(0);
@@ -209,15 +238,34 @@ impl Scene {
         minimum: [u8; 3],
         maximum: [u8; 3],
     ) -> Result<(), Error> {
+        self.dirty_source_output_with_priority(source, minimum, maximum, false)
+    }
+
+    pub(super) fn dirty_source_output_with_priority(
+        &mut self,
+        source: [i32; 3],
+        minimum: [u8; 3],
+        maximum: [u8; 3],
+        interactive: bool,
+    ) -> Result<(), Error> {
         if self.compact.generation == 0 {
             if let Some(handle) = self.state.find(chunk(region(source))) {
-                self.invalidate_fragments(handle, fragments(1 << slot(source)))?;
+                self.invalidate_fragments(handle, fragments(1 << slot(source)), false)?;
             }
             return Ok(());
         }
         let mut regions = BTreeMap::<[i32; 3], FragmentMask>::new();
         for dependency in prime_minecraft::dependent_slabs(source, minimum, maximum)? {
             if dependency.section[1] < self.height[0] || dependency.section[1] >= self.height[1] {
+                continue;
+            }
+            if dependency.section != source
+                && matches!(
+                    self.compact.store.lookup(dependency.section),
+                    crate::store::SourceState::Air
+                )
+            {
+                // 已确认空的中心无需相邻源；它自己的实际变化仍走完整失效。
                 continue;
             }
             let region = region(dependency.section);
@@ -231,13 +279,23 @@ impl Scene {
         }
         for (key, mask) in regions {
             if let Some(handle) = self.state.find(chunk(key)) {
-                self.invalidate_fragments(handle, mask)?;
+                self.invalidate_fragments(
+                    handle,
+                    mask,
+                    interactive && self.state.is_visible(handle),
+                )?;
             }
         }
         Ok(())
     }
 
-    fn invalidate_fragments(&mut self, handle: Handle, mask: FragmentMask) -> Result<(), Error> {
+    fn invalidate_fragments(
+        &mut self,
+        handle: Handle,
+        mask: FragmentMask,
+        interactive: bool,
+    ) -> Result<(), Error> {
+        self.capacity.remove_wait(handle);
         if let Some(index) = self.handle_job_index(handle) {
             let missing = self
                 .state
@@ -247,7 +305,27 @@ impl Scene {
             let affected = fragment_sections(mask);
             let mask = union(mask, fragments(missing & affected));
             let ticket = self.jobs[index].ticket;
-            let cancelled_tints = self.compact.cancel_fragments(ticket, mask);
+            if interactive && !self.jobs[index].interactive {
+                self.compact.promote_job(ticket)?;
+                self.tint_jobs.promote(ticket)?;
+                self.jobs[index].interactive = true;
+                self.interactive_jobs += 1;
+            }
+            if self.compact.generation != 0
+                && self.jobs[index].unavailable & affected == 0
+                && subtract(mask, self.jobs[index].changed).is_empty()
+                && mask
+                    .words()
+                    .into_iter()
+                    .zip(self.jobs[index].compiled.words())
+                    .all(|(affected, compiled)| affected & compiled == 0)
+            {
+                // 待建网片段会读取本次接受的源，尚无输出需要丢弃。
+                return Ok(());
+            }
+            let cancelled_tints =
+                self.compact
+                    .cancel_fragments(ticket, mask, self.jobs[index].interactive)?;
             let job = &mut self.jobs[index];
             job.pending_tints -= cancelled_tints;
             job.pending_tint_mask = subtract(job.pending_tint_mask, mask);
@@ -285,6 +363,11 @@ impl Scene {
             self.reject_handle(handle)?;
             self.recover_candidate(handle)?;
             self.state.invalidate(handle)?;
+            if interactive {
+                let key = key(self.state.chunk(handle).expect("已失效的节点仍保活"));
+                self.edit_refreshes.insert(handle)?;
+                self.masks.get_mut(&key).expect("已标记变化").interactive = true;
+            }
             self.refresh_ledger(handle);
         }
         self.planner_pending = true;
@@ -301,11 +384,12 @@ impl Scene {
             self.remove_candidate_sources(key);
             let previous = self.recovered.insert(key, resource.into_partial());
             assert!(previous.is_none(), "一个节点最多一份未发布所有者");
+            self.refresh_ledger(handle);
         }
         Ok(())
     }
 
-    fn reject_handle(&mut self, handle: Handle) -> Result<(), Error> {
+    pub(super) fn reject_handle(&mut self, handle: Handle) -> Result<(), Error> {
         let Some(value) = self.state.chunk(handle) else {
             return Ok(());
         };

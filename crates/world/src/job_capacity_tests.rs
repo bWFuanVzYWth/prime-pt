@@ -2,6 +2,209 @@
 use super::*;
 use prime_minecraft::fixtures::{self, Pattern};
 
+fn step_capacity_scene(
+    scene: &mut Scene,
+    catalog: &Catalog,
+    distance: u32,
+    source: impl Fn([i32; 3]) -> Option<Pattern>,
+) -> Result<(), Error> {
+    let camera = WorldCamera {
+        origin: [0.; 3],
+        forward: [0., 0., 1., 0.],
+        right: [1., 0., 0., 0.],
+        up: [0., 1., 0., 0.],
+    };
+    let requests = scene.plan(&camera, distance, 0, 1, 64)?;
+    if requests.is_empty() {
+        scene.compile_sources(catalog)?;
+    } else {
+        let mut packet = fixtures::section_packet(&[]);
+        packet[4..8].copy_from_slice(&(requests.len() as u32).to_le_bytes());
+        for request in requests {
+            let pattern = source(request.section);
+            let mut entry = fixtures::section_packet(&[(
+                request.id,
+                request.section,
+                pattern.unwrap_or(Pattern::Sparse),
+            )]);
+            if pattern.is_none() {
+                // 保留原有双状态palette，只在section内部放一个cube。
+                let first_word = entry.len() - 64 * 8;
+                let block = (8 * 16 + 8) * 16 + 8;
+                entry[first_word..].fill(0);
+                entry[first_word + block / 8] = 1 << (block % 8);
+            }
+            packet.extend_from_slice(&entry[16..]);
+        }
+        scene.apply_compact(&packet, catalog)?;
+    }
+    if scene.prepare()? {
+        scene.commit()?;
+    }
+    Ok(())
+}
+
+fn drive_capacity_scene(
+    scene: &mut Scene,
+    catalog: &Catalog,
+    distance: u32,
+    source: impl Fn([i32; 3]) -> Option<Pattern>,
+) -> Result<(), Error> {
+    for _ in 0..256 {
+        step_capacity_scene(scene, catalog, distance, &source)?;
+        if !scene.pending() {
+            return Ok(());
+        }
+    }
+    Err(Error::Input("预算场景未收敛"))
+}
+
+#[test]
+fn shrinking_a_published_region_can_reduce_existing_resident_overage() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    drive_capacity_scene(&mut scene, &catalog, 4, |key| {
+        Some(if matches!(key, [0, 0, 0] | [4, 0, 0]) {
+            Pattern::Dense
+        } else {
+            Pattern::Air
+        })
+    })?;
+    let stride = size_of::<prime_scene::Quad>();
+    scene.set_budget(Budget {
+        resident_bytes: 1600 * stride,
+        staging_bytes: 3072 * stride,
+        region_bytes: 1536 * stride,
+    })?;
+    scene.invalidate_section([0; 3])?;
+    drive_capacity_scene(&mut scene, &catalog, 4, |key| {
+        Some(match key {
+            [0, 0, 0] => Pattern::Sparse,
+            [4, 0, 0] => Pattern::Dense,
+            _ => Pattern::Air,
+        })
+    })?;
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 384);
+    assert_eq!(scene.pressure().required_bytes, 1920 * stride);
+    Ok(())
+}
+
+#[test]
+fn placing_a_block_can_use_resident_space_reserved_from_streaming() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    let stride = size_of::<prime_scene::Quad>();
+    scene.set_budget(Budget {
+        resident_bytes: 1552 * stride,
+        staging_bytes: 1552 * stride,
+        region_bytes: 1542 * stride,
+    })?;
+    let initial = |key: [i32; 3]| match key {
+        [0, 0, 0] => Some(Pattern::Dense),
+        [4, 0, 0] | [8, 0, 0] => None,
+        _ => Some(Pattern::Air),
+    };
+    drive_capacity_scene(&mut scene, &catalog, 0, initial)?;
+    drive_capacity_scene(&mut scene, &catalog, 8, initial)?;
+    scene.apply_changes(&[crate::SourceChange::BlockRange {
+        section: [1, 0, 0],
+        minimum: [8; 3],
+        maximum: [9; 3],
+    }])?;
+    drive_capacity_scene(&mut scene, &catalog, 8, |key| {
+        if key == [1, 0, 0] { None } else { initial(key) }
+    })?;
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1542);
+    assert_eq!(scene.ledger.owned, 1548);
+    Ok(())
+}
+
+#[test]
+fn resident_wait_wakes_when_a_smaller_region_commits() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    let stride = size_of::<prime_scene::Quad>();
+    scene.set_budget(Budget {
+        resident_bytes: 1552 * stride,
+        staging_bytes: 1552 * stride,
+        region_bytes: 1536 * stride,
+    })?;
+    let initial = |key: [i32; 3]| {
+        Some(match key {
+            [0, 0, 0] => Pattern::Dense,
+            [4, 0, 0] => Pattern::Sparse,
+            _ => Pattern::Air,
+        })
+    };
+    drive_capacity_scene(&mut scene, &catalog, 0, initial)?;
+    drive_capacity_scene(&mut scene, &catalog, 4, initial)?;
+    let kernels = scene.work_stats().total.mesh_slabs;
+    for _ in 0..8 {
+        drive_capacity_scene(&mut scene, &catalog, 4, initial)?;
+    }
+    assert_eq!(scene.work_stats().total.mesh_slabs, kernels);
+    assert!(scene.render_regions().all(|region| region.key != [1, 0, 0]));
+
+    scene.invalidate_section([0; 3])?;
+    drive_capacity_scene(&mut scene, &catalog, 4, |key| {
+        if key == [0; 3] {
+            Some(Pattern::Air)
+        } else {
+            initial(key)
+        }
+    })?;
+    let region = scene.render_regions().next().unwrap();
+    assert_eq!((region.key, region.mesh.len()), ([1, 0, 0], 384));
+    Ok(())
+}
+
+#[test]
+fn edit_keeps_progress_with_cold_work_parked_on_staging() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    let bytes = 1536 * size_of::<prime_scene::Quad>();
+    scene.set_budget(Budget {
+        resident_bytes: bytes,
+        staging_bytes: bytes,
+        region_bytes: bytes,
+    })?;
+    let initial = |key: [i32; 3]| {
+        Some(match key {
+            [0, 0, 0] | [4, 0, 0] => Pattern::Dense,
+            _ => Pattern::Air,
+        })
+    };
+    drive_capacity_scene(&mut scene, &catalog, 0, initial)?;
+    for _ in 0..64 {
+        step_capacity_scene(&mut scene, &catalog, 4, initial)?;
+        if scene.work_stats().current.waiting_budget != 0 && scene.staging_available(false) < 384 {
+            break;
+        }
+    }
+    assert!(scene.staging_available(false) < 384);
+    assert!(scene.staging_available(true) >= 384);
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+
+    scene.apply_changes(&[crate::SourceChange::BlockRange {
+        section: [0; 3],
+        minimum: [0; 3],
+        maximum: [16; 3],
+    }])?;
+    drive_capacity_scene(&mut scene, &catalog, 4, |key| {
+        if key == [0; 3] {
+            Some(Pattern::Sparse)
+        } else {
+            initial(key)
+        }
+    })?;
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 384);
+    Ok(())
+}
+
 #[test]
 fn more_than_eight_capacity_waiters_do_not_block_later_air_region() -> Result<(), Error> {
     let catalog = fixtures::catalog()?;
@@ -24,7 +227,12 @@ fn more_than_eight_capacity_waiters_do_not_block_later_air_region() -> Result<()
         publications: 0,
         ..Default::default()
     });
-    scene.invalidate_section([0; 3])?;
+    // 先用交互替换占满完整联合空间，再验证其余普通工作不会阻塞Air。
+    scene.apply_changes(&[crate::SourceChange::BlockRange {
+        section: [0; 3],
+        minimum: [0; 3],
+        maximum: [16; 3],
+    }])?;
     let original = scene.state.find(chunk([0; 3])).unwrap();
     for _ in 0..256 {
         let requests = scene.plan(&camera, 0, 0, 4, 64)?.to_vec();
@@ -85,7 +293,9 @@ fn more_than_eight_capacity_waiters_do_not_block_later_air_region() -> Result<()
         let parked: std::collections::HashSet<_> = scene
             .compact
             .ready
-            .iter()
+            .lane(false)
+            .chain(scene.compact.ready.lane(true))
+            .chain(scene.compact.capacity.keys())
             .filter_map(|work| {
                 scene.compact.groups.get(&crate::store::WorkId {
                     fragment: work.fragment / 4 * 4,

@@ -5,13 +5,17 @@ use prime_minecraft::{
     fixtures::{self, Pattern},
 };
 
-pub(super) fn drive(scene: &mut Scene, catalog: &Catalog, distance: u32) -> Result<usize, Error> {
-    let camera = WorldCamera {
+fn camera() -> WorldCamera {
+    WorldCamera {
         origin: [0.; 3],
         forward: [0., 0., 1., 0.],
         right: [1., 0., 0., 0.],
         up: [0., 1., 0., 0.],
-    };
+    }
+}
+
+pub(super) fn drive(scene: &mut Scene, catalog: &Catalog, distance: u32) -> Result<usize, Error> {
+    let camera = camera();
     let mut colors = 0;
     for _ in 0..20_000 {
         let requests = scene.plan(&camera, distance, 0, 4, 64)?.to_vec();
@@ -47,6 +51,144 @@ pub(super) fn drive(scene: &mut Scene, catalog: &Catalog, distance: u32) -> Resu
         }
     }
     Err(Error::Input("固定生产源推进未收敛"))
+}
+
+#[test]
+fn edits_pass_full_capture_window_and_leave_a_background_turn() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    drive(&mut scene, &catalog, 0)?;
+    let camera = camera();
+    let pending = scene.plan(&camera, 32, 0, 4, 64)?;
+    assert_eq!(pending.len(), 64);
+    let background = pending[0];
+    let edit = [0; 3];
+    assert_ne!(background.section, edit);
+    for turn in 0..8 {
+        scene.apply_changes(&[crate::SourceChange::BlockRange {
+            section: edit,
+            minimum: [1; 3],
+            maximum: [2; 3],
+        }])?;
+        // 模拟Java每轮只完成一个响应，已签发的远处请求保留原wire。
+        let next = scene.plan(&camera, 32, 0, 4, 64)?[0];
+        let pattern = if turn < 7 {
+            assert_eq!(next.section, edit);
+            Pattern::Tinted
+        } else {
+            assert_eq!(next.id, background.id);
+            Pattern::Air
+        };
+        scene.apply_compact(
+            &fixtures::section_packet(&[(next.id, next.section, pattern)]),
+            &catalog,
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn only_local_block_events_pass_the_ordinary_capture_prefix() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    let camera = camera();
+    let background = scene.plan(&camera, 32, 0, 4, 64)?[0];
+    let far = [30, 0, 30];
+    assert_ne!(background.section, far);
+    let event = |section| crate::SourceChange::BlockRange {
+        section,
+        minimum: [1; 3],
+        maximum: [2; 3],
+    };
+    scene.apply_changes(&[event(far)])?;
+    assert_eq!(scene.plan(&camera, 32, 0, 4, 64)?[0].id, background.id);
+    scene.apply_changes(&[event([0; 3])])?;
+    assert_eq!(scene.plan(&camera, 32, 0, 4, 64)?[0].section, [0; 3]);
+    Ok(())
+}
+
+#[test]
+fn repeated_block_event_rejects_the_old_compact_reply() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    let camera = camera();
+    let section = [0; 3];
+    let event = crate::SourceChange::BlockRange {
+        section,
+        minimum: [1; 3],
+        maximum: [2; 3],
+    };
+    scene.apply_changes(&[event])?;
+    let first = scene.plan(&camera, 0, 0, 4, 1)?[0];
+    scene.apply_changes(&[event])?;
+    let latest = scene.plan(&camera, 0, 0, 4, 1)?[0];
+    assert_ne!(first.id, latest.id);
+    scene.apply_compact(
+        &fixtures::section_packet(&[(first.id, section, Pattern::Dense)]),
+        &catalog,
+    )?;
+    assert!(matches!(
+        scene.compact.store.lookup(section),
+        super::SourceState::Unknown
+    ));
+    scene.apply_compact(
+        &fixtures::section_packet(&[(latest.id, section, Pattern::Air)]),
+        &catalog,
+    )?;
+    assert!(matches!(
+        scene.compact.store.lookup(section),
+        super::SourceState::Air
+    ));
+    Ok(())
+}
+
+#[test]
+fn identical_halo_reply_revalidates_prepared_geometry_without_rebuilding() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    drive(&mut scene, &catalog, 0)?;
+    let camera = camera();
+    let center = [0; 3];
+    let handle = scene.state.find(crate::chunks::chunk(center)).unwrap();
+    scene.invalidate_section(center)?;
+    let request = scene.plan(&camera, 0, 0, 4, 64)?[0];
+    assert_eq!(request.section, center);
+    scene.apply_compact(
+        &fixtures::section_packet(&[(request.id, center, Pattern::Sparse)]),
+        &catalog,
+    )?;
+    for _ in 0..16 {
+        if scene.state.replacement(handle).is_some() {
+            break;
+        }
+        assert!(scene.plan(&camera, 0, 0, 4, 64)?.is_empty());
+        scene.compile_sources(&catalog)?;
+    }
+    let replacement = scene.state.replacement(handle).unwrap().revision;
+    let halo = [1, 0, 0];
+    scene.invalidate_section(halo)?;
+    let request = scene.plan(&camera, 0, 0, 4, 64)?[0];
+    assert_eq!(request.section, halo);
+    assert!(!scene.prepare()?);
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+
+    let kernels = scene.work_stats().total.mesh_slabs;
+    scene.apply_compact(
+        &fixtures::section_packet(&[(request.id, halo, Pattern::Air)]),
+        &catalog,
+    )?;
+    scene.plan(&camera, 0, 0, 4, 64)?;
+    assert!(scene.prepare()?);
+    scene.commit()?;
+    let published = scene.render_regions().next().unwrap();
+    assert_eq!(published.geometry_revision, replacement);
+    assert_eq!(published.mesh.len(), 384);
+    assert_eq!(scene.work_stats().total.mesh_slabs, kernels);
+    Ok(())
 }
 
 #[test]

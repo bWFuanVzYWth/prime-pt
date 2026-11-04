@@ -141,7 +141,11 @@ impl Scene {
         Ok(())
     }
 
-    /// 只准备实际patch；来源或预算等待不撤旧几何，退出Bounds的资源独立卸载。
+    /// 借助区块管理器准备已获常驻准入且依赖仍有效的实际覆盖变化。
+    ///
+    /// 缺源片段继承旧网格，容量等待保持已发布覆盖；实际退出需求域的资源独立卸载。
+    /// 宿主从准备视图建立 GPU 候选，期间保持世界输入和规划静止，随后调用
+    /// [`Self::commit`] 或 [`Self::reject`] 结束本次事务。
     pub fn prepare(&mut self) -> Result<bool, Error> {
         let bounds = self.state.config().bounds().expect("有界region域");
         let mut at = 0;
@@ -196,7 +200,9 @@ impl Scene {
         Ok(self.dirty)
     }
 
-    /// GPU接受后发布；资源转移和目录发布已预留容量，不分配、不复制Quad或统计全cut。
+    /// GPU接受后发布；此时释放被替换网格的常驻份额并使符合额度的等待项可重试。
+    /// 宿主须在本次 [`Self::prepare`] 后保持输入静止，并确认旧 GPU 消费已完成。
+    /// 资源转移和目录发布已预留容量，不分配、不复制Quad或统计全cut。
     /// 其后独立退休维护可能扩容来源退休通知Vec；这不改变已经完成的发布事务。
     pub fn commit(&mut self) -> Result<(), Error> {
         for patch in &self.pending {
@@ -216,8 +222,19 @@ impl Scene {
             if change.upsert {
                 self.refresh_ledger(change.handle);
                 self.refresh_tint_index(change.handle);
+                if self
+                    .state
+                    .resource(change.handle)
+                    .is_some_and(|resource| resource.excluded)
+                {
+                    self.capacity.activate_wait(change.handle);
+                } else {
+                    self.capacity.remove_wait(change.handle);
+                }
             } else {
                 self.ledger.remove(change.key, change.handle);
+                self.capacity.remove_wait(change.handle);
+                self.edit_refreshes.remove(&change.handle);
                 self.masks.remove(&change.key);
                 self.tinted.remove(&change.key);
                 self.custom_tinted.remove(&change.key);

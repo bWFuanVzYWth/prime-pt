@@ -15,6 +15,11 @@ pub(crate) struct SourceStamp {
     pub version: u64,
 }
 
+/// 同一世界源域内，捕获签发时该 section 的失效身份。它与内容版本独立。
+/// 只和 Scene 的唯一在途 wire 一起验证，单独的印记不能授权回复。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureStamp(u64);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LocalRange {
     pub min: [u8; 3],
@@ -30,8 +35,9 @@ impl LocalRange {
 
 pub(crate) struct SourceDelta {
     pub key: Key,
-    pub stamp: SourceStamp,
     pub changed: Option<LocalRange>,
+    /// 接受之前的调度类别。它不参与内容判断和源版本。
+    pub interactive: bool,
 }
 
 /// epoch 由候选所有者签发，不能把复用 fragment 槽误认为旧工作；这不是资源引用计数。
@@ -86,6 +92,7 @@ impl Default for Page {
 pub(crate) struct SourceStore {
     generation: u64,
     serial: u64,
+    invalidations: HashMap<Key, CaptureStamp>,
     pages: BTreeMap<Key, Page>,
     spatial: spatial::SpatialIndex,
     reverse: HashMap<Key, HashSet<WorkId>>,
@@ -93,6 +100,7 @@ pub(crate) struct SourceStore {
     missing: BTreeSet<(u64, Key)>,
     missing_by_key: HashMap<Key, u64>,
     missing_age: ReadyQueue<Key>,
+    edited_missing: ReadyQueue<Key>,
     capture_turn: u8,
     woken: BTreeSet<WorkId>,
     window: Option<Bounds>,
@@ -130,7 +138,8 @@ impl SourceStore {
         }
     }
 
-    /// 从未出现的键版本为零；一旦签发，所有世代内版本均非零且不复用。
+    /// 内容身份。未接受过的键版本为零；暂时失效或重捕获到同样内容保留原版本。
+    /// 发布还须确认来源当前可用，不能单凭版本判定有效。
     pub fn stamp(&self, key: Key) -> SourceStamp {
         let (region, slot) = address(key);
         SourceStamp {
@@ -142,37 +151,48 @@ impl SourceStore {
         }
     }
 
+    /// 捕获只签发给尚未得到有效快照的键。每次新失效撤销此前签发的身份。
+    pub fn capture_stamp(&self, key: Key) -> Option<CaptureStamp> {
+        matches!(self.lookup(key), SourceState::Unknown).then(|| {
+            self.invalidations
+                .get(&key)
+                .copied()
+                .unwrap_or(CaptureStamp(0))
+        })
+    }
+
     #[cfg(test)]
     pub fn accept(&mut self, source: SectionSource, air: bool) -> Result<SourceDelta, Error> {
+        let stamp = self.capture_stamp(source.key).expect("测试签发缺源请求");
         Ok(self
-            .accept_batch(vec![(source, air)])?
+            .accept_batch(vec![(source, air, stamp)])?
             .pop()
             .expect("单源事务"))
     }
 
     /// 调用者先验证整包票据、坐标及 Catalog 身份；这里再次封闭世代/版本与压缩所有权。
-    /// 所有可恢复失败都在写入任何源内容之前；实际状态相同只恢复可用性，不扩大 dirty。
+    /// 所有可恢复失败都在写入任何源内容之前；等价快照仅恢复有效性，保留旧表示和内容版本。
     pub fn accept_batch(
         &mut self,
-        sources: Vec<(SectionSource, bool)>,
+        sources: Vec<(SectionSource, bool, CaptureStamp)>,
     ) -> Result<Vec<SourceDelta>, Error> {
-        let end = self
-            .serial
-            .checked_add(sources.len() as u64)
-            .ok_or(Error::Input("source版本序号耗尽"))?;
         let mut seen = HashSet::new();
         seen.try_reserve(sources.len())?;
         let mut staged = Vec::new();
         staged.try_reserve_exact(sources.len())?;
         let mut deltas = Vec::new();
         deltas.try_reserve_exact(sources.len())?;
-        for (index, (source, air)) in sources.into_iter().enumerate() {
+        let mut end = self.serial;
+        for (source, air, stamp) in sources {
             if source.generation == 0
                 || source.generation != self.generation
+                || self.capture_stamp(source.key) != Some(stamp)
                 || air && source.storage.is_none()
                 || !seen.insert(source.key)
             {
-                return Err(Error::Input("source事务世代、air证明或唯一键无效"));
+                return Err(Error::Input(
+                    "source事务世代、失效身份、air证明或唯一键无效",
+                ));
             }
             let (region, slot) = address(source.key);
             let changed = self
@@ -181,26 +201,31 @@ impl SourceStore {
                 .map_or(Some(LocalRange::FULL), |page| {
                     difference(page, slot, source.storage.as_ref(), air)
                 });
+            let version = if changed.is_some() {
+                end = end
+                    .checked_add(1)
+                    .ok_or(Error::Input("source版本序号耗尽"))?;
+                Some(end)
+            } else {
+                None
+            };
             deltas.push(SourceDelta {
                 key: source.key,
-                stamp: SourceStamp {
-                    generation: self.generation,
-                    version: self.serial + index as u64 + 1,
-                },
                 changed,
+                interactive: self.is_edited_missing(source.key),
             });
-            staged.push((source, air));
+            staged.push((source, air, version));
         }
         // 页与 payload 的扩容也在提交前完成；只改变保留容量，不改变可观察源内容。
         let mut new_pages = BTreeMap::<Key, Page>::new();
         let mut payloads = HashMap::<Key, usize>::new();
         payloads.try_reserve(staged.len())?;
-        for (source, air) in &staged {
-            if !air && source.storage.is_some() {
+        for (source, air, version) in &staged {
+            if version.is_some() && !air && source.storage.is_some() {
                 *payloads.entry(address(source.key).0).or_default() += 1;
             }
         }
-        for (source, _) in &staged {
+        for (source, _, _) in &staged {
             let (region, _) = address(source.key);
             if !self.pages.contains_key(&region) {
                 new_pages.entry(region).or_default();
@@ -219,7 +244,7 @@ impl SourceStore {
             self.spatial.insert(region);
         }
         self.serial = end;
-        for ((source, air), delta) in staged.into_iter().zip(&deltas) {
+        for (source, air, version) in staged {
             let key = source.key;
             let (region, slot) = address(key);
             let page = self.pages.get_mut(&region).expect("事务已预备页");
@@ -227,19 +252,22 @@ impl SourceStore {
             if page.present & bit == 0 {
                 self.stats.sources += 1;
             }
-            if let Some(old) = page.storage.remove(&slot) {
-                self.stats.raw_bytes -= old.source_bytes();
-            }
             page.present |= bit;
             page.known |= bit;
             page.valid |= bit;
-            page.versions[usize::from(slot)] = delta.stamp.version;
-            set(&mut page.air, bit, air);
-            set(&mut page.unavailable, bit, source.storage.is_none());
-            if let Some(storage) = source.storage.filter(|_| !air) {
-                self.stats.raw_bytes += storage.source_bytes();
-                page.storage.insert(slot, storage);
+            if let Some(version) = version {
+                page.versions[usize::from(slot)] = version;
+                set(&mut page.air, bit, air);
+                set(&mut page.unavailable, bit, source.storage.is_none());
+                if let Some(old) = page.storage.remove(&slot) {
+                    self.stats.raw_bytes -= old.source_bytes();
+                }
+                if let Some(storage) = source.storage.filter(|_| !air) {
+                    self.stats.raw_bytes += storage.source_bytes();
+                    page.storage.insert(slot, storage);
+                }
             }
+            self.invalidations.remove(&key);
             self.refresh_missing(key);
             self.wake(key);
             self.schedule_retirement(key);
@@ -249,12 +277,7 @@ impl SourceStore {
     }
 
     /// 仅使已捕获数据不可被编译使用；旧 payload 留给下一次真实响应作状态差分。
-    pub fn invalidate(&mut self, key: Key) -> Result<(), Error> {
-        self.missing_age.reserve_insertions(1)?;
-        let serial = self
-            .serial
-            .checked_add(1)
-            .ok_or(Error::Input("source版本序号耗尽"))?;
+    fn invalidate_reserved(&mut self, key: Key, stamp: CaptureStamp) {
         let (region, slot) = address(key);
         let page = self.pages.entry(region).or_insert_with(|| {
             self.spatial.insert(region);
@@ -266,13 +289,16 @@ impl SourceStore {
         }
         page.present |= bit;
         page.valid &= !bit;
-        page.versions[usize::from(slot)] = serial;
-        self.serial = serial;
+        self.invalidations.insert(key, stamp);
         self.stats.pages = self.pages.len();
         self.refresh_missing(key);
         self.wake(key);
         self.schedule_retirement(key);
-        Ok(())
+    }
+
+    #[cfg(test)]
+    fn invalidate(&mut self, key: Key) -> Result<(), Error> {
+        self.invalidate_batch(&[key])
     }
 
     /// 先预留整个唯一键集合的版本域，再使全部旧来源不可读；不部分消费输入批。
@@ -283,12 +309,15 @@ impl SourceStore {
         unique.sort_unstable();
         unique.dedup();
         self.missing_age.reserve_insertions(unique.len())?;
-        self.serial
+        self.invalidations.try_reserve(unique.len())?;
+        let end = self
+            .serial
             .checked_add(unique.len() as u64)
             .ok_or(Error::Input("source版本序号耗尽"))?;
-        for key in unique {
-            self.invalidate(key).expect("已预留全批唯一版本序号");
+        for (index, key) in unique.into_iter().enumerate() {
+            self.invalidate_reserved(key, CaptureStamp(self.serial + index as u64 + 1));
         }
+        self.serial = end;
         Ok(())
     }
 
@@ -408,14 +437,14 @@ impl SourceStore {
         })
     }
 
-    /// 只列仍有消费者且从未捕获/已失效的键；Unavailable 是负缓存，不反复请求。
+    /// 只列仍有普通消费者且从未捕获/已失效的键；编辑队列使用独立队龄。
     #[cfg(test)]
     pub fn missing(&self) -> impl ExactSizeIterator<Item = Key> + '_ {
         self.missing.iter().map(|(_, key)| *key)
     }
 
-    /// 七次优先最早真实消费者，随后一次按公平队龄；在途过滤不消耗签发轮次。
-    pub fn pick_missing(&self, mut eligible: impl FnMut(Key) -> bool) -> Option<Key> {
+    /// 普通来源七次优先最早真实消费者，随后一次按公平队龄。两个索引均不包含编辑源。
+    pub fn pick_background(&self, mut eligible: impl FnMut(Key) -> bool) -> Option<Key> {
         if self.capture_turn == 7 {
             self.missing_age.iter().copied().find(|key| eligible(*key))
         } else {
@@ -426,10 +455,35 @@ impl SourceStore {
         }
     }
 
+    /// 保留同一缺源键首次编辑的队龄，源确认或最后一个依赖撤销时删除。
+    pub fn promote_edit(&mut self, key: Key) -> Result<(), Error> {
+        if let Some(&priority) = self.missing_by_key.get(&key)
+            && self.edited_missing.insert(key)?
+        {
+            self.missing.remove(&(priority, key));
+            self.missing_age.remove(&key);
+        }
+        Ok(())
+    }
+
+    pub fn pick_edit(&self, mut eligible: impl FnMut(Key) -> bool) -> Option<Key> {
+        self.edited_missing
+            .iter()
+            .copied()
+            .find(|key| eligible(*key))
+    }
+
+    pub fn is_edited_missing(&self, key: Key) -> bool {
+        self.edited_missing.contains(&key)
+    }
+
     /// 实际签发才轮转公平队龄；重复通知不改年龄，已知后重新缺失则排到队尾。
     pub fn capture_issued(&mut self, key: Key) -> Result<(), Error> {
         if !self.missing_by_key.contains_key(&key) {
             return Err(Error::Input("签发的source已不再缺失"));
+        }
+        if self.is_edited_missing(key) {
+            return Ok(());
         }
         if !self.missing_age.renew(&key)? {
             return Err(Error::Input("缺源双索引身份不一致"));
@@ -498,6 +552,7 @@ impl SourceStore {
             page.air &= !bit;
             page.unavailable &= !bit;
             page.versions[usize::from(slot)] = 0;
+            self.invalidations.remove(&key);
             self.stats.sources -= 1;
             if page.present == 0 {
                 self.pages.remove(&region);
@@ -540,12 +595,15 @@ impl SourceStore {
                 .and_then(|works| works.iter().map(|work| work.epoch).min())
         {
             self.missing_by_key.insert(key, priority);
-            self.missing.insert((priority, key));
-            self.missing_age
-                .insert(key)
-                .expect("依赖或失效边界已预留完整缺源队龄");
+            if !self.edited_missing.contains(&key) {
+                self.missing.insert((priority, key));
+                self.missing_age
+                    .insert(key)
+                    .expect("依赖或失效边界已预留完整缺源队龄");
+            }
         } else {
             self.missing_age.remove(&key);
+            self.edited_missing.remove(&key);
         }
     }
 
@@ -657,11 +715,14 @@ mod tests {
     fn invalidation_keeps_stale_data_for_exact_actual_state_difference() {
         let mut store = store();
         store.accept(source([0; 3], Some(1)), false).unwrap();
+        let previous = store.stamp([0; 3]);
         store.invalidate([0; 3]).unwrap();
         assert!(matches!(store.lookup([0; 3]), SourceState::Unknown));
+        assert_eq!(store.stamp([0; 3]), previous);
         let mut same = source([0; 3], None);
         same.storage = Some(SectionStorage::new(1, vec![1, 2], vec![0; 64]).unwrap());
         assert!(store.accept(same, false).unwrap().changed.is_none());
+        assert_eq!(store.stamp([0; 3]), previous);
         store.invalidate([0; 3]).unwrap();
         let mut changed = source([0; 3], None);
         let mut words = vec![0; 64];
@@ -674,6 +735,27 @@ mod tests {
                 max_exclusive: [2, 7, 1]
             })
         );
+        assert!(store.stamp([0; 3]).version > previous.version);
+    }
+
+    #[test]
+    fn another_invalidation_rejects_old_capture_without_changing_content_identity() {
+        let mut store = store();
+        let key = [0; 3];
+        store.accept(source(key, Some(1)), false).unwrap();
+        let content = store.stamp(key);
+        store.invalidate(key).unwrap();
+        let old = store.capture_stamp(key).unwrap();
+        store.invalidate(key).unwrap();
+        let latest = store.capture_stamp(key).unwrap();
+        assert_ne!(old, latest);
+        assert!(
+            store
+                .accept_batch(vec![(source(key, Some(2)), false, old)])
+                .is_err()
+        );
+        assert_eq!(store.stamp(key), content);
+        assert!(matches!(store.lookup(key), SourceState::Unknown));
     }
 
     #[test]
@@ -683,27 +765,25 @@ mod tests {
         wrong.generation = 2;
         assert!(
             store
-                .accept_batch(vec![(source([0; 3], Some(1)), false), (wrong, false)])
+                .accept_batch(vec![
+                    (source([0; 3], Some(1)), false, CaptureStamp(0)),
+                    (wrong, false, CaptureStamp(0))
+                ])
                 .is_err()
         );
         assert_eq!(store.stats().sources, 0);
         assert_eq!(store.stamp([0; 3]).version, 0);
-        let stamp = store.accept(source([0; 3], Some(1)), false).unwrap().stamp;
+        store.accept(source([0; 3], Some(1)), false).unwrap();
+        let stamp = store.stamp([0; 3]);
         store.clear(1);
-        assert!(
-            store
-                .accept(source([0; 3], Some(1)), false)
-                .unwrap()
-                .stamp
-                .version
-                > stamp.version
-        );
+        store.accept(source([0; 3], Some(1)), false).unwrap();
+        assert!(store.stamp([0; 3]).version > stamp.version);
         store.serial = u64::MAX - 1;
         assert!(
             store
                 .accept_batch(vec![
-                    (source([1; 3], Some(1)), false),
-                    (source([2; 3], Some(1)), false)
+                    (source([1; 3], Some(1)), false, CaptureStamp(0)),
+                    (source([2; 3], Some(1)), false, CaptureStamp(0))
                 ])
                 .is_err()
         );
@@ -810,22 +890,22 @@ mod tests {
         store.depend(work(1), &[near]).unwrap();
         store.depend(work(2), &[far]).unwrap();
         for _ in 0..7 {
-            assert_eq!(store.pick_missing(|_| true), Some(near));
+            assert_eq!(store.pick_background(|_| true), Some(near));
             store.capture_issued(near).unwrap();
             store.invalidate(near).unwrap();
         }
         assert_eq!(
-            store.pick_missing(|_| false),
+            store.pick_background(|_| false),
             None,
             "在途或零可用输出不消耗公平槽"
         );
-        assert_eq!(store.pick_missing(|key| key != far), Some(near));
+        assert_eq!(store.pick_background(|key| key != far), Some(near));
         assert_eq!(
-            store.pick_missing(|_| true),
+            store.pick_background(|_| true),
             Some(far),
             "预算1跨调用累计，重复近源不能重置公平年龄"
         );
         store.capture_issued(far).unwrap();
-        assert_eq!(store.pick_missing(|_| true), Some(near));
+        assert_eq!(store.pick_background(|_| true), Some(near));
     }
 }

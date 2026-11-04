@@ -31,6 +31,8 @@ use prime_scene::{FragmentMask, MeshParts};
 use prime_scene::{MeshView, RenderRegion};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, VecDeque};
+#[path = "capacity.rs"]
+mod capacity;
 #[path = "compact.rs"]
 mod compact;
 #[cfg(test)]
@@ -70,12 +72,14 @@ const _: () = assert!(size_of::<CaptureRequest>() == 24);
 
 struct PendingCapture {
     wire: CaptureRequest,
+    source_stamp: Option<crate::store::CaptureStamp>,
     ticket: Option<Ticket>,
     slot: usize,
 }
 
 struct RegionJob {
     invalidated: bool,
+    interactive: bool,
     epoch: u64,
     ticket: Ticket,
     handle: Handle,
@@ -103,6 +107,7 @@ struct Dirty {
     handle: Option<Handle>,
     mask: FragmentMask,
     tints: FragmentMask,
+    interactive: bool,
 }
 
 /// 16m来源与64m LOD0渲染资源的唯一CPU所有者；GPU成功后才commit。
@@ -120,10 +125,11 @@ pub struct Scene {
     job_tickets: std::collections::HashMap<Ticket, usize>,
     job_handles: std::collections::HashMap<Handle, usize>,
     completion_jobs: BTreeMap<usize, Ticket>,
-    tint_jobs: crate::ready_queue::ReadyQueue<Ticket>,
+    tint_jobs: crate::priority::PriorityQueue<Ticket>,
+    edit_refreshes: crate::ready_queue::ReadyQueue<Handle>,
+    interactive_jobs: usize,
     recovered: BTreeMap<[i32; 3], PartialRegion>,
     candidate_sources: BTreeMap<[i32; 3], Vec<([i32; 3], crate::store::SourceStamp)>>,
-    candidate_dependents: std::collections::HashMap<[i32; 3], std::collections::BTreeSet<[i32; 3]>>,
     candidate_epochs: BTreeMap<[i32; 3], u64>,
     input_epoch: Option<u64>,
     masks: BTreeMap<[i32; 3], Dirty>,
@@ -137,6 +143,7 @@ pub struct Scene {
     next_revision: u64,
     next_content: u64,
     ledger: Ledger,
+    capacity: capacity::Capacity,
     work_budget: WorkBudget,
     progress: WorkProgress,
     total_progress: WorkProgress,
@@ -157,6 +164,7 @@ pub struct Scene {
     tint_sweep: change_runtime::TintSweep,
     custom_sweep: change_runtime::TintSweep,
     queued_changes: VecDeque<SourceChange>,
+    edit_sources: std::collections::BTreeSet<[i32; 3]>,
     pending_raw: usize,
     scan: Option<usize>,
     scan_again: bool,
@@ -264,10 +272,11 @@ impl Scene {
             job_tickets: std::collections::HashMap::new(),
             job_handles: std::collections::HashMap::new(),
             completion_jobs: BTreeMap::new(),
-            tint_jobs: crate::ready_queue::ReadyQueue::default(),
+            tint_jobs: crate::priority::PriorityQueue::default(),
+            edit_refreshes: crate::ready_queue::ReadyQueue::default(),
+            interactive_jobs: 0,
             recovered: BTreeMap::new(),
             candidate_sources: BTreeMap::new(),
-            candidate_dependents: std::collections::HashMap::new(),
             candidate_epochs: BTreeMap::new(),
             input_epoch: Some(1),
             masks: BTreeMap::new(),
@@ -281,6 +290,7 @@ impl Scene {
             next_revision: 1,
             next_content: 1,
             ledger: Ledger::default(),
+            capacity: capacity::Capacity::default(),
             work_budget: WorkBudget::default(),
             progress: WorkProgress::default(),
             total_progress: WorkProgress::default(),
@@ -301,6 +311,7 @@ impl Scene {
             tint_sweep: change_runtime::TintSweep::default(),
             custom_sweep: change_runtime::TintSweep::default(),
             queued_changes: VecDeque::new(),
+            edit_sources: std::collections::BTreeSet::new(),
             pending_raw: 0,
             scan: None,
             scan_again: false,
@@ -346,15 +357,17 @@ impl Scene {
         self.job_handles.clear();
         self.completion_jobs.clear();
         self.tint_jobs.clear();
+        self.edit_refreshes.clear();
+        self.interactive_jobs = 0;
         self.recovered.clear();
         self.candidate_sources.clear();
-        self.candidate_dependents.clear();
         self.candidate_epochs.clear();
         self.masks.clear();
         self.captures.clear();
         self.output.clear();
         self.target = None;
         self.ledger.clear();
+        self.capacity = capacity::Capacity::default();
         self.view_changes.clear();
         self.view_scratch.clear();
         self.view_len = 0;
@@ -367,6 +380,7 @@ impl Scene {
         self.tint_sweep = change_runtime::TintSweep::default();
         self.custom_sweep = change_runtime::TintSweep::default();
         self.queued_changes.clear();
+        self.edit_sources.clear();
         self.pending_raw = 0;
         self.scan = None;
         self.scan_again = false;
@@ -444,15 +458,48 @@ impl Scene {
             if let Some(previous) = previous_bounds {
                 for edge in crate::spatial::difference(previous, bounds) {
                     for key in self.ledger.keys(edge) {
+                        if let Some(entry) = self.ledger.contribution(key) {
+                            self.capacity.pause_wait(entry.handle);
+                            if self.candidate_sources.contains_key(&key) {
+                                if self.state.replacement(entry.handle).is_some()
+                                    || !self.state.is_visible(entry.handle)
+                                        && self.state.resource(entry.handle).is_some()
+                                {
+                                    self.reject_handle(entry.handle)?;
+                                    if let Some(candidate) =
+                                        self.state.take_unpublished(entry.handle)?
+                                    {
+                                        self.ledger.owned -= candidate.owned_quads();
+                                        self.refresh_ledger(entry.handle);
+                                    }
+                                }
+                                self.remove_candidate_sources(key);
+                            }
+                        }
                         if let Some(partial) = self.recovered.remove(&key) {
                             self.ledger.owned -= partial.parts.len();
                         }
-                        self.remove_candidate_sources(key);
+                    }
+                }
+                for edge in crate::spatial::difference(bounds, previous) {
+                    for key in self.ledger.keys(edge) {
+                        if let Some(entry) = self.ledger.contribution(key)
+                            && self
+                                .state
+                                .resource(entry.handle)
+                                .is_some_and(|resource| resource.excluded)
+                        {
+                            self.capacity.activate_wait(entry.handle);
+                        }
                     }
                 }
             }
             self.retry_handles.clear();
-            self.retry_handles.extend(self.ledger.excluded_handles());
+            self.retry_handles.extend(
+                self.ledger
+                    .excluded_handles()
+                    .filter(|&handle| !self.capacity.has_wait(handle)),
+            );
         }
         if self.target.is_some() && self.height != [min_y, max_y] {
             // job的域外空证明绑定旧高度域；新域不能消费这些阶段结果。
@@ -537,6 +584,11 @@ impl Scene {
             .map(|(_, mesh)| mesh.quads.len())
             .sum::<usize>();
         self.mark_dirty(job.handle, job.dirty);
+        if job.interactive
+            && let Some(mask) = self.masks.get_mut(&job.region)
+        {
+            mask.interactive = true;
+        }
         self.refresh_ledger(job.handle);
         job
     }
@@ -565,6 +617,8 @@ impl Scene {
         self.invalidate_input_epoch();
         self.compact.clear(self.compact.generation);
         self.captures.clear();
+        self.edit_sources.clear();
+        self.queued_changes.clear();
         self.queued_changes.push_back(SourceChange::SourceOverflow);
         self.pending_raw = self.pending_raw.saturating_add(1);
         self.planner_pending = true;
@@ -603,6 +657,13 @@ impl Scene {
                 && self.handle_job_index(entry.handle).is_none()
             {
                 self.ledger.remove(resource.key, entry.handle);
+                self.capacity.remove_wait(entry.handle);
+                self.remove_candidate_sources(resource.key);
+            } else if let Some(entry) = self.ledger.contribution(resource.key)
+                && self.state.is_visible(entry.handle)
+                && self.state.replacement(entry.handle).is_none()
+            {
+                self.remove_candidate_sources(resource.key);
             }
         }
         let before = self.compact.store.stats().maintenance_steps;
@@ -615,9 +676,141 @@ impl Scene {
             .extend(self.compact.store.drain_retired());
     }
 
+    fn begin_region_job(&mut self, build: cm::Build) -> Result<(), Error> {
+        let handle = self.state.find(build.chunk).expect("已签发region保持节点");
+        self.edit_refreshes.remove(&handle);
+        let mask = self.masks.remove(&key(build.chunk)).unwrap_or_default();
+        let recovered = self.recovered.remove(&key(build.chunk));
+        let old = self.state.resource(handle);
+        let mut changed = if mask.handle == Some(handle)
+            && (!mask.mask.is_empty() || !mask.tints.is_empty())
+            && (old.is_some() || recovered.is_some())
+        {
+            mask.mask
+        } else {
+            FragmentMask::all()
+        };
+        if !changed.is_empty()
+            && let Some(old) = old
+        {
+            if old.excluded || self.compact.generation == 0 && old.missing_sections != 0 {
+                changed = FragmentMask::all();
+            } else {
+                changed = change_runtime::union(
+                    changed,
+                    fragments(old.missing_sections & fragment_sections(changed)),
+                );
+            }
+        }
+        let mut sections = Vec::new();
+        let mut bindings = Vec::new();
+        let mut color_updates = Vec::new();
+        let mut verify = FragmentMask::empty();
+        let mut tint_patches = Vec::new();
+        if let Some(recovered) = recovered {
+            // 缺源时没有生成新几何，恢复候选也须重新验证这些section。
+            changed = change_runtime::union(changed, fragments(recovered.missing_sections));
+            // 未受影响的未发布片段只转移所有权，依赖重新齐备后复用，不复制Quad。
+            verify = change_runtime::subtract(recovered.changed, changed);
+            for (slot, mesh) in recovered.parts {
+                if changed.contains(slot) {
+                    self.ledger.owned -= mesh.quads.len();
+                } else {
+                    sections.push((slot, mesh));
+                }
+            }
+            bindings = recovered.bindings;
+            bindings.retain(|entry| !changed.contains(entry.fragment));
+            color_updates = recovered.color_updates;
+            // 重染片段用下一次回填建立补丁，不能同时继承上一候选的颜色差分。
+            let recolored = change_runtime::union(changed, mask.tints);
+            color_updates.retain(|entry| !recolored.contains(entry.fragment));
+            for group in bindings
+                .iter()
+                .filter(|group| !mask.tints.contains(group.fragment))
+            {
+                for (span, &color) in group.spans.iter().zip(&group.colors) {
+                    tint_patches.push(prime_scene::TintPatch::new(
+                        group.fragment,
+                        span.first as usize,
+                        span.count as usize,
+                        color,
+                    )?);
+                }
+            }
+            if let Some(old) = self.state.resource(handle) {
+                for update in &color_updates {
+                    let group = old
+                        .bindings
+                        .iter()
+                        .find(|entry| entry.fragment == update.fragment)
+                        .expect("原候选已校验颜色绑定");
+                    let span = group.spans[update.span];
+                    tint_patches.push(prime_scene::TintPatch::new(
+                        update.fragment,
+                        span.first as usize,
+                        span.count as usize,
+                        update.argb,
+                    )?);
+                }
+            }
+            changed = change_runtime::union(changed, verify);
+        }
+        let dirty = fragment_sections(changed);
+        let mut job = RegionJob {
+            invalidated: false,
+            interactive: mask.handle == Some(handle) && mask.interactive,
+            epoch: self
+                .input_epoch
+                .ok_or(Error::Input("输入世代耗尽，需重建Scene所有者"))?,
+            ticket: build.ticket,
+            handle,
+            region: key(build.chunk),
+            dirty,
+            issued: 0,
+            received: 0,
+            unavailable: 0,
+            projected: self
+                .state
+                .resource(handle)
+                .map_or(0, |old| old.len() - old.fragment_quads(changed))
+                + sections
+                    .iter()
+                    .map(|(_, mesh)| mesh.quads.len())
+                    .sum::<usize>(),
+            sections,
+            changed,
+            compiled: verify,
+            verify,
+            finished: FragmentMask::empty(),
+            tint_mask: mask.tints,
+            bindings,
+            tint_patches,
+            color_updates,
+            pending_tints: 0,
+            pending_tint_mask: FragmentMask::empty(),
+        };
+        for slot in 0..64 {
+            let y = section(job.region, slot)[1];
+            if y < self.height[0] || y >= self.height[1] {
+                job.received |= (1 << slot) & dirty;
+                for fragment in slot * 4..slot * 4 + 4 {
+                    if changed.contains(fragment) {
+                        job.compiled.set(fragment)?;
+                        job.finished.set(fragment)?;
+                    }
+                }
+            }
+        }
+        self.insert_job(job)?;
+        self.refresh_ledger(handle);
+        Ok(())
+    }
+
     /// 视距单位为16m水平列；Y为半开世界section域。返回仍待宿主捕获的请求前缀。
     ///
     /// 分帧回复共享region ticket；每轮至多8个新region，停车任务由依赖事件唤醒。
+    /// 近处实际编辑可先使用部分签发额度，持续竞争时给普通任务保留推进机会。
     /// 输入超域保留旧状态；max_requests最多64且同时在途最多64，未完成请求可延后回复。
     pub fn plan(
         &mut self,
@@ -638,8 +831,10 @@ impl Scene {
         )?;
         self.reject()?;
         self.output.clear();
+        self.prioritize_edit_sources(camera)?;
         self.process_changes()?;
         self.drain_retired();
+        self.wake_capacity_retries()?;
         self.scan_invalidations()?;
         for _ in 0..self.work_budget.maintenance {
             let Some(handle) = self.retry_handles.pop_front() else {
@@ -654,21 +849,49 @@ impl Scene {
             }
         }
         self.retry_excluded = (!self.retry_handles.is_empty()).then_some(0);
-        let owned_limit = (self.budget.resident_bytes + self.budget.staging_bytes)
-            / size_of::<prime_scene::Quad>();
+        let owned_limit = self.staging_limit(false) / size_of::<prime_scene::Quad>();
         if self.pressure.kind == PressureKind::Transition
             && self.ledger.owned + self.blocked_quads <= owned_limit
         {
             self.pressure.kind = PressureKind::None;
             self.blocked_quads = 0;
         }
+        let mut edit_attempts = 0;
+        let mut edit_requests = 0;
+        let bounds = self.state.config().bounds().expect("有界目标");
+        for _ in 0..(JOBS / 2).min(self.work_budget.planner_visits) {
+            let Some(handle) = self.edit_refreshes.pop_first() else {
+                break;
+            };
+            edit_attempts += 1;
+            if self.handle_job_index(handle).is_some()
+                || !self
+                    .state
+                    .chunk(handle)
+                    .is_some_and(|chunk| bounds.intersects(chunk))
+            {
+                continue;
+            }
+            match self.state.request_refresh(handle) {
+                Ok(build) => {
+                    self.begin_region_job(build)?;
+                    edit_requests += 1;
+                }
+                Err(cm::StateError::PendingPatch | cm::StateError::Transition) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let hold_edit_slot = self.interactive_jobs != 0 && self.turn % 4 != 0;
         let result = cm::plan(
             &mut self.state,
             target,
             cm::Budget {
-                visits: self.work_budget.planner_visits,
-                requests: JOBS,
-                switches: self.publication_remaining.min(SWITCHES),
+                visits: self.work_budget.planner_visits - edit_attempts,
+                requests: JOBS - edit_requests,
+                switches: self
+                    .publication_remaining
+                    .min(SWITCHES)
+                    .saturating_sub(usize::from(hold_edit_slot)),
             },
             &mut self.batch,
         );
@@ -679,132 +902,7 @@ impl Scene {
             }
         }
         for request_index in 0..self.batch.requests().len() {
-            let build = self.batch.requests()[request_index];
-            let handle = self.state.find(build.chunk).expect("已签发region保持节点");
-            let mask = self.masks.remove(&key(build.chunk)).unwrap_or_default();
-            let recovered = self.recovered.remove(&key(build.chunk));
-            let old = self.state.resource(handle);
-            let mut changed = if mask.handle == Some(handle)
-                && (!mask.mask.is_empty() || !mask.tints.is_empty())
-                && (old.is_some() || recovered.is_some())
-            {
-                mask.mask
-            } else {
-                FragmentMask::all()
-            };
-            if !changed.is_empty()
-                && let Some(old) = old
-            {
-                if old.excluded || self.compact.generation == 0 && old.missing_sections != 0 {
-                    changed = FragmentMask::all();
-                } else {
-                    changed = change_runtime::union(
-                        changed,
-                        fragments(old.missing_sections & fragment_sections(changed)),
-                    );
-                }
-            }
-            let mut sections = Vec::new();
-            let mut bindings = Vec::new();
-            let mut color_updates = Vec::new();
-            let mut verify = FragmentMask::empty();
-            let mut tint_patches = Vec::new();
-            if let Some(recovered) = recovered {
-                // 缺源时没有生成新几何，恢复候选也须重新验证这些section。
-                changed = change_runtime::union(changed, fragments(recovered.missing_sections));
-                // 未受影响的未发布片段只转移所有权，依赖重新齐备后复用，不复制Quad。
-                verify = change_runtime::subtract(recovered.changed, changed);
-                for (slot, mesh) in recovered.parts {
-                    if changed.contains(slot) {
-                        self.ledger.owned -= mesh.quads.len();
-                    } else {
-                        sections.push((slot, mesh));
-                    }
-                }
-                bindings = recovered.bindings;
-                bindings.retain(|entry| !changed.contains(entry.fragment));
-                color_updates = recovered.color_updates;
-                // 重染片段用下一次回填建立补丁，不能同时继承上一候选的颜色差分。
-                let recolored = change_runtime::union(changed, mask.tints);
-                color_updates.retain(|entry| !recolored.contains(entry.fragment));
-                for group in bindings
-                    .iter()
-                    .filter(|group| !mask.tints.contains(group.fragment))
-                {
-                    for (span, &color) in group.spans.iter().zip(&group.colors) {
-                        tint_patches.push(prime_scene::TintPatch::new(
-                            group.fragment,
-                            span.first as usize,
-                            span.count as usize,
-                            color,
-                        )?);
-                    }
-                }
-                if let Some(old) = self.state.resource(handle) {
-                    for update in &color_updates {
-                        let group = old
-                            .bindings
-                            .iter()
-                            .find(|entry| entry.fragment == update.fragment)
-                            .expect("原候选已校验颜色绑定");
-                        let span = group.spans[update.span];
-                        tint_patches.push(prime_scene::TintPatch::new(
-                            update.fragment,
-                            span.first as usize,
-                            span.count as usize,
-                            update.argb,
-                        )?);
-                    }
-                }
-                changed = change_runtime::union(changed, verify);
-            }
-            let dirty = fragment_sections(changed);
-            let mut job = RegionJob {
-                invalidated: false,
-                epoch: self
-                    .input_epoch
-                    .ok_or(Error::Input("输入世代耗尽，需重建Scene所有者"))?,
-                ticket: build.ticket,
-                handle,
-                region: key(build.chunk),
-                dirty,
-                issued: 0,
-                received: 0,
-                unavailable: 0,
-                projected: self
-                    .state
-                    .resource(handle)
-                    .map_or(0, |old| old.len() - old.fragment_quads(changed))
-                    + sections
-                        .iter()
-                        .map(|(_, mesh)| mesh.quads.len())
-                        .sum::<usize>(),
-                sections,
-                changed,
-                compiled: verify,
-                verify,
-                finished: FragmentMask::empty(),
-                tint_mask: mask.tints,
-                bindings,
-                tint_patches,
-                color_updates,
-                pending_tints: 0,
-                pending_tint_mask: FragmentMask::empty(),
-            };
-            for slot in 0..64 {
-                let y = section(job.region, slot)[1];
-                if y < self.height[0] || y >= self.height[1] {
-                    job.received |= (1 << slot) & dirty;
-                    for fragment in slot * 4..slot * 4 + 4 {
-                        if changed.contains(fragment) {
-                            job.compiled.set(fragment)?;
-                            job.finished.set(fragment)?;
-                        }
-                    }
-                }
-            }
-            self.insert_job(job)?;
-            self.refresh_ledger(handle);
+            self.begin_region_job(self.batch.requests()[request_index])?;
         }
         for patch in self.batch.switches() {
             if matches!(patch.change, Change::Remove(_)) {
@@ -820,7 +918,7 @@ impl Scene {
             self.grow()?;
         }
         let count = max_requests.min(REQUESTS);
-        let captures_before = self.captures.len();
+        let first_wire = self.next_wire;
         let additional = count.saturating_sub(self.captures.len());
         self.next_wire
             .checked_add(additional as u64)
@@ -845,6 +943,7 @@ impl Scene {
                     self.next_wire += 1;
                     self.captures.push(PendingCapture {
                         wire,
+                        source_stamp: None,
                         ticket: Some(job.ticket),
                         slot,
                     });
@@ -852,31 +951,11 @@ impl Scene {
             }
         }
         if self.compact.generation != 0 {
-            while self.captures.len() < count {
-                let captures = &self.captures;
-                let Some(source_key) = self.compact.store.pick_missing(|key| {
-                    !captures.iter().any(|capture| capture.wire.section == key)
-                }) else {
-                    break;
-                };
-                let ticket = self.compact.capture_owner(source_key);
-                let wire = CaptureRequest {
-                    id: self.next_wire,
-                    section: source_key,
-                    reserved: 0,
-                };
-                self.compact.store.capture_issued(source_key)?;
-                self.next_wire += 1;
-                self.captures.push(PendingCapture {
-                    wire,
-                    ticket,
-                    slot: 0,
-                });
-            }
+            self.issue_compact_captures(count)?;
         }
         self.output
             .extend(self.captures.iter().take(count).map(|capture| capture.wire));
-        self.progress.source_requests += self.captures.len() - captures_before;
+        self.progress.source_requests += (self.next_wire - first_wire) as usize;
         self.finish_jobs()?;
         Ok(&self.output)
     }
@@ -1015,7 +1094,12 @@ impl Scene {
         if self.budget == budget {
             return Ok(());
         }
-        let required = self.estimated_resident(&[]) * size_of::<prime_scene::Quad>();
+        let required = if self.compact.generation == 0 {
+            self.estimated_resident(&[])
+        } else {
+            self.ledger.resident()
+        }
+        .saturating_mul(size_of::<prime_scene::Quad>());
         self.budget = budget;
         self.pressure = Pressure::default();
         if required > budget.resident_bytes {
@@ -1029,7 +1113,11 @@ impl Scene {
         }
         self.blocked_quads = 0;
         self.retry_handles.clear();
-        self.retry_handles.extend(self.ledger.excluded_handles());
+        self.retry_handles.extend(
+            self.ledger
+                .excluded_handles()
+                .filter(|&handle| !self.capacity.has_wait(handle)),
+        );
         self.retry_excluded = (!self.retry_handles.is_empty()).then_some(0);
         self.planner_pending = true;
         Ok(())
@@ -1049,10 +1137,12 @@ impl Scene {
         } else {
             0
         };
-        let required = self
-            .ledger
-            .projected()
-            .saturating_mul(size_of::<prime_scene::Quad>());
+        let required = if self.compact.generation == 0 {
+            self.ledger.projected()
+        } else {
+            self.ledger.resident()
+        }
+        .saturating_mul(size_of::<prime_scene::Quad>());
         if required > self.budget.resident_bytes && value.kind != PressureKind::Transition {
             value.kind = PressureKind::Resident;
             value.required_bytes = required;
@@ -1146,35 +1236,6 @@ impl Scene {
             }
         }
         total
-    }
-
-    /// 只协调本批真正产生输出的region；停车中的任务不参与全量重算。
-    fn admit_jobs(&mut self, tickets: &[Ticket]) -> Result<(), Error> {
-        let stride = size_of::<prime_scene::Quad>();
-        for &ticket in tickets {
-            let Some(index) = self.job_index(ticket) else {
-                continue;
-            };
-            let required = self.jobs[index].projected.saturating_mul(stride);
-            if required > self.budget.region_bytes {
-                self.exclude_job(
-                    index,
-                    PressureKind::Region,
-                    required,
-                    self.budget.region_bytes,
-                )?;
-            } else if self.ledger.projected().saturating_mul(stride) > self.budget.resident_bytes
-                && required != 0
-            {
-                self.exclude_job(
-                    index,
-                    PressureKind::Resident,
-                    self.ledger.projected().saturating_mul(stride),
-                    self.budget.resident_bytes,
-                )?;
-            }
-        }
-        Ok(())
     }
 
     fn admit_sources(
@@ -1303,6 +1364,9 @@ impl Scene {
             {
                 continue;
             }
+            if self.compact.generation != 0 && !self.admit_compact_candidate(index)? {
+                continue;
+            }
             let job = self.remove_job(index);
             let source_stamps = self.compact.job_sources(job.ticket);
             self.compact.forget_job(job.ticket);
@@ -1390,6 +1454,23 @@ impl Scene {
             }
             self.refresh_ledger(job.handle);
             self.refresh_tint_index(job.handle);
+            if job.interactive
+                && self.state.replacement(job.handle).is_some()
+                && self.pending.len() < self.publication_remaining.min(SWITCHES)
+                && self
+                    .state
+                    .config()
+                    .bounds()
+                    .expect("有界目标")
+                    .intersects(chunk(job.region))
+            {
+                // 可见替换已完成，直接占用本轮剩余发布额度；仍由prepare校验并由GPU确认。
+                match self.state.prepare_replace(job.handle) {
+                    Ok(patch) => self.pending.push(patch),
+                    Err(cm::StateError::RetirementFull) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
             offset += 1;
         }
         Ok(())
@@ -1408,6 +1489,9 @@ impl Scene {
         self.dirty
             || self.target.is_none()
             || !self.queued_changes.is_empty()
+            || !self.edit_sources.is_empty()
+            || !self.edit_refreshes.is_empty()
+            || self.resident_retry_ready()
             || self.tint_sweep.pending()
             || self.custom_sweep.pending()
             || self.planner_pending

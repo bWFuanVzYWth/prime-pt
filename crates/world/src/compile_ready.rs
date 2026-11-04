@@ -9,7 +9,18 @@ impl Scene {
             .store
             .drain_woken(self.ready_remaining)
             .collect();
-        self.compact.todo.extend(woken);
+        for work in woken {
+            if let Some(index) = self
+                .compact
+                .groups
+                .get(&work)
+                .and_then(|&ticket| self.job_index(ticket))
+            {
+                self.compact
+                    .todo
+                    .insert(work, self.jobs[index].interactive)?;
+            }
+        }
         while self.ready_remaining != 0 {
             let Some(work) = self.compact.todo.pop_first() else {
                 break;
@@ -127,10 +138,13 @@ impl Scene {
                 }
                 if job.changed.contains(fragment)
                     && !job.compiled.contains(fragment)
-                    && self.compact.ready.insert(WorkId {
-                        fragment: fragment as u16,
-                        ..work
-                    })?
+                    && self.compact.ready.insert(
+                        WorkId {
+                            fragment: fragment as u16,
+                            ..work
+                        },
+                        job.interactive,
+                    )?
                 {
                     self.progress.ready_slabs += 1;
                 }
@@ -160,7 +174,9 @@ impl Scene {
             }));
             old.fragment_quads(replaced)
         });
-        job.pending_tints -= self.compact.cancel_fragments(ticket, mask);
+        job.pending_tints -= self
+            .compact
+            .cancel_fragments(ticket, mask, job.interactive)?;
         self.compact.todo.remove(&work);
         let mut discarded = 0;
         job.sections.retain(|(fragment, mesh)| {
@@ -192,23 +208,67 @@ impl Scene {
 
     pub(super) fn compile_ready(&mut self, catalog: &Catalog) -> Result<(), Error> {
         let stride = size_of::<prime_scene::Quad>();
-        let limit = (self.budget.resident_bytes + self.budget.staging_bytes) / stride;
         self.progress.waiting_budget += self.compact.capacity.len();
         while self.mesh_remaining != 0 {
-            let available = limit.saturating_sub(self.ledger.owned);
-            self.wake_capacity(available)?;
-            if self.compact.ready.is_empty() {
-                break;
-            }
-            if available == 0 {
+            let common = self.staging_available(false);
+            let full = self.staging_available(true);
+            if full == 0 {
                 self.progress.waiting_budget += self.compact.ready.len();
                 break;
             }
+            let mut owner = self.capacity.staging_owner();
+            self.wake_capacity(false, common)?;
+            self.wake_capacity(true, if owner.is_none() { full } else { common })?;
+            let mut reserved = Vec::new();
+            if let Some(ticket) = owner {
+                self.collect_reserved_work(ticket, full, &mut reserved)?;
+                if reserved.is_empty()
+                    || full == common
+                    || common >= self.budget.region_bytes / stride
+                {
+                    self.capacity.release_staging(ticket);
+                    reserved.clear();
+                    owner = None;
+                    self.wake_capacity(true, full)?;
+                }
+            }
+            let reserved_ticket = if full > common && common < self.budget.region_bytes / stride {
+                owner.or_else(|| {
+                    self.compact.ready.lane(true).next().and_then(|work| {
+                        self.compact
+                            .groups
+                            .get(&WorkId {
+                                fragment: work.fragment / 4 * 4,
+                                ..*work
+                            })
+                            .copied()
+                    })
+                })
+            } else {
+                None
+            };
+            if let Some(ticket) = reserved_ticket
+                && owner.is_none()
+            {
+                self.collect_reserved_work(ticket, full, &mut reserved)?;
+            }
+            let Some(interactive) = self
+                .compact
+                .ready
+                .select(common != 0 || !reserved.is_empty(), common != 0)
+            else {
+                self.progress.waiting_budget += self.compact.ready.len();
+                break;
+            };
+            let uses_reserved = interactive && !reserved.is_empty();
+            let available = if uses_reserved { full } else { common };
+            let ready_count = if uses_reserved {
+                reserved.len()
+            } else {
+                self.compact.ready.lane(interactive).len()
+            };
             let expanded = self.pool.current_num_threads().saturating_mul(8);
-            let expanded_count = self
-                .mesh_remaining
-                .min(expanded)
-                .min(self.compact.ready.len());
+            let expanded_count = self.mesh_remaining.min(expanded).min(ready_count);
             // 余量至少容纳每项一个未剔除cube slab时放大批次；这只是调度门槛，
             // 不作为任意模型的输出上界。压力或真实限额失败仍走原小波和minimum收缩。
             let wave_limit = if self.pressure.kind == PressureKind::None
@@ -223,16 +283,26 @@ impl Scene {
                 .mesh_remaining
                 .min(wave_limit)
                 .min(available)
-                .min(self.compact.ready.len());
-            let mut work: Vec<_> = self.compact.ready.iter().take(count).copied().collect();
+                .min(ready_count);
+            let mut work: Vec<_> = if uses_reserved {
+                reserved.truncate(count);
+                reserved
+            } else {
+                self.compact
+                    .ready
+                    .lane(interactive)
+                    .take(count)
+                    .copied()
+                    .collect()
+            };
             work.retain(|work| {
                 let minimum = self.compact.minimums.get(work).copied().unwrap_or(1);
                 if minimum <= available {
                     return true;
                 }
                 self.compact.ready.remove(work);
-                self.compact.capacity.insert(*work, minimum);
-                self.compact.capacity_index.insert((minimum, *work));
+                self.compact.capacity.insert(*work, (minimum, interactive));
+                self.compact.capacity_index[usize::from(interactive)].insert((minimum, *work));
                 false
             });
             if work.is_empty() {
@@ -281,7 +351,7 @@ impl Scene {
                         .any(|value| matches!(value, Neighbor::Unknown | Neighbor::Unavailable))
                     {
                         invalid.push(group);
-                        self.compact.todo.insert(group);
+                        self.compact.todo.insert(group, interactive)?;
                         for offset in 0..4 {
                             self.compact.ready.remove(&WorkId {
                                 fragment: group.fragment + offset,
@@ -300,6 +370,7 @@ impl Scene {
             if tasks.is_empty() {
                 continue;
             }
+            self.compact.ready.served(interactive);
             let quota = available / tasks.len();
             let compile = |ready: WorkId, group: usize, max_quads| {
                 prime_minecraft::compile_slab(
@@ -342,11 +413,14 @@ impl Scene {
                 }
             }
             drop(groups);
+            if uses_reserved && used > common {
+                self.capacity
+                    .claim_staging(reserved_ticket.expect("预留任务属于同一候选"));
+            }
             self.mesh_remaining -= executed;
             self.progress.mesh_slabs += executed;
             self.progress.mesh_waves += 1;
             let mut blocked = Vec::new();
-            let mut affected = Vec::with_capacity(tasks.len());
             for ((ready, _), result) in tasks.into_iter().zip(output) {
                 let group = WorkId {
                     fragment: ready.fragment / 4 * 4,
@@ -355,9 +429,6 @@ impl Scene {
                 let Some(&ticket) = self.compact.groups.get(&group) else {
                     continue;
                 };
-                if !affected.contains(&ticket) {
-                    affected.push(ticket);
-                }
                 match result {
                     Ok(value) => {
                         self.accept_slab(ticket, usize::from(ready.fragment), value, catalog)?;
@@ -368,15 +439,15 @@ impl Scene {
                         let required =
                             required.max(self.compact.minimums.get(&ready).copied().unwrap_or(1));
                         self.compact.ready.remove(&ready);
-                        self.compact.capacity.insert(ready, required);
-                        self.compact.capacity_index.insert((required, ready));
+                        self.compact.capacity.insert(ready, (required, interactive));
+                        self.compact.capacity_index[usize::from(interactive)]
+                            .insert((required, ready));
                         self.compact.minimums.insert(ready, required);
                         blocked.push((ticket, required));
                     }
                     Err(error) => return Err(error.into()),
                 }
             }
-            self.admit_jobs(&affected)?;
             if let Some((ticket, required)) = blocked.first().copied()
                 && let Some(index) = self.job_index(ticket)
             {
@@ -394,7 +465,7 @@ impl Scene {
                     self.pressure = Pressure {
                         kind: PressureKind::Transition,
                         required_bytes: self.ledger.owned.saturating_add(required) * stride,
-                        limit_bytes: limit * stride,
+                        limit_bytes: self.staging_limit(uses_reserved),
                         ..Pressure::default()
                     };
                 }
@@ -403,18 +474,51 @@ impl Scene {
         Ok(())
     }
 
-    fn wake_capacity(&mut self, available: usize) -> Result<(), Error> {
-        let mut count = self.mesh_remaining.saturating_sub(self.compact.ready.len());
+    fn wake_capacity(&mut self, interactive: bool, available: usize) -> Result<(), Error> {
+        let index = &mut self.compact.capacity_index[usize::from(interactive)];
+        let mut count = self
+            .mesh_remaining
+            .saturating_sub(self.compact.ready.lane(interactive).len());
         while count != 0
-            && let Some(&(required, work)) = self.compact.capacity_index.first()
+            && let Some(&(required, work)) = index.first()
         {
             if required > available {
                 break;
             }
-            self.compact.ready.insert(work)?;
-            self.compact.capacity_index.pop_first();
+            self.compact.ready.insert(work, interactive)?;
+            index.pop_first();
             self.compact.capacity.remove(&work);
             count -= 1;
+        }
+        Ok(())
+    }
+
+    fn collect_reserved_work(
+        &mut self,
+        ticket: Ticket,
+        available: usize,
+        work: &mut Vec<WorkId>,
+    ) -> Result<(), Error> {
+        let Some(groups) = self.compact.registrations.get(&ticket) else {
+            return Ok(());
+        };
+        for &group in groups.values() {
+            for offset in 0..4 {
+                let item = WorkId {
+                    fragment: group.fragment + offset,
+                    ..group
+                };
+                if let Some((required, true)) = self.compact.capacity.get(&item).copied()
+                    && required <= available
+                {
+                    self.compact.ready.insert(item, true)?;
+                    self.compact.capacity.remove(&item);
+                    self.compact.capacity_index[1].remove(&(required, item));
+                }
+                if self.compact.ready.contains(&item, true) {
+                    work.push(item);
+                }
+            }
         }
         Ok(())
     }

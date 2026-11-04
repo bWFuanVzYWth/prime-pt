@@ -2,9 +2,11 @@
 /// 可配置的最终常驻、过渡和单region逻辑payload上限，单位为字节。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Budget {
-    /// 当前目标域全部region的最终quad payload。
+    /// 当前目标域已发布quad与获准候选的正增长总量。发布前不能用候选缩小额换取容量。
+    /// 压缩源后台接纳上限另留 `min(resident/64, staging/8)`，且至少容纳单region上限。
     pub resident_bytes: usize,
-    /// 旧域和dirty替换部分额外保留的payload余量；不足时暂停替换，不撤旧覆盖。
+    /// 所有实际独占quad可在resident之外使用的过渡容量，含域外旧覆盖、候选及退役。
+    /// 压缩源后台不能使用其中 `min(region, staging/4)` 的交互输出余量。
     pub staging_bytes: usize,
     /// 单个region可提交的payload；不能大于staging_bytes。
     pub region_bytes: usize,

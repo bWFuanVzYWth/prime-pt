@@ -1,6 +1,6 @@
 //! 压缩源、持久乘色绑定和显式slab阶段；只借用源，输出由World独占。
 use super::*;
-use crate::ready_queue::ReadyQueue;
+use crate::priority::PriorityQueue;
 use crate::store::{SourceStamp, SourceState, SourceStore, WorkId};
 use prime_minecraft::{Catalog, Neighbor, Neighborhood, TintRequest};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -25,15 +25,16 @@ pub(super) struct Sources {
     pub indices: HashMap<TintRequest, usize>,
     registrations: HashMap<Ticket, BTreeMap<usize, WorkId>>,
     groups: HashMap<WorkId, Ticket>,
-    todo: BTreeSet<WorkId>,
-    ready: ReadyQueue,
+    todo: PriorityQueue<WorkId>,
+    ready: PriorityQueue<WorkId>,
     expanded: HashSet<WorkId>,
-    capacity: BTreeMap<WorkId, usize>,
-    capacity_index: BTreeSet<(usize, WorkId)>,
+    capacity: BTreeMap<WorkId, (usize, bool)>,
+    capacity_index: [BTreeSet<(usize, WorkId)>; 2],
     minimums: HashMap<WorkId, usize>,
     probes: HashMap<[i32; 3], WorkId>,
     probe_spatial: crate::spatial::SpatialIndex,
     probe_window: Option<Bounds>,
+    edit_capture_turn: u8,
     next_epoch: u64,
 }
 pub(super) struct PendingTint {
@@ -65,11 +66,14 @@ impl Sources {
         self.ready.clear();
         self.expanded.clear();
         self.capacity.clear();
-        self.capacity_index.clear();
+        for index in &mut self.capacity_index {
+            index.clear();
+        }
         self.minimums.clear();
         self.probes.clear();
         self.probe_spatial.clear();
         self.probe_window = None;
+        self.edit_capture_turn = 0;
     }
     pub(super) fn ready_len(&self) -> usize {
         self.ready.len()
@@ -81,11 +85,28 @@ impl Sources {
         if self.store.consumer(key).is_some() {
             return Ok(());
         }
-        if self
-            .probe_window
-            .is_some_and(|bounds| !crate::spatial::contains(bounds, key))
+        self.probe_source(key)?;
+        Ok(())
+    }
+
+    pub(super) fn refresh_edit(&mut self, key: [i32; 3]) -> Result<(), Error> {
+        // 编辑probe独立于建网ticket，重排或取消已有job不丢失本次捕获。
+        if self.probe_source(key)? {
+            self.store.promote_edit(key)?;
+        }
+        Ok(())
+    }
+
+    fn probe_source(&mut self, key: [i32; 3]) -> Result<bool, Error> {
+        if !matches!(self.store.lookup(key), SourceState::Unknown)
+            || self
+                .probe_window
+                .is_some_and(|bounds| !crate::spatial::contains(bounds, key))
         {
-            return Ok(());
+            return Ok(false);
+        }
+        if self.probes.contains_key(&key) {
+            return Ok(true);
         }
         let epoch = self
             .next_epoch
@@ -100,7 +121,7 @@ impl Sources {
         self.next_epoch = epoch;
         self.probes.insert(key, probe);
         self.probe_spatial.insert(key);
-        Ok(())
+        Ok(true)
     }
     pub(super) fn set_window(&mut self, bounds: Bounds) {
         if self.probe_window == Some(bounds) {
@@ -139,9 +160,31 @@ impl Sources {
             .collect()
     }
     fn remove_capacity(&mut self, work: WorkId) {
-        if let Some(required) = self.capacity.remove(&work) {
-            self.capacity_index.remove(&(required, work));
+        if let Some((required, interactive)) = self.capacity.remove(&work) {
+            self.capacity_index[usize::from(interactive)].remove(&(required, work));
         }
+    }
+
+    pub(super) fn promote_job(&mut self, ticket: Ticket) -> Result<(), Error> {
+        let Some(groups) = self.registrations.get(&ticket) else {
+            return Ok(());
+        };
+        for &group in groups.values() {
+            self.todo.promote(group)?;
+            for offset in 0..4 {
+                let work = WorkId {
+                    fragment: group.fragment + offset,
+                    ..group
+                };
+                self.ready.promote(work)?;
+                if let Some((required, false)) = self.capacity.get(&work).copied() {
+                    self.capacity_index[0].remove(&(required, work));
+                    self.capacity_index[1].insert((required, work));
+                    self.capacity.insert(work, (required, true));
+                }
+            }
+        }
+        Ok(())
     }
     pub(super) fn forget_job(&mut self, ticket: Ticket) {
         if let Some(groups) = self.registrations.remove(&ticket) {
@@ -164,7 +207,12 @@ impl Sources {
         self.tints.retain(|tint| tint.ticket != ticket);
         self.prune_tints();
     }
-    pub(super) fn cancel_fragments(&mut self, ticket: Ticket, mask: FragmentMask) -> usize {
+    pub(super) fn cancel_fragments(
+        &mut self,
+        ticket: Ticket,
+        mask: FragmentMask,
+        interactive: bool,
+    ) -> Result<usize, Error> {
         if let Some(groups) = self.registrations.get(&ticket) {
             for fragment in mask.iter() {
                 if let Some(&group) = groups.get(&(fragment / 4)) {
@@ -173,11 +221,11 @@ impl Sources {
                         ..group
                     };
                     self.ready.remove(&work);
-                    if let Some(required) = self.capacity.remove(&work) {
-                        self.capacity_index.remove(&(required, work));
+                    if let Some((required, lane)) = self.capacity.remove(&work) {
+                        self.capacity_index[usize::from(lane)].remove(&(required, work));
                     }
                     self.minimums.remove(&work);
-                    self.todo.insert(group);
+                    self.todo.insert(group, interactive)?;
                 }
             }
         }
@@ -188,7 +236,7 @@ impl Sources {
         if cancelled != 0 {
             self.prune_tints();
         }
-        cancelled
+        Ok(cancelled)
     }
     pub(super) fn cancel_tints(&mut self, ticket: Ticket, mask: FragmentMask) -> usize {
         let before = self.tints.len();
@@ -237,7 +285,7 @@ impl Sources {
                 .or_default()
                 .insert(slot, work);
             self.groups.insert(work, job.ticket);
-            self.todo.insert(work);
+            self.todo.insert(work, job.interactive)?;
         }
         Ok(())
     }
@@ -309,6 +357,84 @@ impl PreparedGeneration<'_> {
     }
 }
 impl Scene {
+    pub(super) fn issue_compact_captures(&mut self, count: usize) -> Result<(), Error> {
+        if count == 0 {
+            return Ok(());
+        }
+        if let Some(edit) = self.compact.store.pick_edit(|_| true) {
+            // Java可以只完成前缀的一条。每八个有编辑的推进轮让普通捕获占首位一次。
+            let first = if self.compact.edit_capture_turn == 7 {
+                self.captures
+                    .iter()
+                    .find(|capture| !self.compact.store.is_edited_missing(capture.wire.section))
+                    .map(|capture| capture.wire.section)
+                    .or_else(|| self.compact.store.pick_background(|_| true))
+                    .unwrap_or(edit)
+            } else {
+                edit
+            };
+            if let Some(index) = self
+                .captures
+                .iter()
+                .position(|capture| capture.wire.section == first)
+            {
+                self.captures[..=index].rotate_right(1);
+            } else {
+                let capture = self.new_compact_capture(first)?;
+                if self.captures.len() == REQUESTS {
+                    self.captures.pop();
+                }
+                self.captures.insert(0, capture);
+            }
+            self.compact.edit_capture_turn = (self.compact.edit_capture_turn + 1) % 8;
+        }
+        while self.captures.len() < count {
+            let eligible = |key| {
+                !self
+                    .captures
+                    .iter()
+                    .any(|capture| capture.wire.section == key)
+            };
+            let Some(key) = self
+                .compact
+                .store
+                .pick_background(eligible)
+                .or_else(|| self.compact.store.pick_edit(eligible))
+            else {
+                break;
+            };
+            let capture = self.new_compact_capture(key)?;
+            self.captures.push(capture);
+        }
+        Ok(())
+    }
+
+    fn new_compact_capture(&mut self, key: [i32; 3]) -> Result<PendingCapture, Error> {
+        let next = self
+            .next_wire
+            .checked_add(1)
+            .ok_or(Error::Input("捕获请求编号溢出"))?;
+        let ticket = self.compact.capture_owner(key);
+        let source_stamp = self
+            .compact
+            .store
+            .capture_stamp(key)
+            .ok_or(Error::Input("签发的source已不再缺失"))?;
+        self.compact.store.capture_issued(key)?;
+        let wire = CaptureRequest {
+            id: self.next_wire,
+            section: key,
+            reserved: 0,
+        };
+        self.next_wire = next;
+        Ok(PendingCapture {
+            wire,
+            ticket,
+            slot: 0,
+            source_stamp: Some(source_stamp),
+        })
+    }
+
     /// GPU资源替换前预留完整世界源域；零世代拒绝，失败不改变旧所有者。
     pub fn stage_source_generation(
         &mut self,
@@ -341,8 +467,9 @@ impl Scene {
     pub const fn generation(&self) -> u64 {
         self.compact.generation
     }
-    /// 先验证整包票据、坐标、世代和Catalog身份，再共同接受原始压缩数据。
-    /// 旧票据忽略；真实状态差分补足声明范围，再唤醒对应候选。
+    /// 先验证整包票据、坐标、世代和 Catalog 身份，再共同接受原始压缩数据。
+    /// 旧票据忽略。等价快照恢复可用性并保留内容版本，实际状态差分精确唤醒受影响候选。
+    /// 持有本轮准备视图的宿主须先结束 GPU 准备和发布，再交付后续源包。
     pub fn apply_compact(&mut self, bytes: &[u8], catalog: &Catalog) -> Result<(), Error> {
         let sources = prime_minecraft::decode_sections(bytes)?;
         let mut accepted = Vec::new();
@@ -363,6 +490,13 @@ impl Scene {
             {
                 return Err(Error::Input("压缩源票据、坐标或资源世代不匹配"));
             }
+            let Some(stamp) = capture.source_stamp else {
+                return Err(Error::Input("压缩源票据缺少失效身份"));
+            };
+            if self.compact.store.capture_stamp(source.key) != Some(stamp) {
+                tickets.push(source.request);
+                continue;
+            }
             let air = if let Some(storage) = &source.storage {
                 catalog.validate_section(storage)?;
                 catalog.section_is_air(storage)?
@@ -370,7 +504,7 @@ impl Scene {
                 false
             };
             tickets.push(source.request);
-            accepted.push((source, air));
+            accepted.push((source, air, stamp));
         }
         let deltas = self.compact.store.accept_batch(accepted)?;
         self.captures
@@ -381,9 +515,12 @@ impl Scene {
                 self.compact.probe_spatial.remove(delta.key);
             }
             if let Some(range) = delta.changed {
-                self.dirty_source_output(delta.key, range.min, range.max_exclusive)?;
-            } else {
-                self.rebind_candidate_source(delta.key, delta.stamp);
+                self.dirty_source_output_with_priority(
+                    delta.key,
+                    range.min,
+                    range.max_exclusive,
+                    delta.interactive,
+                )?;
             }
         }
         self.compile_sources(catalog)
@@ -565,7 +702,8 @@ impl Scene {
             }
             self.jobs[index].tint_mask = FragmentMask::from_words(remaining);
             if requeue {
-                self.tint_jobs.insert(ticket)?;
+                self.tint_jobs
+                    .insert(ticket, self.jobs[index].interactive)?;
             }
             self.queue_completion(ticket);
         }

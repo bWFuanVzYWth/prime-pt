@@ -5,6 +5,7 @@ mod budget_tests;
 mod changes;
 mod chunks;
 mod ledger;
+mod priority;
 mod ready_queue;
 mod region;
 mod source;

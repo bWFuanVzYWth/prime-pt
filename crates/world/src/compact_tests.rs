@@ -56,6 +56,54 @@ fn publish(scene: &mut Scene, catalog: &Catalog) -> Result<(), Error> {
     Err(Error::Input("压缩源发布未收敛"))
 }
 
+#[test]
+fn completed_visible_edit_can_publish_in_the_same_turn() -> Result<(), Error> {
+    for distance in [8, 32] {
+        let (mut scene, catalog) = ready_tinted()?;
+        let colors = vec![0xffff_ffff; scene.tint_requests().len()];
+        scene.apply_tints(&colors)?;
+        publish(&mut scene, &catalog)?;
+        assert_eq!(scene.plan(&camera(), distance, 0, 4, 64)?.len(), 64);
+
+        scene.apply_changes(&[SourceChange::BlockRange {
+            section: [0; 3],
+            minimum: [0; 3],
+            maximum: [16; 3],
+        }])?;
+        let request = scene.plan(&camera(), distance, 0, 4, 64)?[0];
+        assert_eq!(request.section, [0; 3], "视距{distance}的捕获前缀");
+        let packet = fixtures::section_packet(&[(request.id, [0; 3], Pattern::Sparse)]);
+        scene.apply_compact(&packet, &catalog)?;
+        assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+
+        scene.plan(&camera(), distance, 0, 4, 64)?;
+        scene.compile_sources(&catalog)?;
+        assert!(scene.prepare()?, "视距{distance}的已完成替换可在本轮提交");
+        assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 384);
+        scene.commit()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn resync_supersedes_older_source_notifications_in_the_maintenance_queue() -> Result<(), Error> {
+    let (mut scene, catalog) = ready_tinted()?;
+    let colors = vec![0xffff_ffff; scene.tint_requests().len()];
+    scene.apply_tints(&colors)?;
+    publish(&mut scene, &catalog)?;
+    scene.set_work_budget(WorkBudget {
+        maintenance: 1,
+        ..WorkBudget::default()
+    });
+    scene.invalidate_section([32, 0, 0])?;
+    scene.apply_changes(&[SourceChange::SourceOverflow])?;
+
+    let requests = scene.plan(&camera(), 0, 0, 4, 64)?;
+    assert!(requests.iter().any(|request| request.section == [0; 3]));
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+    Ok(())
+}
+
 fn unavailable_packet(request: CaptureRequest) -> Vec<u8> {
     let mut bytes = Vec::new();
     for word in [0x33545250, 1, 1, 0] {
