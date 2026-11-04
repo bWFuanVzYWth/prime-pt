@@ -64,6 +64,12 @@ final class FrameChartFixture {
         require(hover.labels.stream().anyMatch(line -> line.contains("选中 80.00ms"))
                 && hover.labels.stream().anyMatch(line -> line.contains("AS构建/等待") && line.contains("75.0%") && line.contains("60.00ms")),
                 "悬停展示该柱的完整真实样本归因");
+        var scaledHud = new Bounds(1040, 360);
+        require(FrameChartHud.paint(scaledHud, 0, 1040, 360, 88.5, 80, 0.5f)
+                && scaledHud.firstRectangle[0] == 0 && scaledHud.firstRectangle[2] == 520
+                && scaledHud.firstRectangle[3] == 360, "独立 F3 缩放仍贴宿主左下角并为 TPS 保留右半屏");
+        require(scaledHud.labels.stream().anyMatch(line -> line.contains("选中 80.00ms")), "悬停换算到同一 F3 坐标系");
+        require(!FrameChartHud.paint(new Bounds(160, 240), 0, 160, 240, -1, -1, 1), "左半屏过窄时保留宿主图");
         var narrow = new Bounds(160, 200);
         require(FrameChart.paint(narrow, 0, 160, 200, -1, -1), "小窗口有界");
         require(narrow.labels.stream().anyMatch(line -> line.contains("AS 81.3%") && line.contains("65.00ms")),
@@ -149,9 +155,11 @@ final class FrameChartFixture {
     private static final class Bounds implements FrameChart.Surface {
         final int width, height;
         final ArrayList<String> labels = new ArrayList<>();
+        int[] firstRectangle;
         Bounds(int width, int height) { this.width = width; this.height = height; }
         public void fill(int x0, int y0, int x1, int y1, int color) {
             require(x0 >= 0 && x1 >= x0 && x1 <= width && y0 >= 0 && y1 >= y0 && y1 <= height, "矩形有界");
+            if (firstRectangle == null) firstRectangle = new int[] {x0, y0, x1, y1};
         }
         public void text(String text, int x, int y, int color) {
             require(x >= 0 && x + textWidth(text) <= width && y >= 0 && y + 9 <= height, "文字有界");

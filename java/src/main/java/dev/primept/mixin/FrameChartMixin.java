@@ -14,6 +14,6 @@ abstract class FrameChartMixin {
     @Redirect(method = "extractRenderState", at = @At(value = "INVOKE", target =
             "Lnet/minecraft/client/gui/components/debugchart/FpsDebugChart;extractRenderState(Lnet/minecraft/client/gui/GuiGraphicsExtractor;III)V"))
     private void primept$frameChart(FpsDebugChart vanilla, GuiGraphicsExtractor graphics, int x, int width, int height) {
-        if (!FrameChartHud.draw(graphics)) vanilla.extractRenderState(graphics, x, width, height);
+        if (!FrameChartHud.draw(graphics, x, height)) vanilla.extractRenderState(graphics, x, width, height);
     }
 }
