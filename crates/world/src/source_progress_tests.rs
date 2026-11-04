@@ -240,6 +240,68 @@ fn retint_does_not_apply_published_spans_to_an_untinted_replacement() -> Result<
 }
 
 #[test]
+fn returning_to_a_pending_unload_keeps_cover_and_applies_new_tint() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    drive(&mut scene, &catalog, 0)?;
+    let original = WorldCamera {
+        origin: [0.; 3],
+        forward: [0., 0., 1., 0.],
+        right: [1., 0., 0., 0.],
+        up: [0., 1., 0., 0.],
+    };
+    let away = WorldCamera {
+        origin: [-64., 0., 0.],
+        ..original
+    };
+    let value = crate::chunks::chunk([0; 3]);
+    let old = scene.state.find(value).unwrap();
+    scene.plan(&away, 0, 0, 4, 0)?;
+    let removal = *scene
+        .removes
+        .iter()
+        .find(|patch| patch.change == chunk_manager::Change::Remove(value))
+        .expect("已签发旧覆盖的卸载");
+
+    scene.set_work_budget(crate::WorkBudget {
+        publications: 0,
+        ..crate::WorkBudget::default()
+    });
+    scene.apply_changes(&[crate::SourceChange::WorldTint])?;
+    scene.plan(&away, 0, 0, 4, 0)?;
+    scene.state.validate_patch(removal.token)?;
+    scene.plan(&original, 0, 0, 4, 0)?;
+    if scene.prepare()? {
+        scene.commit()?;
+    }
+    assert!(scene.state.is_visible(old));
+    assert!(scene.removes.is_empty(), "取消失效卸载不消耗发布额度");
+
+    scene.set_work_budget(crate::WorkBudget::default());
+    for _ in 0..128 {
+        scene.plan(&original, 0, 0, 4, 0)?;
+        scene.compile_sources(&catalog)?;
+        let count = scene.tint_requests().len();
+        if count != 0 {
+            scene.apply_tints(&vec![0xff00_ff00; count])?;
+        }
+        if scene.prepare()? {
+            scene.commit()?;
+        }
+        assert!(scene.state.is_visible(old));
+        if !scene.pending() {
+            break;
+        }
+    }
+    assert!(!scene.pending());
+    let region = scene.render_regions().next().unwrap();
+    assert_eq!(region.mesh.len(), 1536);
+    assert!(region.mesh.quads().all(|quad| quad.tint() == [0., 1., 0.]));
+    Ok(())
+}
+
+#[test]
 fn probes_leave_the_window_while_real_compilation_dependencies_remain() -> Result<(), Error> {
     use chunk_manager::Bounds;
     let mut sources = super::Sources::default();

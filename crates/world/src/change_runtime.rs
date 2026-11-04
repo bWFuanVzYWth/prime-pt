@@ -292,6 +292,10 @@ impl Scene {
     }
 
     fn recover_candidate(&mut self, handle: Handle) -> Result<(), Error> {
+        // 待卸载的可见节点只有当前资源；保留卸载锁，失效标记仍可用于重新进入视距。
+        if self.state.is_visible(handle) && self.state.replacement(handle).is_none() {
+            return Ok(());
+        }
         if let Some(resource) = self.state.take_unpublished(handle)? {
             let key = resource.key;
             self.remove_candidate_sources(key);

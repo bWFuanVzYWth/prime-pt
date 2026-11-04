@@ -440,6 +440,7 @@ impl Scene {
         )?)?;
         self.ledger.set_bounds(bounds);
         if previous_bounds != Some(bounds) {
+            self.cancel_returned_removals(bounds)?;
             if let Some(previous) = previous_bounds {
                 for edge in crate::spatial::difference(previous, bounds) {
                     for key in self.ledger.keys(edge) {

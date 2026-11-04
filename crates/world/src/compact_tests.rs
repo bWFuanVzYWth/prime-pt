@@ -138,6 +138,43 @@ fn unavailable_halo_preserves_old_mesh_until_recovered_geometry_and_tint_are_com
 }
 
 #[test]
+fn changed_halo_keeps_outgoing_region_until_removal_commits() -> Result<(), Error> {
+    let (mut scene, catalog) = ready_tinted()?;
+    let colors = vec![0xffff_0000; scene.tint_requests().len()];
+    scene.apply_tints(&colors)?;
+    publish(&mut scene, &catalog)?;
+
+    let outgoing = [0; 3];
+    let halo = [3, 0, 0];
+    let handle = scene.state.find(chunk(outgoing)).unwrap();
+    scene.invalidate_section(halo)?;
+    let next_camera = WorldCamera {
+        origin: [64., 0., 0.],
+        ..camera()
+    };
+    let requests = scene.plan(&next_camera, 0, 0, 4, 64)?;
+    let request = requests
+        .iter()
+        .find(|request| request.section == halo)
+        .unwrap();
+    let packet = fixtures::section_packet(&[(request.id, halo, Pattern::Dense)]);
+    assert!(scene.state.is_visible(handle));
+    scene.apply_compact(&packet, &catalog)?;
+    assert!(scene.state.is_visible(handle));
+    assert!(scene.prepare()?);
+    assert!(
+        scene.render_changes().any(
+            |change| matches!(change, prime_scene::RenderChange::Remove(key) if key == outgoing)
+        )
+    );
+    assert!(scene.state.is_visible(handle));
+    scene.commit()?;
+    assert!(!scene.state.is_visible(handle));
+    assert!(!scene.masks.contains_key(&outgoing));
+    Ok(())
+}
+
+#[test]
 fn lowered_budget_keeps_published_partition_and_reports_the_unmet_limit() -> Result<(), Error> {
     let (mut scene, catalog) = ready_tinted()?;
     let colors = vec![0xff123456; scene.tint_requests().len()];

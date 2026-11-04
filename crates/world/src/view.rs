@@ -71,6 +71,21 @@ impl<'a> Iterator for Regions<'a> {
 impl ExactSizeIterator for Regions<'_> {}
 
 impl Scene {
+    pub(super) fn cancel_returned_removals(&mut self, bounds: Bounds) -> Result<(), Error> {
+        // 返回需求域的区块在规划前解除卸载锁，无需等待发布额度。
+        let mut at = 0;
+        while at < self.removes.len() {
+            if matches!(self.removes[at].change, Change::Remove(value) if bounds.intersects(value))
+            {
+                let patch = self.removes.swap_remove(at);
+                self.reject_token(patch)?;
+            } else {
+                at += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn stage_view(&mut self) -> Result<(), Error> {
         self.view_changes.clear();
         self.view_changes.try_reserve(self.pending.len())?;
@@ -203,6 +218,7 @@ impl Scene {
                 self.refresh_tint_index(change.handle);
             } else {
                 self.ledger.remove(change.key, change.handle);
+                self.masks.remove(&change.key);
                 self.tinted.remove(&change.key);
                 self.custom_tinted.remove(&change.key);
                 self.tinted_spatial.remove(change.key);
