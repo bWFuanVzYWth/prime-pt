@@ -678,6 +678,7 @@ pub struct Gpu {
     invocation_reorder: bool,
     display_origin: std::time::Instant,
     display_timeline: simple_engine::display::exposure::Timeline,
+    display_drt: simple_engine::display::PrimeDrtParameters,
 }
 
 impl Gpu {
@@ -762,6 +763,8 @@ impl Gpu {
         };
         // SAFETY: 外部生命周期由导出会话契约维持；本对象不销毁宿主句柄。
         let mut context = unsafe { Context::from_raw(raw)? };
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        context.enable_pipeline_cache(&root.join("../../target/pipeline-cache"));
         let attribute_slots =
             context.max_storage_buffer_range() / size_of::<[[u32; 4]; 3]>() as u32;
         let attribute_slot_limit = attribute_slots
@@ -798,7 +801,6 @@ impl Gpu {
         atmosphere.release_initialization();
         let solar = atmosphere.parameters().sun_radiance_rgb();
         let solar_luminance = 0.2627 * solar[0] + 0.6780 * solar[1] + 0.0593 * solar[2];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let compiler = shader_build::RuntimeCompiler::new(
             root.join("../../target/shaders"),
             &[&root.join("shaders"), &root.join("../../../../shaders")],
@@ -813,6 +815,9 @@ impl Gpu {
             None,
             None,
         )?;
+        let mut display_timeline = simple_engine::display::exposure::Timeline::default();
+        display_timeline
+            .set_compensation(simple_engine::display::exposure::DEFAULT_COMPENSATION)?;
         let gpu = Self {
             rr_runtime: None,
             rr_unavailable: None,
@@ -866,7 +871,8 @@ impl Gpu {
             settings: pt::Settings::default().validate()?,
             invocation_reorder: invocation_reorder && ser_requested,
             display_origin: std::time::Instant::now(),
-            display_timeline: simple_engine::display::exposure::Timeline::default(),
+            display_timeline,
+            display_drt: simple_engine::display::PrimeDrtSettings::DEFAULT.prepare(1.0)?,
         };
         #[cfg(test)]
         let gpu = {
@@ -875,6 +881,25 @@ impl Gpu {
             gpu
         };
         Ok(gpu)
+    }
+
+    /// 更新自动测光强度与 SDR 显示曲线，手动 EV 仍取自帧环境。
+    /// 只更新 CPU 设置，保留 PT/RR 历史与已准备的管线。
+    /// # Errors
+    /// 强度或 DRT 参数无效时保留当前设置。
+    pub fn set_display_options(
+        &mut self,
+        auto_exposure: f32,
+        saturation: f32,
+        hue: f32,
+        compression_start: f32,
+    ) -> Result<(), Error> {
+        let drt =
+            simple_engine::display::PrimeDrtSettings::new(1.0, hue, saturation, compression_start)?
+                .prepare(1.0)?;
+        self.display_timeline.set_compensation(auto_exposure)?;
+        self.display_drt = drt;
+        Ok(())
     }
 
     fn build_scene(context: &mut Context, mesh: &Mesh) -> Result<Scene, Error> {
@@ -1137,6 +1162,8 @@ impl Gpu {
         })();
         if result.is_err() {
             self.collect_resources()?;
+        } else {
+            self.context.flush_pipeline_cache();
         }
         result
     }
@@ -2050,9 +2077,8 @@ impl Gpu {
                 self.settings.max_dielectric_events,
             ]);
             words.extend(
-                simple_engine::display::PrimeDrtSettings::DEFAULT
+                self.display_drt
                     .with_exposure(environment.exposure_ev.exp2())?
-                    .prepare(1.0)?
                     .to_array()
                     .map(f32::to_bits),
             );

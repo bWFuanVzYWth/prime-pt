@@ -1125,6 +1125,7 @@ dependencies = [
  "android_system_properties",
  "ash 0.38.0+1.3.281",
  "ash 0.38.0+1.4.352",
+ "blake3",
  "cc",
  "log",
  "pollster",

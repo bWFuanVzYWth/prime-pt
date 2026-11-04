@@ -20,6 +20,9 @@ final class NativeBatchFixture {
             var batch=linker.downcallHandle(symbols.find("prime_invalidate_batch").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_LONG));
             var error=linker.downcallHandle(symbols.find("prime_error").orElseThrow(),FunctionDescriptor.of(ADDRESS));
             var profile=linker.downcallHandle(symbols.find("prime_profile").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_LONG,JAVA_LONG,ADDRESS,ADDRESS,JAVA_INT,JAVA_INT));
+            var display = Native.bindDisplayOptions(symbols);
+            if (Native.invokeDisplayOptions(display, 0L, DisplaySettings.DEFAULT) != -1 || !message(error).equals("无效 native 句柄"))
+                throw new AssertionError("显示参数须通过 FFM 并抵达会话查找");
             var stages=ByteBuffer.allocateDirect(FrameChart.STAGES*8).order(ByteOrder.LITTLE_ENDIAN);
             if(Native.invokeProfile(profile,0L,8_000_000L,stages,null,0)!=-1||!message(error).equals("无效 native 句柄"))throw new AssertionError("隐藏图表必须以NULL/0输出通过FFM与指针检查");
             var packets=packets();

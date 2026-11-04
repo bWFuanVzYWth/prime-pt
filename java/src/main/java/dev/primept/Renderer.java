@@ -145,6 +145,7 @@ public final class Renderer {
         long stage = System.nanoTime();
         renderer.updateBudget(updateBudget);
         renderer.updateSolarOrbit(Settings.solar());
+        renderer.updateDisplayOptions(Settings.display());
         if(biomeWorld!=minecraft.level){renderer.biomeWorld(SourceResources.prepared().biomes.world(minecraft.level));biomeWorld=minecraft.level;}
         var invalidations=CHANGES.batch(minecraft.level,1024);
         if(invalidations!=null){renderer.invalidateBatch(invalidations);CHANGES.accepted();}

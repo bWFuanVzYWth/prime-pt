@@ -392,6 +392,27 @@ pub extern "C" fn prime_set_solar_orbit(id: u64, latitude: i32, ecliptic_longitu
     })
 }
 
+/// 设置自动曝光强度、DRT 饱和补偿、色相补偿和压缩起点，均为归一化比例。
+/// 对应范围为 0..=1、0..=0.5、0..=1、0..=0.99。
+/// 成功返回 0。会话或参数无效时返回 -1，保留原值。调用只修改 CPU 设置。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_set_display_options(
+    id: u64,
+    auto_exposure: f32,
+    saturation: f32,
+    hue: f32,
+    compression_start: f32,
+) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| {
+            engine
+                .gpu
+                .set_display_options(auto_exposure, saturation, hue, compression_start)?;
+            Ok(())
+        })
+    })
+}
+
 /// 依宿主水平视距及完整世界高度推进64m LOD0窗口，返回至多capacity条待捕请求。
 ///
 /// 请求为 little-endian 的 `id:u64, sx:i32, sy:i32, sz:i32, reserved:u32=0`，每条 24B。

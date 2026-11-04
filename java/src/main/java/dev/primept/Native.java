@@ -19,6 +19,8 @@ final class Native implements AutoCloseable {
     private UpdateBudget updateBudget;
     private final MethodHandle setSolarOrbit;
     private SolarSettings solar;
+    private final MethodHandle setDisplayOptions;
+    private DisplaySettings display;
     private boolean serRequested;
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex) {
@@ -50,6 +52,7 @@ final class Native implements AutoCloseable {
         setSer = bind(symbols, "prime_set_ser", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         setUpdateBudget = bind(symbols, "prime_set_update_budget", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         setSolarOrbit = bind(symbols, "prime_set_solar_orbit", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT));
+        setDisplayOptions = bindDisplayOptions(symbols);
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         cameraMedium = bind(symbols, "prime_camera_medium", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
@@ -94,6 +97,25 @@ final class Native implements AutoCloseable {
             check((int) setSolarOrbit.invokeExact(handle, next.latitude(), next.longitude()));
             solar = next;
         } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void updateDisplayOptions(DisplaySettings next) {
+        if (next.equals(display)) return;
+        try {
+            check(invokeDisplayOptions(setDisplayOptions, handle, next));
+            display = next;
+        } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    static MethodHandle bindDisplayOptions(SymbolLookup symbols) {
+        return bind(symbols, "prime_set_display_options", FunctionDescriptor.of(JAVA_INT, JAVA_LONG,
+                JAVA_FLOAT, JAVA_FLOAT, JAVA_FLOAT, JAVA_FLOAT));
+    }
+
+    /** 生产和真实 FFM 夹具共用整数百分比到 native 归一化参数的调用点。 */
+    static int invokeDisplayOptions(MethodHandle target, long id, DisplaySettings options) throws Throwable {
+        return (int) target.invokeExact(id, options.autoExposure() / 100.0f, options.saturation() / 100.0f,
+                options.hue() / 100.0f, options.compressionStart() / 100.0f);
     }
 
     int plan(ByteBuffer camera, int distance, int minSectionY, int maxSectionYExclusive, ByteBuffer requests) {

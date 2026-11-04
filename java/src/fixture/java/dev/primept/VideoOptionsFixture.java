@@ -55,7 +55,9 @@ final class VideoOptionsFixture {
                 VideoOptions.Row.RESET, VideoOptions.Row.RENDER, VideoOptions.Row.SER, VideoOptions.Row.RR,
                 VideoOptions.Row.QUALITY, VideoOptions.Row.SAMPLES, VideoOptions.Row.BOUNCES,
                 VideoOptions.Row.UPDATE_BUDGET, VideoOptions.Row.LIGHTING, VideoOptions.Row.LATITUDE,
-                VideoOptions.Row.SOLAR_LONGITUDE, VideoOptions.Row.DISPLAY, VideoOptions.Row.EXPOSURE)),
+                VideoOptions.Row.SOLAR_LONGITUDE, VideoOptions.Row.DISPLAY, VideoOptions.Row.EXPOSURE,
+                VideoOptions.Row.AUTO_EXPOSURE, VideoOptions.Row.DRT_SATURATION, VideoOptions.Row.DRT_HUE,
+                VideoOptions.Row.DRT_COMPRESSION_START)),
                 "恢复默认置顶，渲染、光照和显示分栏的控件各出现一次");
     }
 

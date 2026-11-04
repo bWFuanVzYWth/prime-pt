@@ -26,6 +26,7 @@ public final class Settings {
     public static int bounces() { return Holder.CONFIG.bounces(); }
     static UpdateBudget updateBudget() { return Holder.CONFIG.updateBudget(); }
     static SolarSettings solar() { return Holder.CONFIG.solar(); }
+    static DisplaySettings display() { return Holder.CONFIG.display(); }
     static boolean rr() { return requestedRr() && StreamlineBootstrap.available(); }
 
     /** 保存成功后才发布新值；输入无效抛出 IllegalArgumentException，IO 失败抛出 IOException。 */
@@ -41,6 +42,22 @@ public final class Settings {
     }
     static void setSolarLongitude(int value) throws IOException {
         Holder.CONFIG.setSolar(new SolarSettings(solar().latitude(), value));
+    }
+    static void setAutoExposure(int value) throws IOException {
+        var options = display();
+        Holder.CONFIG.setDisplay(new DisplaySettings(value, options.saturation(), options.hue(), options.compressionStart()));
+    }
+    static void setDrtSaturation(int value) throws IOException {
+        var options = display();
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), value, options.hue(), options.compressionStart()));
+    }
+    static void setDrtHue(int value) throws IOException {
+        var options = display();
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), value, options.compressionStart()));
+    }
+    static void setDrtCompressionStart(int value) throws IOException {
+        var options = display();
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), options.hue(), value));
     }
     public static void reset() throws IOException { Holder.CONFIG.reset(); }
 

@@ -29,5 +29,13 @@
   "primept.settings.update_budget.throughput": "Throughput",
   "primept.settings.exposure": "Exposure",
   "primept.settings.exposure.tooltip": "Adjust brightness after RR and before display mapping. +1 EV doubles brightness. The slider previews 0.25 EV steps and saves on release. Opening settings preserves precise command values.\nCommand: /pt exposure -16..16",
+  "primept.settings.auto_exposure": "Auto exposure strength",
+  "primept.settings.auto_exposure.tooltip": "Scales the exposure correction from scene metering. At 0% the automatic correction is off. At 100% the full correction applies. Defaults to 65%. Manual EV remains an additional offset.",
+  "primept.settings.drt_saturation": "DRT saturation compensation",
+  "primept.settings.drt_saturation.tooltip": "Controls saturation compensation during primeDRT gamut mapping. Defaults to 5%.",
+  "primept.settings.drt_hue": "DRT hue compensation",
+  "primept.settings.drt_hue.tooltip": "Controls hue compensation during primeDRT gamut mapping. Defaults to 75%.",
+  "primept.settings.drt_compression_start": "DRT compression start",
+  "primept.settings.drt_compression_start.tooltip": "Sets where the highlight compression curve leaves its linear segment. Defaults to 40%.",
   "primept.settings.save_failed": "Could not save PT settings"
 }

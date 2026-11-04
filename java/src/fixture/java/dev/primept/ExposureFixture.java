@@ -14,6 +14,7 @@ final class ExposureFixture {
         rejectedInputs(file);
         migration(file);
         solarSettings(file);
+        displaySettings(file);
         serDefaults(file);
         failedSave(file);
         Files.deleteIfExists(file);
@@ -25,6 +26,7 @@ final class ExposureFixture {
         require(config.rr() && config.quality() == Quality.PERFORMANCE && config.ev() == 0
                 && config.samples() == 1 && config.bounces() == 12 && config.ser()
                 && config.updateBudget() == UpdateBudget.BALANCED, "默认开启 SER、Performance RR、0 EV、1 SPP、12 顶点和平衡更新");
+        require(config.display().equals(new DisplaySettings(65, 5, 75, 40)), "自动曝光和 DRT 各自使用显示默认值");
     }
 
     private static void commandBoundary(Path file) {
@@ -122,6 +124,20 @@ final class ExposureFixture {
         require(saved.solar().equals(solstice), "其它设置保存时保留太阳轨迹参数");
         saved.reset();
         require(new SettingsConfig(file).solar().equals(SolarSettings.DEFAULT), "恢复旧 Prime 的太阳默认值");
+    }
+
+    private static void displaySettings(Path file) throws Exception {
+        Files.writeString(file, "exposure_ev=-3\ndisplay.saturation_percent=12\n");
+        var config = new SettingsConfig(file);
+        require(config.display().equals(new DisplaySettings(65, 12, 75, 40)), "读取旧版显示键并补入缺省值");
+        var next = new DisplaySettings(0, 5, 100, 99);
+        config.setDisplay(next);
+        require(config.ev() == -3, "修改自动曝光和 DRT 保留手动 EV");
+        config.command("pt ev 1.23456");
+        var saved = new SettingsConfig(file);
+        require(saved.ev() == 1.23456f && saved.display().equals(next), "修改手动 EV 保留自动曝光和 DRT 配置");
+        saved.reset();
+        defaults(file);
     }
 
     private static void failedSave(Path file) throws Exception {

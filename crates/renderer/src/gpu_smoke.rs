@@ -1269,6 +1269,52 @@ fn hardware_pt_auto_exposure_preserves_hdr() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
+#[ignore = "需要 Vulkan 硬件光追；验证强度缩放测光目标并保持适应历史"]
+fn hardware_pt_auto_exposure_strength_scales_target_ev() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    exposure_view(&mut gpu)?;
+    freeze_exposure_clock(&mut gpu);
+    gpu.set_display_options(1.0, 0.05, 0.75, 0.4)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, 16, 6)?;
+    host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
+    let full = exposure_state(&mut gpu)?;
+    gpu.set_display_options(0.5, 0.05, 0.75, 0.4)?;
+    gpu.invalidate()?;
+    host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
+    let half = exposure_state(&mut gpu)?;
+    assert!(f32::from_bits(full[2]).abs() > 0.01);
+    assert!((f32::from_bits(half[2]) - 0.5 * f32::from_bits(full[2])).abs() < 1e-6);
+    assert_eq!(full[0], half[0], "零帧间隔保留已适应的曝光");
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件光追；验证显示曲线只改变呈现"]
+fn hardware_pt_drt_controls_only_change_display() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    exposure_view(&mut gpu)?;
+    gpu.set_display_options(0.0, 0.05, 0.75, 0.4)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, 16, 6)?;
+    host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
+    let first = image.download(&mut gpu.context)?;
+    let hdr = exposure_hdr(&mut gpu)?;
+    gpu.set_display_options(0.0, 0.5, 0.0, 0.95)?;
+    gpu.invalidate()?;
+    host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
+    assert_eq!(hdr, exposure_hdr(&mut gpu)?);
+    assert_ne!(first, image.download(&mut gpu.context)?);
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "需要 Vulkan 硬件光追；验证resize保留曝光适应历史"]
 fn hardware_pt_auto_exposure_resize_preserves_adaptation() -> Result<(), Box<dyn std::error::Error>>
 {

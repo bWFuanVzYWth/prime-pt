@@ -22,7 +22,8 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, LATITUDE, SOLAR_LONGITUDE, DISPLAY, EXPOSURE }
+    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, LATITUDE, SOLAR_LONGITUDE,
+        DISPLAY, EXPOSURE, AUTO_EXPOSURE, DRT_SATURATION, DRT_HUE, DRT_COMPRESSION_START }
 
     @FunctionalInterface
     interface Action { void run() throws IOException; }
@@ -34,13 +35,14 @@ public final class VideoOptions {
     interface SelectionSetter<T> { void set(T value) throws IOException; }
 
     enum ValueFormat {
-        INTEGER, ANGLE, EXPOSURE;
+        INTEGER, ANGLE, EXPOSURE, PERCENT;
 
         String text(double value) {
             return switch (this) {
                 case INTEGER -> Integer.toString((int)value);
                 case ANGLE -> (int)value + "°";
                 case EXPOSURE -> Float.toString((float)value) + " EV";
+                case PERCENT -> (int)value + "%";
             };
         }
     }
@@ -117,6 +119,14 @@ public final class VideoOptions {
             case DISPLAY -> list.addHeader(text("display"));
             case EXPOSURE -> addSlider("exposure", Settings.MIN_EV, Settings.MAX_EV, 0.25,
                     Settings::exposure, value -> Settings.setExposure((float)value), ValueFormat.EXPOSURE);
+            case AUTO_EXPOSURE -> addSlider("auto_exposure", 0, DisplaySettings.MAX_AUTO_EXPOSURE, 1,
+                    () -> Settings.display().autoExposure(), value -> Settings.setAutoExposure((int)value), ValueFormat.PERCENT);
+            case DRT_SATURATION -> addSlider("drt_saturation", 0, DisplaySettings.MAX_SATURATION, 1,
+                    () -> Settings.display().saturation(), value -> Settings.setDrtSaturation((int)value), ValueFormat.PERCENT);
+            case DRT_HUE -> addSlider("drt_hue", 0, DisplaySettings.MAX_HUE, 1,
+                    () -> Settings.display().hue(), value -> Settings.setDrtHue((int)value), ValueFormat.PERCENT);
+            case DRT_COMPRESSION_START -> addSlider("drt_compression_start", 0, DisplaySettings.MAX_COMPRESSION_START, 1,
+                    () -> Settings.display().compressionStart(), value -> Settings.setDrtCompressionStart((int)value), ValueFormat.PERCENT);
         }
     }
 

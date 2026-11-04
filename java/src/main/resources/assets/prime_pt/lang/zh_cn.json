@@ -29,5 +29,13 @@
   "primept.settings.update_budget.throughput": "吞吐",
   "primept.settings.exposure": "曝光",
   "primept.settings.exposure.tooltip": "在 RR 之后、显示映射之前调整亮度。+1 EV 将亮度加倍。滑块按 0.25 EV 步进，拖动时预览数值，松开后保存。打开设置保留命令输入的精确值。\n命令：/pt exposure -16..16",
+  "primept.settings.auto_exposure": "自动曝光强度",
+  "primept.settings.auto_exposure.tooltip": "控制场景测光产生的曝光补偿。0% 关闭自动补偿，100% 应用完整补偿，默认 65%。手动 EV 仍作为额外偏移。",
+  "primept.settings.drt_saturation": "DRT 饱和度补偿",
+  "primept.settings.drt_saturation.tooltip": "控制 primeDRT 色域映射时的饱和度补偿，默认 5%。",
+  "primept.settings.drt_hue": "DRT 色相补偿",
+  "primept.settings.drt_hue.tooltip": "控制 primeDRT 色域映射时的色相补偿，默认 75%。",
+  "primept.settings.drt_compression_start": "DRT 压缩起点",
+  "primept.settings.drt_compression_start.tooltip": "设置高光压缩曲线开始偏离线性段的位置，默认 40%。",
   "primept.settings.save_failed": "PT 设置保存失败"
 }

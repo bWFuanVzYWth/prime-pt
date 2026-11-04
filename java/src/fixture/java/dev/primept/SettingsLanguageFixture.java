@@ -65,9 +65,11 @@ final class SettingsLanguageFixture {
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us"), false));
                     requireText("render", "PT rendering");
                     requireWidgetText("Samples per frame", "DLSS quality", "Performance (2×)");
+                    requireAutoExposure("Auto exposure strength");
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "PT 渲染");
                     requireWidgetText("每帧采样数", "DLSS 质量", "性能（2×）");
+                    requireAutoExposure("自动曝光强度");
                 }
 
                 Files.createDirectories(lang);
@@ -111,5 +113,13 @@ final class SettingsLanguageFixture {
 
     private static void require(boolean condition, String message) {
         if (!condition) throw new AssertionError(message);
+    }
+
+    private static void requireAutoExposure(String caption) {
+        var slider = new VideoOptions.Slider("auto_exposure", 0, DisplaySettings.MAX_AUTO_EXPOSURE, 1,
+                DisplaySettings.DEFAULT::autoExposure, value -> {},
+                error -> { throw new AssertionError(error); }, VideoOptions.ValueFormat.PERCENT);
+        var expected = Options.genericValueLabel(Component.literal(caption), Component.literal("65%"));
+        require(slider.getMessage().getString().equals(expected.getString()), "自动曝光显示一次本地化标题和百分比");
     }
 }
