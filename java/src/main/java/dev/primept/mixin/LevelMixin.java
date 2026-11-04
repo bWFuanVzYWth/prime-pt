@@ -21,8 +21,8 @@ abstract class LevelMixin {
     }
 
     @Inject(method = "setSectionDirtyWithNeighbors", at = @At("HEAD"),cancellable=true)
-    private void primept$section(int x, int y, int z, CallbackInfo callback) {
-        Renderer.section((ClientLevel) (Object) this, x, y, z);
+    private void primept$skipLightPacketDirty(CallbackInfo callback) {
+        // 原版光照包更新的是光照层，Prime 只捕获方块状态源。
         callback.cancel();
     }
 

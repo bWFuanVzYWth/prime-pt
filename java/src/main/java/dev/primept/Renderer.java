@@ -178,9 +178,6 @@ public final class Renderer {
     }
     /** 已加载chunk收到独立biome数据，不清其压缩block源。 */
     public static void biomeColumn(ClientLevel level,int x,int z){CHANGES.biome(level,x,z);}
-    /** 只标记源，GPU 不在世界更新回调中使用。 */
-    public static void section(ClientLevel level, int x, int y, int z) { CHANGES.section(level, x, y, z); }
-
     /** 必须在宿主 VulkanDevice.close 之前调用。 */
     public static void close() {
         if (renderer == null) return;

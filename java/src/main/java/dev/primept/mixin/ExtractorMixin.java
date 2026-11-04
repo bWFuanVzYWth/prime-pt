@@ -30,9 +30,10 @@ abstract class ExtractorMixin {
         callback.cancel();
     }
 
-    @Inject(method = "setSectionDirty(IIIZ)V", at = @At("HEAD"), cancellable = true)
-    private void primept$dirty(int x, int y, int z, boolean playerChanged, CallbackInfo callback) {
-        Renderer.section(level, x, y, z);
+    @Inject(method = {"blockChanged", "setSectionRangeDirty", "setSectionDirty(IIIZ)V"},
+            at = @At("HEAD"), cancellable = true)
+    private void primept$skipRasterDirty(CallbackInfo callback) {
+        // 方块、整列和 biome 的实际写入已各自通知 Prime。光栅失效无须重捕获。
         callback.cancel();
     }
 

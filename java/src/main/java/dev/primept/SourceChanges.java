@@ -4,8 +4,9 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 
-/** 薄事件所有者：按真实world身份/列/section合并，成功提交后才释放冻结的PDI1批。 */
+/** 按真实 world 身份合并写入事件。方块编辑和普通列通知独立保留，成功提交后才释放冻结的 PDI1 批。 */
 final class SourceChanges {
     static final int BLOCK_RANGE=1,SECTION_SOURCE=2,COLUMN_SOURCE=3,BIOME_COLUMN=4,WORLD_TINT=5,SOURCE_OVERFLOW=6;
     private static final int MAX_NODES=1<<19;
@@ -17,22 +18,24 @@ final class SourceChanges {
     SourceChanges(){this(MAX_NODES);}
     SourceChanges(int maxNodes){if(maxNodes<2)throw new IllegalArgumentException("事件节点额度至少为2");this.maxNodes=maxNodes;}
     private record Stage(Object world,ByteBuffer bytes){}
+    private record Section(int x,int y,int z){}
     private static final class World {
+        final LinkedHashMap<Section,Range> edits=new LinkedHashMap<>();
         final LinkedHashMap<Long,Column> columns=new LinkedHashMap<>();
         boolean tint,overflow;
+        boolean editFirst=true;
         int nodes;
     }
     private static final class Column {
         final int x,z;
-        final LinkedHashMap<Integer,Range> sections=new LinkedHashMap<>();
+        final LinkedHashSet<Integer> sections=new LinkedHashSet<>();
         boolean source,biome;
         int minY,maxY;
         Column(int x,int z){this.x=x;this.z=z;}
     }
     private static final class Range {
         int min,max;
-        boolean whole;
-        Range(int local,boolean whole){min=whole?0:local;max=whole?4095:local;this.whole=whole;}
+        Range(int local){min=local;max=local;}
         void include(int local){min=pack(Math.min(min&15,local&15),Math.min(min>>>8,local>>>8),Math.min((min>>>4)&15,(local>>>4)&15));max=pack(Math.max(max&15,local&15),Math.max(max>>>8,local>>>8),Math.max((max>>>4)&15,(local>>>4)&15));}
     }
     static int pack(int x,int y,int z){return x|z<<4|y<<8;}
@@ -43,24 +46,23 @@ final class SourceChanges {
         if(column==null){column=new Column(x,z);world.columns.put(key,column);world.nodes++;nodes++;}
         return column;
     }
-    private void overflow(World world){nodes-=world.nodes;world.nodes=0;world.columns.clear();world.tint=false;world.overflow=true;}
+    private void overflow(World world){nodes-=world.nodes;world.nodes=0;world.edits.clear();world.columns.clear();world.tint=false;world.overflow=true;}
     private void bound(World world){if(nodes>maxNodes)overflow(world);}
 
-    /** 精确block源变化；不在Java计算邻域或原版模型。同section仅保变化AABB。 */
+    /** 实际方块写入。同一 section 只保留变化 AABB，整列通知不覆盖编辑身份。 */
     synchronized void block(Object owner,int x,int y,int z){
         var world=world(owner);if(world.overflow)return;
-        int sx=x>>4,sy=y>>4,sz=z>>4;var column=column(world,sx,sz);
-        if(column.source&&sy>=column.minY&&sy<column.maxY)return;
-        int local=pack(x&15,y&15,z&15);var range=column.sections.get(sy);
-        if(range==null){column.sections.put(sy,new Range(local,false));world.nodes++;nodes++;}
-        else if(!range.whole)range.include(local);
+        var section=new Section(x>>4,y>>4,z>>4);
+        int local=pack(x&15,y&15,z&15);var range=world.edits.get(section);
+        if(range==null){world.edits.put(section,new Range(local));world.nodes++;nodes++;}
+        else range.include(local);
         bound(world);
     }
-    /** 只有完整section来源信息时使用；覆盖同key的block范围通知。 */
+    /** 只有完整 section 来源信息时使用，可由包含该段的整列通知覆盖。 */
     synchronized void section(Object owner,int x,int y,int z){
         var world=world(owner);if(world.overflow)return;var column=column(world,x,z);
         if(column.source&&y>=column.minY&&y<column.maxY)return;
-        var previous=column.sections.put(y,new Range(0,true));if(previous==null){world.nodes++;nodes++;}
+        if(column.sections.add(y)){world.nodes++;nodes++;}
         bound(world);
     }
     /** chunk加载/卸载的真实列范围；取消逐section及邻列枚举，biome单独标记。 */
@@ -69,7 +71,7 @@ final class SourceChanges {
         var world=world(owner);if(world.overflow)return;var column=column(world,x,z);
         if(column.source){column.minY=Math.min(column.minY,minY);column.maxY=Math.max(column.maxY,maxY);}else{column.source=true;column.minY=minY;column.maxY=maxY;}
         column.biome|=biome;
-        var entries=column.sections.entrySet().iterator();while(entries.hasNext()){int y=entries.next().getKey();if(y>=column.minY&&y<column.maxY){entries.remove();world.nodes--;nodes--;}}
+        var entries=column.sections.iterator();while(entries.hasNext()){int y=entries.next();if(y>=column.minY&&y<column.maxY){entries.remove();world.nodes--;nodes--;}}
         bound(world);
     }
     /** 只失效实际替换的biome列，不将普通block变化等同biome变化。 */
@@ -77,7 +79,11 @@ final class SourceChanges {
     /** 原版颜色缓存/配置变化，不清压缩方块源或原始biome。 */
     synchronized void all(Object owner){var world=world(owner);if(!world.overflow)world.tint=true;}
 
-    /** 返回冻结借用批；未accepted时重复返回同一内容，失败不会丢掉已移出的通知。 */
+    /**
+     * 返回冻结借用批。全局补偿先行，剩余额度内优先发送真实编辑，并为普通通知保留份额；
+     * 双方积压且只剩一项额度时轮换。任一队列不足时由另一队列填满。
+     * 未确认时重复返回同一内容，新事件继续归待发队列。
+     */
     synchronized ByteBuffer batch(Object owner,int limit){
         if(limit<1||limit>16384)throw new IllegalArgumentException("事件批容量无效");
         if(staged!=null){if(staged.world==owner)return staged.bytes.duplicate().order(ByteOrder.LITTLE_ENDIAN);staged=null;}
@@ -87,20 +93,43 @@ final class SourceChanges {
         int count=0;
         if(world.overflow){write(SOURCE_OVERFLOW,0,0,0,0,0);world.overflow=false;count++;}
         if(world.tint&&count<limit){write(WORLD_TINT,0,0,0,0,0);world.tint=false;count++;}
+        if(count<limit&&!world.edits.isEmpty()){
+            int editLimit=limit;
+            if(!world.columns.isEmpty()){
+                int remaining=limit-count;
+                editLimit=count+(remaining+1)/2;
+                if(remaining==1){
+                    if(!world.editFirst)editLimit=count;
+                    world.editFirst=!world.editFirst;
+                }
+            }
+            count=writeEdits(world,count,editLimit);
+        }
         var columns=world.columns.entrySet().iterator();
         while(count<limit&&columns.hasNext()){
             var column=columns.next().getValue();
             if(column.source){write(COLUMN_SOURCE,column.x,column.minY,column.z,column.maxY,1|(column.biome?2:0));column.source=false;column.biome=false;count++;}
             else if(column.biome){write(BIOME_COLUMN,column.x,0,column.z,0,0);column.biome=false;count++;}
-            var sections=column.sections.entrySet().iterator();
+            var sections=column.sections.iterator();
             while(count<limit&&sections.hasNext()){
-                var entry=sections.next();var range=entry.getValue();write(range.whole?SECTION_SOURCE:BLOCK_RANGE,column.x,entry.getKey(),column.z,range.whole?0:range.min,range.whole?0:range.max);sections.remove();world.nodes--;nodes--;count++;
+                int y=sections.next();write(SECTION_SOURCE,column.x,y,column.z,0,0);sections.remove();world.nodes--;nodes--;count++;
             }
             if(!column.source&&!column.biome&&column.sections.isEmpty()){columns.remove();world.nodes--;nodes--;}
         }
+        count=writeEdits(world,count,limit);
         if(count==0)return null;
         packet.patchInt(8,count);staged=new Stage(owner,packet.finish().asReadOnlyBuffer().order(ByteOrder.LITTLE_ENDIAN));
         return staged.bytes.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+    }
+    private int writeEdits(World world,int count,int limit){
+        if(count==limit||world.edits.isEmpty())return count;
+        var edits=world.edits.entrySet().iterator();
+        while(count<limit&&edits.hasNext()){
+            var edit=edits.next();var section=edit.getKey();var range=edit.getValue();
+            write(BLOCK_RANGE,section.x,section.y,section.z,range.min,range.max);
+            edits.remove();world.nodes--;nodes--;count++;
+        }
+        return count;
     }
     /** Native全批校验/应用成功后确认；在途新通知进入独立pending表，不随旧批丢弃。 */
     synchronized void accepted(){if(staged==null)throw new IllegalStateException("没有待确认事件批");staged=null;}

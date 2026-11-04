@@ -6,8 +6,8 @@ import net.minecraft.core.SectionPos;
 /** 生产PDI1合并/冻结/确认行为及真实26.3负坐标oracle；无客户端或GPU。 */
 final class SourceChangesFixture {
     public static void main(String[] arguments){
-        coordinates();coalescing();columns();retry();worlds();largeView();overflow();
-        System.out.println("PDI1生产事件：真实坐标、同key合并、列支配、失败重试、在途新事件、万section与一次溢出补偿通过");
+        coordinates();coalescing();columns();overlappingEdit();editPriority();retry();worlds();largeView();overflow();
+        System.out.println("PDI1生产事件：真实坐标、同key合并、编辑优先、失败重试、在途新事件、万section与一次溢出补偿通过");
     }
     private static int count(ByteBuffer bytes){
         if(bytes==null||bytes.getInt(0)!=0x31494450||bytes.getInt(4)!=1||bytes.getInt(12)!=0||bytes.remaining()!=16+24*bytes.getInt(8))throw new AssertionError("PDI1完整布局错误");
@@ -32,9 +32,49 @@ final class SourceChangesFixture {
     }
     private static void columns(){
         var changes=new SourceChanges();Object world=new Object();
-        changes.block(world,1,1,1);changes.section(world,0,1,0);changes.biome(world,0,0);changes.column(world,0,0,-4,20,true);
+        changes.section(world,0,1,0);changes.biome(world,0,0);changes.column(world,0,0,-4,20,true);
         var bytes=changes.batch(world,1024);
         if(count(bytes)!=1||bytes.getInt(16)!=3||bytes.getInt(24)!=-4||bytes.getInt(32)!=20||bytes.getInt(36)!=3)throw new AssertionError("列通知应支配该域source并保独立biome标志");
+        changes.accepted();
+    }
+    private static void overlappingEdit(){
+        for(boolean editFirst:new boolean[]{true,false}){
+            var changes=new SourceChanges();Object world=new Object();
+            if(editFirst)changes.block(world,1,1,1);
+            changes.column(world,0,0,-4,20,true);
+            if(!editFirst)changes.block(world,1,1,1);
+            var bytes=changes.batch(world,1024);
+            if(count(bytes)!=2||bytes.getInt(16)!=SourceChanges.BLOCK_RANGE||bytes.getInt(32)!=0x111
+                    ||bytes.getInt(36)!=0x111||bytes.getInt(40)!=SourceChanges.COLUMN_SOURCE)
+                throw new AssertionError("同一列里的真实编辑必须保留精确范围和独立身份");
+            changes.accepted();
+        }
+    }
+    private static void editPriority(){
+        var changes=new SourceChanges();Object world=new Object();
+        for(int i=0;i<4096;i++)changes.column(world,i,0,-4,20,true);
+        changes.block(world,-16,0,0);
+        var bytes=changes.batch(world,1);
+        if(count(bytes)!=1||bytes.getInt(16)!=SourceChanges.BLOCK_RANGE||bytes.getInt(20)!=-1)
+            throw new AssertionError("普通积压不能阻挡真实编辑先发");
+        changes.accepted();
+        changes.block(world,-32,0,0);
+        bytes=changes.batch(world,1);
+        if(count(bytes)!=1||bytes.getInt(16)!=SourceChanges.COLUMN_SOURCE||bytes.getInt(20)!=0)
+            throw new AssertionError("单项额度下普通通知也须前进");
+        changes.accepted();
+        changes.block(world,-48,0,0);changes.block(world,-64,0,0);
+        bytes=changes.batch(world,3);
+        if(count(bytes)!=3||bytes.getInt(16)!=SourceChanges.BLOCK_RANGE||bytes.getInt(20)!=-2
+                ||bytes.getInt(40)!=SourceChanges.BLOCK_RANGE||bytes.getInt(44)!=-3
+                ||bytes.getInt(64)!=SourceChanges.COLUMN_SOURCE||bytes.getInt(68)!=1)
+            throw new AssertionError("持续编辑时普通通知仍保留批内份额");
+        changes.accepted();
+        bytes=changes.batch(world,3);
+        if(count(bytes)!=3||bytes.getInt(16)!=SourceChanges.BLOCK_RANGE||bytes.getInt(20)!=-4
+                ||bytes.getInt(40)!=SourceChanges.COLUMN_SOURCE||bytes.getInt(44)!=2
+                ||bytes.getInt(64)!=SourceChanges.COLUMN_SOURCE||bytes.getInt(68)!=3)
+            throw new AssertionError("优先队列用不完的额度必须给普通队列");
         changes.accepted();
     }
     private static void retry(){
