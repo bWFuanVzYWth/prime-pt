@@ -4,7 +4,7 @@
 //! 工作池、BLAS/TLAS、SBT 和 pipeline。每次进入 native 前，宿主必须提交并等待
 //! 前次 native 命令完成，且独占 graphics queue。句柄不会转移设备所有权。
 //! 源包只在调用内借用；palette/资源字典解码成自持输入，section编译及tint续接分阶段发布。
-//! region所需源全部就绪后才成为可发布资源，一个64m region合并4³个section。
+//! 一个64m region合并4³个section；缺源section保留旧片段，已完成片段可发布。
 //! 使用 [`Quad`] 的直接寻址属性 ABI：任意四角、固定012/023、三角面退化为quad，
 //! 不要求轴对齐。位置只由 AS position fetch 提供，不保留 shader 顶点/索引副本。
 //! 宿主必须启用 [KHR position fetch] 扩展和 feature，无回退；能力边界见 [`Quad`]。
@@ -60,6 +60,7 @@ pub(crate) enum Error {
 
 struct Engine {
     scene: scene::Scene,
+    attribute_limited_resident_bytes: u64,
     gpu: gpu::Gpu,
     atlas_ready: bool,
     catalog: prime_minecraft::Catalog,
@@ -79,6 +80,22 @@ struct TintContinuation {
 }
 
 impl Engine {
+    fn grow_view_budget(&mut self, view_distance: u32) -> Result<(), Error> {
+        const MIB: usize = 1024 * 1024;
+        let mut budget = self.scene.budget();
+        // 视距16到32逐步提高逻辑常驻上限；收缩窗口时只回收资源，不使其余区块失效。
+        let requested = (1024 + view_distance.saturating_sub(16).min(16) as usize * 64) * MIB;
+        if requested <= budget.resident_bytes {
+            return Ok(());
+        }
+        let resident = (requested as u64).min(self.attribute_limited_resident_bytes) as usize;
+        if resident > budget.resident_bytes {
+            budget.resident_bytes = resident;
+            self.scene.set_budget(budget)?;
+        }
+        Ok(())
+    }
+
     fn retire_tint_sources(&mut self) {
         for key in self.scene.drain_retired_sources() {
             self.tint_pending = None;
@@ -237,6 +254,9 @@ pub unsafe extern "C" fn prime_create_options(
                 flags & 2 == 0,
             )?
         };
+        // 属性槽按二次幂增长，额外留四分之一给空洞及过渡范围。
+        let attribute_limited_resident_bytes =
+            (u64::from(gpu.attribute_slot_limit()) * 3 / 4) * size_of::<Quad>() as u64;
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         if id == 0 {
             return Err(Error::Input("会话 ID 耗尽"));
@@ -249,6 +269,7 @@ pub unsafe extern "C" fn prime_create_options(
                 id,
                 Engine {
                     scene,
+                    attribute_limited_resident_bytes,
                     gpu,
                     atlas_ready: false,
                     catalog: prime_minecraft::Catalog::default(),
@@ -329,7 +350,7 @@ pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
 ///
 /// 请求为 little-endian 的 `id:u64, sx:i32, sy:i32, sz:i32, reserved:u32=0`，每条 24B。
 /// view_distance以16m列计；高度为半开section范围。每个region合并4³个section。
-/// 未回复请求在后续调用保持同一ID；宿主可分帧用PRT2回复，捕获失败才调用
+/// 未回复请求在后续调用保持同一ID；宿主可分帧用PRT3回复，捕获失败才调用
 /// [`prime_fail_capture`]。窗口移动不清空场景，超出联合容量返回错误。
 ///
 /// # Safety
@@ -352,6 +373,7 @@ pub unsafe extern "C" fn prime_plan(
         let camera = unsafe { camera.read_unaligned() };
         let mut count = 0;
         with_engine(id, |engine| {
+            engine.grow_view_budget(view_distance)?;
             let planned: &[scene::CaptureRequest] = engine.scene.plan(
                 &camera,
                 view_distance,
@@ -469,7 +491,7 @@ pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
 /// native录制/SDK、宿主提交、未归因。最近场景更新规模按独立序号导出，非所选柱的规模。
 /// plan内的同步编译从规划移到网格项；native场景细分从录制总耗时扣除，
 /// 视图准备归场景准备/提交，余量由引擎统计补齐；不提供GPU timestamp。
-/// columns为1..=512个实际图表像素列，输出容量至少704+120*columns且不超过62144。
+/// columns为1..=512个实际图表像素列，输出容量至少728+120*columns且不超过62168。
 /// columns=0时只记录，output须为空且capacity=0；隐藏图表不生成或传输窗口快照。
 ///
 /// # Safety

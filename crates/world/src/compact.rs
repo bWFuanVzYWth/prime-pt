@@ -184,15 +184,21 @@ impl Sources {
         let before = self.tints.len();
         self.tints
             .retain(|tint| tint.ticket != ticket || !mask.contains(tint.fragment));
-        self.prune_tints();
-        before - self.tints.len()
+        let cancelled = before - self.tints.len();
+        if cancelled != 0 {
+            self.prune_tints();
+        }
+        cancelled
     }
     pub(super) fn cancel_tints(&mut self, ticket: Ticket, mask: FragmentMask) -> usize {
         let before = self.tints.len();
         self.tints
             .retain(|tint| tint.ticket != ticket || !mask.contains(tint.fragment));
-        self.prune_tints();
-        before - self.tints.len()
+        let cancelled = before - self.tints.len();
+        if cancelled != 0 {
+            self.prune_tints();
+        }
+        cancelled
     }
     pub(super) fn register(&mut self, job: &RegionJob) -> Result<(), Error> {
         // 同一ticket的dirty只取并集，分组仅在整job退休时删除；数量相等即已注册完整。

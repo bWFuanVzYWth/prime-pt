@@ -6,8 +6,8 @@ import java.util.Locale;
 
 /** PFT2 的渲染线程显示副本；统计、窗口与保峰抽样由引擎唯一维护。 */
 final class FrameChart {
-    static final int MAGIC = 0x32544650, VERSION = 4, STAGES = 14, MAX_BARS = 512;
-    static final int HEADER_BYTES = 320, DETAIL_BYTES = 128, BAR_BYTES = 120;
+    static final int MAGIC = 0x32544650, VERSION = 5, STAGES = 14, MAX_BARS = 512;
+    static final int HEADER_BYTES = 344, DETAIL_BYTES = 128, BAR_BYTES = 120;
     static final int BARS_OFFSET = HEADER_BYTES + 3 * DETAIL_BYTES;
     static final int CAPACITY = BARS_OFFSET + MAX_BARS * BAR_BYTES;
     static final String[] LABELS = {"宿主等待", "tint/源维护", "规划", "宿主捕获", "网格编译/合并", "三角编码", "属性/光源打包",
@@ -27,7 +27,7 @@ final class FrameChart {
     private static long blasSubmitWaitNs, tlasNs, attributeWriteNs;
     private static int pressureKind, excludedRegions;
     private static long requiredBytes, limitBytes, deferredRequests;
-    private static final long[] WORK = new long[16];
+    private static final long[] WORK = new long[19];
     private static boolean snapshotRequested;
 
     private FrameChart() {}
@@ -59,7 +59,8 @@ final class FrameChart {
      * 92 为 scene valid，96..152 为场景序号、dirty/instance 数、三角/属性字节与 BLAS提交等待/TLAS/属性写入纳秒。
      * 场景字段属于最近一次更新，不与选中帧绑定。v3在160/164保存CPU压力原因/排除region数，
      * 168/176/184保存需要字节/预算字节/延后请求数；压力属于当前状态。
-     * v4在192起保存16项工作计数；320 起三条 128B detail，704 起 120B bar。
+     * 192起保存16项工作计数，320/328/336为需求域中已确认缺源的段、在途任务和已签发待回复捕获。
+     * 344起三条128B详情，728起120B保峰柱。
      */
     static void update(ByteBuffer source) {
         if (source.order() != ByteOrder.LITTLE_ENDIAN || source.limit() < BARS_OFFSET
@@ -142,7 +143,7 @@ final class FrameChart {
         int legendRows = (STAGES + legendColumns - 1) / legendColumns;
         int detailRows = compact ? 2 : 3;
         int pressureHeight = compact || pressureKind == 0 && excludedRegions == 0 && deferredRequests == 0 ? 0 : 22;
-        int sceneHeight=compact?22:44,workHeight=compact?22:44;
+        int sceneHeight=compact?22:44,workHeight=compact?22:55;
         int fixedHeight = 51 + detailRows * 11 + 6 + legendRows * 10 + 8 + sceneHeight + workHeight + pressureHeight + 6;
         if (height < fixedHeight + 20) return false;
         int graphHeight = Math.min(72, height - fixedHeight);
@@ -228,10 +229,16 @@ final class FrameChart {
         int workTop=sceneTop+sceneHeight;
         text(surface,compact?format("建网%d/%d 待编%d",WORK[2],WORK[1],WORK[3])
                 :format("工作轮 #%d · 建网 %d/%d slab · 待编%d",WORK[0],WORK[2],WORK[1],WORK[3]),left,workTop,graphWidth,0xffc2cad6);
-        text(surface,format("遇缺源%d/容量%d · 发布%d",WORK[4],WORK[5],WORK[6]),left,workTop+11,graphWidth,0xffc2cad6);
-        if(!compact){
+        if (compact) {
+            text(surface, format("缺源%d段 任务%d 捕获%d", WORK[16], WORK[17], WORK[18]),
+                    left, workTop + 11, graphWidth, 0xffc2cad6);
+        } else {
+            text(surface, format("遇缺源%d/容量%d · 发布%d", WORK[4], WORK[5], WORK[6]),
+                    left, workTop + 11, graphWidth, 0xffc2cad6);
             text(surface,format("源请求%d 命中%d · 复用%d 取消%d",WORK[7],WORK[8],WORK[9],WORK[10]),left,workTop+22,graphWidth,0xffc2cad6);
             text(surface,format("Rust通知 %d→%d · 累计建网%d 发布%d · 空段%d",WORK[11],WORK[12],WORK[13],WORK[14],WORK[15]),left,workTop+33,graphWidth,0xffc2cad6);
+            text(surface, format("目标缺源%d段 · 在途%d区 · 待回复%d请求", WORK[16], WORK[17], WORK[18]),
+                    left, workTop + 44, graphWidth, 0xffc2cad6);
         }
         if (pressureHeight != 0) {
             String cause = switch (pressureKind) { case 1 -> "常驻预算"; case 2 -> "等待回收"; case 3 -> "单区预算"; default -> "容量状态"; };

@@ -126,6 +126,12 @@ pub struct WorkStats {
     pub total: WorkProgress,
     /// 当前真正可执行的队列长度。
     pub queued_slabs: usize,
+    /// 当前需求域中已确认缺源的 section 数，含已完成但尚未发布的候选。
+    pub unavailable_sections: usize,
+    /// 等待源、建网、颜色或容量的活跃 region 工作数。
+    pub inflight_jobs: usize,
+    /// 已签发但尚未收到宿主回应的源捕获数。
+    pub pending_captures: usize,
 }
 
 /// O(1)可观测所有权账与间接输入规模；各项不是进程RSS或GPU显存估算。

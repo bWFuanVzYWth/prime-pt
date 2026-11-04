@@ -15,6 +15,12 @@ pub(super) fn fragments(sections: u64) -> FragmentMask {
     FragmentMask::from_words(words)
 }
 
+pub(super) fn sections(fragments: FragmentMask) -> u64 {
+    fragments
+        .iter()
+        .fold(0, |bits, fragment| bits | (1 << (fragment / 4)))
+}
+
 impl Scene {
     pub(super) fn job_index(&self, ticket: Ticket) -> Option<usize> {
         self.job_tickets.get(&ticket).copied()
@@ -162,7 +168,7 @@ impl Scene {
         let next = self.state.replacement(handle).or(current);
         let projected =
             if let Some(job) = self.handle_job_index(handle).map(|index| &self.jobs[index]) {
-                if job.unavailable != 0 {
+                if self.compact.generation == 0 && job.unavailable != 0 {
                     current.map_or(0, RegionMesh::len)
                 } else {
                     job.projected
@@ -179,8 +185,27 @@ impl Scene {
                 handle,
                 projected,
                 excluded: next.is_some_and(|resource| resource.excluded),
+                unavailable_sections: next.map_or(0, |resource| {
+                    resource.missing_sections.count_ones() as usize
+                }),
             },
         );
+    }
+
+    pub(super) fn refresh_job_projection(&mut self, index: usize) {
+        let job = &mut self.jobs[index];
+        let replaced = change_runtime::subtract(job.changed, fragments(job.unavailable));
+        job.projected = self
+            .state
+            .resource(job.handle)
+            .map_or(0, |old| old.len() - old.fragment_quads(replaced))
+            + job
+                .sections
+                .iter()
+                .map(|(_, mesh)| mesh.quads.len())
+                .sum::<usize>();
+        let handle = job.handle;
+        self.refresh_ledger(handle);
     }
 
     pub(super) fn grow(&mut self) -> Result<(), Error> {
@@ -229,6 +254,9 @@ impl Scene {
             current: self.progress,
             total: self.total_progress.combined(self.progress),
             queued_slabs: self.compact.ready_len(),
+            unavailable_sections: self.ledger.unavailable_sections(),
+            inflight_jobs: self.jobs.len(),
+            pending_captures: self.captures.len(),
         }
     }
 

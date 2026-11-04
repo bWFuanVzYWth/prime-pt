@@ -9,10 +9,10 @@
 //! 默认resident1GiB、staging256MiB、单region256MiB，均为96B quad逻辑payload。
 //! 源缓存、Vec余量、metadata/分配器/线程及GPU另计，不宣称RSS或显存总上限。
 //! resident/region不足形成明确BudgetExcluded并暴露Pressure，Unavailable保留来源负缓存；
-//! 两者均保留已有完整覆盖，不得以空候选替换旧mesh。提高预算或来源恢复后重试。
+//! 缺源section保留旧片段，同批已完成片段可独立更新；提高预算或来源恢复后重试。
 //! 过渡压力按任务最低输出空间暂缓，不阻止其它可执行小任务和Air证明。
 //! 相同region身份仅在新输出完整且GPU接受后替换；完全退出当前Bounds的资源可独立卸载，
-//! 不等待边缘不可用来源或整窗就绪。负缓存恢复重新捕获完整region来源。
+//! 不等待边缘不可用来源或整窗就绪。负缓存恢复重新编译受影响的section。
 //! State从256节点按真实容量阻碍增长，空的大视距不预分配整窗metadata。
 //!
 //! WorkBudget分别限制管理器逻辑步、slab内核、发布和各维护队列；同轮源包共享内核与
@@ -45,7 +45,7 @@ mod view;
 use view::{View, ViewChange};
 #[path = "owner.rs"]
 mod owner;
-use owner::fragments;
+use owner::{fragments, sections as fragment_sections};
 #[path = "change_runtime.rs"]
 mod change_runtime;
 #[cfg(any(test, feature = "test-fixtures"))]
@@ -451,6 +451,7 @@ impl Scene {
                     }
                 }
             }
+            self.retry_handles.clear();
             self.retry_handles.extend(self.ledger.excluded_handles());
         }
         if self.target.is_some() && self.height != [min_y, max_y] {
@@ -681,28 +682,36 @@ impl Scene {
             let build = self.batch.requests()[request_index];
             let handle = self.state.find(build.chunk).expect("已签发region保持节点");
             let mask = self.masks.remove(&key(build.chunk)).unwrap_or_default();
+            let recovered = self.recovered.remove(&key(build.chunk));
+            let old = self.state.resource(handle);
             let mut changed = if mask.handle == Some(handle)
                 && (!mask.mask.is_empty() || !mask.tints.is_empty())
+                && (old.is_some() || recovered.is_some())
             {
                 mask.mask
             } else {
                 FragmentMask::all()
             };
             if !changed.is_empty()
-                && self
-                    .state
-                    .resource(handle)
-                    .is_some_and(|old| !old.available)
+                && let Some(old) = old
             {
-                changed = FragmentMask::all();
+                if old.excluded || self.compact.generation == 0 && old.missing_sections != 0 {
+                    changed = FragmentMask::all();
+                } else {
+                    changed = change_runtime::union(
+                        changed,
+                        fragments(old.missing_sections & fragment_sections(changed)),
+                    );
+                }
             }
-            let recovered = self.recovered.remove(&key(build.chunk));
             let mut sections = Vec::new();
             let mut bindings = Vec::new();
             let mut color_updates = Vec::new();
             let mut verify = FragmentMask::empty();
             let mut tint_patches = Vec::new();
             if let Some(recovered) = recovered {
+                // 缺源时没有生成新几何，恢复候选也须重新验证这些section。
+                changed = change_runtime::union(changed, fragments(recovered.missing_sections));
                 // 未受影响的未发布片段只转移所有权，依赖重新齐备后复用，不复制Quad。
                 verify = change_runtime::subtract(recovered.changed, changed);
                 for (slot, mesh) in recovered.parts {
@@ -749,9 +758,7 @@ impl Scene {
                 }
                 changed = change_runtime::union(changed, verify);
             }
-            let dirty = changed
-                .iter()
-                .fold(0u64, |bits, fragment| bits | (1 << (fragment / 4)));
+            let dirty = fragment_sections(changed);
             let mut job = RegionJob {
                 invalidated: false,
                 epoch: self
@@ -1021,6 +1028,7 @@ impl Scene {
             };
         }
         self.blocked_quads = 0;
+        self.retry_handles.clear();
         self.retry_handles.extend(self.ledger.excluded_handles());
         self.retry_excluded = (!self.retry_handles.is_empty()).then_some(0);
         self.planner_pending = true;
@@ -1082,7 +1090,7 @@ impl Scene {
             Vec::new(),
             old.map_or(revision, |old| old.revision),
             old.map_or(content_revision, |old| old.content_revision),
-            false,
+            old.map_or(0, |old| old.missing_sections),
             true,
         )?;
         let _ = self.state.complete(job.ticket, resource);
@@ -1285,26 +1293,18 @@ impl Scene {
                 continue;
             };
             let job = &self.jobs[index];
+            let legacy_unavailable = self.compact.generation == 0 && job.unavailable != 0;
             if job.invalidated
                 || Some(job.epoch) != self.input_epoch
-                || (job.unavailable == 0
-                    && (job.received != job.dirty
+                || (!legacy_unavailable
+                    && ((job.received | job.unavailable) != job.dirty
                         || !job.tint_mask.is_empty()
                         || job.pending_tints != 0))
             {
                 continue;
             }
             let job = self.remove_job(index);
-            let mut source_stamps = self.compact.job_sources(job.ticket);
-            if job.unavailable != 0 {
-                // 负缓存只需要已知不可用证明；未参与构建的Unknown不能变成永等门。
-                source_stamps.retain(|(key, _)| {
-                    !matches!(
-                        self.compact.store.lookup(*key),
-                        crate::store::SourceState::Unknown
-                    )
-                });
-            }
+            let source_stamps = self.compact.job_sources(job.ticket);
             self.compact.forget_job(job.ticket);
             self.compact
                 .tints
@@ -1316,24 +1316,28 @@ impl Scene {
                 .iter()
                 .map(|(_, mesh)| mesh.quads.len())
                 .sum::<usize>();
-            let available = job.unavailable == 0;
             let build = (|| -> Result<RegionMesh, Error> {
                 let mut parts = MeshParts::default();
-                if available {
+                if !legacy_unavailable {
                     for (fragment, mesh) in job.sections {
                         parts.insert(fragment, mesh)?;
                     }
                 }
                 let old = self.state.resource(job.handle);
-                let changed = if available {
-                    job.changed
-                } else {
+                let changed = if legacy_unavailable {
                     FragmentMask::empty()
-                };
-                let (bindings, patches, colors) = if available {
-                    (job.bindings, job.tint_patches, job.color_updates)
                 } else {
+                    change_runtime::subtract(job.changed, fragments(job.unavailable))
+                };
+                let (bindings, patches, colors) = if legacy_unavailable {
                     (Vec::new(), Vec::new(), Vec::new())
+                } else {
+                    (job.bindings, job.tint_patches, job.color_updates)
+                };
+                let missing_sections = if legacy_unavailable {
+                    u64::MAX
+                } else {
+                    (old.map_or(0, |old| old.missing_sections) & !job.dirty) | job.unavailable
                 };
                 RegionMesh::candidate(
                     job.region,
@@ -1345,7 +1349,7 @@ impl Scene {
                     colors,
                     first_revision + offset,
                     first_content + offset,
-                    available,
+                    missing_sections,
                     false,
                 )
             })();
@@ -1375,7 +1379,7 @@ impl Scene {
                     resource.content_revision = old.content_revision;
                 }
             }
-            if !available {
+            if legacy_unavailable {
                 self.ledger.owned -= partial;
             }
             if let Err(rejected) = self.state.complete(job.ticket, resource) {

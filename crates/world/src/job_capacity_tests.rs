@@ -103,7 +103,7 @@ fn more_than_eight_capacity_waiters_do_not_block_later_air_region() -> Result<()
                     .replacement(handle)
                     .or_else(|| scene.state.resource(handle))
             })
-            .is_some_and(|resource| resource.available && resource.len() == 0);
+            .is_some_and(|resource| resource.missing_sections == 0 && resource.len() == 0);
         if peak_waiters > 8 && air_resolved {
             break;
         }

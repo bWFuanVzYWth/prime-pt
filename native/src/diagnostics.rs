@@ -7,7 +7,9 @@ use std::time::Duration;
 
 pub(crate) const STAGES: usize = 14;
 pub(crate) const COLUMNS: usize = 512;
-pub(crate) const HEADER: usize = 704;
+const DETAILS_OFFSET: usize = 344;
+const DETAIL_BYTES: usize = 128;
+pub(crate) const HEADER: usize = DETAILS_OFFSET + 3 * DETAIL_BYTES;
 pub(crate) const BAR: usize = 120;
 
 #[derive(Clone, Copy, Default)]
@@ -103,7 +105,7 @@ impl Profile {
         Ok(())
     }
 
-    /// PFT2 v4：320B头、三个128B详情、至多512个120B保峰柱；不持有宿主借用。
+    /// PFT2 v5：344B头、三个128B详情、至多512个120B保峰柱；不持有宿主借用。
     pub(crate) fn write(&mut self, output: &mut [u8], columns: usize) -> Result<usize, Error> {
         if columns == 0 || columns > COLUMNS || output.len() < HEADER + columns * BAR {
             return Err(Error::Input("PFT2输出容量或柱数无效"));
@@ -114,7 +116,7 @@ impl Profile {
         let output = &mut output[..size];
         output.fill(0);
         put_u32(output, 0, 0x3254_4650);
-        put_u32(output, 4, 4);
+        put_u32(output, 4, 5);
         put_u32(output, 8, STAGES as u32);
         put_u32(output, 12, count as u32);
         let snapshot = self.stats.snapshot();
@@ -136,7 +138,7 @@ impl Profile {
         {
             if let Some(sample) = sample {
                 mask |= 1 << index;
-                write_sample(output, 320 + index * 128, 16, sample);
+                write_sample(output, DETAILS_OFFSET + index * DETAIL_BYTES, 16, sample);
             }
         }
         put_u32(output, 88, mask);
@@ -163,6 +165,9 @@ impl Profile {
             self.work.total.mesh_slabs as u64,
             self.work.total.publications as u64,
             current.empty_sections as u64,
+            self.work.unavailable_sections as u64,
+            self.work.inflight_jobs as u64,
+            self.work.pending_captures as u64,
         ]
         .into_iter()
         .enumerate()
@@ -229,12 +234,16 @@ mod tests {
         profile.record(200, stages).unwrap();
         let mut bytes = vec![0; HEADER + BAR];
         profile.write(&mut bytes, 1).unwrap();
-        let attribution: [u64; STAGES] = std::array::from_fn(|i| word(&bytes, 336 + i * 8));
+        let attribution: [u64; STAGES] =
+            std::array::from_fn(|i| word(&bytes, DETAILS_OFFSET + 16 + i * 8));
         assert_eq!(
             attribution,
             [0, 0, 0, 0, 0, 15, 5, 20, 5, 10, 15, 30, 0, 100]
         );
-        assert_eq!(attribution.iter().sum::<u64>(), word(&bytes, 320));
+        assert_eq!(
+            attribution.iter().sum::<u64>(),
+            word(&bytes, DETAILS_OFFSET)
+        );
     }
 
     #[test]
@@ -249,9 +258,9 @@ mod tests {
         profile.record(140, stages).unwrap();
         let mut bytes = vec![0; HEADER + BAR];
         profile.write(&mut bytes, 1).unwrap();
-        assert_eq!(word(&bytes, 336 + 2 * 8), 40);
-        assert_eq!(word(&bytes, 336 + 4 * 8), 100);
-        assert_eq!(word(&bytes, 320), 140);
+        assert_eq!(word(&bytes, DETAILS_OFFSET + 16 + 2 * 8), 40);
+        assert_eq!(word(&bytes, DETAILS_OFFSET + 16 + 4 * 8), 100);
+        assert_eq!(word(&bytes, DETAILS_OFFSET), 140);
         assert_eq!(profile.plan_mesh_ns, 0);
     }
 
@@ -272,6 +281,15 @@ mod tests {
     #[ignore = "生成PFT2供Gradle frameChartFixture验证生产native writer"]
     fn native_profile_fixture() {
         let mut profile = Profile::default();
+        profile.set_work(
+            prime_world::WorkStats {
+                unavailable_sections: 90,
+                inflight_jobs: 14,
+                pending_captures: 7,
+                ..Default::default()
+            },
+            128,
+        );
         for ns in [10_000_000, 80_000_000, 12_000_000] {
             let mut stages = [0; STAGES];
             if ns == 80_000_000 {

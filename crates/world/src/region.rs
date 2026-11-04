@@ -28,7 +28,7 @@ pub(crate) struct RegionMesh {
     comparison: (bool, bool),
     pub revision: u64,
     pub content_revision: u64,
-    pub available: bool,
+    pub missing_sections: u64,
     pub excluded: bool,
 }
 
@@ -37,6 +37,7 @@ pub(crate) struct PartialRegion {
     pub changed: FragmentMask,
     pub bindings: Vec<FragmentBindings>,
     pub color_updates: Vec<BindingColor>,
+    pub missing_sections: u64,
 }
 
 impl RegionMesh {
@@ -51,7 +52,7 @@ impl RegionMesh {
         color_updates: Vec<BindingColor>,
         revision: u64,
         content_revision: u64,
-        available: bool,
+        missing_sections: u64,
         excluded: bool,
     ) -> Result<Self, Error> {
         bindings.sort_unstable_by_key(|entry| entry.fragment);
@@ -79,7 +80,7 @@ impl RegionMesh {
                 comparison,
                 revision,
                 content_revision,
-                available,
+                missing_sections,
                 excluded,
             })
         } else {
@@ -98,7 +99,7 @@ impl RegionMesh {
                 comparison: (false, false),
                 revision,
                 content_revision,
-                available,
+                missing_sections,
                 excluded,
             })
         }
@@ -129,6 +130,7 @@ impl RegionMesh {
             changed: self.changed,
             bindings: self.bindings,
             color_updates: self.color_updates,
+            missing_sections: self.missing_sections,
         }
     }
 

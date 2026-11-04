@@ -217,6 +217,9 @@ impl Scene {
         }
         let mut regions = BTreeMap::<[i32; 3], FragmentMask>::new();
         for dependency in prime_minecraft::dependent_slabs(source, minimum, maximum)? {
+            if dependency.section[1] < self.height[0] || dependency.section[1] >= self.height[1] {
+                continue;
+            }
             let region = region(dependency.section);
             let mask = regions.entry(region).or_default();
             let section = slot(dependency.section);
@@ -236,6 +239,13 @@ impl Scene {
 
     fn invalidate_fragments(&mut self, handle: Handle, mask: FragmentMask) -> Result<(), Error> {
         if let Some(index) = self.handle_job_index(handle) {
+            let missing = self
+                .state
+                .resource(handle)
+                .map_or(0, |old| old.missing_sections)
+                | self.jobs[index].unavailable;
+            let affected = fragment_sections(mask);
+            let mask = union(mask, fragments(missing & affected));
             let ticket = self.jobs[index].ticket;
             let cancelled_tints = self.compact.cancel_fragments(ticket, mask);
             let job = &mut self.jobs[index];
@@ -258,28 +268,18 @@ impl Scene {
             job.compiled = subtract(job.compiled, mask);
             job.verify = subtract(job.verify, mask);
             job.finished = subtract(job.finished, mask);
-            job.dirty = job
-                .changed
-                .iter()
-                .fold(0, |bits, fragment| bits | (1 << (fragment / 4)));
+            job.unavailable &= !affected;
+            job.dirty = fragment_sections(job.changed);
             job.received = 0;
             for section in 0..64 {
                 refresh_received(job, section);
             }
-            let old = self.state.resource(handle);
-            job.projected = old.map_or(0, RegionMesh::len)
-                - old.map_or(0, |old| old.fragment_quads(job.changed))
-                + job
-                    .sections
-                    .iter()
-                    .map(|(_, mesh)| mesh.quads.len())
-                    .sum::<usize>();
             self.progress.cancelled_slabs += mask.iter().count();
             if self.compact.generation != 0 {
                 self.compact.register(&self.jobs[index])?;
             }
             self.queue_completion(ticket);
-            self.refresh_ledger(handle);
+            self.refresh_job_projection(index);
         } else {
             self.mark_fragments(handle, mask, FragmentMask::empty());
             self.reject_handle(handle)?;
@@ -409,8 +409,17 @@ impl Scene {
         let Some(handle) = self.state.find(chunk(key)) else {
             return Ok(());
         };
+        let missing = self
+            .state
+            .replacement(handle)
+            .or_else(|| self.state.resource(handle))
+            .map_or(0, |region| region.missing_sections);
         if let Some(index) = self.handle_job_index(handle) {
             let job = &mut self.jobs[index];
+            let mask = subtract(mask, fragments(job.unavailable | (missing & !job.dirty)));
+            if mask.is_empty() {
+                return Ok(());
+            }
             job.tint_mask = union(job.tint_mask, mask);
             job.pending_tints -= self.compact.cancel_tints(job.ticket, mask);
             job.pending_tint_mask = subtract(job.pending_tint_mask, mask);
@@ -422,6 +431,10 @@ impl Scene {
             let ticket = job.ticket;
             self.queue_tints(ticket)?;
         } else {
+            let mask = subtract(mask, fragments(missing));
+            if mask.is_empty() {
+                return Ok(());
+            }
             self.reject_handle(handle)?;
             self.recover_candidate(handle)?;
             self.mark_fragments(handle, FragmentMask::empty(), mask);

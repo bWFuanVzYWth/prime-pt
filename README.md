@@ -26,11 +26,11 @@ world 只使用引擎 `chunk_manager` 的 LOD0。水平目标来自宿主有效�
 
 CPU 以四层 slab 持有独立输出，一个 section 的四个内核共享只读邻域，直接生成 region 局部坐标。准备视图借用旧片段和变化输出，GPU 成功后移动发布，避免 section 拼接、坐标二次平移和完整 region 复制。持久 tint 绑定引用资源世代内稳定配方身份，纯颜色刷新借用旧几何并提交属性范围。几何 revision 变化才重建所属 region 的 BLAS；tint/UV/材质属性变化保留 BLAS。dirty 三角输入共享一次批构建与 scratch，非空 BLAS 批有一次同步提交/完成，TLAS 按实例集合或 anchor 变化重建。每帧修改/复用前仍等待此前宿主命令完成，当前不是异步加载流水线。
 
-同 region 刷新遵循引擎 [State](../../crates/chunk_manager/src/lib.rs) 的无缝发布契约：源、halo、tint 或候选尚未齐备，以及预算不足、GPU 准备失败时，继续显示旧 mesh；新属性、BLAS/TLAS 和最终绘制集合准备成功后一次切换，旧资源按实际完成边界退役。未知或不可用源只能记录负缓存，不能冒充真实空网格撤下旧几何。完整编译结果确认为空时，才允许原子清除该覆盖。LOD 父子替换使用相同边界，Prime 当前仍只使用 LOD0。
+同 region 刷新遵循引擎 [State](../../crates/chunk_manager/src/lib.rs) 的无缝发布契约。压缩源明确未加载时，只保留受影响 section 的旧片段，同批其余已就绪片段可以发布；来源恢复后重试受影响的 section。只有确认为空的编译结果才能清除旧覆盖。新属性、BLAS/TLAS 和最终绘制集合准备成功后一次切换，旧资源按实际完成边界退役。LOD 父子替换使用相同边界，Prime 当前仍只使用 LOD0。
 
 GPU 的 48 B/quad 属性缓冲持久保留容量：容量内只打包和映射写入变化范围，无内容变化或仅 anchor 变化不重写属性；扩容才新建缓冲并重写全部活动属性。纯属性更新保留 TLAS。活动发光 quad 使用稳定数据槽、紧凑活动选择表和反查索引；颜色刷新不扫描灯，灯集合/槽位变化只准备变化行，增长时才完整重建容量表；运行期均匀选择灯并使用实际离散 PMF，不重建全局 alias。纹理内 alias 和静态面积复用资源准备产物，过程流体的两三角面积可在 shader 计算。
 
-默认 CPU quad 逻辑预算为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**，不包含源缓存、Vec 余量、线程、驱动或 GPU 内存。超额以 [Pressure](crates/world/src/budget.rs) 区分最终容量、过渡等待和单 region 容量；暂停或排除新候选时保留已有覆盖，不能靠提前撤下同一覆盖解锁容量。下调预算时已发布几何可能高于新限制，持续报告压力并阻止新增，直到预算提高或实际域外资源退休；不宣称此时已满足新上限。manager 从实际占用按需扩容；显式 [WorkBudget](crates/world/src/budget.rs) 在一次 plan 开始的推进轮中约束内核、规划访问、发布及维护，后续源包和颜色回填共享剩余额度。缺源或容量受阻的任务不能耗尽建网额度并阻挡可执行任务。调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
+CPU quad 逻辑预算初始为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**。宿主视距从 16 增至 32 时，常驻上限按每格 64 MiB 提高，最高 **2 GiB**，增量受 GPU 属性缓冲槽数约束。会话内只调高此上限，窗口缩小时按实际退出范围回收资源。逻辑预算只计 quad payload。超额以 [Pressure](crates/world/src/budget.rs) 区分常驻容量、过渡等待和单 region 容量。manager 从实际占用按需扩容；显式 [WorkBudget](crates/world/src/budget.rs) 在一次 plan 开始的推进轮中约束内核、规划访问、发布及维护，后续源包和颜色回填共享剩余额度。调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
 
 ## 渲染能力与边界
 

@@ -87,7 +87,7 @@ fn unavailable_halo_preserves_old_mesh_until_recovered_geometry_and_tint_are_com
     scene.apply_compact(&unavailable_packet(requests[0]), &catalog)?;
     publish(&mut scene, &catalog)?;
     let old = scene.state.resource(handle).unwrap();
-    assert!(!old.available);
+    assert_ne!(old.missing_sections, 0);
     assert_eq!(old.parts.get(0).unwrap().quads.as_ptr(), pointer);
     assert_eq!((old.revision, old.content_revision), revisions);
     assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
@@ -121,7 +121,7 @@ fn unavailable_halo_preserves_old_mesh_until_recovered_geometry_and_tint_are_com
     let colors = vec![0xff00ff00; scene.tint_requests().len()];
     scene.apply_tints(&colors)?;
     publish(&mut scene, &catalog)?;
-    assert!(scene.state.resource(handle).unwrap().available);
+    assert_eq!(scene.state.resource(handle).unwrap().missing_sections, 0);
     assert_eq!(
         scene
             .render_regions()

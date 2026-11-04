@@ -654,6 +654,13 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    /// 单个 quad 属性缓冲允许的槽数，按分配器使用的二次幂容量向下取整。
+    /// 空洞、场景内其他缓冲和实际可用显存另计。
+    pub fn attribute_slot_limit(&self) -> u32 {
+        let slots = self.context.max_storage_buffer_range() / size_of::<[[u32; 4]; 3]>() as u32;
+        slots.checked_ilog2().map_or(0, |shift| 1 << shift)
+    }
+
     /// # Safety
     /// 句柄属于同一活动 Vulkan 1.2 设备，已启用 RT pipeline、RayQuery 和 device address。
     /// 另须启用 KHR position fetch 扩展及 feature；没有无 position fetch 的回退路径。

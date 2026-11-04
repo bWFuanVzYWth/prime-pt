@@ -32,6 +32,8 @@ final class FrameChartFixture {
                     && nativeBounds.labels.stream().anyMatch(line -> line.contains("场景写入3.00MiB") && line.contains("1.00ms"))
                     && nativeBounds.labels.stream().anyMatch(line -> line.contains("BLAS提交/等待 1.00ms") && line.contains("TLAS 2.00ms")),
                     "真实场景规模与主机子段独立显示");
+            require(nativeBounds.labels.stream().anyMatch(line -> line.contains("目标缺源90段")
+                    && line.contains("在途14区") && line.contains("待回复7请求")), "源状态跨语言一致");
             if (image != null) render(image.resolveSibling(image.getFileName().toString().replace(".png", "-native.png")));
             System.out.println("Native PFT2 -> Java frame chart producer/consumer fixture passed");
         }
@@ -54,6 +56,8 @@ final class FrameChartFixture {
         require(sink.labels.stream().anyMatch(line->line.contains("建网 3/8 slab")&&line.contains("待编12"))
                 &&sink.labels.stream().anyMatch(line->line.contains("遇缺源5/容量2")&&line.contains("发布1"))
                 &&sink.labels.stream().anyMatch(line->line.contains("Rust通知 50→7")&&line.contains("空段64")),"真实工作预算、队列、遇阻与合并计数可区分");
+        require(sink.labels.stream().anyMatch(line -> line.contains("目标缺源77段")
+                && line.contains("在途11区") && line.contains("待回复3请求")), "当前源状态独立于本轮遇阻");
         require(FrameChart.columns() == 508, "下一次 native 保峰使用实际图宽");
         var hover = new Bounds(520, 360);
         FrameChart.paint(hover, 0, 520, 360, 177, 160);
@@ -65,9 +69,10 @@ final class FrameChartFixture {
         require(narrow.labels.stream().anyMatch(line -> line.contains("BLAS 81.3%") && line.contains("65.00ms")),
                 "窄GUI仍直接显示最大项及占比");
         require(narrow.labels.stream().anyMatch(line->line.contains("建网3/8 待编12")),"窄GUI保留本轮建网预算和ready队列");
+        require(narrow.labels.stream().anyMatch(line -> line.contains("缺源77段 任务11 捕获3")), "窄GUI保留当前源状态");
         require(!FrameChart.paint(new Bounds(96, 120), 0, 96, 120, -1, -1), "过小窗口回到宿主图");
         rejects(packet, 0, 0x31544650, "旧 PFT1 不混读");
-        rejects(packet,4,3,"旧PFT2版本不混读");
+        rejects(packet, 4, 4, "旧PFT2版本不混读");
         rejects(packet, 8, 10, "阶段数量");
         rejects(packet, 92, 2, "场景有效标志");
         packet.putLong(128, -1); expectRejected(packet, "负属性字节"); packet.putLong(128, 3 * 1_048_576L);
@@ -109,7 +114,7 @@ final class FrameChartFixture {
         data.putInt(92, 1); data.putLong(96, 302); data.putLong(104, 2); data.putLong(112, 64);
         data.putLong(120, 6 * 1_048_576L); data.putLong(128, 3 * 1_048_576L);
         data.putLong(136, 1_000_000); data.putLong(144, 2_000_000); data.putLong(152, 1_000_000);
-        long[] work={40,8,3,12,5,2,1,17,99,21,4,50,7,1000,300,64};
+        long[] work={40,8,3,12,5,2,1,17,99,21,4,50,7,1000,300,64,77,11,3};
         for(int field=0;field<work.length;field++)data.putLong(192+field*8,work[field]);
         sample(data, FrameChart.HEADER_BYTES, 16, 8_000_000, 11, 3_000_000);
         sample(data, FrameChart.HEADER_BYTES + FrameChart.DETAIL_BYTES, 16, 80_000_000, 7, 65_000_000);

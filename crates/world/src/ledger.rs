@@ -8,6 +8,7 @@ pub(crate) struct Contribution {
     pub handle: Handle,
     pub projected: usize,
     pub excluded: bool,
+    pub unavailable_sections: usize,
 }
 
 #[derive(Default)]
@@ -15,6 +16,7 @@ pub(crate) struct Ledger {
     pub owned: usize,
     projected: usize,
     excluded: usize,
+    unavailable_sections: usize,
     bounds: Option<Bounds>,
     records: BTreeMap<Key, Contribution>,
     excluded_keys: BTreeSet<Key>,
@@ -32,6 +34,10 @@ impl Ledger {
 
     pub const fn excluded(&self) -> usize {
         self.excluded
+    }
+
+    pub const fn unavailable_sections(&self) -> usize {
+        self.unavailable_sections
     }
 
     pub fn contribution(&self, key: Key) -> Option<Contribution> {
@@ -52,6 +58,7 @@ impl Ledger {
             if self.bounds.is_some_and(|bounds| contains(bounds, key)) {
                 self.projected -= previous.projected;
                 self.excluded -= usize::from(previous.excluded);
+                self.unavailable_sections -= previous.unavailable_sections;
             }
         } else {
             self.spatial.insert(key);
@@ -59,6 +66,7 @@ impl Ledger {
         if self.bounds.is_some_and(|bounds| contains(bounds, key)) {
             self.projected += value.projected;
             self.excluded += usize::from(value.excluded);
+            self.unavailable_sections += value.unavailable_sections;
         }
     }
 
@@ -76,6 +84,7 @@ impl Ledger {
         if self.bounds.is_some_and(|bounds| contains(bounds, key)) {
             self.projected -= previous.projected;
             self.excluded -= usize::from(previous.excluded);
+            self.unavailable_sections -= previous.unavailable_sections;
         }
     }
 
@@ -97,6 +106,7 @@ impl Ledger {
                     let value = self.records[&key];
                     self.projected -= value.projected;
                     self.excluded -= usize::from(value.excluded);
+                    self.unavailable_sections -= value.unavailable_sections;
                 }
             }
             for edge in difference(bounds, previous) {
@@ -104,6 +114,7 @@ impl Ledger {
                     let value = self.records[&key];
                     self.projected += value.projected;
                     self.excluded += usize::from(value.excluded);
+                    self.unavailable_sections += value.unavailable_sections;
                 }
             }
         } else {
@@ -111,6 +122,7 @@ impl Ledger {
                 let value = self.records[&key];
                 self.projected += value.projected;
                 self.excluded += usize::from(value.excluded);
+                self.unavailable_sections += value.unavailable_sections;
             }
         }
         self.bounds = Some(bounds);

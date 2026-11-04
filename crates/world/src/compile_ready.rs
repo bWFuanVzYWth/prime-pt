@@ -32,6 +32,9 @@ impl Scene {
                 continue;
             }
             let slot = usize::from(work.fragment) / 4;
+            if self.jobs[index].unavailable & (1 << slot) != 0 {
+                continue;
+            }
             let center = section(work.region, slot);
             let wanted = (slot * 4..slot * 4 + 4)
                 .filter(|&fragment| {
@@ -45,10 +48,7 @@ impl Scene {
                     continue;
                 }
                 SourceState::Unavailable => {
-                    self.jobs[index].unavailable |= 1 << slot;
-                    let handle = self.jobs[index].handle;
-                    self.refresh_ledger(handle);
-                    self.queue_completion(ticket);
+                    self.defer_section(index, work, center)?;
                     continue;
                 }
                 SourceState::Air => {
@@ -71,11 +71,32 @@ impl Scene {
                         }
                     }
                     self.progress.empty_sections += usize::from(proved);
+                    if !job.tint_mask.is_empty() {
+                        self.queue_tints(ticket)?;
+                    }
                     self.queue_completion(ticket);
                     continue;
                 }
                 SourceState::Available(_) => {}
             }
+            let neighborhood = self.neighborhood(center, self.compact.generation);
+            if let Some(missing) = neighborhood
+                .sections
+                .iter()
+                .position(|neighbor| matches!(neighbor, Neighbor::Unavailable))
+            {
+                let offset = [missing % 3, missing / 9, missing / 3 % 3];
+                self.defer_section(
+                    index,
+                    work,
+                    std::array::from_fn(|axis| center[axis] + offset[axis] as i32 - 1),
+                )?;
+                continue;
+            }
+            let waiting = neighborhood
+                .sections
+                .iter()
+                .any(|neighbor| matches!(neighbor, Neighbor::Unknown));
             if !self.compact.expanded.contains(&work) {
                 let mut keys = Vec::with_capacity(27);
                 for y in -1..=1 {
@@ -91,23 +112,7 @@ impl Scene {
                 self.compact.store.depend(work, &keys)?;
                 self.compact.expanded.insert(work);
             }
-            let neighborhood = self.neighborhood(center, self.compact.generation);
-            if neighborhood
-                .sections
-                .iter()
-                .any(|neighbor| matches!(neighbor, Neighbor::Unavailable))
-            {
-                self.jobs[index].unavailable |= 1 << slot;
-                let handle = self.jobs[index].handle;
-                self.refresh_ledger(handle);
-                self.queue_completion(ticket);
-                continue;
-            }
-            if neighborhood
-                .sections
-                .iter()
-                .any(|neighbor| matches!(neighbor, Neighbor::Unknown))
-            {
+            if waiting {
                 self.progress.waiting_sources += wanted;
                 continue;
             }
@@ -132,6 +137,56 @@ impl Scene {
             }
             self.queue_completion(ticket);
         }
+        Ok(())
+    }
+
+    fn defer_section(
+        &mut self,
+        index: usize,
+        work: WorkId,
+        missing: [i32; 3],
+    ) -> Result<(), Error> {
+        // 已知未加载的来源足以阻止该section提交，暂不保留其余halo的捕获需求。
+        self.compact.store.depend(work, &[missing])?;
+        self.compact.expanded.remove(&work);
+        let job = &mut self.jobs[index];
+        let slot = 1 << (usize::from(work.fragment) / 4);
+        let mask = fragments(slot);
+        let ticket = job.ticket;
+        let handle = job.handle;
+        let retained = self.state.resource(handle).map_or(0, |old| {
+            let replaced = FragmentMask::from_words(std::array::from_fn(|word| {
+                job.changed.words()[word] & mask.words()[word]
+            }));
+            old.fragment_quads(replaced)
+        });
+        job.pending_tints -= self.compact.cancel_fragments(ticket, mask);
+        self.compact.todo.remove(&work);
+        let mut discarded = 0;
+        job.sections.retain(|(fragment, mesh)| {
+            if mask.contains(*fragment) {
+                discarded += mesh.quads.len();
+                false
+            } else {
+                true
+            }
+        });
+        job.bindings.retain(|entry| !mask.contains(entry.fragment));
+        job.tint_patches
+            .retain(|patch| !mask.contains(patch.fragment()));
+        job.color_updates
+            .retain(|entry| !mask.contains(entry.fragment));
+        job.pending_tint_mask = change_runtime::subtract(job.pending_tint_mask, mask);
+        job.tint_mask = change_runtime::subtract(job.tint_mask, mask);
+        job.compiled = change_runtime::subtract(job.compiled, mask);
+        job.verify = change_runtime::subtract(job.verify, mask);
+        job.finished = change_runtime::subtract(job.finished, mask);
+        job.received &= !slot;
+        job.unavailable |= slot;
+        self.ledger.owned -= discarded;
+        job.projected = job.projected - discarded + retained;
+        self.refresh_ledger(handle);
+        self.queue_completion(ticket);
         Ok(())
     }
 
