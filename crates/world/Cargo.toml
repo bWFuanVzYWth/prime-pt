@@ -3,7 +3,7 @@ name = "prime_world"
 version = "0.1.0"
 edition = "2024"
 [features]
-test-fixtures = []
+test-fixtures = ["prime_minecraft/fixtures"]
 [dependencies]
 prime_scene = { path = "../scene" }
 prime_minecraft = { path = "../minecraft" }

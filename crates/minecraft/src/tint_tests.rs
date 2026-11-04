@@ -1,5 +1,20 @@
 use super::*;
 #[test]
+fn final_color_invalidation_keeps_actual_biome_and_raw_color_sources() {
+    let resources = fixtures::resources().unwrap();
+    let mut world = fixtures::world(&resources).unwrap();
+    let requests = fixtures::requests();
+    let plan = world.plan(&requests, &resources, 7).unwrap();
+    let ids = vec![0; plan.biome_sample_count()];
+    let expected = world.finish(plan, &resources, &ids, &[]).unwrap();
+    world.invalidate_colors();
+    let plan = world.plan(&requests, &resources, 7).unwrap();
+    assert_eq!(plan.cached_colors(), 0);
+    assert_eq!(plan.biome_sample_count(), 0);
+    assert_eq!(plan.source_samples(), 0);
+    assert_eq!(world.finish(plan, &resources, &[], &[]).unwrap(), expected);
+}
+#[test]
 fn native_and_custom_requests_keep_order_and_exact_integer_colors() {
     let resources = fixtures::resources().unwrap();
     let mut world = fixtures::world(&resources).unwrap();

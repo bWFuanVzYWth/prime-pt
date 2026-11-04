@@ -8,6 +8,9 @@ pub enum Error {
     /// 引擎相机坐标或投影不合法。
     #[error(transparent)]
     Camera(#[from] camera::Error),
+    /// 场景元数据或候选缓冲分配失败。
+    #[error(transparent)]
+    Allocation(#[from] std::collections::TryReserveError),
 }
 /// 当前 mod 的不透明 OpenPBR 预设；两者共享相同 Flow 子集，无额外材质表读取。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -322,8 +325,10 @@ pub struct Mesh {
     pub quads: Vec<Quad>,
 }
 
+mod mesh_parts;
 mod mesh_view;
-pub use mesh_view::{MeshView, Quads};
+pub use mesh_parts::{FragmentMask, IntoFragments, MeshParts, PreparedParts, TintPatch};
+pub use mesh_view::{AttributeRange, AttributeRanges, Attributes, Fragments, MeshView, Quads};
 
 /// 一份借用的64m region渲染输入；不包含源编译器或区块管理器所有权。
 ///
@@ -351,6 +356,15 @@ pub struct RenderView<'a> {
     pub regions: &'a [RenderRegion<'a>],
     /// 全部实例及相机本次使用的绝对f64坐标原点。
     pub anchor: [f64; 3],
+}
+
+/// 同一场景世代内的稀疏渲染变化；数据借用持续到一次GPU准备返回。
+#[derive(Clone, Copy)]
+pub enum RenderChange<'a> {
+    /// 完整region候选；仅颜色变化可以通过MeshView属性覆盖表达。
+    Upsert(RenderRegion<'a>),
+    /// 真实空输出或退出需求域；未知源不能用此项撤下旧覆盖。
+    Remove([i32; 3]),
 }
 
 /// 主光线参数；right/up 已包含垂直 FOV 与宽高比，无矩阵约定依赖。

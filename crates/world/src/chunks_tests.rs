@@ -258,7 +258,13 @@ fn dirty_section_merge_preserves_unaffected_region_ranges() -> Result<(), Error>
     publish(&mut scene)?;
     let old = *scene.entries().next().unwrap().2.quads().next().unwrap();
     let handle = scene.state.find(chunk([0; 3])).unwrap();
-    let pointer = scene.state.resource(handle).unwrap().parts()[slot(untouched)]
+    let pointer = scene
+        .state
+        .resource(handle)
+        .unwrap()
+        .parts
+        .get(slot(untouched) * 4)
+        .unwrap()
         .quads
         .as_ptr();
     scene.invalidate_section([0; 3])?;
@@ -272,8 +278,19 @@ fn dirty_section_merge_preserves_unaffected_region_ranges() -> Result<(), Error>
     assert!(mesh.quads().nth(1).unwrap().same_attributes(&old));
     let handle = scene.state.find(chunk([0; 3])).unwrap();
     let resource = scene.state.resource(handle).unwrap();
-    assert_eq!(resource.parts()[slot(untouched)].quads.len(), 1);
-    assert_eq!(resource.parts()[slot(untouched)].quads.as_ptr(), pointer);
+    assert_eq!(
+        resource.parts.get(slot(untouched) * 4).unwrap().quads.len(),
+        1
+    );
+    assert_eq!(
+        resource
+            .parts
+            .get(slot(untouched) * 4)
+            .unwrap()
+            .quads
+            .as_ptr(),
+        pointer
+    );
     Ok(())
 }
 
@@ -395,7 +412,8 @@ fn invalidation_before_completion_rejects_the_old_capture() -> Result<(), Error>
     scene.apply(&colored(&old, Some(old[0].section), 0x00ff_ffff, 0.))?;
     assert!(scene.state.resource(handle).is_none());
     let fresh = one_region(&mut scene)?;
-    assert_eq!(fresh.len(), 64);
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].section, old[0].section);
     assert!(
         fresh
             .iter()
@@ -409,22 +427,24 @@ fn invalidation_before_completion_rejects_the_old_capture() -> Result<(), Error>
 }
 
 #[test]
-fn excessive_view_distance_fails_without_reconfiguring_or_clearing() -> Result<(), Error> {
+fn large_view_distance_grows_from_actual_occupancy_and_keeps_intersection_capture()
+-> Result<(), Error> {
     let mut scene = Scene::new()?;
     eprintln!(
-        "region_adapter state_reserved_bytes={} region_resource_inline_bytes={} dirty_table_bytes={}",
+        "region_adapter state_reserved_bytes={} region_resource_inline_bytes={} dirty_entry_payload_bytes={}",
         scene.state.reserved_bytes(),
         size_of::<RegionMesh>(),
-        scene.masks.capacity() * size_of::<Dirty>()
+        scene.masks.len() * size_of::<([i32; 3], Dirty)>()
     );
     one_region(&mut scene)?;
-    let config = *scene.state.config();
     let wire = scene.captures[0].wire.id;
-    assert!(scene.plan(&camera([0.; 3]), 512, -4, 20, 64).is_err());
-    assert_eq!(*scene.state.config(), config);
-    assert_eq!(scene.captures[0].wire.id, wire);
-    scene.plan(&camera([0.; 3]), 32, -4, 20, 0)?;
-    assert!(volume(scene.state.config().bounds().unwrap()) * 2 + 64 <= CAPACITY);
+    scene.plan(&camera([0.; 3]), 512, 0, 4, 64)?;
+    assert!(scene.captures.iter().any(|capture| capture.wire.id == wire));
+    assert!(
+        scene.state.config().capacity() < volume(scene.state.config().bounds().unwrap()),
+        "只为实际占用增长，不预分配整个目标体积"
+    );
+    assert_eq!(scene.ledger.owned, 0);
     Ok(())
 }
 
@@ -564,7 +584,7 @@ fn transition_pressure_preserves_same_region_until_capacity_allows_replacement()
             .sum::<usize>(),
         1
     );
-    assert!(scene.retained_quads <= 4);
+    assert!(scene.ledger.owned <= 4);
     Ok(())
 }
 
@@ -575,7 +595,13 @@ fn rejecting_gpu_candidate_keeps_the_original_fragment_allocation() -> Result<()
     scene.apply(&colored(&requests, Some([1, 2, 3]), 0x00ff_ffff, 0.))?;
     publish(&mut scene)?;
     let handle = scene.state.find(chunk([0; 3])).unwrap();
-    let pointer = scene.state.resource(handle).unwrap().parts()[slot([1, 2, 3])]
+    let pointer = scene
+        .state
+        .resource(handle)
+        .unwrap()
+        .parts
+        .get(slot([1, 2, 3]) * 4)
+        .unwrap()
         .quads
         .as_ptr();
     scene.invalidate_section([0; 3])?;
@@ -586,7 +612,13 @@ fn rejecting_gpu_candidate_keeps_the_original_fragment_allocation() -> Result<()
     assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 2);
     scene.reject()?;
     assert_eq!(
-        scene.state.resource(handle).unwrap().parts()[slot([1, 2, 3])]
+        scene
+            .state
+            .resource(handle)
+            .unwrap()
+            .parts
+            .get(slot([1, 2, 3]) * 4)
+            .unwrap()
             .quads
             .as_ptr(),
         pointer

@@ -37,12 +37,20 @@ pub fn resource_packet() -> Vec<u8> {
     resource_packet_with_fluid_fields(0, false)
 }
 
+/// 完整模型/PTR1保持同一指定世代的资源fixture，用于真实替换事务。
+pub fn resource_packet_generation(generation: u64) -> Vec<u8> {
+    resource_packet_fields(0, false, generation)
+}
+
 pub(crate) fn resource_packet_with_fluid_fields(support: u32, falling: bool) -> Vec<u8> {
+    resource_packet_fields(support, falling, 1)
+}
+fn resource_packet_fields(support: u32, falling: bool, generation: u64) -> Vec<u8> {
     let mut b = Vec::new();
     for v in [0x314d5250, 263] {
         word(&mut b, v);
     }
-    long(&mut b, 1);
+    long(&mut b, generation);
     for v in [1, 4, 2, 0, 1, 2] {
         word(&mut b, v);
     }
@@ -128,6 +136,16 @@ pub(crate) fn resource_packet_with_fluid_fields(support: u32, falling: bool) -> 
             word(&mut b, v);
         }
     }
+    let mut tint = crate::tint::fixtures::resource_bytes();
+    tint[8..16].copy_from_slice(&generation.to_le_bytes());
+    // fixture水状态为3，保留真实流体-1来源；不是缺recipe时默认白色。
+    let count_at = 16 + 256 * 4 + 16 + 3 * 4;
+    tint[count_at..count_at + 4].copy_from_slice(&8u32.to_le_bytes());
+    for value in [3, u32::MAX, 4, 0] {
+        word(&mut tint, value);
+    }
+    word(&mut b, tint.len() as u32);
+    b.extend(tint);
     b
 }
 

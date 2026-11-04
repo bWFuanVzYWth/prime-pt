@@ -1,9 +1,19 @@
 //! 引擎区块调度的LOD0所有者；源编译、准备和GPU确认后的发布分别处理。
 mod budget;
+#[cfg(test)]
+mod budget_tests;
+mod changes;
 mod chunks;
+mod ledger;
+mod ready_queue;
 mod region;
 mod source;
-pub use budget::{Budget, Pressure, PressureKind};
+mod spatial;
+mod store;
+pub use budget::{
+    Budget, PayloadStats, Pressure, PressureKind, WorkBudget, WorkProgress, WorkStats,
+};
+pub use changes::SourceChange;
 pub use chunks::{CaptureRequest, PreparedGeneration, Scene};
 pub use prime_scene::{Camera, Environment, Material, Mesh, Quad, WorldCamera};
 use source::{Section, compile, decode};
@@ -34,6 +44,12 @@ pub enum Error {
     /// 已准备Minecraft资源或压缩源编译失败，不触发运行时资源补建。
     #[error(transparent)]
     Minecraft(#[from] prime_minecraft::Error),
+    /// 元数据或候选缓冲预留失败；尚未发布的输出由原所有者回收。
+    #[error(transparent)]
+    Allocation(#[from] std::collections::TryReserveError),
+    /// 管理器按实际占用扩容失败，旧身份和资源保持有效。
+    #[error(transparent)]
+    Growth(#[from] chunk_manager::GrowthError),
 }
 
 #[cfg(test)]

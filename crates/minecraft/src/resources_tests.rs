@@ -2,10 +2,27 @@
 use crate::{Catalog, Error, fixtures};
 
 #[test]
+fn air_proof_uses_actual_uniform_state_and_rejects_unknown_identity() {
+    let mut catalog = fixtures::catalog().unwrap();
+    let air = crate::SectionStorage::new(0, vec![0], vec![]).unwrap();
+    let invisible_fluid = crate::SectionStorage::new(0, vec![3], vec![]).unwrap();
+    assert!(catalog.section_is_air(&air).unwrap());
+    assert!(!catalog.section_is_air(&invisible_fluid).unwrap());
+    let nonuniform = crate::SectionStorage::new(1, vec![0, 1], vec![0; 64]).unwrap();
+    assert!(!catalog.section_is_air(&nonuniform).unwrap());
+    assert!(
+        catalog
+            .section_is_air(&crate::SectionStorage::new(0, vec![u32::MAX], vec![]).unwrap())
+            .is_err()
+    );
+    catalog.states.get_mut(&0).unwrap().flags = 16;
+    assert!(!catalog.section_is_air(&air).unwrap());
+}
+
+#[test]
 fn failed_or_abandoned_resource_candidate_preserves_the_published_catalog() {
     let mut catalog = fixtures::catalog().unwrap();
-    let mut bytes = fixtures::resource_packet();
-    bytes[8..16].copy_from_slice(&2u64.to_le_bytes());
+    let mut bytes = fixtures::resource_packet_generation(2);
     {
         let mut prepared = catalog.stage_resources(&bytes).unwrap();
         let maps = prepared

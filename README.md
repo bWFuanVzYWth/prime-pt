@@ -14,6 +14,8 @@ Minecraft **26.3 / Fabric** 的 Prime PT 重写，复用 simple_engine 的 Slang
 
 Java 只绑定 Minecraft 类型与源字段，转发事件和宿主句柄。[SourceResources](java/src/main/java/dev/primept/SourceResources.java) 在首次加载/资源重载捕获完整注册状态、模型 DAG、剔除形状、sprite 和 tint recipe；[Capture](java/src/main/java/dev/primept/Capture.java) 运行期按 native ticket 复制真实 section 的 palette/bit storage，使用 **PRT3**，不逐 block 选择模型、剔面或展开 quad。每批至多 64 section，每完成一个 section 检查 3 ms 捕获预算，未回复 ticket 保留到后续帧。
 
+宿主变化由单一真实来源回调捕获，按世界、列、section 范围合并后以 PDI1 批量转发；几何、源替换、biome 和颜色失效分开处理，失败保留未确认批次。资源重载走独立世代事务。入口见 [SourceChanges](java/src/main/java/dev/primept/SourceChanges.java) 与 [变化包边界](native/src/changes.rs)。
+
 Rust 校验同世代资源与完整邻域后，以四层 slab 为批量内核执行模型选择、位置偏移、剔面和流体几何；工作池只由 world 调度。草、叶、干叶、水、高草、红石、藤茎等原版 tint 的 zoom、颜色表、noise 和 box blend 在 [tint](crates/minecraft/src/tint.rs) 计算，世界 seed、biome palette 与已捕获 quart 按世界缓存；Java 只回报缺失的原始 quart 身份。自定义 tint 函数保留显式批量宿主回退，结果齐备后才能发布 mesh。
 
 ## 资源准备与增量更新
@@ -22,13 +24,13 @@ Rust 校验同世代资源与完整邻域后，以四层 slab 为批量内核执
 
 world 只使用引擎 `chunk_manager` 的 LOD0。水平目标来自宿主有效视距，覆盖完整世界高度，向 64 m region 对齐；每 region 管理 4³ 个 16 m section，一个非空 region 一个 BLAS。相机以 f64 保存绝对位置，CPU 几何/BLAS 保留 region 局部坐标，TLAS 平移减去 64 m anchor 后转 f32。移窗保留需求交集与有效 ticket，完全退出需求域的 region 独立卸载；边缘未加载源不会永久阻塞域外退休。未加载、真实空和预算排除有不同状态。
 
-CPU 保留 section 分片，准备视图借用旧分片和 dirty 输出，GPU 成功后移动发布，避免重复制完整 region。几何 revision 变化才重建所属 region 的 BLAS；tint/UV/材质属性变化保留 BLAS。dirty 三角输入共享一次批构建与 scratch，非空 BLAS 批有一次同步提交/完成，TLAS 按实例集合或 anchor 变化重建。每帧修改/复用前仍等待此前宿主命令完成，当前不是异步加载流水线。
+CPU 以四层 slab 持有独立输出，一个 section 的四个内核共享只读邻域，直接生成 region 局部坐标。准备视图借用旧片段和变化输出，GPU 成功后移动发布，避免 section 拼接、坐标二次平移和完整 region 复制。持久 tint 绑定引用资源世代内稳定配方身份，纯颜色刷新借用旧几何并提交属性范围。几何 revision 变化才重建所属 region 的 BLAS；tint/UV/材质属性变化保留 BLAS。dirty 三角输入共享一次批构建与 scratch，非空 BLAS 批有一次同步提交/完成，TLAS 按实例集合或 anchor 变化重建。每帧修改/复用前仍等待此前宿主命令完成，当前不是异步加载流水线。
 
 同 region 刷新遵循引擎 [State](../../crates/chunk_manager/src/lib.rs) 的无缝发布契约：源、halo、tint 或候选尚未齐备，以及预算不足、GPU 准备失败时，继续显示旧 mesh；新属性、BLAS/TLAS 和最终绘制集合准备成功后一次切换，旧资源按实际完成边界退役。未知或不可用源只能记录负缓存，不能冒充真实空网格撤下旧几何。完整编译结果确认为空时，才允许原子清除该覆盖。LOD 父子替换使用相同边界，Prime 当前仍只使用 LOD0。
 
-GPU 的 48 B/quad 属性缓冲持久保留容量：容量内只打包和映射写入变化范围，无内容变化或仅 anchor 变化不重写属性；扩容才新建缓冲并重写全部活动属性。纯属性更新保留 TLAS。活动发光 quad 按变化 region 缓存，灯集合/槽位变化时更新活动表；运行期均匀选择灯并使用实际离散 PMF，不重建全局 alias。纹理内 alias 和静态面积复用资源准备产物，过程流体的两三角面积可在 shader 计算。
+GPU 的 48 B/quad 属性缓冲持久保留容量：容量内只打包和映射写入变化范围，无内容变化或仅 anchor 变化不重写属性；扩容才新建缓冲并重写全部活动属性。纯属性更新保留 TLAS。活动发光 quad 使用稳定数据槽、紧凑活动选择表和反查索引；颜色刷新不扫描灯，灯集合/槽位变化只准备变化行，增长时才完整重建容量表；运行期均匀选择灯并使用实际离散 PMF，不重建全局 alias。纹理内 alias 和静态面积复用资源准备产物，过程流体的两三角面积可在 shader 计算。
 
-默认 CPU quad 逻辑预算为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**，不包含源缓存、Vec 余量、线程、驱动或 GPU 内存。超额以 [Pressure](crates/world/src/budget.rs) 区分最终容量、过渡等待和单 region 容量；暂停或排除新候选时保留已有覆盖，不能靠提前撤下同一覆盖解锁容量。下调预算时已发布几何可能高于新限制，持续报告压力并阻止新增，直到预算提高或实际域外资源退休；不宣称此时已满足新上限。固定 manager 容量、调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
+默认 CPU quad 逻辑预算为 resident **1 GiB**、staging **256 MiB**、单 region **256 MiB**，不包含源缓存、Vec 余量、线程、驱动或 GPU 内存。超额以 [Pressure](crates/world/src/budget.rs) 区分最终容量、过渡等待和单 region 容量；暂停或排除新候选时保留已有覆盖，不能靠提前撤下同一覆盖解锁容量。下调预算时已发布几何可能高于新限制，持续报告压力并阻止新增，直到预算提高或实际域外资源退休；不宣称此时已满足新上限。manager 从实际占用按需扩容；显式 [WorkBudget](crates/world/src/budget.rs) 在一次 plan 开始的推进轮中约束内核、规划访问、发布及维护，后续源包和颜色回填共享剩余额度。缺源或容量受阻的任务不能耗尽建网额度并阻挡可执行任务。调度限额与恢复条件见 [Scene](crates/world/src/chunks.rs)。
 
 ## 渲染能力与边界
 
@@ -83,7 +85,7 @@ SDK 在任何 Vulkan 对象前安装 interposer；初始化失败记录原因并
 
 ## 诊断、基准与验收
 
-F3+2 用 Prime 分项图替换左侧 FPS 图，保留宿主 TPS 图。统计与按像素保留最长整帧的采样复用引擎 `frame_loop::timing`；14 个互斥分项覆盖等待、tint/源维护、规划/捕获、编译/三角、属性与光源打包/写入、BLAS、TLAS、场景准备/提交、录制/SDK、宿主提交和未归因。`plan` 内同步推进的源编译计入网格项，视图准备归场景准备/提交；网格项也包含解码、预算核算和合并，并非纯建网内核。最大项显示毫秒及占比，预算压力显示排除数、延后数及所需/限制容量；场景更新序号/规模明确属于最近更新，不冒充所选历史帧。全部为**主线程墙钟**，不是 GPU timestamp。图隐藏时不格式化文本；读取诊断不增加 GPU 回读/等待。入口见 [diagnostics](native/src/diagnostics.rs) 和 [FrameChart](java/src/main/java/dev/primept/FrameChart.java)。
+F3+2 用 Prime 分项图替换左侧 FPS 图，保留宿主 TPS 图。统计与按像素保留最长整帧的采样复用引擎 `frame_loop::timing`；14 个互斥分项覆盖等待、tint/源维护、规划/捕获、编译/三角、属性与光源打包/写入、BLAS、TLAS、场景准备/提交、录制/SDK、宿主提交和未归因。`plan` 内同步推进的源编译计入网格项，视图准备归场景准备/提交；网格项也包含解码、预算核算和合并，并非纯建网内核。最大项显示毫秒及占比，预算压力显示排除数、延后数及所需/限制容量；场景更新序号/规模明确属于最近更新，不冒充所选历史帧。全部为**主线程墙钟**，不是 GPU timestamp。工作状态显示建网 slab 已用/额度、ready 队列、本轮遇缺源/容量、发布、复用和取消数；Rust 通知 raw→unique 不包含已在 Java 合并的原始宿主回调数量。图隐藏时只记录，不生成或传输 PFT2 快照；保峰直接比较整帧 u64 纳秒，不构造未消费的 float 图表。读取诊断不增加 GPU 回读/等待。入口见 [diagnostics](native/src/diagnostics.rs) 和 [FrameChart](java/src/main/java/dev/primept/FrameChart.java)。
 
 CPU 同源基准无需游戏/GPU：
 
@@ -93,7 +95,7 @@ $env:PRIME_WORLD_BENCH_OUTPUT = Join-Path (Resolve-Path ../..).Path "temp/prime-
 cargo bench -p prime_world --features test-fixtures --bench source_pipeline
 ```
 
-[source_pipeline](crates/world/benches/source_pipeline.rs) 保存实际 PRM1/PRT3、PTR1/PBW1 输入及 hash、原始 `samples.jsonl` 和边界说明。输入覆盖空源、密集/稀疏模型、流体、tint、27 邻域与 1/8 worker 的生产 world 调度；资源字典和私有池建立在计时外，world 段包含规划、fixture 源包写入、decode、slab fork/join、合并与 CPU 提交。world 的固定 ARGB fixture 回填不含真实宿主 tint 回调成本。独立 `vanilla_tint` 段测真正 plan/finish 的冷/热缓存、radius 0/7、失效和自定义回退响应分配；两类测量不能相加冒充完整帧耗时。Java 捕获、GPU 与全局资源准备另计。
+[source_pipeline](crates/world/benches/source_pipeline.rs) 保存实际 PRM1/PRT3、PTR1/PBW1 输入及 hash、原始 `samples.jsonl` 和边界说明。输入覆盖空源、密集/稀疏模型、流体、tint、27 邻域与 1/8 worker 的生产 world 调度；资源字典和私有池建立在计时外，私有池广播等待全部 worker 就绪并跨样本复用，clear/资源绑定不计入样本；world 段包含规划、fixture 源包写入、decode、slab fork/join、候选发布与 CPU 提交。新增视距 4/32 的初载、稀疏编辑和 256 轮稳态消费者，输出完整属性/位置摘要在计时外生成。world 的固定 ARGB fixture 回填不含真实宿主 tint 回调成本。独立 `vanilla_tint` 段测真正 plan/finish 的冷/热缓存、radius 0/7、失效和自定义回退响应分配；两类测量不能相加冒充完整帧耗时。Java 捕获、GPU 与全局资源准备另计。
 
 完整 world 用例每轮新建私有池；构造调用虽在计时外，worker 就绪和前一池退出未显式等待，仍可能与首波计时重叠。该用例包含冷启动影响，尤其多线程空源结果不能代替实机常驻线程池的暖测。原始漂移与输入身份须一起保留。
 

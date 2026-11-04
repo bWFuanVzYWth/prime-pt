@@ -8,10 +8,14 @@
 
 use crate::scene::{Camera, Environment, Mesh};
 use prime_scene::MaterialDefinition;
+#[path = "attribute_update.rs"]
+mod attribute_update;
 #[path = "lighting.rs"]
 mod lighting;
 #[path = "materials.rs"]
 mod materials;
+#[path = "region_match.rs"]
+mod region_match;
 use crate::{reconstruction::CameraFrame, streamline};
 #[path = "exposure.rs"]
 mod exposure;
@@ -116,7 +120,7 @@ struct MaterialGpu {
     emission_alias: Buffer,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct LightingGpu {
     alias: Buffer,
     meta: Buffer,
@@ -128,15 +132,15 @@ struct LightingGpu {
 impl LightingGpu {
     fn upload(context: &mut Context, tables: Option<&lighting::Tables>) -> Result<Self, Error> {
         let upload = |context: &mut Context, data: &[u8]| -> Result<_, Error> {
-            Ok(Buffer::upload(
-                context,
-                if data.is_empty() { &[0; 16] } else { data },
-            )?)
+            let data = if data.is_empty() { &[0; 16] } else { data };
+            let buffer = Buffer::mapped_device_local(context, data.len() as u64)?;
+            buffer.write(context, 0, data)?;
+            Ok(buffer)
         };
         Ok(Self {
             alias: upload(
                 context,
-                tables.map_or(&[0u8; 16], |t| bytemuck::bytes_of(&t.selection)),
+                tables.map_or(&[0u8; 16], |t| bytemuck::cast_slice(&t.selection)),
             )?,
             meta: upload(
                 context,
@@ -1284,45 +1288,41 @@ impl Gpu {
             self.scene_update = Some(metrics);
             return Ok(());
         }
+        let matches = region_match::regions(
+            source.regions,
+            self.region_cache.entries(),
+            &self.attribute_revisions,
+        )?;
         let mut update = self.region_cache.begin(source.regions.len())?;
         let (slots, entries, _) = update.parts_mut();
         let started = std::time::Instant::now();
-        let dirty_triangles = source.regions.iter().try_fold(0usize, |count, region| {
-            if scene_cache::find_revision(
-                self.region_cache.entries(),
-                region.key,
-                region.geometry_revision,
-                |e| e.key,
-                |e| e.revision,
-            )
-            .is_some()
-            {
-                Ok(count)
-            } else {
-                count
-                    .checked_add(
-                        region
-                            .mesh
-                            .len()
-                            .checked_mul(2)
-                            .ok_or(Error::Invalid("dirty三角数量溢出"))?,
-                    )
-                    .ok_or(Error::Invalid("dirty三角数量溢出"))
-            }
-        })?;
+        let dirty_triangles =
+            source
+                .regions
+                .iter()
+                .zip(&matches)
+                .try_fold(0usize, |count, (region, matched)| {
+                    if matched.reuse.is_some() {
+                        Ok(count)
+                    } else {
+                        count
+                            .checked_add(
+                                region
+                                    .mesh
+                                    .len()
+                                    .checked_mul(2)
+                                    .ok_or(Error::Invalid("dirty三角数量溢出"))?,
+                            )
+                            .ok_or(Error::Invalid("dirty三角数量溢出"))
+                    }
+                })?;
         let mut triangles = Vec::new();
         triangles
             .try_reserve_exact(dirty_triangles)
             .map_err(scene_cache::Error::from)?;
         let mut pending = Vec::with_capacity(source.regions.len());
-        for region in source.regions {
-            if let Some(index) = scene_cache::find_revision(
-                self.region_cache.entries(),
-                region.key,
-                region.geometry_revision,
-                |e| e.key,
-                |e| e.revision,
-            ) {
+        for (region, matched) in source.regions.iter().zip(&matches) {
+            if let Some(index) = matched.reuse {
                 entries.push(scene_cache::Prepared::Reused(index));
                 continue;
             }
@@ -1390,17 +1390,23 @@ impl Gpu {
             .regions
             .iter()
             .zip(entries.iter())
-            .filter(|(r, e)| {
-                grow || matches!(e, scene_cache::Prepared::Built(_))
-                    || self
-                        .attribute_revisions
-                        .binary_search_by_key(&r.key, |v| v.0)
-                        .ok()
-                        .is_none_or(|i| self.attribute_revisions[i].1 != r.content_revision)
+            .zip(&matches)
+            .filter(|((_, e), matched)| {
+                grow || matches!(e, scene_cache::Prepared::Built(_)) || matched.attributes_dirty
             })
-            .try_fold(0usize, |n, (r, _)| {
-                n.checked_add(r.mesh.len())
-                    .ok_or(Error::Invalid("属性数量溢出"))
+            .try_fold(0usize, |n, ((r, e), _)| {
+                let partial = !grow
+                    && !matches!(e, scene_cache::Prepared::Built(_))
+                    && r.mesh.attribute_only();
+                let count = if partial {
+                    r.mesh
+                        .attribute_ranges()
+                        .map(|range| range.quads.len())
+                        .sum()
+                } else {
+                    r.mesh.len()
+                };
+                n.checked_add(count).ok_or(Error::Invalid("属性数量溢出"))
             })?;
         attributes
             .try_reserve_exact(dirty_count)
@@ -1408,27 +1414,35 @@ impl Gpu {
         let mut ranges = Vec::with_capacity(source.regions.len());
         let mut instances = Vec::with_capacity(source.regions.len());
         let mut versions = Vec::with_capacity(source.regions.len());
-        for (region, entry) in source.regions.iter().zip(entries.iter()) {
+        for ((region, entry), matched) in source.regions.iter().zip(entries.iter()).zip(&matches) {
             let built = matches!(entry, scene_cache::Prepared::Built(_));
             let entry = entry.get(self.region_cache.entries());
-            let dirty = grow
-                || built
-                || self
-                    .attribute_revisions
-                    .binary_search_by_key(&region.key, |v| v.0)
-                    .ok()
-                    .is_none_or(|i| self.attribute_revisions[i].1 != region.content_revision);
+            let dirty = grow || built || matched.attributes_dirty;
             if dirty {
-                let start = attributes.len();
-                for quad in region.mesh.quads() {
-                    if !quad.valid()
-                        || quad.material_id().index() as usize >= self.light_sides.len()
-                    {
-                        return Err(Error::Invalid("quad记录或材质索引不属于当前资源世代"));
+                if !grow && !built && region.mesh.attribute_only() {
+                    for patch in region.mesh.attribute_ranges() {
+                        let start = attributes.len();
+                        attributes.extend(patch.attributes());
+                        ranges.push((
+                            (entry.range.start as usize + patch.first) * 48,
+                            start..attributes.len(),
+                        ));
                     }
-                    attributes.push(quad.attributes());
+                } else {
+                    let start = attributes.len();
+                    // 新几何已在AS输入边界校验；复用几何的普通属性候选仍需检查。
+                    if !built {
+                        for quad in region.mesh.quads() {
+                            if !quad.valid()
+                                || quad.material_id().index() as usize >= self.light_sides.len()
+                            {
+                                return Err(Error::Invalid("quad记录或材质身份不属于当前资源世代"));
+                            }
+                        }
+                    }
+                    attributes.extend(region.mesh.attributes());
+                    ranges.push((entry.range.start as usize * 48, start..attributes.len()));
                 }
-                ranges.push((entry.range.start as usize * 48, start..attributes.len()));
             }
             versions.push((region.key, region.content_revision));
             if !same_geometry || source.anchor != self.anchor {
@@ -1477,20 +1491,12 @@ impl Gpu {
         metrics.light_pack_ns = elapsed_ns(light_started);
         metrics.geometry_ns += metrics.light_pack_ns;
         let light_started = std::time::Instant::now();
-        let uploaded = lights
-            .tables
-            .as_ref()
-            .is_some_and(|tables| tables.selection[0] != 0);
         let lighting_gpu = if let Some(tables) = &lights.tables {
-            if uploaded {
-                LightingGpu::upload(&mut self.context, Some(tables))?
-            } else {
-                self.program_lighting
-            }
+            LightingGpu::upload(&mut self.context, Some(tables))?
         } else {
             self.lighting_gpu
         };
-        if uploaded {
+        if lights.tables.is_some() {
             metrics.light_upload_ns = elapsed_ns(light_started);
             metrics.light_upload_bytes = lighting_gpu.alias.len()
                 + lighting_gpu.meta.len()
@@ -1514,21 +1520,68 @@ impl Gpu {
             self.scene.quads
         };
         let allocation_ns = if grow { elapsed_ns(uploading) } else { 0 };
-        let collecting = std::time::Instant::now();
-        let mut candidates = lighting_gpu.roots().to_vec();
-        candidates.extend([vulkan::native::Resource::from(top), quads.into()]);
-        self.collect_with(&candidates)?;
-        metrics.collect_ns = elapsed_ns(collecting);
+        let bindings_changed =
+            top != self.scene.top || quads != self.scene.quads || lighting_gpu != self.lighting_gpu;
+        if bindings_changed {
+            let collecting = std::time::Instant::now();
+            let mut candidates = lighting_gpu.roots().to_vec();
+            candidates.extend([vulkan::native::Resource::from(top), quads.into()]);
+            self.collect_with(&candidates)?;
+            metrics.collect_ns = elapsed_ns(collecting);
+        }
         metrics.resources_ns += metrics.collect_ns;
         // 目录独占校验之后只有一次原子映射写入；成功复制后发布阶段不再失败。
         let publication = self
             .region_cache
             .prepare(update, |entry| entry.range.clone())?;
-        let light_publication = self.lighting.publication(lights.update)?;
-        if !writes.is_empty() {
+        let light_publication = self.lighting.publication(lights)?;
+        let patches = light_publication.patches();
+        fn rows(values: &[(usize, [u32; 4])]) -> Vec<(usize, &[u8])> {
+            values
+                .iter()
+                .map(|(row, value)| (row * 16, bytemuck::bytes_of(value)))
+                .collect()
+        }
+        let alias_writes = rows(&patches.alias);
+        let meta_writes = rows(&patches.meta);
+        let inverse_writes = rows(&patches.inverse);
+        let region_writes = rows(&patches.regions);
+        let vertex_writes: Vec<_> = patches
+            .vertices
+            .iter()
+            .map(|(row, value)| (row * 16, bytemuck::bytes_of(value)))
+            .collect();
+        let light_patch_bytes = (alias_writes.len()
+            + meta_writes.len()
+            + inverse_writes.len()
+            + region_writes.len()
+            + vertex_writes.len()) as u64
+            * 16;
+
+        if !writes.is_empty() || light_patch_bytes != 0 {
             let writing = std::time::Instant::now();
-            quads.write_ranges(&mut self.context, &writes)?;
-            metrics.attribute_upload_ns = elapsed_ns(writing);
+            Buffer::write_scattered_batches(
+                &mut self.context,
+                &[
+                    (&quads, &writes),
+                    (&lighting_gpu.alias, &alias_writes),
+                    (&lighting_gpu.meta, &meta_writes),
+                    (&lighting_gpu.vertices, &vertex_writes),
+                    (&lighting_gpu.inverse, &inverse_writes),
+                    (&lighting_gpu.regions, &region_writes),
+                ],
+            )?;
+            // 共同映射/复制的墙钟只归因一次，不能按buffer把同一等待重复累加。
+            let wall = elapsed_ns(writing);
+            if writes.is_empty() {
+                metrics.light_upload_ns += wall;
+            } else {
+                metrics.attribute_upload_ns = wall;
+            }
+            metrics.light_upload_bytes += light_patch_bytes;
+            if writes.is_empty() {
+                metrics.resources_ns += wall;
+            }
         }
         metrics.attribute_upload_ns += allocation_ns;
         metrics.attribute_upload_bytes = (attributes.len() * 48) as u64;
@@ -1542,7 +1595,9 @@ impl Gpu {
         self.scene = Scene { top, quads };
         self.anchor = source.anchor;
         self.attribute_revisions = versions;
-        self.renderer = None;
+        if bindings_changed {
+            self.renderer = None;
+        }
         if let Some(view) = &mut self.view {
             view.progress.reset();
         }

@@ -5,6 +5,7 @@
 //! 未知自定义函数只通过独立宿主请求回填，不在纯编译内核中调用宿主。
 use std::{
     collections::{HashMap, HashSet},
+    num::NonZeroU32,
     sync::atomic::{AtomicU64, Ordering},
 };
 static OWNER_IDS: AtomicU64 = AtomicU64::new(1);
@@ -21,7 +22,14 @@ pub struct TintResources {
     owner: u64,
     generation: u64,
     definitions: biome_source::Definitions,
-    recipes: HashMap<(u32, i32), Option<biome::Recipe>>,
+    recipes: HashMap<(u32, i32), NonZeroU32>,
+    sources: Vec<TintSource>,
+    custom: bool,
+}
+struct TintSource {
+    state: u32,
+    slot: i32,
+    recipe: Option<biome::Recipe>,
 }
 impl TintResources {
     /// 校验并拥有完整PTR1，失败不修改已发布资源。
@@ -43,6 +51,8 @@ impl TintResources {
         let count = r.count(16)?;
         let mut recipes = HashMap::new();
         recipes.try_reserve(count)?;
+        let mut sources = Vec::new();
+        sources.try_reserve_exact(count)?;
         for _ in 0..count {
             let state = r.u32()?;
             let slot = r.i32()?;
@@ -56,28 +66,85 @@ impl TintResources {
             } else {
                 Some(biome::Recipe::read(kind, value)?)
             };
-            if recipes.insert((state, slot), recipe).is_some() {
+            let id = NonZeroU32::new(
+                u32::try_from(sources.len() + 1).map_err(|_| Error::Input("tint source ID溢出"))?,
+            )
+            .expect("从1发行source ID");
+            if recipes.insert((state, slot), id).is_some() {
                 return Err(Error::Input("tint recipe身份重复"));
             }
+            sources.push(TintSource {
+                state,
+                slot,
+                recipe,
+            });
         }
         r.finish()?;
+        let custom = sources.iter().any(|source| source.recipe.is_none());
         Ok(Self {
             owner: owner_id()?,
             generation,
             definitions,
             recipes,
+            sources,
+            custom,
         })
     }
     #[cfg(test)]
     pub(crate) fn fixture_color(&self, state: u32, slot: i32) -> Option<u32> {
-        match self.recipes.get(&(state, slot)) {
-            Some(Some(biome::Recipe::Color(c))) => Some(*c),
+        match self
+            .recipes
+            .get(&(state, slot))
+            .map(|id| self.sources[id.get() as usize - 1].recipe)
+        {
+            Some(Some(biome::Recipe::Color(c))) => Some(c),
             _ => None,
         }
     }
     /// 资源身份，必须与方块、材质与世界tint源的世代一致。
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+    /// 此资源世代是否包含任意宿主回退；其世界依赖未声明时不能套用原版局部规则。
+    pub const fn has_custom_sources(&self) -> bool {
+        self.custom
+    }
+    /// 解释本资源表内非零source ID的宿主回退属性；无效ID返回错误。
+    /// ID须来自同一资源世代，跨世代检查由Catalog/World发布边界维持。
+    pub fn is_custom_source(&self, source: u32) -> Result<bool, Error> {
+        let index = source
+            .checked_sub(1)
+            .ok_or(Error::Input("tint source ID为零"))? as usize;
+        Ok(self
+            .sources
+            .get(index)
+            .ok_or(Error::Input("tint source ID越界"))?
+            .recipe
+            .is_none())
+    }
+    pub(crate) fn source_id(&self, state: u32, slot: i32) -> Result<NonZeroU32, Error> {
+        self.recipes
+            .get(&(state, slot))
+            .copied()
+            .ok_or(Error::Input("tint引用未准备的source身份"))
+    }
+    pub(crate) fn source_request(
+        &self,
+        source: u32,
+        position: [i32; 3],
+    ) -> Result<TintRequest, Error> {
+        let index = source
+            .checked_sub(1)
+            .ok_or(Error::Input("tint source ID为零"))? as usize;
+        let source = self
+            .sources
+            .get(index)
+            .ok_or(Error::Input("tint source ID越界"))?;
+        Ok(TintRequest {
+            position,
+            state: source.state,
+            slot: source.slot,
+        })
     }
 }
 
@@ -215,10 +282,8 @@ impl TintWorld {
             {
                 return Err(Error::Input("tint位置超出世界范围"));
             }
-            let recipe = resources
-                .recipes
-                .get(&(request.state, request.slot))
-                .ok_or(Error::Input("tint引用未准备的source身份"))?;
+            let id = resources.source_id(request.state, request.slot)?;
+            let recipe = &resources.sources[id.get() as usize - 1].recipe;
             if let Some(recipe) = recipe {
                 output.push((false, native.len()));
                 native.push(*request);
@@ -316,6 +381,12 @@ impl TintWorld {
     pub fn invalidate(&mut self, all: bool, columns: &HashSet<(i32, i32)>) {
         self.blend.invalidate(all, columns);
         self.source.invalidate(all, columns);
+        self.serial = self.serial.saturating_add(1);
+    }
+    /// 仅最终颜色失效；底层biome/资源未变时保留原始quart、source颜色和seed-only zoom。
+    /// 自定义函数没有可共享颜色缓存，调用者须同时刷新其实际绑定；旧续接计划失效。
+    pub fn invalidate_colors(&mut self) {
+        self.blend.invalidate_colors();
         self.serial = self.serial.saturating_add(1);
     }
     /// 消费section退出时回收其可能引用的页；邻近存活消费者可按需重算共享halo。

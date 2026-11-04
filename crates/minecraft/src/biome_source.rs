@@ -236,8 +236,8 @@ impl Cache {
     }
 }
 
-/// Each quart cube has the same eight jittered corners for all 64 block positions.
-/// Seed-only winners survive biome/colormap changes; consumer retirement bounds their storage.
+/// 每个 quart 立方体的 64 个方块位置共用八个扰动角；胜者仅依赖 seed，
+/// 群系或颜色表变化时可保留，消费者退休负责限制驻留。
 #[derive(Default)]
 struct ZoomCache {
     seed: Option<u64>,
@@ -267,7 +267,7 @@ impl ZoomCube {
                 + salt
         };
         let fiddle = |state: Corners| {
-            // The masked value is at most 1023; narrow before conversion to avoid emulated u64鈫抐64.
+            // 掩码结果最多 1023，先缩为 u32，避免 u64 转 f64 的模拟指令。
             let value = ((state >> 24) & Corners::splat(1023))
                 .cast::<u32>()
                 .cast::<f64>();
@@ -307,7 +307,7 @@ impl ZoomCube {
         let x = distance(0, [0., 0., 0., 0., 1., 1., 1., 1.]);
         let y = distance(1, [0., 0., 1., 1., 0., 0., 1., 1.]);
         let z = distance(2, [0., 1., 0., 1., 0., 1., 0., 1.]);
-        // Preserve vanilla's (z虏 + y虏) + x虏 order, without FMA. Lowest lane wins ties.
+        // 保持原版 (z²+y²)+x² 的次序，不融合乘加；相等时最低通道获胜。
         let distance = z * z + y * y + x * x;
         let mut best = f64::INFINITY;
         let mut winner = 0;

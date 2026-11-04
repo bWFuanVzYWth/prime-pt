@@ -48,10 +48,12 @@ final class SourceBiomes {
     private final IdentityHashMap<Biome,Integer> palette=new IdentityHashMap<>();
     private final Packet resources=new Packet(),worldSource=new Packet(),response=new Packet();
     private ClientLevel world;
+    private boolean accepted;
 
     SourceBiomes(long generation){if(generation==0)throw new IllegalArgumentException("tint资源世代为零");this.generation=generation;}
     /** 完整资源遍历时注册实际模型slot或流体-1；不执行最终颜色函数。 */
     void register(BlockState state,int slot,BlockTintSource source){
+        if(accepted)throw new IllegalStateException("已发布tint资源不能追加recipe");
         if(slot< -1)throw new IllegalArgumentException("tint slot小于-1");
         int kind=source==null?8:KINDS.getOrDefault(source.getClass(),9);
         int value=switch(kind){
@@ -67,6 +69,7 @@ final class SourceBiomes {
     }
     /** PTR1由Catalog候选一并校验和发布；运行期不追加recipe。 */
     ByteBuffer packet(){
+        if(accepted)throw new IllegalStateException("已发布tint资源不能重新捕获");
         resources.clear();resources.putInt(0x31525450);resources.putInt(263);resources.putLong(generation);
         writeDefinitions(resources);
         resources.putInt(recipes.size());
@@ -76,6 +79,8 @@ final class SourceBiomes {
         }
         return resources.finish();
     }
+    /** Rust已接收完整资源后释放临时recipe和字典包；世界应答只保留biome身份。 */
+    void accepted(){accepted=true;recipes.clear();resources.discard();}
     /** 世界进入/资源重载时一次捕获完整registry palette与seed；不求最终tint。 */
     ByteBuffer world(ClientLevel level){
         var biomes=new ArrayList<Biome>();var next=new IdentityHashMap<Biome,Integer>();

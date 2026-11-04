@@ -66,6 +66,87 @@ fn scene() -> Mesh {
 }
 
 #[test]
+#[ignore = "真实Vulkan RT；纯tint只写变化quad且整批拒绝不部分写入"]
+fn hardware_pt_sparse_tint_publication_keeps_geometry_and_writes_only_the_patch()
+-> Result<(), Box<dyn std::error::Error>> {
+    use prime_scene::{FragmentMask, MeshParts, PreparedParts, RenderChange, TintPatch};
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    upload(
+        &mut gpu,
+        &[MaterialDefinition::default(); 2],
+        &[],
+        &[[u32::MAX, 0, 0, 0]; 2],
+    )?;
+    let mut parts = MeshParts::default();
+    parts.insert(0, scene())?;
+    parts.insert(
+        255,
+        Mesh {
+            quads: vec![scene().quads[0]; 200],
+        },
+    )?;
+    gpu.set_regions(RenderView {
+        generation: gpu.resource_generation,
+        anchor: [0.; 3],
+        regions: &[RenderRegion {
+            key: [0; 3],
+            geometry_revision: 1,
+            content_revision: 1,
+            mesh: parts.view(),
+        }],
+    })?;
+    let top = gpu.scene.top;
+    let storage = gpu.scene.quads;
+    let base = gpu.region_cache.entries()[0].range.start as u64 * 48;
+    let mut before = vec![0; parts.len() * 48];
+    storage.read(&mut gpu.context, base, &mut before)?;
+    let candidate = PreparedParts::prepare(&parts, MeshParts::default(), FragmentMask::empty())?
+        .with_tints(&parts, vec![TintPatch::new(255, 100, 1, 0xff12_3456)?])?;
+    let region = RenderRegion {
+        key: [0; 3],
+        geometry_revision: 1,
+        content_revision: 2,
+        mesh: candidate.view(&parts),
+    };
+    let unsupported = [
+        RenderChange::Upsert(region),
+        RenderChange::Upsert(RenderRegion {
+            key: [1, 0, 0],
+            ..region
+        }),
+    ];
+    assert!(!gpu.try_attribute_changes(gpu.resource_generation, [0.; 3], &unsupported)?);
+    let mut after = vec![0; before.len()];
+    storage.read(&mut gpu.context, base, &mut after)?;
+    assert_eq!(after, before, "不支持的混合批不能提前写入前缀");
+    assert!(gpu.try_attribute_changes(
+        gpu.resource_generation,
+        [0.; 3],
+        &[RenderChange::Upsert(region)]
+    )?);
+    let timing = gpu.scene_timing().unwrap();
+    assert_eq!(timing.attribute_upload_bytes, 48);
+    assert_eq!(timing.light_upload_bytes, 0);
+    assert_eq!(timing.acceleration_ns, 0);
+    assert_eq!(timing.collect_ns, 0);
+    assert_eq!(gpu.scene.top, top);
+    assert_eq!(gpu.scene.quads, storage);
+    storage.read(&mut gpu.context, base, &mut after)?;
+    let offset = (2 + 100) * 48;
+    assert_eq!(&after[..offset], &before[..offset]);
+    assert_eq!(&after[offset + 48..], &before[offset + 48..]);
+    let words: &[[[u32; 4]; 3]] = bytemuck::cast_slice(&after[offset..offset + 48]);
+    assert_eq!(
+        words[0][2][..3],
+        [0x12, 0x34, 0x56].map(|v| (v as f32 / 255.).to_bits())
+    );
+    let _retired = candidate.finish(&mut parts);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan RT；按变化范围写入，anchor与空发布不重写属性"]
 fn hardware_pt_incremental_attributes_keep_storage_and_tlas()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -272,55 +353,112 @@ fn hardware_pt_static_emission_alias_and_dynamic_area_match_reverse_pdf()
             light_areas: &[[u32::MAX, 0, 0, 0]; 2],
         })?;
         publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
-        host.render_environment(
+        assert_light_pdfs(
+            &host,
             &mut gpu,
             &image,
-            &camera(),
-            Environment {
-                sun_direction: [0.; 3],
-                ..Default::default()
-            },
+            if static_alias { "static" } else { "dynamic" },
         )?;
-        let view = gpu.view.as_ref().unwrap();
-        let (mut bindings, _) = gpu.renderer_bindings(
-            view,
-            &gpu.atlas,
-            &gpu.scene,
-            gpu.material_gpu,
-            gpu.lighting_gpu,
-        );
-        let output = Buffer::new(&mut gpu.context, 32 * 16, true)?;
-        bindings.push(Binding::StorageBuffer(output));
-        let bindings = Bindings::new(&mut gpu.context, &bindings)?;
-        let pipeline = ComputePipeline::new(
-            &mut gpu.context,
-            bindings,
-            shader(
-                include_bytes!(concat!(env!("OUT_DIR"), "/light_probe.spv")),
-                c"light_probe_main",
-            ),
-        )?;
-        let mut commands = Commands::new(&gpu.context)?;
-        commands.dispatch(pipeline, [1, 1, 1])?;
-        commands
-            .finish(&mut gpu.context)?
-            .submit_and_wait(&mut gpu.context)?;
-        let mut bytes = vec![0; 32 * 16];
-        output.read(&mut gpu.context, 0, &mut bytes)?;
-        for record in bytes.as_chunks::<16>().0 {
-            let value: [f32; 4] = std::array::from_fn(|i| {
-                f32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap())
-            });
-            assert!(
-                value.iter().all(|v| v.is_finite()) && value[3] == 1.,
-                "alias={static_alias}, probe={value:?}"
-            );
-            assert!(
-                (value[0] - value[1]).abs() / (1. + value[0].max(value[1])) < 1e-5,
-                "alias={static_alias}, forward/reverse={value:?}"
-            );
-        }
     }
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+fn assert_light_pdfs(
+    host: &Host,
+    gpu: &mut Gpu,
+    image: &Image,
+    label: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    host.render_environment(
+        gpu,
+        image,
+        &camera(),
+        Environment {
+            sun_direction: [0.; 3],
+            ..Default::default()
+        },
+    )?;
+    let view = gpu.view.as_ref().unwrap();
+    let (mut bindings, _) = gpu.renderer_bindings(
+        view,
+        &gpu.atlas,
+        &gpu.scene,
+        gpu.material_gpu,
+        gpu.lighting_gpu,
+    );
+    let output = Buffer::new(&mut gpu.context, 32 * 16, true)?;
+    bindings.push(Binding::StorageBuffer(output));
+    let bindings = Bindings::new(&mut gpu.context, &bindings)?;
+    let pipeline = ComputePipeline::new(
+        &mut gpu.context,
+        bindings,
+        shader(
+            include_bytes!(concat!(env!("OUT_DIR"), "/light_probe.spv")),
+            c"light_probe_main",
+        ),
+    )?;
+    let mut commands = Commands::new(&gpu.context)?;
+    commands.dispatch(pipeline, [1, 1, 1])?;
+    commands
+        .finish(&mut gpu.context)?
+        .submit_and_wait(&mut gpu.context)?;
+    let mut bytes = vec![0; 32 * 16];
+    output.read(&mut gpu.context, 0, &mut bytes)?;
+    for record in bytes.as_chunks::<16>().0 {
+        let value: [f32; 4] = std::array::from_fn(|i| {
+            f32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap())
+        });
+        assert!(
+            value.iter().all(|v| v.is_finite()) && value[3] == 1.,
+            "mode={label}, probe={value:?}"
+        );
+        assert!(
+            (value[0] - value[1]).abs() / (1. + value[0].max(value[1])) < 1e-5,
+            "mode={label}, forward/reverse={value:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT；稳定灯数据槽与紧凑选择rank分离后正逆PDF保持一致"]
+fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    let dark = MaterialDefinition::default();
+    let lamp = MaterialDefinition {
+        emission: [1., 1., 1., 20.],
+        ..dark
+    };
+    upload(&mut gpu, &[dark, lamp], &[], &[[u32::MAX, 0, 0, 0]; 2])?;
+    let quad = scene().quads[1];
+    let mut mesh = Mesh {
+        quads: vec![quad; 6],
+    };
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    let lighting = gpu.lighting_gpu;
+    mesh.quads[1] =
+        Quad::with_material(quad.positions(), quad.uv(), quad.tint(), MaterialId::new(0));
+    publish(&mut gpu, &mesh, 1, 2, [0.; 3])?;
+    assert_eq!(gpu.lighting_gpu.roots(), lighting.roots());
+    mesh.quads.push(quad);
+    publish(&mut gpu, &mesh, 2, 3, [0.; 3])?;
+    assert_eq!(gpu.lighting_gpu.roots(), lighting.roots());
+    let mut bytes = vec![0; lighting.alias.len() as usize];
+    lighting.alias.read(&mut gpu.context, 0, &mut bytes)?;
+    let selectors: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|v| u32::from_le_bytes(*v))
+        .collect();
+    assert_eq!(selectors[0], 6);
+    assert_eq!(selectors[5], 5, "末灯移到rank1且保留data slot5");
+    assert_eq!(selectors[9], 1, "新灯重用data slot1但位于rank5");
+    assert_light_pdfs(&host, &mut gpu, &image, "swap_and_reuse")?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

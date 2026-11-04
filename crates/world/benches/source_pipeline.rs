@@ -117,12 +117,21 @@ fn drive(
     pattern: Pattern,
     whole_region: bool,
 ) -> Result<Value> {
+    drive_window(scene, catalog, pattern, whole_region, 0)
+}
+fn drive_window(
+    scene: &mut Scene,
+    catalog: &Catalog,
+    pattern: Pattern,
+    whole_region: bool,
+    view_distance: u32,
+) -> Result<Value> {
     let mut requests = 0;
     let mut queries = 0;
     let mut steps = 0;
     for _ in 0..20_000 {
         steps += 1;
-        let batch = scene.plan(&camera(), 0, 0, 4, 64)?.to_vec();
+        let batch = scene.plan(&camera(), view_distance, 0, 4, 64)?.to_vec();
         requests += batch.len();
         if !batch.is_empty() {
             let records: Vec<_> = batch
@@ -169,6 +178,44 @@ fn drive(
         }
     }
     Err("world benchmark未收敛".into())
+}
+fn world_output(scene: &Scene) -> Value {
+    let mut hash = blake3::Hasher::new();
+    let mut quads = 0;
+    let mut regions = 0;
+    for region in scene.render_regions() {
+        regions += 1;
+        for coordinate in region.key {
+            hash.update(&coordinate.to_le_bytes());
+        }
+        for quad in region.mesh.quads() {
+            for row in quad.attributes() {
+                for word in row {
+                    hash.update(&word.to_le_bytes());
+                }
+            }
+            for position in quad.positions() {
+                for component in position {
+                    hash.update(&component.to_bits().to_le_bytes());
+                }
+            }
+            quads += 1;
+        }
+    }
+    {
+        let payload = scene.payload_stats();
+        let work = scene.work_stats();
+        json!({"regions":regions,"quads":quads,"blake3":hash.finalize().to_hex().as_str(),
+            "payload":{"owned_quads":payload.owned_quads,"projected_quads":payload.projected_quads,
+                "source_bytes":payload.source_bytes,"source_pages":payload.source_pages,"source_sections":payload.source_sections,
+                "dependency_edges":payload.dependency_edges,"state_capacity":payload.state_capacity,
+                "occupied_nodes":payload.occupied_nodes,"state_reserved_bytes":payload.state_reserved_bytes,
+                "inflight_jobs":payload.inflight_jobs,"pending_captures":payload.pending_captures},
+            "work":{"total_mesh_slabs":work.total.mesh_slabs,"total_publications":work.total.publications,
+                "reused_slabs":work.total.reused_slabs,"cancelled_slabs":work.total.cancelled_slabs,
+                "budget_scans":work.total.budget_scans,"budget_slot_visits":work.total.budget_slot_visits,
+                "queued_slabs":work.queued_slabs}})
+    }
 }
 fn tint_result(
     world: &mut prime_minecraft::tint::TintWorld,
@@ -336,9 +383,11 @@ fn main() -> Result {
         }
     }
     for workers in [1, 8] {
-        // 私有池和Catalog创建在计时外；每次调用真实plan/PRT3 producer/compile/tint/commit。
+        // 私有池跨样本持久复用并显式广播等待就绪；每轮clear与资源绑定在计时外。
+        let mut scene = Scene::with_threads(workers)?;
+        scene.prepare_workers();
         for sample in 0..WARMUP + SAMPLES {
-            let mut scene = Scene::with_threads(workers)?;
+            scene.clear();
             scene.source_generation(catalog.generation())?;
             let started = Instant::now();
             let result = drive(&mut scene, &catalog, Pattern::Tinted, false)?;
@@ -366,8 +415,10 @@ fn main() -> Result {
         }
     }
     for workers in [1, 8] {
+        let mut scene = Scene::with_threads(workers)?;
+        scene.prepare_workers();
         for sample in 0..WARMUP + SAMPLES {
-            let mut scene = Scene::with_threads(workers)?;
+            scene.clear();
             scene.source_generation(catalog.generation())?;
             let started = Instant::now();
             let result = drive(&mut scene, &catalog, Pattern::Dense, true)?;
@@ -380,8 +431,10 @@ fn main() -> Result {
     vanilla_tint_cases(&mut raw, &output)?;
     // 新增case追加在所有已有case之后，不把它冒充before已有覆盖。
     for workers in [1, 8] {
+        let mut scene = Scene::with_threads(workers)?;
+        scene.prepare_workers();
         for sample in 0..WARMUP + SAMPLES {
-            let mut scene = Scene::with_threads(workers)?;
+            scene.clear();
             scene.source_generation(catalog.generation())?;
             let started = Instant::now();
             let result = drive(&mut scene, &catalog, Pattern::Air, true)?;
@@ -391,11 +444,78 @@ fn main() -> Result {
             )?;
         }
     }
-    let metadata = json!({"version":2,"profile":"release","warmup":WARMUP,"samples":SAMPLES,"workers":[1,8],"resources_blake3":hash(&resources),"inputs":inputs,
+    // 大窗口初次收敛及稀疏编辑共用生产入口；输出摘要在计时结束后生成。
+    for distance in [4, 32] {
+        let mut scene = Scene::with_threads(8)?;
+        scene.prepare_workers();
+        scene.source_generation(catalog.generation())?;
+        let started = Instant::now();
+        let result = drive_window(&mut scene, &catalog, Pattern::Tinted, false, distance)?;
+        let elapsed = started.elapsed().as_nanos() as u64;
+        write_json(
+            &mut raw,
+            &json!({"case":format!("large_window/initial_view{distance}"),"workers":8,"sample":0,"warmup":false,"wall_ns":elapsed,"result":result,"output":world_output(&scene)}),
+        )?;
+        for sample in 0..WARMUP + SAMPLES {
+            scene.invalidate_section([0; 3])?;
+            let started = Instant::now();
+            let result = drive_window(
+                &mut scene,
+                &catalog,
+                if sample % 2 == 0 {
+                    Pattern::Sparse
+                } else {
+                    Pattern::Tinted
+                },
+                false,
+                distance,
+            )?;
+            let elapsed = started.elapsed().as_nanos() as u64;
+            write_json(
+                &mut raw,
+                &json!({"case":format!("large_window/sparse_view{distance}"),"workers":8,"sample":sample,"warmup":sample<WARMUP,"wall_ns":elapsed,"result":result,"output":world_output(&scene)}),
+            )?;
+        }
+        measure(
+            &mut raw,
+            &format!("large_window/steady_256_view{distance}"),
+            8,
+            || {
+                for _ in 0..256 {
+                    assert!(scene.plan(&camera(), distance, 0, 4, 64)?.is_empty());
+                    assert!(!scene.prepare()?);
+                }
+                Ok(json!({"turns":256,"pending":scene.pending()}))
+            },
+        )?;
+    }
+    // 候选专用策略对照；原版没有slab额度接口，不将此段冒充原版成对case。
+    for workers in [1, 8] {
+        for quota in [64, 128, 256] {
+            let mut scene = Scene::with_threads(workers)?;
+            scene.prepare_workers();
+            for sample in 0..WARMUP + SAMPLES {
+                scene.clear();
+                scene.source_generation(catalog.generation())?;
+                scene.set_work_budget(prime_world::WorkBudget {
+                    mesh_slabs: quota,
+                    ..Default::default()
+                });
+                let started = Instant::now();
+                let result = drive(&mut scene, &catalog, Pattern::Dense, true)?;
+                let elapsed = started.elapsed().as_nanos() as u64;
+                write_json(
+                    &mut raw,
+                    &json!({"case":format!("work_budget/initial_dense_k{quota}"),"workers":workers,"sample":sample,"warmup":sample<WARMUP,"wall_ns":elapsed,"result":result,"output":world_output(&scene)}),
+                )?;
+            }
+        }
+    }
+    let metadata = json!({"version":3,"profile":"release","warmup":WARMUP,"samples":SAMPLES,"workers":[1,8],"resources_blake3":hash(&resources),"inputs":inputs,
         "executable":std::env::current_exe()?.to_string_lossy(),"executable_blake3":hash(&fs::read(std::env::current_exe()?)?),
-        "boundaries":{"decode":"production PRT3 decode+owned source consumption/drop; wire preparation excluded","section":"production serial 4slab section compiler+mesh/tint consumption/drop; Catalog/halo setup excluded",
-        "tint_apply":"production apply_tints+output consumption/drop; producer template copy excluded","vanilla_tint":"real TintWorld plan+fixture raw biome/custom response allocation+finish+color consumption/drop; world/resource setup/drop outside timer; recompute includes invalidate","world":"owned pool setup excluded; includes plan+Rust fixture PRT3 writer+owned decode+4slab fork/join+section merge+unique tint callback response+CPU prepare/commit; no GPU"},
-        "omissions":["Minecraft/Java capture and real host tint callback cost","GPU upload/AS/render/present","no old equivalent source-pipeline baseline; first API baseline only"]});
+        "boundaries":{"decode":"production PRT3 decode+owned source consumption/drop; wire preparation excluded","section":"test-fixtures CompiledSection compatibility wrapper: serial slab kernels + per-quad tint expansion/section merge + consumption/drop; not the production sparse-fragment path; Catalog/halo setup excluded",
+        "tint_apply":"production apply_tints+output consumption/drop; producer template copy excluded","vanilla_tint":"real TintWorld plan+fixture raw biome/custom response allocation+finish+color consumption/drop; world/resource setup/drop outside timer; recompute includes invalidate","world":"persistent pool broadcast-primed outside timer and reused across samples; world clear/source generation excluded; includes plan+Rust fixture PRT3 writer+owned decode+explicit slab batch kernels+fragment ownership+unique tint callback response+CPU prepare/commit; no GPU"},
+        "omissions":["Minecraft/Java capture and real host tint callback cost","GPU upload/AS/render/present","stage frozen before-source uses identical warmed-pool harness; original cold-pool evidence remains separate"]});
     fs::write(
         output.join("input.json"),
         serde_json::to_vec_pretty(&metadata)?,

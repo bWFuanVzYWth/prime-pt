@@ -488,6 +488,16 @@ impl PreparedCatalog<'_> {
                             bound.push(BoundQuad {
                                 index,
                                 material: id,
+                                tint: if q.tint < 0 {
+                                    None
+                                } else {
+                                    Some(
+                                        self.next
+                                            .tints()
+                                            .ok_or(Error::Input("模型tint缺少准备资源"))?
+                                            .source_id(state_id, q.tint)?,
+                                    )
+                                },
                             });
                             face_mask |= 1 << q.face;
                         }
@@ -552,6 +562,16 @@ impl PreparedCatalog<'_> {
                     state.name.as_str(),
                     "minecraft:cobweb" | "minecraft:bamboo_sapling"
                 );
+            let fluid_tint = if state.fluid_kind != 0 && self.next.fluids[&state.fluid].tinted {
+                Some(
+                    self.next
+                        .tints()
+                        .ok_or(Error::Input("流体tint缺少准备资源"))?
+                        .source_id(state_id, -1)?,
+                )
+            } else {
+                None
+            };
             bindings.sort_unstable_by_key(|binding| binding.model);
             let state = self
                 .next
@@ -562,6 +582,7 @@ impl PreparedCatalog<'_> {
             state.face_mask = face_mask;
             state.matching_block = matching_block;
             state.blocks_motion = blocks_motion;
+            state.fluid_tint = fluid_tint;
         }
         self.next.definitions = definitions;
         Ok(MaterialResources {

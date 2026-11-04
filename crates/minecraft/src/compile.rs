@@ -1,10 +1,90 @@
 //! 同步、无隐藏调度的section/slab内核；邻域与资源只借用，输出独占。
 
+use crate::TintSpan;
 use crate::{
     Catalog, Error, SectionStorage,
     resources::{Model, State},
 };
 use prime_scene::{Mesh, Quad};
+
+/// 一个四层slab的显式输入；调度者共享邻域、独占每个输出，不在内核创建线程池。
+#[derive(Clone, Copy, Debug)]
+pub struct SlabCompile {
+    /// section内首Y，仅允许0/4/8/12。
+    pub first_y: usize,
+    /// section在64m region内的基准，每轴为0/16/32/48；输出直接使用最终region-local坐标。
+    pub origin: [f32; 3],
+    /// 本份输出额度；同时限制索引域为u32，超额在push之前返回OutputLimit。
+    pub max_quads: usize,
+}
+
+/// 一个slab的独占输出；World保留分片，不为组装region复制quad。
+#[derive(Default)]
+pub struct CompiledSlab {
+    /// 最终region-local真实quad。
+    pub mesh: Mesh,
+    /// 持久tint来源；同block/source连续quad共用span，应用颜色后仍保留。
+    pub bindings: Vec<TintSpan>,
+}
+impl CompiledSlab {
+    pub(crate) fn bind(&mut self, quad: usize, source: std::num::NonZeroU32, local: [i32; 3]) {
+        let local = (local[0] | local[2] << 4 | local[1] << 8) as u16;
+        if let Some(last) = self.bindings.last_mut()
+            && last.source == source.get()
+            && last.local == local
+            && u64::from(last.first) + u64::from(last.count) == quad as u64
+        {
+            last.count += 1;
+        } else {
+            self.bindings.push(TintSpan {
+                first: quad as u32,
+                count: 1,
+                source: source.get(),
+                local,
+                reserved: 0,
+            });
+        }
+    }
+    /// 按span顺序应用完整ARGB；先校验全部范围，失败不改变mesh或持久绑定。
+    pub fn apply_tints(&mut self, colors: &[u32]) -> Result<(), Error> {
+        if colors.len() != self.bindings.len() {
+            return Err(Error::Input("slab tint响应数量不匹配"));
+        }
+        let mut end = 0u64;
+        for binding in &self.bindings {
+            binding.validate(self.mesh.quads.len())?;
+            if u64::from(binding.first) < end {
+                return Err(Error::Input("slab tint span重叠或顺序无效"));
+            }
+            end = u64::from(binding.first) + u64::from(binding.count);
+        }
+        for (binding, color) in self.bindings.iter().zip(colors) {
+            let tint = [16, 8, 0].map(|shift| ((color >> shift) & 255) as f32 / 255.);
+            for quad in &mut self.mesh.quads[binding.first as usize
+                ..(u64::from(binding.first) + u64::from(binding.count)) as usize]
+            {
+                quad.set_tint(tint);
+            }
+        }
+        Ok(())
+    }
+    #[cfg(any(test, feature = "fixtures"))]
+    fn legacy(self, catalog: &Catalog, key: [i32; 3]) -> Result<CompiledSection, Error> {
+        let mut tints = Vec::new();
+        for binding in self.bindings {
+            let request = catalog.tint_request(catalog.generation(), key, binding)?;
+            tints.extend(
+                (binding.first as usize
+                    ..(u64::from(binding.first) + u64::from(binding.count)) as usize)
+                    .map(|quad| TintPatch { quad, request }),
+            );
+        }
+        Ok(CompiledSection {
+            mesh: self.mesh,
+            tints,
+        })
+    }
+}
 
 /// 一个邻域位置的真实可用状态；Unknown不能作为air参与编译。
 #[derive(Clone, Copy)]
@@ -37,11 +117,12 @@ pub struct TintRequest {
     pub position: [i32; 3],
     /// 真实registry状态ID。
     pub state: u32,
-    /// block tint slot，-1表示实际流体tint源。
+    /// 方块乘色槽，-1表示实际流体tint源。
     pub slot: i32,
 }
 
 /// 一个quad所需的tint结果；world完成回调前不得发布其mesh。
+#[cfg(any(test, feature = "fixtures"))]
 pub struct TintPatch {
     /// 本输出Mesh内的quad索引。
     pub quad: usize,
@@ -50,6 +131,7 @@ pub struct TintPatch {
 }
 
 /// 自持几何与显式后续求值；不持有Catalog或输入包引用。
+#[cfg(any(test, feature = "fixtures"))]
 #[derive(Default)]
 pub struct CompiledSection {
     /// slab或section局部坐标的真实四角，保持源primitive次序。
@@ -58,6 +140,7 @@ pub struct CompiledSection {
     pub tints: Vec<TintPatch>,
 }
 
+#[cfg(any(test, feature = "fixtures"))]
 impl CompiledSection {
     /// 按patch顺序应用真实ARGB结果；先验证完整长度，失败保留原mesh。
     pub fn apply_tints(&mut self, colors: &[u32]) -> Result<(), Error> {
@@ -233,6 +316,7 @@ fn covered(catalog: &Catalog, source: u32, neighbor: u32) -> bool {
 
 /// 编译一个4层slab；first_y必须为0/4/8/12。无线程池、无嵌套调度。
 /// 未知资源或必要邻域返回错误，输出不发布；world在全部slab/tint完成后合并发布。
+#[cfg(any(test, feature = "fixtures"))]
 pub fn compile_section_slab(
     catalog: &Catalog,
     neighborhood: &Neighborhood<'_>,
@@ -243,17 +327,46 @@ pub fn compile_section_slab(
 
 /// 调度层给定最大输出quad数的slab入口；每个模型quad扩容前检查额度。
 /// 流体每块至多六个面，在临时独占输出中同样受此额度限制。
+#[cfg(any(test, feature = "fixtures"))]
 pub fn compile_section_slab_limited(
     catalog: &Catalog,
     neighborhood: &Neighborhood<'_>,
     first_y: usize,
     max_quads: usize,
 ) -> Result<CompiledSection, Error> {
-    if ![0, 4, 8, 12].contains(&first_y) || catalog.generation() != neighborhood.generation {
+    compile_slab(
+        catalog,
+        neighborhood,
+        SlabCompile {
+            first_y,
+            origin: [0.; 3],
+            max_quads,
+        },
+    )?
+    .legacy(catalog, neighborhood.key)
+}
+
+/// 编译一个已校验世代的slab，直接写region-local坐标并返回持久紧凑tint绑定。
+/// 共享只读Neighborhood可被四个并行slab复用；缺source返回错误，不发布部分输出。
+pub fn compile_slab(
+    catalog: &Catalog,
+    neighborhood: &Neighborhood<'_>,
+    options: SlabCompile,
+) -> Result<CompiledSlab, Error> {
+    let SlabCompile {
+        first_y,
+        origin,
+        max_quads,
+    } = options;
+    let max_quads = max_quads.min(u32::MAX as usize);
+    if ![0, 4, 8, 12].contains(&first_y)
+        || catalog.generation() != neighborhood.generation
+        || origin.iter().any(|v| ![0., 16., 32., 48.].contains(v))
+    {
         return Err(Error::Input("slab范围或资源世代无效"));
     }
     match neighborhood.sections[13] {
-        Neighbor::Empty => return Ok(CompiledSection::default()),
+        Neighbor::Empty => return Ok(CompiledSlab::default()),
         Neighbor::Available(storage) => {
             if let Some(id) = storage.uniform_state() {
                 let state = catalog
@@ -261,13 +374,13 @@ pub fn compile_section_slab_limited(
                     .get(&id)
                     .ok_or(Error::Input("section引用未准备的状态ID"))?;
                 if state.flags & 1 != 0 || state.flags & 16 != 0 && state.fluid_kind == 0 {
-                    return Ok(CompiledSection::default());
+                    return Ok(CompiledSlab::default());
                 }
             }
         }
         _ => {}
     }
-    let mut output = CompiledSection::default();
+    let mut output = CompiledSlab::default();
     let mut stack = Vec::new();
     for y in first_y..first_y + 4 {
         for z in 0..16 {
@@ -293,7 +406,7 @@ pub fn compile_section_slab_limited(
                             state,
                             state_id: id,
                             local,
-                            absolute,
+                            origin,
                         },
                         &mut output,
                         max_quads,
@@ -360,7 +473,10 @@ pub fn compile_section_slab_limited(
                                 let material = binding.material;
                                 let positions = quad.positions.map(|point| {
                                     std::array::from_fn(|axis| {
-                                        point[axis] + offset[axis] + local[axis] as f32
+                                        point[axis]
+                                            + offset[axis]
+                                            + local[axis] as f32
+                                            + origin[axis]
                                     })
                                 });
                                 let at = output.mesh.quads.len();
@@ -372,15 +488,8 @@ pub fn compile_section_slab_limited(
                                 output.mesh.quads.push(Quad::with_material(
                                     positions, quad.uv, [1.; 3], material,
                                 ));
-                                if quad.tint >= 0 {
-                                    output.tints.push(TintPatch {
-                                        quad: at,
-                                        request: TintRequest {
-                                            position: absolute,
-                                            state: id,
-                                            slot: quad.tint,
-                                        },
-                                    });
+                                if let Some(source) = binding.tint {
+                                    output.bind(at, source, local);
                                 }
                             }
                         }
@@ -393,6 +502,7 @@ pub fn compile_section_slab_limited(
 }
 
 /// 串行完整section入口；调度层可直接并行调用四个slab而无需本wrapper。
+#[cfg(any(test, feature = "fixtures"))]
 pub fn compile_section(
     catalog: &Catalog,
     neighborhood: &Neighborhood<'_>,

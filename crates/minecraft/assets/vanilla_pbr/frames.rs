@@ -1,5 +1,5 @@
 // 冻结自原版PBR manifest schema1；运行时不解析JSON。
-// manifest SHA256: 9d1d2c78352622add4eeda26db9be5f64f66ed37c6107f3a112e3a27c364e666
+// manifest 的 SHA256：9d1d2c78352622add4eeda26db9be5f64f66ed37c6107f3a112e3a27c364e666
 #[rustfmt::skip]
 static FROZEN: [Frozen; 52] = [
     Frozen { name: "minecraft:block/blast_furnace_front_on", sheet: [16, 32], frame: [16, 16], sequence: &[[0, 10], [1, 10]], interpolate: true },

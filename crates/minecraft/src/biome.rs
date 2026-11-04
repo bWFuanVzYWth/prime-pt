@@ -1,5 +1,4 @@
-//! Exact vanilla box filtering over native zoomed biome colors;
-//! this module owns deduplication, integer sums and dependency-scoped cached outputs.
+//! 原版缩放群系色的精确盒式过滤；本模块拥有去重、整数累加与依赖范围内的缓存。
 use crate::TintRequest as Request;
 use crate::tint::{ColumnCache, Section};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -86,7 +85,7 @@ pub(crate) struct Cache {
 }
 
 struct SourcePage {
-    // Allocate only sampled resolver/Y planes, rather than all 4 * 4096 colors.
+    // 仅分配实际采样的颜色种类/Y 平面，避免一次驻留全部 4×4096 色。
     planes: [Option<Box<SourcePlane>>; 64],
 }
 impl Default for SourcePage {
@@ -117,9 +116,8 @@ fn plane_index(resolver: Resolver, y: i32) -> usize {
     (resolver as usize - 1) * 16 + (y & 15) as usize
 }
 
-/// Both supported MC BiomeManagers choose one of the eight quart corners at
-/// (block - 2) >> 2 and +1. A changed column affects samples in [-2, 17], then
-/// the exact box filter expands that horizontal dependency by its blend radius.
+/// 两种受支持的 BiomeManager 均从 `(block-2)>>2` 及其 +1 的八个 quart 角选择。
+/// 变更列影响 `[-2,17]` 内的方块样本，再由精确盒式过滤扩张水平混合半径。
 fn dependency_masks(columns: &HashSet<(i32, i32)>, margin: i32) -> HashMap<(i32, i32), [u64; 4]> {
     let mut masks = HashMap::<_, [u64; 4]>::new();
     for &(x, z) in columns {
@@ -140,6 +138,9 @@ fn dependency_masks(columns: &HashSet<(i32, i32)>, margin: i32) -> HashMap<(i32,
     masks
 }
 impl Cache {
+    pub(crate) fn invalidate_colors(&mut self) {
+        self.sections.clear();
+    }
     pub fn invalidate(&mut self, all: bool, columns: &HashSet<(i32, i32)>) {
         if all {
             self.sections.clear();
@@ -175,13 +176,11 @@ impl Cache {
     }
     pub fn forget(&mut self, section: Section) {
         self.sections.remove(&section);
-        // An upper double-height plant at local Y=0 queries the section below.
-        // Retire that dependency too, including a query below the world's section range.
+        // 局部 Y=0 的双格植物上半部读取下方 section；回收包含世界高度外的该依赖。
         self.sections
             .remove(&Section(section.0, section.1 - 1, section.2));
-        // Raw samples include the horizontal filter halo and the upper-plant query
-        // below the consumer. Retiring this superset bounds storage to live consumers;
-        // shared neighboring pages may be recomputed, but never survive all owners.
+        // 原始样本包含水平过滤边界和植物下方查询；回收这个超集把驻留限制在存活消费者内。
+        // 相邻消费者共享页可按需重算，但不会在全部消费者退出后残留。
         for y in section.1 - 1..=section.1 {
             for z in section.2 - 1..=section.2 + 1 {
                 for x in section.0 - 1..=section.0 + 1 {
@@ -239,8 +238,7 @@ impl Cache {
             }
             tile.wanted.push((index, query));
         }
-        // Index a whole source row fragment at once, rather than hashing every sample.
-        // The value is separately allocated so growing the map does not move 256 indices.
+        // 一次索引整个源行片段，避免逐样本哈希；独占堆值使映射增长不搬动 256 项索引。
         let mut unique: HashMap<SourceKey, Box<SourceIndices>> = HashMap::new();
         let mut samples = Vec::new();
         let mut values = Vec::new();
@@ -252,8 +250,7 @@ impl Cache {
             tile.max = tile.max.map(|p| p + radius);
             tile.width = (tile.max[0] - tile.min[0] + 1) as usize;
             let height = (tile.max[1] - tile.min[1] + 1) as usize;
-            // Queries occupy one 16x16 tile; the validated maximum radius is 7.
-            // Keep exactly the union of requested squares, including holes in sparse tiles.
+            // 查询位于一个 16×16 平铺区域，已校验最大半径为 7；只保留请求方框并集。
             let mut rows = [0u32; 30];
             let side = (radius * 2 + 1) as usize;
             for (_, query) in &tile.wanted {
@@ -297,8 +294,7 @@ impl Cache {
                             if let Some(plane) =
                                 cached.filter(|p| p.valid[local / 64] & (1 << (local & 63)) != 0)
                             {
-                                // A cold batch reads the validated response directly. Allocate a
-                                // merged array only when a real cross-batch sample hit requires it.
+                                // 冷批次直接读已校验响应，仅真实命中跨批样本时分配合并数组。
                                 if cached_samples == 0 {
                                     values.resize(samples.len(), 0);
                                     missing_slots.extend(0..samples.len());
@@ -378,8 +374,7 @@ impl Cache {
                 let mut row = [0; 3];
                 for x in 0..tile.width {
                     let index = tile.samples[y * tile.width + x];
-                    // Holes lie outside every requested filter square. Their zero contribution
-                    // cancels in the integral image without querying a fictitious source value.
+                    // 空隙不属于任何请求方框；积分图中零贡献相消，无须查询虚构源值。
                     let color = if index == usize::MAX {
                         0
                     } else {
@@ -398,7 +393,7 @@ impl Cache {
                 let x = (query.position[0] - plan.radius - tile.min[0]) as usize;
                 let z = (query.position[2] - plan.radius - tile.min[1]) as usize;
                 let color = if plan.radius == 0 {
-                    // With blending disabled MC returns the resolver's entire ARGB unchanged.
+                    // 禁用混合时，原版完整保留颜色解析器的 ARGB。
                     values[tile.samples[z * tile.width + x]]
                 } else {
                     let mut color = 0xff00_0000;
@@ -522,7 +517,7 @@ mod tests {
             }];
             let mut cache = Cache::default();
             let plan = cache.prepare(std::iter::once(request), &recipes, 7);
-            // Merely planning or abandoning a response must not populate the cache.
+            // 只计划或丢弃响应均不得填充缓存。
             assert_eq!(
                 cache.prepare(std::iter::once(request), &recipes, 7).samples,
                 plan.samples
@@ -539,7 +534,7 @@ mod tests {
                 let values: Vec<_> = reference.samples.iter().copied().map(color).collect();
                 assert_eq!(cache.finish(plan, &[]), cold.finish(reference, &values));
             }
-            // An actual callback result at the same position must never reuse a biome color.
+            // 同位置的真实自定义回调不得误用群系颜色。
             for value in [0x8070903f, 0x12345678] {
                 let plan = cache.prepare(std::iter::once(request), &[Recipe::Color(value)], 0);
                 assert_eq!(cache.finish(plan, &[]), [value]);
@@ -582,8 +577,7 @@ mod tests {
                 }
             }
         }
-        // Worst-case zoom dependence: every sample that could read the changed quart
-        // column changes. Check positive/negative columns, edges/corners and all radii.
+        // 缩放最坏依赖：所有可能读取变化 quart 列的样本均变更；覆盖负列、边角与全部半径。
         for column in [(-1, -1), (0, 0), (1, 1)] {
             let affected = |q: Sample| {
                 (column.0 * 16 - 2..=column.0 * 16 + 17).contains(&q.position[0])

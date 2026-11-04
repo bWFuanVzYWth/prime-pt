@@ -38,6 +38,9 @@ final class FrameChartFixture {
         var packet = snapshot(240);
         FrameChart.clear();
         require(!FrameChart.ready(), "clear 隐藏旧世界快照");
+        require(FrameChart.takeColumns()==0,"隐藏图表不导出快照");
+        FrameChart.requestSnapshot();require(FrameChart.takeColumns()>0,"首次显示可在尚无快照时请求");
+        require(FrameChart.takeColumns()==0,"每次显示请求只消费一次");
         FrameChart.update(packet);
         require(FrameChart.ready(), "接受有效快照");
         var sink = new Bounds(520, 360);
@@ -48,9 +51,12 @@ final class FrameChartFixture {
                 && sink.labels.stream().anyMatch(line -> line.contains("BLAS构建/等待") && line.contains("81.3%") && line.contains("65.00ms")),
                 "卡顿直接显示最大项及整帧占比");
         require(sink.labels.stream().anyMatch(line -> line.contains("最近场景更新 #302")), "场景输入明确标记独立更新序号");
+        require(sink.labels.stream().anyMatch(line->line.contains("建网 3/8 slab")&&line.contains("待编12"))
+                &&sink.labels.stream().anyMatch(line->line.contains("遇缺源5/容量2")&&line.contains("发布1"))
+                &&sink.labels.stream().anyMatch(line->line.contains("Rust通知 50→7")&&line.contains("空段64")),"真实工作预算、队列、遇阻与合并计数可区分");
         require(FrameChart.columns() == 508, "下一次 native 保峰使用实际图宽");
         var hover = new Bounds(520, 360);
-        FrameChart.paint(hover, 0, 520, 360, 177, 200);
+        FrameChart.paint(hover, 0, 520, 360, 177, 160);
         require(hover.labels.stream().anyMatch(line -> line.contains("选中 80.00ms"))
                 && hover.labels.stream().anyMatch(line -> line.contains("BLAS构建/等待") && line.contains("75.0%") && line.contains("60.00ms")),
                 "悬停展示该柱的完整真实样本归因");
@@ -58,12 +64,15 @@ final class FrameChartFixture {
         require(FrameChart.paint(narrow, 0, 160, 200, -1, -1), "小窗口有界");
         require(narrow.labels.stream().anyMatch(line -> line.contains("BLAS 81.3%") && line.contains("65.00ms")),
                 "窄GUI仍直接显示最大项及占比");
+        require(narrow.labels.stream().anyMatch(line->line.contains("建网3/8 待编12")),"窄GUI保留本轮建网预算和ready队列");
         require(!FrameChart.paint(new Bounds(96, 120), 0, 96, 120, -1, -1), "过小窗口回到宿主图");
         rejects(packet, 0, 0x31544650, "旧 PFT1 不混读");
+        rejects(packet,4,3,"旧PFT2版本不混读");
         rejects(packet, 8, 10, "阶段数量");
         rejects(packet, 92, 2, "场景有效标志");
         packet.putLong(128, -1); expectRejected(packet, "负属性字节"); packet.putLong(128, 3 * 1_048_576L);
         rejects(packet, 160, 4, "CPU压力原因枚举");
+        packet.putLong(200,-1);expectRejected(packet,"负工作统计");packet.putLong(200,8);
         packet.putInt(160, 1); packet.putInt(164, 3); packet.putLong(168, 150 * 1_048_576L); packet.putLong(176, 128 * 1_048_576L); packet.putLong(184, 7);
         FrameChart.update(packet);
         var pressure = new Bounds(520, 360); FrameChart.paint(pressure, 0, 520, 360, -1, -1);
@@ -100,6 +109,8 @@ final class FrameChartFixture {
         data.putInt(92, 1); data.putLong(96, 302); data.putLong(104, 2); data.putLong(112, 64);
         data.putLong(120, 6 * 1_048_576L); data.putLong(128, 3 * 1_048_576L);
         data.putLong(136, 1_000_000); data.putLong(144, 2_000_000); data.putLong(152, 1_000_000);
+        long[] work={40,8,3,12,5,2,1,17,99,21,4,50,7,1000,300,64};
+        for(int field=0;field<work.length;field++)data.putLong(192+field*8,work[field]);
         sample(data, FrameChart.HEADER_BYTES, 16, 8_000_000, 11, 3_000_000);
         sample(data, FrameChart.HEADER_BYTES + FrameChart.DETAIL_BYTES, 16, 80_000_000, 7, 65_000_000);
         sample(data, FrameChart.HEADER_BYTES + 2 * FrameChart.DETAIL_BYTES, 16, 130_000_000, 3, 110_000_000);

@@ -13,6 +13,7 @@
 
 #![recursion_limit = "256"]
 
+mod changes;
 mod diagnostics;
 use prime_renderer as gpu;
 use prime_renderer::streamline;
@@ -392,9 +393,49 @@ pub unsafe extern "C" fn prime_plan(
 pub extern "C" fn prime_invalidate_section(id: u64, sx: i32, sy: i32, sz: i32) -> i32 {
     guarded(-1, || {
         with_engine(id, |engine| {
-            engine.tint_columns.insert((sx, sz));
             engine.tint_pending = None;
             Ok(engine.scene.invalidate_section([sx, sy, sz])?)
+        })
+    })
+}
+
+/// 同步消费PDI1变化批；完整验证后才入场景队列，几何与biome/tint依赖分别失效。
+/// # Safety
+/// data在调用内借出len字节只读连续内存；调用者独占会话，失败可保留同一包重试。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_invalidate_batch(id: u64, data: *const u8, len: u64) -> i32 {
+    guarded(-1, || {
+        let len = usize::try_from(len).map_err(|_| Error::Input("变化包长度越界"))?;
+        if data.is_null() || !(16..=scene::MAX_PACKET).contains(&len) {
+            return Err(Error::Input("变化包指针或长度无效"));
+        }
+        // SAFETY: 调用者保持完整借用，上方已校验长度。
+        let input = unsafe { std::slice::from_raw_parts(data, len) };
+        let changes = changes::decode(input)?;
+        with_engine(id, |engine| {
+            engine.scene.apply_changes(&changes)?;
+            engine.tint_pending = None;
+            for change in &changes {
+                match *change {
+                    scene::SourceChange::BiomeColumn { x, z }
+                    | scene::SourceChange::ColumnSource {
+                        x, z, biome: true, ..
+                    } => {
+                        engine.tint_columns.insert((x, z));
+                    }
+                    scene::SourceChange::WorldTint => {
+                        if let Some(world) = &mut engine.tint_world {
+                            world.invalidate_colors();
+                        }
+                    }
+                    scene::SourceChange::SourceOverflow => {
+                        engine.tint_invalidate_all = true;
+                        engine.tint_columns.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
         })
     })
 }
@@ -428,7 +469,8 @@ pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
 /// native录制/SDK、宿主提交、未归因。最近场景更新规模按独立序号导出，非所选柱的规模。
 /// plan内的同步编译从规划移到网格项；native场景细分从录制总耗时扣除，
 /// 视图准备归场景准备/提交，余量由引擎统计补齐；不提供GPU timestamp。
-/// columns为1..=512个实际图表像素列，输出容量至少576+120*columns且不超过62016。
+/// columns为1..=512个实际图表像素列，输出容量至少704+120*columns且不超过62144。
+/// columns=0时只记录，output须为空且capacity=0；隐藏图表不生成或传输窗口快照。
 ///
 /// # Safety
 /// stages借出至少112B只读内存，output借出capacity字节可写内存；二者不重叠，
@@ -446,11 +488,12 @@ pub unsafe extern "C" fn prime_profile(
         let columns = columns as usize;
         let capacity = capacity as usize;
         if stages.is_null()
-            || output.is_null()
-            || columns == 0
             || columns > diagnostics::COLUMNS
-            || capacity < diagnostics::HEADER + columns * diagnostics::BAR
-            || capacity > diagnostics::HEADER + diagnostics::COLUMNS * diagnostics::BAR
+            || (columns == 0 && (!output.is_null() || capacity != 0))
+            || (columns != 0
+                && (output.is_null()
+                    || capacity < diagnostics::HEADER + columns * diagnostics::BAR
+                    || capacity > diagnostics::HEADER + diagnostics::COLUMNS * diagnostics::BAR))
         {
             return Err(Error::Input("PFT2指针、容量或柱数无效"));
         }
@@ -458,13 +501,19 @@ pub unsafe extern "C" fn prime_profile(
             // SAFETY: 调用者借出完整112B；不要求对齐。
             u64::from_le(unsafe { stages.add(i * 8).cast::<u64>().read_unaligned() })
         });
-        // SAFETY: 调用者独占完整可写输出，长度上限已检查。
-        let output = unsafe { std::slice::from_raw_parts_mut(output, capacity) };
         let mut size = 0;
         with_engine(id, |engine| {
             engine.profile.set_pressure(engine.scene.pressure());
+            engine.profile.set_work(
+                engine.scene.work_stats(),
+                engine.scene.work_budget().mesh_slabs,
+            );
             engine.profile.record(elapsed_ns, timings)?;
-            size = engine.profile.write(output, columns)? as i32;
+            if columns != 0 {
+                // SAFETY: 调用者独占完整可写输出；非空指针与长度上限均已检查。
+                let output = unsafe { std::slice::from_raw_parts_mut(output, capacity) };
+                size = engine.profile.write(output, columns)? as i32;
+            }
             Ok(())
         })?;
         Ok(size)
@@ -616,7 +665,9 @@ pub extern "C" fn prime_invalidate_tints(id: u64) -> i32 {
         with_engine(id, |engine| {
             engine.scene.invalidate_tints();
             engine.tint_pending = None;
-            engine.tint_invalidate_all = true;
+            if let Some(world) = &mut engine.tint_world {
+                world.invalidate_colors();
+            }
             Ok(())
         })
     })
@@ -899,12 +950,23 @@ pub unsafe extern "C" fn prime_draw(
             engine.profile.scene[0] = elapsed_ns(prepare_started);
             if changed {
                 let scene_started = std::time::Instant::now();
-                let regions: Vec<_> = engine.scene.render_regions().collect();
-                if let Err(error) = engine.gpu.set_regions(prime_scene::RenderView {
-                    generation: engine.scene.generation(),
-                    regions: &regions,
-                    anchor: engine.scene.anchor(),
-                }) {
+                let publication = (|| {
+                    let changes: Vec<_> = engine.scene.render_changes().collect();
+                    if engine.gpu.try_attribute_changes(
+                        engine.scene.generation(),
+                        engine.scene.anchor(),
+                        &changes,
+                    )? {
+                        return Ok(());
+                    }
+                    let regions: Vec<_> = engine.scene.render_regions().collect();
+                    engine.gpu.set_regions(prime_scene::RenderView {
+                        generation: engine.scene.generation(),
+                        regions: &regions,
+                        anchor: engine.scene.anchor(),
+                    })
+                })();
+                if let Err(error) = publication {
                     engine.scene.reject()?;
                     return Err(error.into());
                 }

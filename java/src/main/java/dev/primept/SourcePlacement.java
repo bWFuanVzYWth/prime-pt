@@ -108,7 +108,7 @@ final class SourcePlacement {
                 method.setAccessible(true);
                 return method;
             } catch (NoSuchMethodException absent) {
-                // Continue to the actual inherited declaration, not a type-name guess.
+                // 继续查找实际继承声明，不根据类型名称猜测。
             }
         }
         throw new IllegalStateException("Missing placement source declaration: " + name);

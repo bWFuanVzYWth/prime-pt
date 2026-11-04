@@ -39,7 +39,6 @@ abstract class ExtractorMixin {
     @Inject(method = "allChanged", at = @At("HEAD"), cancellable = true)
     private void primept$invalidate(CallbackInfo callback) {
         if (level != null) level.clearTintCaches();
-        Renderer.invalidate(level);
         callback.cancel();
     }
 

@@ -141,3 +141,11 @@ tasks.register('modelRandomFixture', JavaExec) {
     mainClass = 'dev.primept.ModelRandomFixture'
     args rootProject.file('target/java-model-random.bin').absolutePath
 }
+
+tasks.register('nativeBatchFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.NativeBatchFixture'
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    systemProperty 'primept.native', providers.gradleProperty('nativeLibrary').getOrElse(rootProject.file('target/release/prime_pt.dll').absolutePath)
+}

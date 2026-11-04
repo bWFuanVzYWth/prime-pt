@@ -10,7 +10,9 @@ public final class FrameChartHud {
     /** 有世界和 native 有效帧时替代原版 FPS 图，其余情况保留宿主图。 */
     public static boolean draw(GuiGraphicsExtractor graphics) {
         var minecraft = Minecraft.getInstance();
-        if (minecraft.level == null || !FrameChart.ready()) return false;
+        if (minecraft.level == null) return false;
+        FrameChart.requestSnapshot();
+        if(!FrameChart.ready())return false;
         var window = minecraft.getWindow();
         double mx = minecraft.mouseHandler.isMouseGrabbed() ? -1
                 : minecraft.mouseHandler.xpos() * graphics.guiWidth() / window.getScreenWidth();

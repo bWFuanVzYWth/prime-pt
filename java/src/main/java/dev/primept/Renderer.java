@@ -15,7 +15,6 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Direction;
 import org.joml.Vector4f;
 import org.lwjgl.vulkan.VK10;
 
@@ -45,7 +44,7 @@ public final class Renderer {
         RenderSystem.assertOnRenderThread();
         ensureRenderer();await();
         var next=SourceResources.prepareReload(Minecraft.getInstance());
-        Atlas.send(renderer);renderer.sources(next.packet());next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;
+        Atlas.send(renderer);renderer.sources(next.packet());next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;CHANGES.clear();
     }
 
     private static void ensureRenderer(){
@@ -105,14 +104,8 @@ public final class Renderer {
             FrameChart.clear();
         }
         if(biomeWorld!=minecraft.level){renderer.biomeWorld(SourceResources.prepared().biomes.world(minecraft.level));biomeWorld=minecraft.level;}
-        if (CHANGES.takeOverflow()) renderer.invalidateAll();
-        for (int i = 0; i < 256; i++) {
-            var change = CHANGES.poll();
-            if (change == null) break;
-            if (change.world() != minecraft.level) continue;
-            if (change.all()) renderer.invalidateTints();
-            else renderer.invalidateSection(change.x(), change.y(), change.z());
-        }
+        var invalidations=CHANGES.batch(minecraft.level,1024);
+        if(invalidations!=null){renderer.invalidateBatch(invalidations);CHANGES.accepted();}
         STAGES.putLong(8, System.nanoTime() - stage);
         stage = System.nanoTime();
         int count = renderer.plan(CAMERA, minecraft.options.getEffectiveRenderDistance(),
@@ -156,8 +149,7 @@ public final class Renderer {
         long completed = System.nanoTime();
         long elapsed = lastCompleted == 0 || minecraft.isPaused() ? 0 : completed - lastCompleted;
         lastCompleted = completed;
-        renderer.profile(elapsed, STAGES, PROFILE, FrameChart.columns());
-        FrameChart.update(PROFILE);
+        if(renderer.profile(elapsed, STAGES, PROFILE, FrameChart.takeColumns())>0)FrameChart.update(PROFILE);
     }
 
     private static void await() {
@@ -176,22 +168,16 @@ public final class Renderer {
     public static void environment(ClientLevel level, Camera camera, float partial) {
         EnvironmentPacket.write(level, camera, partial, ENVIRONMENT);
     }
-    /** block 变化同时失效相邻 section 的剔除结果。 */
+    /** 仅捕获实际block源范围；邻域及slab依赖由Rust统一推导一次。 */
     public static void dirty(ClientLevel level, BlockPos pos) {
-        section(level, pos.getX() >> 4, pos.getY() >> 4, pos.getZ() >> 4);
-        for (var direction : Direction.values()) {
-            var neighbor = pos.relative(direction);
-            section(level, neighbor.getX() >> 4, neighbor.getY() >> 4, neighbor.getZ() >> 4);
-        }
+        CHANGES.block(level,pos.getX(),pos.getY(),pos.getZ());
     }
     /** chunk 加载和卸载统一替换对应 section 源。 */
     public static void column(ClientLevel level, int x, int z) {
-        for (int y = level.getMinSectionY(); y <= level.getMaxSectionY(); y++) {
-            section(level, x, y, z);
-            section(level, x - 1, y, z); section(level, x + 1, y, z);
-            section(level, x, y, z - 1); section(level, x, y, z + 1);
-        }
+        CHANGES.column(level,x,z,level.getMinSectionY(),level.getMaxSectionY()+1,true);
     }
+    /** 已加载chunk收到独立biome数据，不清其压缩block源。 */
+    public static void biomeColumn(ClientLevel level,int x,int z){CHANGES.biome(level,x,z);}
     /** 只标记源，GPU 不在世界更新回调中使用。 */
     public static void section(ClientLevel level, int x, int y, int z) { CHANGES.section(level, x, y, z); }
 

@@ -2,12 +2,12 @@
 //! AS等待、属性分配/映射写入分别计时，不伪装成GPU timestamp。
 
 use crate::Error;
-use frame_loop::timing::{FrameAttribution, FrameSample, FrameStats, compact_chart};
+use frame_loop::timing::{FrameAttribution, FrameSample, FrameStats};
 use std::time::Duration;
 
 pub(crate) const STAGES: usize = 14;
 pub(crate) const COLUMNS: usize = 512;
-pub(crate) const HEADER: usize = 576;
+pub(crate) const HEADER: usize = 704;
 pub(crate) const BAR: usize = 120;
 
 #[derive(Clone, Copy, Default)]
@@ -32,9 +32,15 @@ pub(crate) struct Profile {
     pub update: Option<SceneInfo>,
     last_update: Option<(u64, SceneInfo)>,
     pressure: prime_world::Pressure,
+    work: prime_world::WorkStats,
+    mesh_budget: usize,
 }
 
 impl Profile {
+    pub(crate) fn set_work(&mut self, work: prime_world::WorkStats, mesh_budget: usize) {
+        self.work = work;
+        self.mesh_budget = mesh_budget;
+    }
     pub(crate) fn set_pressure(&mut self, pressure: prime_world::Pressure) {
         let previous = self.pressure;
         if (
@@ -97,19 +103,18 @@ impl Profile {
         Ok(())
     }
 
-    /// PFT2：192B头、三个128B详情、至多512个120B保峰柱；不持有宿主借用。
+    /// PFT2 v4：320B头、三个128B详情、至多512个120B保峰柱；不持有宿主借用。
     pub(crate) fn write(&mut self, output: &mut [u8], columns: usize) -> Result<usize, Error> {
         if columns == 0 || columns > COLUMNS || output.len() < HEADER + columns * BAR {
             return Err(Error::Input("PFT2输出容量或柱数无效"));
         }
-        let mut bars = [[0.; STAGES]; COLUMNS];
         let mut winners = [0; COLUMNS];
-        let count = compact_chart(self.stats.chart(), columns, &mut bars, &mut winners);
+        let count = self.stats.compact_sample_indices(columns, &mut winners);
         let size = HEADER + count * BAR;
         let output = &mut output[..size];
         output.fill(0);
         put_u32(output, 0, 0x3254_4650);
-        put_u32(output, 4, 3);
+        put_u32(output, 4, 4);
         put_u32(output, 8, STAGES as u32);
         put_u32(output, 12, count as u32);
         let snapshot = self.stats.snapshot();
@@ -131,7 +136,7 @@ impl Profile {
         {
             if let Some(sample) = sample {
                 mask |= 1 << index;
-                write_sample(output, 192 + index * 128, 16, sample);
+                write_sample(output, 320 + index * 128, 16, sample);
             }
         }
         put_u32(output, 88, mask);
@@ -140,6 +145,30 @@ impl Profile {
         put_u64(output, 168, self.pressure.required_bytes as u64);
         put_u64(output, 176, self.pressure.limit_bytes as u64);
         put_u64(output, 184, self.pressure.deferred_requests as u64);
+        let current = self.work.current;
+        for (index, value) in [
+            self.work.turn,
+            self.mesh_budget as u64,
+            current.mesh_slabs as u64,
+            self.work.queued_slabs as u64,
+            current.waiting_sources as u64,
+            current.waiting_budget as u64,
+            current.publications as u64,
+            current.source_requests as u64,
+            current.source_hits as u64,
+            current.reused_slabs as u64,
+            current.cancelled_slabs as u64,
+            current.raw_invalidations as u64,
+            current.unique_invalidations as u64,
+            self.work.total.mesh_slabs as u64,
+            self.work.total.publications as u64,
+            current.empty_sections as u64,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            put_u64(output, 192 + index * 8, value.min(i64::MAX as u64));
+        }
         if let Some((sequence, info)) = self.last_update {
             put_u32(output, 92, 1);
             for (index, value) in [
@@ -200,12 +229,12 @@ mod tests {
         profile.record(200, stages).unwrap();
         let mut bytes = vec![0; HEADER + BAR];
         profile.write(&mut bytes, 1).unwrap();
-        let attribution: [u64; STAGES] = std::array::from_fn(|i| word(&bytes, 208 + i * 8));
+        let attribution: [u64; STAGES] = std::array::from_fn(|i| word(&bytes, 336 + i * 8));
         assert_eq!(
             attribution,
             [0, 0, 0, 0, 0, 15, 5, 20, 5, 10, 15, 30, 0, 100]
         );
-        assert_eq!(attribution.iter().sum::<u64>(), word(&bytes, 192));
+        assert_eq!(attribution.iter().sum::<u64>(), word(&bytes, 320));
     }
 
     #[test]
@@ -220,9 +249,9 @@ mod tests {
         profile.record(140, stages).unwrap();
         let mut bytes = vec![0; HEADER + BAR];
         profile.write(&mut bytes, 1).unwrap();
-        assert_eq!(word(&bytes, 208 + 2 * 8), 40);
-        assert_eq!(word(&bytes, 208 + 4 * 8), 100);
-        assert_eq!(word(&bytes, 192), 140);
+        assert_eq!(word(&bytes, 336 + 2 * 8), 40);
+        assert_eq!(word(&bytes, 336 + 4 * 8), 100);
+        assert_eq!(word(&bytes, 320), 140);
         assert_eq!(profile.plan_mesh_ns, 0);
     }
 

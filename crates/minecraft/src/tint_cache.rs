@@ -1,4 +1,4 @@
-//! Primary column/page storage: local invalidations do not scan unrelated resident pages.
+//! 按列索引的页所有者；局部失效不扫描无关驻留页。
 
 use std::collections::HashMap;
 

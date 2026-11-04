@@ -203,7 +203,7 @@ final class SourceResources {
         var tint=biomes.packet();packet.putInt(tint.remaining());packet.putBuffer(tint);
         return packet.finish();
     }
-    void accepted(){accepted=true;prepared=this;packet.discard();states.clear();modelIds.clear();models.clear();faceIds.clear();faces.clear();fluidIds.clear();fluids.clear();spriteIds.clear();sprites.clear();}
+    void accepted(){accepted=true;prepared=this;packet.discard();biomes.accepted();states.clear();modelIds.clear();models.clear();faceIds.clear();faces.clear();fluidIds.clear();fluids.clear();spriteIds.clear();sprites.clear();}
     void empty(Packet out,BlockState air){if(!statesKnown.get(Block.getId(air)))throw new IllegalStateException("空section引用未准备状态");out.putInt(1);out.putInt(0);out.putInt(1);out.putInt(0);out.putInt(Block.getId(air));}
 
     private void writeState(BlockState s) {

@@ -7,7 +7,7 @@ import geometry.ray;
 import params;
 import mod_materials;
 
-/// 活动registry首行[count,0,0,0]；运行期无全局alias构建。
+/// 首行[count,0,0,0]，后续每行四个活动数据槽；运行期无全局alias构建。
 [[vk::binding(30, 0)]]
 StructuredBuffer<uint4> light_alias;
 /// 每灯[split,rho0,rho1,globalQuadSlot]。
@@ -16,10 +16,10 @@ public StructuredBuffer<uint4> light_meta;
 /// region-local四角，按light_sampling::pack_vertices编码，每灯三个float4。
 [[vk::binding(32, 0)]]
 public StructuredBuffer<float4> light_vertices;
-/// scene_cache::directory稀疏目录，identity=globalQuadSlot+1，entry.y=lightIndex。
+/// 首行[count,mask,1,0]，后续每桶[key=globalQuadSlot+1,dataSlot+1,0,0]。
 [[vk::binding(33, 0)]]
 StructuredBuffer<uint4> light_inverse;
-/// regionKey.xyz与发射sideMask；平移在shader按当前anchor计算。
+/// regionKey.xyz与(activeRank<<2)|sideMask；平移在shader按当前anchor计算。
 [[vk::binding(34, 0)]]
 public StructuredBuffer<int4> light_regions;
 /// 每资源世代唯一的静态纹理内alias，control.w>>1给出header word偏移。
@@ -43,10 +43,9 @@ uint light_index(uint quad)
     uint slot = light_hash(key) & header.y;
     for (uint probe = 0; probe <= header.y; ++probe)
     {
-        uint4 packed = light_inverse[header.z + slot / 2u];
-        uint2 item = (slot & 1u) == 0u ? packed.xy : packed.zw;
+        uint2 item = light_inverse[header.z + slot].xy;
         if (item.x == key)
-            return light_inverse[item.y].y;
+            return item.y - 1u;
         if (item.x == 0u)
             return 0xffffffffu;
         slot = (slot + 1u) & header.y;
@@ -60,7 +59,7 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
     pt::LightAliasSample selected = pt::uniform_light_sample(header.x, sample.z);
     if (selected.pmf <= 0)
         return result;
-    uint index = selected.index;
+    uint index = light_alias[1u + selected.index / 4u][selected.index & 3u];
     uint4 meta = light_meta[index];
     uint primitive = meta.w * 2u;
     uint alias_offset = materials[material_id(primitive)].control.w >> 1u;
@@ -86,7 +85,7 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
         return result;
     result.direction = delta * rsqrt(distance_squared);
     result.pdf = pt::quad_light_pdf(point.position, target.position, target.normal, area.density,
-                                    selected.pmf, uint(light_regions[index].w));
+                                    selected.pmf, uint(light_regions[index].w) & 3u);
     if (result.pdf <= 0 || !geometry::connection_ray(point, target, result.visibility))
     {
         result.pdf = 0;
@@ -111,7 +110,7 @@ public float quad_emission_pdf(pt::Hit hit, float3 previous)
     if (index == 0xffffffffu)
         return 0;
     uint4 header = light_alias[0];
-    float pmf = pt::uniform_light_pmf(header.x, index);
+    float pmf = pt::uniform_light_pmf(header.x, uint(light_regions[index].w) >> 2u);
     uint4 meta = light_meta[index];
     ModMaterial material = materials[material_id(hit.identity.x)];
     uint alias_offset = material.control.w >> 1u;
@@ -134,5 +133,5 @@ public float quad_emission_pdf(pt::Hit hit, float3 previous)
         density = pt::quad_area_density(meta, hit.identity.x & 1u);
     }
     return pt::quad_light_pdf(previous, hit.surface.position, hit.surface.normal, density, pmf,
-                              uint(light_regions[index].w));
+                              uint(light_regions[index].w) & 3u);
 }

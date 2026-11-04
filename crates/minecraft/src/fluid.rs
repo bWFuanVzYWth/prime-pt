@@ -6,7 +6,7 @@
 
 use crate::{
     Catalog, Error,
-    compile::{CompiledSection, Neighborhood, TintPatch, TintRequest, fluid_state},
+    compile::{CompiledSlab, Neighborhood, fluid_state},
     resources::{Placement, State},
 };
 use prime_scene::Quad;
@@ -18,6 +18,7 @@ static EMPTY: State = State {
     faces: [0; 6],
     fluid_kind: 0,
     fluid: 0,
+    fluid_tint: None,
     level: 0,
     emission: 0,
     placement: Placement {
@@ -101,21 +102,21 @@ pub(crate) struct FluidBlock<'a> {
     pub state: &'a State,
     pub state_id: u32,
     pub local: [i32; 3],
-    pub absolute: [i32; 3],
+    pub origin: [f32; 3],
 }
 
 pub(crate) fn emit(
     catalog: &Catalog,
     neighborhood: &Neighborhood<'_>,
     block: FluidBlock<'_>,
-    output: &mut CompiledSection,
+    output: &mut CompiledSlab,
     max_quads: usize,
 ) -> Result<(), Error> {
     let FluidBlock {
         state,
         state_id,
         local,
-        absolute,
+        origin,
     } = block;
     if state.fluid_kind > 2 {
         return Err(Error::Input("自定义流体需要显式源适配"));
@@ -237,20 +238,19 @@ pub(crate) fn emit(
                 });
             }
             output.mesh.quads.push(Quad::with_material(
-                positions.map(|p| std::array::from_fn(|axis| p[axis] + local[axis] as f32)),
+                positions.map(|p| {
+                    std::array::from_fn(|axis| p[axis] + local[axis] as f32 + origin[axis])
+                }),
                 uv,
                 [1.; 3],
                 material,
             ));
             if source.tinted {
-                output.tints.push(TintPatch {
-                    quad: at,
-                    request: TintRequest {
-                        position: absolute,
-                        state: state_id,
-                        slot: -1,
-                    },
-                });
+                output.bind(
+                    at,
+                    state.fluid_tint.ok_or(Error::Input("流体tint来源未准备"))?,
+                    local,
+                );
             }
             Ok(())
         };

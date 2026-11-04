@@ -18,6 +18,7 @@ pub(crate) struct State {
     pub faces: [u32; 6],
     pub fluid_kind: u32,
     pub fluid: u32,
+    pub fluid_tint: Option<std::num::NonZeroU32>,
     pub level: u32,
     pub emission: u32,
     pub placement: Placement,
@@ -30,6 +31,7 @@ pub(crate) struct State {
 pub(crate) struct BoundQuad {
     pub index: usize,
     pub material: prime_scene::MaterialId,
+    pub tint: Option<std::num::NonZeroU32>,
 }
 pub(crate) struct ModelBinding {
     pub model: u32,
@@ -266,6 +268,7 @@ fn decode(bytes: &[u8]) -> Result<(Catalog, bool), Error> {
                 faces,
                 fluid_kind,
                 fluid,
+                fluid_tint: None,
                 level,
                 emission,
                 placement,
@@ -483,8 +486,23 @@ fn decode(bytes: &[u8]) -> Result<(Catalog, bool), Error> {
 }
 
 impl Catalog {
+    /// 证明单状态压缩源是否为真实 `isAir`，不把不可见方块或无模型方块视为空。
+    ///
+    /// 非单状态布局返回 `false`；完整状态身份仍由接受边界的
+    /// [`Self::validate_section`] 校验。单状态引用未准备 ID 时返回错误。
+    pub fn section_is_air(&self, storage: &crate::SectionStorage) -> Result<bool, Error> {
+        let Some(id) = storage.uniform_state() else {
+            return Ok(false);
+        };
+        let state = self
+            .states
+            .get(&id)
+            .ok_or(Error::Input("section引用未准备的状态ID"))?;
+        Ok(state.flags & 1 != 0)
+    }
+
     /// 接受压缩源前校验完整状态域，不追加或准备运行时资源。
-    /// local palette包含未使用项也全部校验；global模式校验实际4096个registry ID。
+    /// 局部调色板包含未使用项也全部校验；全局模式校验实际4096个registry ID。
     pub fn validate_section(&self, storage: &crate::SectionStorage) -> Result<(), Error> {
         let valid = if storage.palette_values().is_empty() {
             (0..4096).all(|index| {

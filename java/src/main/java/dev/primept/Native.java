@@ -13,7 +13,7 @@ import static java.lang.foreign.ValueLayout.*;
 /** 同步 FFM 边界；CPU 包借用到返回，宿主图像必须保活至 GPU 提交完成。 */
 final class Native implements AutoCloseable {
     private final Arena arena = Arena.ofConfined();
-    private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, invalidateTints, failCapture, batch, sources, cameraMedium, tintBegin, tintRequests, tints, biomeWorld, biomeRequests, biomeSamples, atlas, draw, setSer, error;
+    private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, invalidateTints, invalidateBatch, failCapture, batch, sources, cameraMedium, tintBegin, tintRequests, tints, biomeWorld, biomeRequests, biomeSamples, atlas, draw, setSer, error;
     private final long handle;
     private boolean serRequested;
 
@@ -41,6 +41,7 @@ final class Native implements AutoCloseable {
         invalidateSection = bind(symbols, "prime_invalidate_section", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT));
         invalidateAll = bind(symbols, "prime_invalidate_all", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         invalidateTints = bind(symbols,"prime_invalidate_tints",FunctionDescriptor.of(JAVA_INT,JAVA_LONG));
+        invalidateBatch=bind(symbols,"prime_invalidate_batch",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_LONG));
         failCapture = bind(symbols, "prime_fail_capture", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG));
         setSer = bind(symbols, "prime_set_ser", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
@@ -82,14 +83,22 @@ final class Native implements AutoCloseable {
         } catch (Throwable e) { throw unchecked(e); }
     }
 
-    void profile(long elapsed, ByteBuffer stages, ByteBuffer output, int columns) {
-        output.clear();
+    int profile(long elapsed, ByteBuffer stages, ByteBuffer output, int columns) {
+        if(columns!=0)output.clear();
         try {
-            int size = (int) profile.invokeExact(handle, elapsed, MemorySegment.ofBuffer(stages),
-                    MemorySegment.ofBuffer(output), output.remaining(), columns);
+            int size = invokeProfile(profile,handle,elapsed,stages,output,columns);
             if (size < 0) throw failure();
-            output.limit(size);
+            if(size>0)output.limit(size);
+            return size;
         } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    /** 仅记录时传空输出；生产和真实FFM验收共用显式静态类型的调用点。 */
+    static int invokeProfile(MethodHandle target,long id,long elapsed,ByteBuffer stages,ByteBuffer output,int columns)throws Throwable{
+        MemorySegment timings=MemorySegment.ofBuffer(stages);
+        MemorySegment destination=columns==0?MemorySegment.NULL:MemorySegment.ofBuffer(output);
+        int capacity=columns==0?0:output.remaining();
+        return (int)target.invokeExact(id,elapsed,timings,destination,capacity,columns);
     }
 
     void invalidateSection(int x, int y, int z) {
@@ -103,6 +112,14 @@ final class Native implements AutoCloseable {
     }
 
     void invalidateTints(){try{check((int)invalidateTints.invokeExact(handle));}catch(Throwable e){throw unchecked(e);}}
+    /** 输入为已冻结PDI1；Native完整校验/应用成功后，调用者才确认事件所有权。 */
+    void invalidateBatch(ByteBuffer bytes){try{check(invokeInvalidationBatch(invalidateBatch,handle,bytes));}catch(Throwable e){throw unchecked(e);}}
+    /** 生产与真实FFM fixture共用调用点，显式固定指针/长度的静态类型。 */
+    static int invokeInvalidationBatch(MethodHandle target,long id,ByteBuffer bytes)throws Throwable{
+        MemorySegment source=bytes==null?MemorySegment.NULL:MemorySegment.ofBuffer(bytes);
+        long length=bytes==null?0L:bytes.remaining();
+        return (int)target.invokeExact(id,source,length);
+    }
 
     void failCapture(long request) {
         try { check((int) failCapture.invokeExact(handle, request)); }

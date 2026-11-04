@@ -1,5 +1,5 @@
 //! PRT3: magic/count/generation，随后ticket/key/status/bits/palette-count/word-count及数组。
-//! packed storage采用Minecraft的整word分组，无跨word字段，index=(y*16+z)*16+x。
+//! 压缩存储采用Minecraft的整word分组，无跨word字段，index=(y*16+z)*16+x。
 
 use crate::{Error, wire::Reader};
 use std::collections::HashSet;

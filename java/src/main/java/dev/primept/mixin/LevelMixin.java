@@ -10,21 +10,20 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(ClientLevel.class)
 abstract class LevelMixin {
-    @Inject(method = "setBlock", at = @At("RETURN"))
-    private void primept$block(BlockPos pos, BlockState state, int flags, int recursionLeft, CallbackInfoReturnable<Boolean> callback) {
-        if (callback.getReturnValueZ()) Renderer.dirty((ClientLevel) (Object) this, pos);
+    @Inject(method = "setBlocksDirty", at = @At("HEAD"),cancellable=true)
+    private void primept$block(BlockPos pos, BlockState previous,BlockState current,CallbackInfo callback) {
+        if(previous!=current)Renderer.dirty((ClientLevel) (Object) this,pos);
+        // 此入口是Level.setBlock的真实源变化通知；截断下游27次Java网格依赖枚举。
+        callback.cancel();
     }
 
-    @Inject(method = "setSectionDirtyWithNeighbors", at = @At("HEAD"))
+    @Inject(method = "setSectionDirtyWithNeighbors", at = @At("HEAD"),cancellable=true)
     private void primept$section(int x, int y, int z, CallbackInfo callback) {
         Renderer.section((ClientLevel) (Object) this, x, y, z);
-        Renderer.section((ClientLevel) (Object) this, x - 1, y, z); Renderer.section((ClientLevel) (Object) this, x + 1, y, z);
-        Renderer.section((ClientLevel) (Object) this, x, y - 1, z); Renderer.section((ClientLevel) (Object) this, x, y + 1, z);
-        Renderer.section((ClientLevel) (Object) this, x, y, z - 1); Renderer.section((ClientLevel) (Object) this, x, y, z + 1);
+        callback.cancel();
     }
 
     @Inject(method = "onChunkLoaded", at = @At("RETURN"))

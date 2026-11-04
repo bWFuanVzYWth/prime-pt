@@ -8,9 +8,13 @@
 mod biome;
 mod biome_source;
 pub mod tint;
+mod tint_binding;
+#[cfg(test)]
+mod tint_binding_tests;
 mod tint_cache;
 
 mod compile;
+mod dependencies;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 mod fluid;
@@ -23,13 +27,16 @@ mod vanilla;
 pub mod vanilla_frames;
 mod wire;
 
+#[cfg(any(test, feature = "fixtures"))]
 pub use compile::{
-    CompiledSection, Neighbor, Neighborhood, TintPatch, TintRequest, compile_section,
-    compile_section_slab, compile_section_slab_limited,
+    CompiledSection, TintPatch, compile_section, compile_section_slab, compile_section_slab_limited,
 };
+pub use compile::{CompiledSlab, Neighbor, Neighborhood, SlabCompile, TintRequest, compile_slab};
+pub use dependencies::{SlabDependencies, SlabDependency, dependent_slabs};
 pub use materials::MaterialResources;
 pub use palette::{SectionSource, SectionStorage, decode_sections};
 pub use resources::{Catalog, ImageSource, PreparedCatalog, ResourceChange, SpriteSource};
+pub use tint_binding::TintSpan;
 
 /// 原始压缩源与资源协议的最大单包字节数，不是总场景内存预算。
 pub const MAX_PACKET: usize = 256 * 1024 * 1024;
