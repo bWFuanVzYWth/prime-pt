@@ -120,7 +120,7 @@ void primary_miss(inout TracePayload payload)
 [shader("anyhit")]
 void primary_anyhit(inout TracePayload payload, BuiltInTriangleIntersectionAttributes attributes)
 {
-    if (!material_accepts(PrimitiveIndex() + InstanceID() * 2u, attributes.barycentrics,
+    if (!material_accepts(region_primitive(InstanceID(), PrimitiveIndex()), attributes.barycentrics,
                           HitKind() == 0xfeu))
         IgnoreHit();
 }
@@ -129,7 +129,7 @@ void primary_anyhit(inout TracePayload payload, BuiltInTriangleIntersectionAttri
 void primary_closesthit(inout TracePayload payload,
                         BuiltInTriangleIntersectionAttributes attributes)
 {
-    payload.primitive = PrimitiveIndex() + InstanceID() * 2u;
+    payload.primitive = region_primitive(InstanceID(), PrimitiveIndex());
     payload.bary = attributes.barycentrics;
     payload.distance = RayTCurrent();
     float3 a = HitTriangleVertexPosition(0), b = HitTriangleVertexPosition(1),

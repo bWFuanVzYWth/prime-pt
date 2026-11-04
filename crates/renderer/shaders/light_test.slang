@@ -8,8 +8,16 @@ import pt.light_sampling;
 import geometry.ray;
 
 /// 每lane输出[forward_pdf,reverse_pdf,真实发光BT.709亮度,有效样本]；仅测试额外binding。
-[[vk::binding(36, 0)]]
+[[vk::binding(37, 0)]]
 RWStructuredBuffer<float4> probes;
+
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void region_primitive_probe_main()
+{
+    probes[0] = asfloat(uint4(region_primitive(0u, 0u), region_primitive(0u, 1u),
+                              region_primitive(1u, 0u), region_primitive(1u, 3u)));
+}
 
 [shader("compute")]
 [numthreads(32, 1, 1)]

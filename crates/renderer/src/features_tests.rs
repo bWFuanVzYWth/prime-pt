@@ -40,6 +40,119 @@ fn publish(
     })
 }
 
+#[test]
+#[ignore = "真实Vulkan compute；以两个基址验证全局图元索引跨过24位"]
+fn hardware_pt_region_primitive_index_keeps_full_quad_base()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    host.render_environment(&mut gpu, &image, &camera(), Environment::default())?;
+    let view = gpu.view.as_ref().unwrap();
+    let (mut bindings, _) = gpu.renderer_bindings(
+        view,
+        &gpu.atlas,
+        &gpu.scene,
+        gpu.material_gpu,
+        gpu.lighting_gpu,
+    );
+    let bases = [1u32 << 23, (1u32 << 24) + 17];
+    let base_buffer = Buffer::new(&mut gpu.context, 8, true)?;
+    base_buffer.write(&mut gpu.context, 0, bytemuck::cast_slice(&bases))?;
+    bindings[36] = Binding::StorageBuffer(base_buffer);
+    let output = Buffer::new(&mut gpu.context, 16, true)?;
+    bindings.push(Binding::StorageBuffer(output));
+    let bindings = Bindings::new(&mut gpu.context, &bindings)?;
+    let pipeline = ComputePipeline::new(
+        &mut gpu.context,
+        bindings,
+        shader(
+            include_bytes!(concat!(env!("OUT_DIR"), "/region_primitive_probe.spv")),
+            c"region_primitive_probe_main",
+        ),
+    )?;
+    let mut commands = Commands::new(&gpu.context)?;
+    commands.dispatch(pipeline, [1, 1, 1])?;
+    commands
+        .finish(&mut gpu.context)?
+        .submit_and_wait(&mut gpu.context)?;
+    let mut indices = [0u32; 4];
+    output.read(&mut gpu.context, 0, bytemuck::cast_slice_mut(&mut indices))?;
+    assert_eq!(
+        indices,
+        [
+            bases[0] * 2,
+            bases[0] * 2 + 1,
+            bases[1] * 2,
+            bases[1] * 2 + 3
+        ]
+    );
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT；区域实例顺序和属性槽分别变化时保留正确材质"]
+fn hardware_pt_region_instance_order_is_independent_of_attribute_slot()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    let materials = [[1., 0., 0., 10.], [0., 1., 0., 10.]].map(|emission| {
+        let mut material = MaterialDefinition {
+            emission,
+            ..Default::default()
+        };
+        material.control[1] = 1;
+        material
+    });
+    upload(&mut gpu, &materials, &[], &[[u32::MAX, 0, 0, 0]; 2])?;
+    let meshes = [0, 1].map(|index| Mesh {
+        quads: vec![Quad::with_material(
+            [[-2., -2., 4.], [-2., 2., 4.], [2., 2., 4.], [2., -2., 4.]],
+            [[0.5; 2]; 4],
+            [1.; 3],
+            MaterialId::new(index),
+        )],
+    });
+    let regions =
+        [([-1, 0, 0], &meshes[1]), ([0; 3], &meshes[0])].map(|(key, mesh)| RenderRegion {
+            key,
+            geometry_revision: 1,
+            content_revision: 1,
+            mesh: mesh.into(),
+        });
+    let submit = |gpu: &mut Gpu, regions| {
+        gpu.set_regions(RenderView {
+            generation: gpu.resource_generation,
+            regions,
+            anchor: [0.; 3],
+        })
+    };
+    submit(&mut gpu, &regions[1..])?;
+    submit(&mut gpu, &regions)?;
+    let entries = gpu.region_cache.entries();
+    assert!(entries[0].range.start > entries[1].range.start);
+    let environment = Environment {
+        sun_direction: [0.; 3],
+        ..Default::default()
+    };
+    let display = host.render_environment(&mut gpu, &image, &camera(), environment)?;
+    let pixel = center(&display);
+    assert!(u16::from(pixel[0]) > u16::from(pixel[1]) + 20);
+
+    submit(&mut gpu, &regions[..1])?;
+    let left_camera = Camera {
+        origin: [-64., 0., 0., 0.],
+        ..camera()
+    };
+    let display = host.render_environment(&mut gpu, &image, &left_camera, environment)?;
+    let pixel = center(&display);
+    assert!(u16::from(pixel[1]) > u16::from(pixel[0]) + 20);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
 fn scene() -> Mesh {
     Mesh {
         quads: vec![

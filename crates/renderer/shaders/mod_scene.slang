@@ -28,6 +28,14 @@ StructuredBuffer<float4> sky_mapping;
 Texture2D<float4> sky_texture;
 [[vk::binding(18, 0)]]
 Texture2D<float4> optical_depth;
+[[vk::binding(36, 0)]]
+StructuredBuffer<uint> instance_quad_bases;
+
+/// 实例自定义索引只选择对应区块的属性起点。每个 quad 在 BLAS 中占两个三角形。
+public uint region_primitive(uint instance, uint local_primitive)
+{
+    return instance_quad_bases[instance] * 2u + local_primitive;
+}
 
 float sun_cos()
 {
@@ -188,9 +196,9 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         {
             // RayQuery 不执行 any-hit；候选必须使用与主查询相同的覆盖规则。
             if (query.CandidateType() == CANDIDATE_NON_OPAQUE_TRIANGLE &&
-                material_accepts(query.CandidatePrimitiveIndex() + query.CandidateInstanceID() * 2u,
-                                 query.CandidateTriangleBarycentrics(),
-                                 query.CandidateTriangleFrontFace()))
+                material_accepts(
+                    region_primitive(query.CandidateInstanceID(), query.CandidatePrimitiveIndex()),
+                    query.CandidateTriangleBarycentrics(), query.CandidateTriangleFrontFace()))
                 query.CommitNonOpaqueTriangleHit();
         }
         return query.CommittedStatus() != COMMITTED_NOTHING;

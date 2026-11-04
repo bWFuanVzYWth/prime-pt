@@ -89,6 +89,7 @@ pub enum Error {
 struct Scene {
     top: AccelerationStructure,
     quads: Buffer,
+    instance_quad_bases: Buffer,
 }
 
 /// 首次加载或重载的一份完整只读资源输入；借用在准备调用返回时结束。
@@ -192,9 +193,9 @@ pub struct SceneUpdateTiming {
     pub resources_ns: u64,
     /// 变化属性与必要TLAS实例的CPU准备，已计入geometry_ns。
     pub attribute_pack_ns: u64,
-    /// 属性buffer分配及上传，已计入resources_ns。
+    /// 属性及实例基址缓冲分配和上传，已计入resources_ns。
     pub attribute_upload_ns: u64,
-    /// 实际写入的变化属性字节；增长时包含全部活动范围，不含槽空洞或保留容量。
+    /// 实际写入的变化属性和实例基址字节，按活动范围计量。
     pub attribute_upload_bytes: u64,
     /// 活动光源注册及其目录编码的CPU准备，已计入geometry_ns。
     pub light_pack_ns: u64,
@@ -612,6 +613,7 @@ pub struct Gpu {
     rr_sample: u32,
     rr_quality: streamline::Quality,
     context: Context,
+    attribute_slot_limit: u32,
     scene: Scene,
     anchor: [f64; 3],
     region_cache: scene_cache::Cache<RegionGpu>,
@@ -656,9 +658,8 @@ pub struct Gpu {
 impl Gpu {
     /// 单个 quad 属性缓冲允许的槽数，按分配器使用的二次幂容量向下取整。
     /// 空洞、场景内其他缓冲和实际可用显存另计。
-    pub fn attribute_slot_limit(&self) -> u32 {
-        let slots = self.context.max_storage_buffer_range() / size_of::<[[u32; 4]; 3]>() as u32;
-        slots.checked_ilog2().map_or(0, |shift| 1 << shift)
+    pub const fn attribute_slot_limit(&self) -> u32 {
+        self.attribute_slot_limit
     }
 
     /// # Safety
@@ -736,6 +737,11 @@ impl Gpu {
         };
         // SAFETY: 外部生命周期由导出会话契约维持；本对象不销毁宿主句柄。
         let mut context = unsafe { Context::from_raw(raw)? };
+        let attribute_slots =
+            context.max_storage_buffer_range() / size_of::<[[u32; 4]; 3]>() as u32;
+        let attribute_slot_limit = attribute_slots
+            .checked_ilog2()
+            .map_or(0, |shift| 1 << shift);
         let atlas = Image::new(&mut context, [1, 1, 1], ImageFormat::Rgba8Srgb)?;
         atlas.upload(&mut context, &[255; 4])?;
         let energy = Image::new(
@@ -797,6 +803,7 @@ impl Gpu {
             rr_sample: 0,
             rr_quality: streamline::Quality::Performance,
             context,
+            attribute_slot_limit,
             scene,
             anchor: [0.0; 3],
             region_cache: scene_cache::Cache::new()?,
@@ -872,7 +879,12 @@ impl Gpu {
             }]
         };
         let top = context.acceleration_instances(&instances)?;
-        Ok(Scene { top, quads })
+        let instance_quad_bases = Buffer::upload(context, &[0; size_of::<u32>()])?;
+        Ok(Scene {
+            top,
+            quads,
+            instance_quad_bases,
+        })
     }
 
     /// 完成旧提交后切换阶段程序；仅 transport shader 不同，保留数据和 PT/RR 历史。
@@ -1080,6 +1092,7 @@ impl Gpu {
             self.region_cache = region_cache;
             self.attribute_revisions.clear();
             self.scene.top = self.program_scene.top;
+            self.scene.instance_quad_bases = self.program_scene.instance_quad_bases;
             self.lighting = lighting;
             self.lighting_gpu = self.program_lighting;
             self.light_areas = light_areas;
@@ -1267,6 +1280,9 @@ impl Gpu {
         if source.generation != self.resource_generation {
             return Err(Error::Invalid("region与材质资源世代不匹配"));
         }
+        if source.regions.len() > 1 << 24 {
+            return Err(Error::Invalid("region实例数量超过24位身份域"));
+        }
         if source.anchor.iter().any(|v| !v.is_finite())
             || source.regions.windows(2).any(|p| p[0].key >= p[1].key)
             || source
@@ -1336,8 +1352,8 @@ impl Gpu {
             let count = u32::try_from(region.mesh.len())
                 .map_err(|_| Error::Invalid("region面索引超过u32"))?;
             let range = slots.take(count)?;
-            if range.end > 1 << 24 {
-                return Err(Error::Invalid("region属性槽超过实例24位索引"));
+            if range.end > self.attribute_slot_limit {
+                return Err(Error::Invalid("region属性槽超过设备缓冲容量"));
             }
             let start = triangles.len();
             for quad in region.mesh.quads() {
@@ -1463,7 +1479,7 @@ impl Gpu {
                         [0., 1., 0., offset[1]],
                         [0., 0., 1., offset[2]],
                     ],
-                    custom_index: entry.range.start,
+                    custom_index: instances.len() as u32,
                 });
             }
         }
@@ -1482,11 +1498,11 @@ impl Gpu {
             self.scene.top
         };
         metrics.acceleration_ns += metrics.tlas_ns;
+        let light_started = std::time::Instant::now();
         let bases: Vec<_> = entries
             .iter()
             .map(|e| e.get(self.region_cache.entries()).range.start)
             .collect();
-        let light_started = std::time::Instant::now();
         let lights = self.lighting.prepare(
             source,
             &bases,
@@ -1526,13 +1542,34 @@ impl Gpu {
         } else {
             self.scene.quads
         };
-        let allocation_ns = if grow { elapsed_ns(uploading) } else { 0 };
-        let bindings_changed =
-            top != self.scene.top || quads != self.scene.quads || lighting_gpu != self.lighting_gpu;
+        let mut allocation_ns = if grow { elapsed_ns(uploading) } else { 0 };
+        // 实例身份只引用同序目录；属性槽可独立扩展。anchor变化和纯属性更新复用目录。
+        let base_write = (!same_geometry && !bases.is_empty())
+            .then(|| (0, bytemuck::cast_slice(bases.as_slice())));
+        let instance_quad_bases = if let Some((_, bytes)) = base_write
+            && (bytes.len() as u64 > self.scene.instance_quad_bases.len()
+                || self.scene.instance_quad_bases == self.program_scene.instance_quad_bases)
+        {
+            let started = std::time::Instant::now();
+            let capacity = bytes.len().max(256).next_power_of_two();
+            let buffer = Buffer::mapped_device_local(&mut self.context, capacity as u64)?;
+            allocation_ns += elapsed_ns(started);
+            buffer
+        } else {
+            self.scene.instance_quad_bases
+        };
+        let bindings_changed = top != self.scene.top
+            || quads != self.scene.quads
+            || instance_quad_bases != self.scene.instance_quad_bases
+            || lighting_gpu != self.lighting_gpu;
         if bindings_changed {
             let collecting = std::time::Instant::now();
             let mut candidates = lighting_gpu.roots().to_vec();
-            candidates.extend([vulkan::native::Resource::from(top), quads.into()]);
+            candidates.extend([
+                vulkan::native::Resource::from(top),
+                quads.into(),
+                instance_quad_bases.into(),
+            ]);
             self.collect_with(&candidates)?;
             metrics.collect_ns = elapsed_ns(collecting);
         }
@@ -1565,12 +1602,14 @@ impl Gpu {
             + vertex_writes.len()) as u64
             * 16;
 
-        if !writes.is_empty() || light_patch_bytes != 0 {
+        let writes_attributes = !writes.is_empty() || base_write.is_some();
+        if writes_attributes || light_patch_bytes != 0 {
             let writing = std::time::Instant::now();
             Buffer::write_scattered_batches(
                 &mut self.context,
                 &[
                     (&quads, &writes),
+                    (&instance_quad_bases, base_write.as_slice()),
                     (&lighting_gpu.alias, &alias_writes),
                     (&lighting_gpu.meta, &meta_writes),
                     (&lighting_gpu.vertices, &vertex_writes),
@@ -1580,18 +1619,19 @@ impl Gpu {
             )?;
             // 共同映射/复制的墙钟只归因一次，不能按buffer把同一等待重复累加。
             let wall = elapsed_ns(writing);
-            if writes.is_empty() {
+            if !writes_attributes {
                 metrics.light_upload_ns += wall;
             } else {
                 metrics.attribute_upload_ns = wall;
             }
             metrics.light_upload_bytes += light_patch_bytes;
-            if writes.is_empty() {
+            if !writes_attributes {
                 metrics.resources_ns += wall;
             }
         }
         metrics.attribute_upload_ns += allocation_ns;
-        metrics.attribute_upload_bytes = (attributes.len() * 48) as u64;
+        metrics.attribute_upload_bytes =
+            (attributes.len() * 48 + base_write.map_or(0, |(_, bytes)| bytes.len())) as u64;
         metrics.resources_ns += metrics.attribute_upload_ns;
         let publishing = std::time::Instant::now();
         publication.commit();
@@ -1599,7 +1639,11 @@ impl Gpu {
         self.lighting.set_epoch(self.resource_generation);
         self.lighting_gpu = lighting_gpu;
         self.lighting_dirty = false;
-        self.scene = Scene { top, quads };
+        self.scene = Scene {
+            top,
+            quads,
+            instance_quad_bases,
+        };
         self.anchor = source.anchor;
         self.attribute_revisions = versions;
         if bindings_changed {
@@ -1634,8 +1678,10 @@ impl Gpu {
         let mut roots = vec![
             self.scene.top.into(),
             self.scene.quads.into(),
+            self.scene.instance_quad_bases.into(),
             self.program_scene.top.into(),
             self.program_scene.quads.into(),
+            self.program_scene.instance_quad_bases.into(),
             self.atlas.into(),
             self.energy.into(),
             self.nearest.into(),
@@ -1710,6 +1756,7 @@ impl Gpu {
             buffer(&lighting.inverse),
             buffer(&lighting.regions),
             buffer(&materials.emission_alias),
+            buffer(&scene.instance_quad_bases),
         ]);
         let post = vec![
             buffer(&view.params),
