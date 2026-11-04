@@ -1,10 +1,15 @@
 //! Minecraft 的场景与宿主适配；资源、AS、pipeline/SBT 和命令执行由引擎维护。
 //!
 //! 每次调用或销毁前宿主须确认前次命令完成，并在调用期间独占队列。
-//! 设备/输出导入、宿主命令编码与 引擎 SDK 求值共享同一完成边界。
+//! 设备和输出导入、宿主命令编码与引擎 SDK 求值共享同一完成边界。
 //! 64m region局部BLAS由scene_cache独占；revision变化只重建对应BLAS，anchor只改变TLAS平移。
 //! 一批dirty三角输入连续收集，共享native上传与scratch并只提交等待一次；返回后释放CPU输入。
 //! 属性存储保留容量并仅写变化范围；全部准备与目录校验后原子写入，再进行不失败的发布。
+//!
+//! 首次加载和资源重载先准备材质范围、静态发光 alias、Slang callable 及普通／SER 管线与 SBT，
+//! 成功后一次发布资源世代，失败保留上一代。切换已支持的 SER 变体只选择现有程序。
+//! region 增量更新复用已准备的材质资源，旧 GPU 资源在最后一次实际使用完成后退役。
+//! 局部几何变动按 region 重建 BLAS，纯 tint 走属性更新，anchor 变化更新 TLAS 平移。
 
 use crate::scene::{Camera, Environment, Mesh};
 use prime_scene::MaterialDefinition;
@@ -81,6 +86,9 @@ pub enum Error {
     /// 光源选择或面积输入无效。
     #[error(transparent)]
     Lights(#[from] light_sampling::Error),
+    /// 无法读取开发宿主的工作目录。
+    #[error("无法读取开发宿主的工作目录")]
+    DevelopmentDirectory(#[source] std::io::Error),
     /// 宿主输入不符合当前渲染契约。
     #[error("PT 宿主输入：{0}")]
     Invalid(&'static str),
@@ -735,7 +743,7 @@ impl Gpu {
         }
     }
 
-    /// `runtime_root` 指向已提取并校验的发行资源。开发宿主传 `None`，使用源码树与本机 Slang。
+    /// `runtime_root` 指向已提取并校验的发行资源。开发宿主传 `None`，从当前工作目录向上定位项目源码并使用本机 Slang。
     /// 发行资源的两套 shader 源码在会话期间保持有效，派生缓存写入同根 `cache/`。
     /// # Safety
     /// 句柄属于同一活动设备，已启用 RT pipeline、RayQuery、device address 与 position fetch；family/index
@@ -761,11 +769,15 @@ impl Gpu {
                 root.join("shaders/engine"),
             )
         } else {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let current = std::env::current_dir().map_err(Error::DevelopmentDirectory)?;
+            let root = current
+                .ancestors()
+                .find(|path| path.join("crates/renderer/shaders/primary.slang").is_file())
+                .ok_or(Error::Invalid("开发宿主须从 Prime PT 源码目录启动"))?;
             (
-                root.join("../../target"),
-                root.join("shaders"),
-                root.join("../../../../shaders"),
+                root.join("target"),
+                root.join("crates/renderer/shaders"),
+                root.join("../../shaders"),
             )
         };
         let includes = [prime_shaders.as_path(), engine_shaders.as_path()];
@@ -834,7 +846,7 @@ impl Gpu {
             .submit_and_wait(&mut context)?;
         atmosphere.release_initialization();
         let solar = atmosphere.parameters().solar_irradiance_rgb();
-        // 旧 Prime 的太阳基准是大气外法向辐照度 Y=8，太阳盘辐亮度由 shader 推导。
+        // 太阳基准为大气外法向辐照度 Y=8，太阳盘辐亮度由 shader 推导。
         let solar_y = 0.262_700_2 * solar[0] + 0.677_998_07 * solar[1] + 0.059_301_715 * solar[2];
         let program_view = View::new_scaled(
             &mut context,

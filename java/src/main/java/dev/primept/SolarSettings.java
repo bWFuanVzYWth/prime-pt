@@ -1,6 +1,6 @@
 package dev.primept;
 
-/** 旧 Prime 的观测纬度与太阳黄经，均使用整数度。 */
+/** 观测纬度与太阳黄经，均使用整数度。 */
 record SolarSettings(int latitude, int longitude) {
     static final SolarSettings DEFAULT = new SolarSettings(30, 0);
 

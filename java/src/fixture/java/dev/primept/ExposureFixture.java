@@ -125,7 +125,7 @@ final class ExposureFixture {
         var saved = new SettingsConfig(file);
         require(saved.solar().equals(solstice), "其它设置保存时保留太阳轨迹参数");
         saved.reset();
-        require(new SettingsConfig(file).solar().equals(SolarSettings.DEFAULT), "恢复旧 Prime 的太阳默认值");
+        require(new SettingsConfig(file).solar().equals(SolarSettings.DEFAULT), "恢复太阳轨迹默认值");
     }
 
     private static void displaySettings(Path file) throws Exception {

@@ -1,4 +1,7 @@
 //! PRM1资源字典；Java只转发实际模型拓扑、shape占用、sprite和状态声明。
+//!
+//! 首次加载和资源重载各准备一份完整字典。模型、材质、sprite 与 tint 配方的身份只在
+//! 所属资源世代有效。编译任务借用稳定身份，资源准备及发布由 Catalog 所有者统一处理。
 
 use crate::{Error, wire::Reader};
 use std::collections::{HashMap, HashSet};

@@ -1,4 +1,7 @@
 //! 资源准备阶段构造共享数据atlas、材质身份、静态面积与纹理内alias。
+//!
+//! 原版 PBR 按 sprite 身份读取冻结数据。外部资源的 `_n`／`_s` 贴图当前只做检测和报告。
+//! 动画包络用于准备保守材质能力，绘制使用准备时的首帧，材质 atlas 不随 tick 切换。
 use crate::{
     Error, ImageSource, PreparedCatalog, SpriteSource,
     emission_power::{PowerMoments, textured_amplitude},

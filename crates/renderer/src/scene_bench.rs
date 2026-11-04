@@ -1,6 +1,6 @@
 //! 显式运行的场景收敛基线；使用真实宿主 draw，不启动 Minecraft。
 //!
-//! PRIME_PT_SCENE_BENCH_OUTPUT 指定 temp/prime-regions-20261104 下的新目录。
+//! PRIME_PT_SCENE_BENCH_OUTPUT 指定 temp/scene-bench 下的新目录。
 //! 视距4、Y为[-4,8) section，向4³对齐；基准相机窗口含1728个section/27个region，
 //! 其中固定64个非空section属于同一region，共98,304个quad；1024×576、1spp、12顶点、普通RT、RR关闭。
 //! steady每轮从绝对样本0开始；edit只重捕一个section并重建所属region，消费生产增量入口。
@@ -34,8 +34,7 @@ fn ns(start: Instant) -> u64 {
 }
 
 fn output_directory() -> Result<PathBuf> {
-    let base =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../../temp/prime-regions-20261104");
+    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../temp/scene-bench");
     fs::create_dir_all(&base)?;
     let base = base.canonicalize()?;
     let value = std::env::var_os("PRIME_PT_SCENE_BENCH_OUTPUT")
@@ -51,7 +50,7 @@ fn output_directory() -> Result<PathBuf> {
         .ok_or("输出目录缺少父目录")?
         .canonicalize()?;
     if !parent.starts_with(&base) {
-        return Err("输出目录必须位于 temp/prime-regions-20261104 内".into());
+        return Err("输出目录必须位于 temp/scene-bench 内".into());
     }
     let target = parent.join(target.file_name().ok_or("输出目录名称无效")?);
     fs::create_dir(&target)?;

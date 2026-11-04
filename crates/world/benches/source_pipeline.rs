@@ -1,4 +1,9 @@
 //! 显式Release CPU基线，输入由生产PRM/PRT3 writer fixture产生；不启动游戏或GPU。
+//!
+//! world 用例计入规划、源包写入、解码、slab 编译与 CPU 发布。真实 Java 捕获、宿主 tint
+//! 回调、GPU 和全局资源准备另计。独立的 vanilla_tint 用例覆盖配方缓存及宿主回退响应分配。
+//! 完整 world 用例每轮新建私有池；虽然构造在计时外，线程就绪与前一池退出仍可能重叠首波工作。
+//! 输入包、工作量和输出摘要随原始样本保存，用于对齐负载与测量边界。
 use prime_minecraft::fixtures::{self, Pattern};
 use prime_minecraft::{
     Catalog, CompiledSection, Neighbor, Neighborhood, TintPatch, compile_section, decode_sections,

@@ -3,7 +3,7 @@
   "id": "prime_pt",
   "version": "0.1.0",
   "name": "Prime PT",
-  "description": "基于 simple_engine 重写的 Prime PT，使用 Slang、Vulkan 和 DLSS RR。",
+  "description": "使用 Slang、Vulkan 和 DLSS RR 的路径追踪客户端 Mod。",
   "environment": "client",
   "mixins": ["prime_pt.mixins.json"],
   "depends": {"fabricloader": ">=0.19.5", "fabric-resource-loader-v1": ">=3.0.4", "minecraft": "26.3", "java": ">=25"}

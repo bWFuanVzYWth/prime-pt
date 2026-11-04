@@ -1,4 +1,5 @@
-//! 宿主变化包的完整边界校验；解析不触碰世界或资源所有者。
+//! 宿主变化包 PDI1 的完整边界校验。Java 合并世界、列与 section 范围后提交，
+//! 区分几何、源替换、biome 和颜色失效。解析不触碰世界或资源所有者，宿主在接收失败时保留未确认批次。
 use crate::Error;
 use prime_world::SourceChange;
 

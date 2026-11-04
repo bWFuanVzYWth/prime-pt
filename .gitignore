@@ -1,3 +1,7 @@
+/.agent/
+/.agents/
+/.vscode/
+/local/
 /target/
 /native/target/
 /build/

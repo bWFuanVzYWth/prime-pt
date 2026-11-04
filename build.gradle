@@ -1,3 +1,4 @@
+import groovy.json.JsonOutput
 import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.util.HexFormat
@@ -59,6 +60,19 @@ loom {
     }
 }
 def streamlineSdk = providers.environmentVariable('STREAMLINE_SDK').getOrElse(rootProject.file('../../target/streamline-sdk').absolutePath)
+def buildRoots = [
+        'source': rootProject.file('../..'),
+        'cargo': providers.environmentVariable('CARGO_HOME').map { rootProject.file(it) }.orNull,
+        'rustup': providers.environmentVariable('RUSTUP_HOME').map { rootProject.file(it) }.orNull,
+        'target': cargoTargetDir,
+        'home': rootProject.file(System.getProperty('user.home')),
+        'sdk': rootProject.file(streamlineSdk),
+        'slang': slangCompiler.parentFile.parentFile,
+].findAll { name, file -> file != null }
+def pathSpellings = { File directory ->
+    def path = directory.toPath().toAbsolutePath().normalize().toString()
+    [path.replace('\\', '/'), path.replace('/', '\\')].unique()
+}
 
 tasks.register('verifyStreamline', Exec) {
     workingDir rootDir
@@ -71,6 +85,15 @@ tasks.register('buildNative', Exec) {
     environment 'CARGO_TARGET_DIR', cargoTargetDir.absolutePath
     if (slangCompiler.isFile()) environment 'SLANGC', slangCompiler.absolutePath
     def args = ['cargo', 'build', '--profile', nativeProfile, '--locked', '--manifest-path', 'native/Cargo.toml']
+    def remaps = buildRoots.collectMany { name, directory ->
+        pathSpellings(directory).collect { "--remap-path-prefix=${it}=/build/${name}".toString() }
+    }
+    def rustConfig = layout.buildDirectory.file('native/rust-path-remaps.toml').get().asFile
+    doFirst {
+        rustConfig.parentFile.mkdirs()
+        rustConfig.setText("[target.x86_64-pc-windows-msvc]\nrustflags = ${JsonOutput.toJson(remaps)}\n", 'UTF-8')
+    }
+    args.addAll(['--config', rustConfig.absolutePath])
     if (gradle.startParameter.offline) args.add('--offline')
     commandLine args
 }
@@ -128,11 +151,12 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'slang'
     }
     from('crates/renderer/shaders') {
-        include '**/*.slang'
+        include 'primary.slang', 'params.slang', 'mod_*.slang'
         into 'shaders/prime'
     }
     from('../../shaders') {
-        include '**/*.slang'
+        include 'atmosphere/*.slang', 'bsdf/openpbr/**/*.slang', 'color/*.slang',
+                'display/prime_drt.slang', 'geometry/*.slang', 'pt/*.slang'
         into 'shaders/engine'
     }
     doLast {
@@ -145,6 +169,17 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         }
         for (def path : ['slang/LICENSES', 'slang/third-party-notices']) {
             if (fileTree(new File(directory, path)).empty) throw new GradleException("发行运行时缺少 ${path}")
+        }
+        if (nativeProfile == 'release-lto') {
+            def binary = new String(new File(directory, 'prime_pt.dll').bytes, 'ISO-8859-1').toLowerCase(Locale.ROOT)
+            for (def entry : buildRoots.entrySet()) {
+                for (def path : pathSpellings(entry.value)) {
+                    for (def encoding : ['UTF-8', 'UTF-16LE']) {
+                        def needle = new String(path.getBytes(encoding), 'ISO-8859-1').toLowerCase(Locale.ROOT)
+                        if (binary.contains(needle)) throw new GradleException("发行 DLL 含本机路径：${entry.key}")
+                    }
+                }
+            }
         }
         def prefix = directory.toPath()
         def files = fileTree(directory).matching { exclude 'manifest.sha256' }.files.collectEntries {
@@ -181,7 +216,7 @@ def bundledRuntimeFixture = tasks.register('bundledRuntimeFixture', JavaExec) {
     workingDir layout.buildDirectory
     environment.remove('SLANGC')
     environment.remove('VULKAN_SDK')
-    args rootProject.file('target/单包 runtime fixture').absolutePath
+    args rootProject.file('target/bundled-runtime-fixture').absolutePath
 }
 tasks.register('buildRelease') {
     dependsOn tasks.named('build'), bundledRuntimeFixture

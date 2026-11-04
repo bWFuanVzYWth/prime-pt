@@ -1,4 +1,15 @@
-//! Minecraft 26.3 的引擎 PT 场景适配实验。
+//! Minecraft 26.3 的路径追踪宿主适配与原生会话入口。
+//!
+//! # 组件与数据流
+//!
+//! Java 绑定宿主类型，转发资源字典、区块源、变化与设备句柄。
+//! [`prime_minecraft`] 校验资源世代并把宿主数据编译为几何及材质输入；
+//! [`prime_world::Scene`] 持有需求窗口、捕获票据、预算与区块替换候选。
+//! [`prime_scene`] 定义宿主无关的几何、材质身份与相机视图，
+//! [`prime_renderer::Gpu`] 准备并提交 GPU 资源、积分和呈现。
+//! 引擎提供通用算法及设备接入，Minecraft 的源数据解释与设置策略留在本项目。
+//!
+//! # 宿主调用边界
 //!
 //! Java 在渲染线程同步借出源包、atlas 与宿主 Vulkan 句柄；Rust 拥有 mesh、
 //! 工作池、BLAS/TLAS、SBT 和 pipeline。操作 GPU 所有者前，宿主必须提交并等待
@@ -95,10 +106,11 @@ struct TintContinuation {
 }
 
 impl Engine {
+    /// 视距从 16 到 32 时，每格增加 64 MiB 逻辑常驻额度，最高 2 GiB，受 GPU 属性容量约束。
+    /// 会话内只提高上限，窗口收缩按实际退出的 region 回收资源。
     fn grow_view_budget(&mut self, view_distance: u32) -> Result<(), Error> {
         const MIB: usize = 1024 * 1024;
         let mut budget = self.scene.budget();
-        // 视距16到32逐步提高逻辑常驻上限；收缩窗口时只回收资源，不使其余区块失效。
         let requested = (1024 + view_distance.saturating_sub(16).min(16) as usize * 64) * MIB;
         if requested <= budget.resident_bytes {
             return Ok(());
