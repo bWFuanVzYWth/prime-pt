@@ -180,7 +180,7 @@ pt::TransportCall load_landing(uint pixel, uint2 coordinate, float4 rgb_header)
     data.path.medium = parameters[0].initial_medium;
     data.pixel = coordinate;
     data.sample = parameters[0].reconstruction.w > 0
-                      ? parameters[0].temporal.x + sample_counts[pixel]
+                      ? parameters[0].rr_sample + sample_counts[pixel]
                       : sample_counts[pixel];
     return data;
 }
@@ -193,7 +193,7 @@ void prefix_main()
     uint pixel = coordinate.y * params.image.x + coordinate.x;
     pt::TransportCall data = (pt::TransportCall)0;
     data.pixel = coordinate;
-    data.sample = params.reconstruction.w > 0 ? params.temporal.x + sample_counts[pixel]
+    data.sample = params.reconstruction.w > 0 ? params.rr_sample + sample_counts[pixel]
                                               : sample_counts[pixel];
     if (accumulation[pixel].w < 0)
     {

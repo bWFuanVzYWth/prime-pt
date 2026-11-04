@@ -21,6 +21,8 @@ final class Native implements AutoCloseable {
     private SolarSettings solar;
     private final MethodHandle setDisplayOptions;
     private DisplaySettings display;
+    private final MethodHandle setLightingOptions;
+    private LightingSettings lighting;
     private boolean serRequested;
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex) {
@@ -53,6 +55,7 @@ final class Native implements AutoCloseable {
         setUpdateBudget = bind(symbols, "prime_set_update_budget", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         setSolarOrbit = bind(symbols, "prime_set_solar_orbit", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT));
         setDisplayOptions = bindDisplayOptions(symbols);
+        setLightingOptions = bindLightingOptions(symbols);
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         cameraMedium = bind(symbols, "prime_camera_medium", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
@@ -116,6 +119,23 @@ final class Native implements AutoCloseable {
     static int invokeDisplayOptions(MethodHandle target, long id, DisplaySettings options) throws Throwable {
         return (int) target.invokeExact(id, options.autoExposure() / 100.0f, options.saturation() / 100.0f,
                 options.hue() / 100.0f, options.compressionStart() / 100.0f);
+    }
+
+    void updateLightingOptions(LightingSettings next) {
+        if (next.equals(lighting)) return;
+        try {
+            check(invokeLightingOptions(setLightingOptions, handle, next));
+            lighting = next;
+        } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    static MethodHandle bindLightingOptions(SymbolLookup symbols) {
+        return bind(symbols, "prime_set_lighting_options", FunctionDescriptor.of(JAVA_INT, JAVA_LONG,
+                JAVA_FLOAT, JAVA_FLOAT));
+    }
+
+    static int invokeLightingOptions(MethodHandle target, long id, LightingSettings options) throws Throwable {
+        return (int) target.invokeExact(id, options.sunEv(), options.blockEmissionEv());
     }
 
     int plan(ByteBuffer camera, int distance, int minSectionY, int maxSectionYExclusive, ByteBuffer requests) {

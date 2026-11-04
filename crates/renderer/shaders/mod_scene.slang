@@ -64,7 +64,12 @@ float3 solar_radiance(float3 direction, float altitude_km)
         p.solar * atmosphere::view_transmittance(p, optical_depth, linear_sampler, direction);
     float3 rgb = spectrum.x * p.rgb[0].xyz + spectrum.y * p.rgb[1].xyz + spectrum.z * p.rgb[2].xyz +
                  spectrum.w * p.rgb[3].xyz;
-    return max(color::rec2020_to_bt709(rgb * parameters[0].atmosphere_settings.xyz * sun_pdf()), 0);
+    // 辐照度按太阳盘投影立体角换算，采样 PDF 则使用未投影立体角。
+    float sine = sin(p.sun.z);
+    float projected_solid_angle = atmosphere::PI * sine * sine;
+    return max(color::rec2020_to_bt709(rgb * parameters[0].atmosphere_settings.xyz /
+                                       projected_solid_angle),
+               0);
 }
 
 /// 主查询只交接硬件命中引用；OpenPBR 翻译在消费交点时执行。
@@ -94,7 +99,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public pt::SurfaceMaterial guide_material(pt::Hit hit, float4 incident)
     {
-        return resolve_material(hit, ~openpbr::FLOW_EMISSION, ~0u);
+        return resolve_material(hit, ~openpbr::FLOW_EMISSION, ~0u, 1.0);
     }
 
     public bool intersect(float3 origin, float3 direction, out pt::Hit hit)
@@ -136,12 +141,12 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public pt::SurfaceMaterial resolve(pt::Hit hit, uint capability, float4 incident)
     {
-        return resolve_material(hit, ~0u, ~0u);
+        return resolve_material(hit, ~0u, ~0u, parameters[0].block_emission_scale);
     }
 
     public pt::SurfaceMaterial resolve_flow(pt::Hit hit, uint flow, float4 incident)
     {
-        return resolve_material(hit, flow, OPENPBR_VARIANT);
+        return resolve_material(hit, flow, OPENPBR_VARIANT, parameters[0].block_emission_scale);
     }
 
     public openpbr::Energy energy()
@@ -177,7 +182,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
     public float3 light_emission(geometry::SurfacePoint point, pt::LightSample sample, bool solar)
     {
         return solar ? solar_radiance(sample.direction, altitude(point.position.y))
-                     : quad_light_emission(sample);
+                     : quad_light_emission(sample, parameters[0].block_emission_scale);
     }
 
     public float emission_pdf(pt::Hit hit, float3 previous)

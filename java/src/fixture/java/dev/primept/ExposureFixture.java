@@ -15,6 +15,7 @@ final class ExposureFixture {
         migration(file);
         solarSettings(file);
         displaySettings(file);
+        lightingSettings(file);
         serDefaults(file);
         failedSave(file);
         Files.deleteIfExists(file);
@@ -27,6 +28,7 @@ final class ExposureFixture {
                 && config.samples() == 1 && config.bounces() == 12 && config.ser()
                 && config.updateBudget() == UpdateBudget.BALANCED, "默认开启 SER、Performance RR、0 EV、1 SPP、12 顶点和平衡更新");
         require(config.display().equals(new DisplaySettings(65, 5, 75, 40)), "自动曝光和 DRT 各自使用显示默认值");
+        require(config.lighting().equals(LightingSettings.DEFAULT), "太阳和方块发光默认各为 0 EV");
     }
 
     private static void commandBoundary(Path file) {
@@ -138,6 +140,21 @@ final class ExposureFixture {
         require(saved.ev() == 1.23456f && saved.display().equals(next), "修改手动 EV 保留自动曝光和 DRT 配置");
         saved.reset();
         defaults(file);
+    }
+
+    private static void lightingSettings(Path file) throws Exception {
+        Files.writeString(file, "exposure_ev=-3\nlighting.sun_ev_quarters=-7\nlighting.block_emission_ev_quarters=17\n");
+        var config = new SettingsConfig(file);
+        require(config.lighting().sunEv() == -1.75f && config.lighting().blockEmissionEv() == 4.25f,
+                "沿用旧配置的四分之一 EV 单位");
+        var next = new LightingSettings(-32, 40);
+        config.setLighting(next);
+        require(config.ev() == -3, "调节光源强度保留手动曝光");
+        config.setExposure(2f);
+        var saved = new SettingsConfig(file);
+        require(saved.lighting().equals(next) && saved.ev() == 2f, "光照与曝光配置独立保存");
+        saved.reset();
+        require(new SettingsConfig(file).lighting().equals(LightingSettings.DEFAULT), "恢复旧版光照默认值");
     }
 
     private static void failedSave(Path file) throws Exception {

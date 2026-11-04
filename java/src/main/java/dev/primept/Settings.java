@@ -27,6 +27,7 @@ public final class Settings {
     static UpdateBudget updateBudget() { return Holder.CONFIG.updateBudget(); }
     static SolarSettings solar() { return Holder.CONFIG.solar(); }
     static DisplaySettings display() { return Holder.CONFIG.display(); }
+    static LightingSettings lighting() { return Holder.CONFIG.lighting(); }
     static boolean rr() { return requestedRr() && StreamlineBootstrap.available(); }
 
     /** 保存成功后才发布新值；输入无效抛出 IllegalArgumentException，IO 失败抛出 IOException。 */
@@ -42,6 +43,12 @@ public final class Settings {
     }
     static void setSolarLongitude(int value) throws IOException {
         Holder.CONFIG.setSolar(new SolarSettings(solar().latitude(), value));
+    }
+    static void setSunEvQuarters(int value) throws IOException {
+        Holder.CONFIG.setLighting(new LightingSettings(value, lighting().blockEmissionEvQuarters()));
+    }
+    static void setBlockEmissionEvQuarters(int value) throws IOException {
+        Holder.CONFIG.setLighting(new LightingSettings(lighting().sunEvQuarters(), value));
     }
     static void setAutoExposure(int value) throws IOException {
         var options = display();

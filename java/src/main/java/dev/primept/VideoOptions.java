@@ -3,6 +3,7 @@ package dev.primept;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.function.Consumer;
 import java.util.function.DoubleSupplier;
 import java.util.function.Supplier;
@@ -22,7 +23,8 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, LATITUDE, SOLAR_LONGITUDE,
+    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
+        LATITUDE, SOLAR_LONGITUDE,
         DISPLAY, EXPOSURE, AUTO_EXPOSURE, DRT_SATURATION, DRT_HUE, DRT_COMPRESSION_START }
 
     @FunctionalInterface
@@ -35,13 +37,14 @@ public final class VideoOptions {
     interface SelectionSetter<T> { void set(T value) throws IOException; }
 
     enum ValueFormat {
-        INTEGER, ANGLE, EXPOSURE, PERCENT;
+        INTEGER, ANGLE, EXPOSURE, LIGHTING_EV, PERCENT;
 
         String text(double value) {
             return switch (this) {
                 case INTEGER -> Integer.toString((int)value);
                 case ANGLE -> (int)value + "°";
                 case EXPOSURE -> Float.toString((float)value) + " EV";
+                case LIGHTING_EV -> String.format(Locale.ROOT, "%+.2f EV", value);
                 case PERCENT -> (int)value + "%";
             };
         }
@@ -112,6 +115,15 @@ public final class VideoOptions {
                 list.addBig(updateBudget);
             }
             case LIGHTING -> list.addHeader(text("lighting"));
+            case SUN_EV -> addSlider("sun_ev", -LightingSettings.SUN_LIMIT * LightingSettings.EV_STEP,
+                    LightingSettings.SUN_LIMIT * LightingSettings.EV_STEP, LightingSettings.EV_STEP,
+                    () -> Settings.lighting().sunEv(),
+                    value -> Settings.setSunEvQuarters((int)(value / LightingSettings.EV_STEP)), ValueFormat.LIGHTING_EV);
+            case BLOCK_EMISSION_EV -> addSlider("block_emission_ev",
+                    -LightingSettings.BLOCK_EMISSION_LIMIT * LightingSettings.EV_STEP,
+                    LightingSettings.BLOCK_EMISSION_LIMIT * LightingSettings.EV_STEP, LightingSettings.EV_STEP,
+                    () -> Settings.lighting().blockEmissionEv(),
+                    value -> Settings.setBlockEmissionEvQuarters((int)(value / LightingSettings.EV_STEP)), ValueFormat.LIGHTING_EV);
             case LATITUDE -> addSlider("latitude", -90, 90, 1,
                     () -> Settings.solar().latitude(), value -> Settings.setSolarLatitude((int)value), ValueFormat.ANGLE);
             case SOLAR_LONGITUDE -> addSlider("solar_longitude", 0, 359, 1,

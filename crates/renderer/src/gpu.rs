@@ -247,7 +247,7 @@ struct View {
     counts: Buffer,
     landing: Vec<Buffer>,
     prefix: Buffer,
-    progress: pt::Progress<[u32; 23]>,
+    progress: pt::Progress<[u32; 25]>,
     present: ComputePipeline,
     rr_enabled: bool,
     quality: streamline::Quality,
@@ -664,7 +664,9 @@ pub struct Gpu {
     linear: Sampler,
     atmosphere: atmosphere::native::Atmosphere,
     atmosphere_pending: bool,
-    solar_luminance: f32,
+    solar_reference_scale: f32,
+    sun_gain: f32,
+    block_emission_gain: f32,
     view: Option<View>,
     program_view: View,
     compiler: shader_build::RuntimeCompiler,
@@ -799,8 +801,9 @@ impl Gpu {
             .initialize(&mut context)?
             .submit_and_wait(&mut context)?;
         atmosphere.release_initialization();
-        let solar = atmosphere.parameters().sun_radiance_rgb();
-        let solar_luminance = 0.2627 * solar[0] + 0.6780 * solar[1] + 0.0593 * solar[2];
+        let solar = atmosphere.parameters().solar_irradiance_rgb();
+        // 旧 Prime 的太阳基准是大气外法向辐照度 Y=8，太阳盘辐亮度由 shader 推导。
+        let solar_y = 0.262_700_2 * solar[0] + 0.677_998_07 * solar[1] + 0.059_301_715 * solar[2];
         let compiler = shader_build::RuntimeCompiler::new(
             root.join("../../target/shaders"),
             &[&root.join("shaders"), &root.join("../../../../shaders")],
@@ -859,7 +862,9 @@ impl Gpu {
             linear,
             atmosphere,
             atmosphere_pending: false,
-            solar_luminance,
+            solar_reference_scale: 8.0 / solar_y,
+            sun_gain: 1.0,
+            block_emission_gain: 1.0,
             view: None,
             program_view,
             compiler,
@@ -899,6 +904,27 @@ impl Gpu {
                 .prepare(1.0)?;
         self.display_timeline.set_compensation(auto_exposure)?;
         self.display_drt = drt;
+        Ok(())
+    }
+
+    /// 设置太阳与局部材质发光的场景线性倍率，以 EV 表示。
+    /// 太阳倍率也作用于天空散射与 Aerial 辉光。两个值只更新 CPU 帧参数，
+    /// 发生有效的输运变化时重启原始 PT 累积，保留 RR 历史和已准备的灯表。
+    /// # Errors
+    /// 太阳 EV 超出 −8..=8 或方块发光 EV 超出 −10..=10 时保持原设置。
+    pub fn set_lighting_options(
+        &mut self,
+        sun_ev: f32,
+        block_emission_ev: f32,
+    ) -> Result<(), Error> {
+        if !(-8.0..=8.0).contains(&sun_ev) {
+            return Err(Error::Invalid("太阳强度须为 −8..=8 EV"));
+        }
+        if !(-10.0..=10.0).contains(&block_emission_ev) {
+            return Err(Error::Invalid("方块发光强度须为 −10..=10 EV"));
+        }
+        self.sun_gain = sun_ev.exp2();
+        self.block_emission_gain = block_emission_ev.exp2();
         Ok(())
     }
 
@@ -1964,12 +1990,18 @@ impl Gpu {
         }
         let mut result = Vec::with_capacity(4);
         let recording = (|| -> Result<(), Error> {
-            let solar_scale = if environment.enabled() {
-                20_000.0 / self.solar_luminance
+            let sky_enabled = environment.enabled();
+            let solar_scale = if sky_enabled {
+                self.solar_reference_scale * self.sun_gain
             } else {
                 0.0
             };
-            if environment.enabled() {
+            let block_emission_scale = if self.has_emission {
+                self.block_emission_gain
+            } else {
+                1.0
+            };
+            if sky_enabled {
                 self.atmosphere.prepare(
                     &mut self.context,
                     atmosphere::View {
@@ -2054,6 +2086,8 @@ impl Gpu {
                         environment.sun_direction[1].to_bits(),
                         environment.sun_direction[2].to_bits(),
                         environment.sea_level.to_bits(),
+                        solar_scale.to_bits(),
+                        block_emission_scale.to_bits(),
                     ][i - 16]
                 }
             });
@@ -2083,11 +2117,7 @@ impl Gpu {
                     .map(f32::to_bits),
             );
             words.extend(environment.sun_direction.map(f32::to_bits));
-            words.push(if environment.enabled() {
-                20_000.0f32.to_bits()
-            } else {
-                0
-            });
+            words.push(if sky_enabled { 1.0f32.to_bits() } else { 0 });
             words.extend(self.atmosphere.parameters().words());
             words.extend([solar_scale, solar_scale, solar_scale, 64.0].map(f32::to_bits));
             let jitter = crate::reconstruction::jitter(
@@ -2104,7 +2134,7 @@ impl Gpu {
                 ]
                 .map(f32::to_bits),
             );
-            words.extend([self.rr_sample, 0, 0, 0]);
+            words.extend([self.rr_sample, block_emission_scale.to_bits(), 0, 0]);
             words.extend(
                 self.rr_previous
                     .as_ref()
@@ -2118,9 +2148,7 @@ impl Gpu {
             words.extend(self.initial_medium.map(f32::to_bits));
             view.params
                 .write(&mut self.context, 0, bytemuck::cast_slice(&words))?;
-            if environment.enabled()
-                && let Some(recorded) = self.atmosphere.record(&mut self.context)?
-            {
+            if sky_enabled && let Some(recorded) = self.atmosphere.record(&mut self.context)? {
                 result.push(recorded);
             }
             if batch.first() == 0 {

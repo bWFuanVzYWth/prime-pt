@@ -98,11 +98,12 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
     result.emission_reference = index;
     return result;
 }
-public float3 quad_light_emission(pt::LightSample sample)
+public float3 quad_light_emission(pt::LightSample sample, float block_emission_scale)
 {
     uint flags = asuint(sample.emission.z);
     uint primitive = light_meta[sample.emission_reference].w * 2u + (flags & 1u);
-    return material_emission(primitive, sample.emission.xy, (flags & 2u) != 0);
+    return material_emission(primitive, sample.emission.xy, (flags & 2u) != 0,
+                             block_emission_scale);
 }
 public float quad_emission_pdf(pt::Hit hit, float3 previous)
 {

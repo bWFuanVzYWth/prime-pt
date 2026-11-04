@@ -66,10 +66,12 @@ final class SettingsLanguageFixture {
                     requireText("render", "PT rendering");
                     requireWidgetText("Samples per frame", "DLSS quality", "Performance (2×)");
                     requireAutoExposure("Auto exposure strength");
+                    requireLighting("Sun intensity", "Block emission intensity");
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "PT 渲染");
                     requireWidgetText("每帧采样数", "DLSS 质量", "性能（2×）");
                     requireAutoExposure("自动曝光强度");
+                    requireLighting("太阳强度", "方块发光强度");
                 }
 
                 Files.createDirectories(lang);
@@ -121,5 +123,14 @@ final class SettingsLanguageFixture {
                 error -> { throw new AssertionError(error); }, VideoOptions.ValueFormat.PERCENT);
         var expected = Options.genericValueLabel(Component.literal(caption), Component.literal("65%"));
         require(slider.getMessage().getString().equals(expected.getString()), "自动曝光显示一次本地化标题和百分比");
+    }
+
+    private static void requireLighting(String sun, String block) {
+        requireText("sun_ev", sun);
+        requireText("block_emission_ev", block);
+        var slider = new VideoOptions.Slider("sun_ev", -8, 8, 0.25, () -> 1.25, value -> {},
+                error -> { throw new AssertionError(error); }, VideoOptions.ValueFormat.LIGHTING_EV);
+        var expected = Options.genericValueLabel(Component.literal(sun), Component.literal("+1.25 EV"));
+        require(slider.getMessage().getString().equals(expected.getString()), "光照显示本地化标题和有符号 EV");
     }
 }

@@ -75,8 +75,9 @@ impl Host {
             let profile = directory
                 .ancestors()
                 .find(|path| {
-                    path.file_name()
-                        .is_some_and(|name| name == "debug" || name == "release")
+                    path.file_name().is_some_and(|name| {
+                        name == "debug" || name == "release" || name == "release-lto"
+                    })
                 })
                 .ok_or("测试程序不在 Cargo profile 内")?;
             // 测试链接产物与 build-script 的 OUT_DIR hash 不同；只复制可再生 runtime。
@@ -1226,6 +1227,17 @@ fn exposure_hdr(gpu: &mut Gpu) -> Result<Vec<u8>, Error> {
     Ok(bytes)
 }
 
+fn accumulated_rgb(gpu: &mut Gpu) -> Result<Vec<[f32; 3]>, Error> {
+    Ok(exposure_hdr(gpu)?
+        .as_chunks::<16>()
+        .0
+        .iter()
+        .map(|pixel| {
+            std::array::from_fn(|i| f32::from_le_bytes(pixel[i * 4..i * 4 + 4].try_into().unwrap()))
+        })
+        .collect())
+}
+
 fn exposure_view(gpu: &mut Gpu) -> Result<(), Error> {
     let mut view = View::new(&mut gpu.context, [32, 32], false)?;
     view.accumulation = Buffer::new(&mut gpu.context, 32 * 32 * 16, true)?;
@@ -1236,6 +1248,48 @@ fn exposure_view(gpu: &mut Gpu) -> Result<(), Error> {
 fn freeze_exposure_clock(gpu: &mut Gpu) {
     // 宿主时钟固定为零：elapsed 对未来原点饱和，避免GPU耗时影响适应断言。
     gpu.display_origin = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+}
+
+#[test]
+#[ignore = "真实 Vulkan RT；太阳盘与散射天空共享场景线性太阳 EV"]
+fn hardware_pt_sun_ev_doubles_disk_and_scattered_sky() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    exposure_view(&mut gpu)?;
+    let camera = Camera {
+        forward: [0., 1., 0., 0.],
+        right: [0.014, 0., 0., 0.],
+        up: [0., 0., -0.014, 0.],
+        ..camera()
+    };
+    let options = Options::new(false, streamline::Quality::Dlaa, 1, 4)?;
+    host.render_options(&mut gpu, &image, &camera, Environment::default(), options)?;
+    let baseline = accumulated_rgb(&mut gpu)?;
+    gpu.set_lighting_options(1., 0.)?;
+    host.render_options(&mut gpu, &image, &camera, Environment::default(), options)?;
+    let brighter = accumulated_rgb(&mut gpu)?;
+    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 1);
+    let peak = baseline.iter().map(|pixel| pixel[0]).fold(0., f32::max);
+    assert!(peak > 1000., "视野包含太阳盘，峰值 {peak}");
+    assert!(
+        baseline
+            .iter()
+            .any(|pixel| (f32::MIN_POSITIVE..0.01 * peak).contains(&pixel[0])),
+        "视野包含散射天空"
+    );
+    for (before, after) in baseline
+        .into_iter()
+        .flatten()
+        .zip(brighter.into_iter().flatten())
+    {
+        assert!(
+            (after - 2. * before).abs() <= 1e-5 * (1. + before),
+            "太阳 EV 线性放大 {before} -> {after}"
+        );
+    }
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
 }
 
 #[test]

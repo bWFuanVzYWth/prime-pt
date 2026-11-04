@@ -93,7 +93,7 @@ bool emits_on_side(ModMaterial material, bool front)
     return (material.control.y & side) != 0 && material.emission.w > 0 &&
            ((material.control.z & 32u) == 0 || front);
 }
-public float3 material_emission(uint primitive, float2 bary, bool front)
+public float3 material_emission(uint primitive, float2 bary, bool front, float block_emission_scale)
 {
     ModMaterial material = materials[material_id(primitive)];
     if (!emits_on_side(material, front))
@@ -105,7 +105,7 @@ public float3 material_emission(uint primitive, float2 bary, bool front)
     float3 result = material.emission.xyz * material.emission.w * texel.xyz;
     if ((material.control.z & 4u) != 0)
         result *= mers_atlas.SampleLevel(atlas_sampler, uv, 0).y;
-    return result;
+    return result * block_emission_scale;
 }
 float2 normal_sign(float2 value)
 {
@@ -169,7 +169,8 @@ uint material_variant(ModMaterial material)
 }
 
 /// 消费已通过覆盖测试的命中；callable 的 Flow 和 variant 都在资源准备时特化。
-public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant)
+public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant,
+                                            float block_emission_scale)
 {
     uint primitive = hit.identity.x;
     ModMaterial material = materials[material_id(primitive)];
@@ -239,6 +240,7 @@ public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant
         result.emission = material.emission.xyz * material.emission.w * hit.texel.xyz;
         if (textured_emission)
             result.emission *= mers.y;
+        result.emission *= block_emission_scale;
     }
     result.boundary_filter = 1;
     return result;

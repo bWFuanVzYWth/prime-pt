@@ -54,7 +54,8 @@ final class VideoOptionsFixture {
         require(Arrays.asList(VideoOptions.Row.values()).equals(List.of(
                 VideoOptions.Row.RESET, VideoOptions.Row.RENDER, VideoOptions.Row.SER, VideoOptions.Row.RR,
                 VideoOptions.Row.QUALITY, VideoOptions.Row.SAMPLES, VideoOptions.Row.BOUNCES,
-                VideoOptions.Row.UPDATE_BUDGET, VideoOptions.Row.LIGHTING, VideoOptions.Row.LATITUDE,
+                VideoOptions.Row.UPDATE_BUDGET, VideoOptions.Row.LIGHTING, VideoOptions.Row.SUN_EV,
+                VideoOptions.Row.BLOCK_EMISSION_EV, VideoOptions.Row.LATITUDE,
                 VideoOptions.Row.SOLAR_LONGITUDE, VideoOptions.Row.DISPLAY, VideoOptions.Row.EXPOSURE,
                 VideoOptions.Row.AUTO_EXPOSURE, VideoOptions.Row.DRT_SATURATION, VideoOptions.Row.DRT_HUE,
                 VideoOptions.Row.DRT_COMPRESSION_START)),

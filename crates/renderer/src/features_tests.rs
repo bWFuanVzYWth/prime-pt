@@ -418,6 +418,70 @@ fn hardware_pt_emissive_quad_lights_the_receiver_from_the_correct_side()
 }
 
 #[test]
+#[ignore = "真实 Vulkan RT；方块 EV 同比例改变命中发光与受光面的 NEE"]
+fn hardware_pt_block_ev_doubles_visible_and_sampled_emission()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    let lamp = MaterialDefinition {
+        emission: [1., 1., 1., 20.],
+        ..Default::default()
+    };
+    upload(
+        &mut gpu,
+        &[MaterialDefinition::default(), lamp],
+        &[],
+        &[[u32::MAX, 0, 0, 0]; 2],
+    )?;
+    let mut mesh = scene();
+    mesh.quads.push(Quad::with_material(
+        [
+            [-0.4, -0.4, 1.],
+            [-0.4, 0.4, 1.],
+            [0.4, 0.4, 1.],
+            [0.4, -0.4, 1.],
+        ],
+        [[0.5; 2]; 4],
+        [1.; 3],
+        MaterialId::new(1),
+    ));
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    exposure_view(&mut gpu)?;
+    let environment = Environment {
+        sun_direction: [0.; 3],
+        ..Environment::default()
+    };
+    let options = Options::new(false, streamline::Quality::Dlaa, 4, 4)?;
+    host.render_options(&mut gpu, &image, &camera(), environment, options)?;
+    let baseline = accumulated_rgb(&mut gpu)?;
+    gpu.set_lighting_options(0., 1.)?;
+    host.render_options(&mut gpu, &image, &camera(), environment, options)?;
+    let brighter = accumulated_rgb(&mut gpu)?;
+    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 4);
+    let receiver = |pixels: &[[f32; 3]]| -> f32 {
+        pixels
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .flat_map(|row| &row[24..])
+            .map(|p| p[0])
+            .sum()
+    };
+    for (before, after) in [
+        (baseline[16 * 32 + 16][0], brighter[16 * 32 + 16][0]),
+        (receiver(&baseline), receiver(&brighter)),
+    ] {
+        assert!(
+            before > 0.0 && (after - 2. * before).abs() < 1e-5 * before,
+            "方块发光 EV {before} -> {after}"
+        );
+    }
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan RT；错误静态alias与错误region世代保留已发布资源"]
 fn hardware_pt_rejected_resource_domain_preserves_the_published_generation()
 -> Result<(), Box<dyn std::error::Error>> {

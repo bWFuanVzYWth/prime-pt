@@ -413,6 +413,18 @@ pub extern "C" fn prime_set_display_options(
     })
 }
 
+/// 设置太阳强度（−8..=8 EV）与方块发光强度（−10..=10 EV）。
+/// 只修改下一帧的 CPU 光照参数。成功返回 0，会话或参数无效返回 −1 并保留原值。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_set_lighting_options(id: u64, sun_ev: f32, block_emission_ev: f32) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| {
+            engine.gpu.set_lighting_options(sun_ev, block_emission_ev)?;
+            Ok(())
+        })
+    })
+}
+
 /// 依宿主水平视距及完整世界高度推进64m LOD0窗口，返回至多capacity条待捕请求。
 ///
 /// 请求为 little-endian 的 `id:u64, sx:i32, sy:i32, sz:i32, reserved:u32=0`，每条 24B。

@@ -15,6 +15,7 @@ mod tint_cache;
 
 mod compile;
 mod dependencies;
+mod emission_power;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 mod fluid;

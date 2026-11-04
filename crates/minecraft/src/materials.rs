@@ -1,6 +1,7 @@
 //! 资源准备阶段构造共享数据atlas、材质身份、静态面积与纹理内alias。
 use crate::{
     Error, ImageSource, PreparedCatalog, SpriteSource,
+    emission_power::{PowerMoments, textured_amplitude},
     resources::{BoundQuad, Model, ModelBinding, SourceQuad, State},
 };
 use light_sampling::{
@@ -31,15 +32,22 @@ struct SpriteMaps {
     auxiliary: bool,
     textured: bool,
     proposal: Option<EmissionProposal>,
+    power: Option<PowerMoments>,
     glass_extinction: [f32; 3],
 }
 
 #[derive(Hash, PartialEq, Eq)]
-struct AliasKey {
+struct EmissionKey {
     sprite: u32,
     uv: [[u32; 2]; 4],
     areas: [u64; 2],
     cutout: bool,
+}
+
+#[derive(Default)]
+struct PreparedEmission {
+    alias_offset: Option<u32>,
+    power_ratio: Option<f64>,
 }
 
 fn glass_extinction(reference: [u8; 4]) -> [f32; 3] {
@@ -269,37 +277,78 @@ fn prepare_sprite(
         }
     }
     let textured = material.is_some_and(|m| m.pixels.as_chunks::<4>().0.iter().any(|p| p[1] != 0));
+    let source_frames = if s.frames.is_empty() {
+        &[[0, 1]][..]
+    } else {
+        &s.frames
+    };
     let count = s.extent[0] as usize * s.extent[1] as usize;
-    let proposal = if count <= MAX_TEXELS {
-        let mut weights = vec![0f32; count];
-        let mut emission_envelope = vec![if textured { 0f32 } else { 1f32 }; count];
-        let mut alpha = vec![0u8; count];
-        let frames: Vec<_> = if s.frames.is_empty() {
-            vec![0]
+    let keep_proposal = count <= MAX_TEXELS;
+    let mut proposal_samples = keep_proposal.then(|| (vec![0f32; count], vec![0u8; count]));
+    let mut color_texel = |[x, y]: [u32; 2], frame: u32| {
+        let [x, y] = [x as usize, y as usize];
+        let rgba = if let Some(i) = s.images.first().filter(|i| !i.pixels.is_empty()) {
+            sample(i, x, y, s.extent, frame as usize)
         } else {
-            s.frames.iter().map(|v| v[0] as usize).collect()
+            let sx = dx + x * w / s.extent[0] as usize;
+            let sy = dy + y * h / s.extent[1] as usize;
+            albedo[(sy * extent[0] as usize + sx) * 4..][..4]
+                .try_into()
+                .expect("已验证atlas")
         };
-        for frame in frames {
-            for y in 0..s.extent[1] as usize {
-                for x in 0..s.extent[0] as usize {
-                    let p = if let Some(i) = s.images.first().filter(|i| !i.pixels.is_empty()) {
-                        sample(i, x, y, s.extent, frame)
-                    } else {
-                        let sx = dx + x * w / s.extent[0] as usize;
-                        let sy = dy + y * h / s.extent[1] as usize;
-                        albedo[(sy * extent[0] as usize + sx) * 4..][..4]
-                            .try_into()
-                            .expect("已验证atlas")
-                    };
-                    let luminance =
-                        0.2126 * linear(p[0]) + 0.7152 * linear(p[1]) + 0.0722 * linear(p[2]);
-                    let at = y * s.extent[0] as usize + x;
-                    weights[at] = weights[at].max(luminance);
-                    alpha[at] = alpha[at].max(p[3]);
+        let luminance = color_luminance(rgba);
+        if let Some((weights, alpha)) = &mut proposal_samples {
+            let at = y * s.extent[0] as usize + x;
+            weights[at] = weights[at].max(luminance);
+            alpha[at] = alpha[at].max(rgba[3]);
+        }
+        (luminance, rgba[3])
+    };
+    let power = if textured {
+        let material = material.expect("textured来自实际材质图");
+        let layout = layout.expect("材质已建立布局");
+        // 同一宿主帧内的 Color 与 G 配对，再以声明时长积分。冻结 GPU 帧独立于参考功率。
+        let mut durations = std::collections::BTreeMap::<u32, u64>::new();
+        for &[host_frame, duration] in source_frames {
+            *durations.entry(host_frame).or_default() += u64::from(duration);
+        }
+        Some(PowerMoments::new(s.extent, |texel| {
+            let mut moments = [0.; 4];
+            for (&host_frame, &duration) in &durations {
+                let (luminance, alpha) = color_texel(texel, host_frame);
+                let energy = f64::from(luminance) * duration as f64;
+                let material_frame = if s.frames.is_empty() {
+                    frame
+                } else {
+                    host_frame
+                };
+                let g = f64::from(
+                    sample_material(material, layout, material_frame, texel, s.extent)[1],
+                ) / 255.;
+                moments[0] += energy;
+                moments[1] += energy * g;
+                if alpha >= 128 {
+                    moments[2] += energy;
+                    moments[3] += energy * g;
+                }
+            }
+            moments
+        })?)
+    } else {
+        if keep_proposal {
+            for &[frame, _] in source_frames {
+                for y in 0..s.extent[1] {
+                    for x in 0..s.extent[0] {
+                        color_texel([x, y], frame);
+                    }
                 }
             }
         }
+        None
+    };
+    let proposal = if let Some((mut weights, alpha)) = proposal_samples {
         if textured {
+            let mut emission_envelope = vec![0f32; count];
             let material = material.expect("textured来自实际材质图");
             let layout = layout.expect("材质已建立布局");
             let frames = if layout.frames().is_empty() {
@@ -318,9 +367,9 @@ fn prepare_sprite(
                     }
                 }
             }
-        }
-        for (weight, emission) in weights.iter_mut().zip(emission_envelope) {
-            *weight *= emission;
+            for (weight, emission) in weights.iter_mut().zip(emission_envelope) {
+                *weight *= emission;
+            }
         }
         EmissionProposal::new(s.extent, &weights, &alpha)?
     } else {
@@ -332,6 +381,7 @@ fn prepare_sprite(
         auxiliary: auxiliary.is_some(),
         textured,
         proposal,
+        power,
         glass_extinction: glass_extinction(
             albedo[((dy + h / 2) * extent[0] as usize + dx + w / 2) * 4..][..4]
                 .try_into()
@@ -339,6 +389,15 @@ fn prepare_sprite(
         ),
     })
 }
+
+fn color_luminance([r, g, b, _]: [u8; 4]) -> f32 {
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+}
+
+fn native_amplitude(level: u32) -> f32 {
+    (level as f32 / 15.).powi(2)
+}
+
 fn definition(state: &State, q: &SourceQuad, s: &SpriteSource, m: &SpriteMaps) -> Definition {
     let mut v = Definition {
         uv_bounds: s.bounds,
@@ -356,12 +415,11 @@ fn definition(state: &State, q: &SourceQuad, s: &SpriteSource, m: &SpriteMaps) -
         v.control[2] |= Definition::AUXILIARY;
     }
     v.control[3] = u32::from(m.authored);
-    let native = (state.emission.max(q.emission) as f32 / 15.).powi(2);
     if m.textured {
         v.control[2] |= Definition::TEXTURED_EMISSION;
-        v.emission = [1., 1., 1., 1f32.max(native)];
-    } else if native > 0. {
-        v.emission = [1., 1., 1., native];
+        v.emission = [1.; 4];
+    } else if state.emission.max(q.emission) > 0 {
+        v.emission = [1., 1., 1., native_amplitude(state.emission.max(q.emission))];
     }
     if q.layer == 1 {
         v.control[1] = 3;
@@ -426,7 +484,7 @@ impl PreparedCatalog<'_> {
         }
         let mut words = vec![0u32];
         let mut word_intern: HashMap<Vec<u32>, u32> = HashMap::new();
-        let mut geometry_intern: HashMap<AliasKey, u32> = HashMap::new();
+        let mut geometry_intern: HashMap<EmissionKey, PreparedEmission> = HashMap::new();
         let mut sides = HashMap::new();
         for (&id, model) in &self.next.models {
             if let Model::Mesh(quads) = model {
@@ -512,56 +570,72 @@ impl PreparedCatalog<'_> {
                                 && let Ok(geometry) = QuadArea::new(&q.positions)
                             {
                                 area = geometry.words();
-                                if let Some(proposal) = &m.proposal {
+                                let level = state.emission.max(q.emission);
+                                let power = m.power.as_ref().filter(|_| level > 0);
+                                if m.proposal.is_some() || power.is_some() {
                                     let uv = q.uv.map(|uv| {
                                         [
                                             (uv[0] - s.bounds[0]) / (s.bounds[2] - s.bounds[0]),
                                             (uv[1] - s.bounds[1]) / (s.bounds[3] - s.bounds[1]),
                                         ]
                                     });
-                                    let key = AliasKey {
+                                    let cutout = q.layer == 1;
+                                    let key = EmissionKey {
                                         sprite: q.sprite,
                                         uv: uv.map(|uv| uv.map(f32::to_bits)),
                                         areas: geometry.areas().map(f64::to_bits),
-                                        cutout: q.layer == 1,
+                                        cutout,
                                     };
-                                    let offset = if let Some(offset) = geometry_intern.get(&key) {
-                                        *offset
-                                    } else {
-                                        let coverage = if q.layer == 1 {
-                                            Coverage::AlphaThreshold(128)
+                                    let prepared = geometry_intern.entry(key).or_default();
+                                    if let Some(power) = power {
+                                        let ratio =
+                                            *prepared.power_ratio.get_or_insert_with(|| {
+                                                power.ratio(Some((uv, geometry.areas())), cutout)
+                                            });
+                                        v.emission[3] =
+                                            textured_amplitude(native_amplitude(level), ratio);
+                                    }
+                                    if let Some(proposal) = &m.proposal {
+                                        let offset = if let Some(offset) = prepared.alias_offset {
+                                            offset
                                         } else {
-                                            Coverage::Opaque
-                                        };
-                                        let offset = if let Some(table) = EmitterAlias::build(
-                                            q.positions,
-                                            uv,
-                                            coverage,
-                                            proposal,
-                                        )? {
-                                            if let Some(offset) = word_intern.get(table.words()) {
-                                                *offset
+                                            let coverage = if cutout {
+                                                Coverage::AlphaThreshold(128)
                                             } else {
-                                                let offset =
-                                                    u32::try_from(words.len()).map_err(|_| {
-                                                        Error::Input("资源alias偏移溢出")
-                                                    })?;
-                                                if offset > u32::MAX >> 1 {
-                                                    return Err(Error::Input(
-                                                        "资源alias偏移超过31bit",
-                                                    ));
+                                                Coverage::Opaque
+                                            };
+                                            let offset = if let Some(table) = EmitterAlias::build(
+                                                q.positions,
+                                                uv,
+                                                coverage,
+                                                proposal,
+                                            )? {
+                                                if let Some(offset) = word_intern.get(table.words())
+                                                {
+                                                    *offset
+                                                } else {
+                                                    let offset = u32::try_from(words.len())
+                                                        .map_err(|_| {
+                                                            Error::Input("资源alias偏移溢出")
+                                                        })?;
+                                                    if offset > u32::MAX >> 1 {
+                                                        return Err(Error::Input(
+                                                            "资源alias偏移超过31bit",
+                                                        ));
+                                                    }
+                                                    words.extend_from_slice(table.words());
+                                                    word_intern
+                                                        .insert(table.words().to_vec(), offset);
+                                                    offset
                                                 }
-                                                words.extend_from_slice(table.words());
-                                                word_intern.insert(table.words().to_vec(), offset);
-                                                offset
-                                            }
-                                        } else {
-                                            0
+                                            } else {
+                                                0
+                                            };
+                                            prepared.alias_offset = Some(offset);
+                                            offset
                                         };
-                                        geometry_intern.insert(key, offset);
-                                        offset
-                                    };
-                                    v.control[3] |= offset << 1;
+                                        v.control[3] |= offset << 1;
+                                    }
                                 }
                             }
                             let key = (v.words(), area);
@@ -620,7 +694,14 @@ impl PreparedCatalog<'_> {
                         positions: [[0.; 3]; 4],
                         uv: [[0.; 2]; 4],
                     };
-                    let v = definition(state, &q, &self.next.sprites[&sprite], &maps[&sprite]);
+                    let maps = &maps[&sprite];
+                    let mut v = definition(state, &q, &self.next.sprites[&sprite], maps);
+                    if let Some(power) = &maps.power
+                        && state.emission > 0
+                    {
+                        let ratio = power.ratio(None, q.layer == 1);
+                        v.emission[3] = textured_amplitude(native_amplitude(state.emission), ratio);
+                    }
                     let key = (v.words(), sentinel);
                     let id = if let Some(id) = intern.get(&key) {
                         *id
@@ -691,6 +772,35 @@ impl PreparedCatalog<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dual_emitter_preserves_dark_texels_and_mixes_authored_and_host_power() -> Result<(), Error> {
+        let mut catalog = crate::Catalog::default();
+        let mut prepared = catalog.stage_resources(&crate::fixtures::resource_packet())?;
+        prepared.next.states.get_mut(&1).unwrap().emission = 15;
+        let sprite = prepared.next.sprites.get_mut(&1).unwrap();
+        sprite.name = "minecraft:block/torch".into();
+        sprite.vanilla = true;
+        let resources = prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+        let green: Vec<_> = resources
+            .mers
+            .as_chunks::<{ 32 * 4 }>()
+            .0
+            .iter()
+            .flat_map(|row| row[..16 * 4].as_chunks::<4>().0)
+            .map(|p| f64::from(p[1]) / 255.)
+            .collect();
+        let authored_mean = green.iter().sum::<f64>() / green.len() as f64;
+        let expected_mean = (1. + authored_mean) * 0.5;
+        let state = &prepared.next.states[&1];
+        let material =
+            prepared.next.definitions[state.leaves[0].quads[0].material.index() as usize];
+        let amplitude = f64::from(material.emission[3]);
+        assert_ne!(material.control[2] & Definition::TEXTURED_EMISSION, 0);
+        assert!(green.contains(&0.));
+        assert!((authored_mean * amplitude - expected_mean).abs() < 1e-7);
+        Ok(())
+    }
 
     #[test]
     fn grass_sides_bind_only_one_quad_with_the_overlay_tint() -> Result<(), Error> {
