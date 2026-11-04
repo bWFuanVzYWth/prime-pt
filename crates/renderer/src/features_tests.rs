@@ -737,3 +737,67 @@ fn hardware_pt_region_material_change_restores_cutout_coverage()
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
+
+#[test]
+#[ignore = "真实Vulkan RT；同一不透明quad的镂空覆盖只染覆盖层"]
+fn hardware_pt_grass_overlay_selects_tinted_grass_and_untinted_dirt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let image = image(&mut gpu)?;
+    let material = MaterialDefinition {
+        uv_bounds: [0., 0., 0.5, 1.],
+        overlay_bounds: [0.5, 0., 1., 1.],
+        control: [
+            0,
+            1,
+            MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS,
+            0,
+        ],
+        ..Default::default()
+    };
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [4, 1],
+        albedo: &[
+            255, 0, 0, 255, 255, 0, 0, 255, 255, 255, 255, 0, 255, 255, 255, 255,
+        ],
+        materials: &[material],
+        mers: &[0, 0, 242, 0].repeat(4),
+        auxiliary: &[128, 128, 0, 85].repeat(4),
+        emission_alias_words: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]],
+    })?;
+    let mesh = Mesh {
+        quads: vec![Quad::with_material(
+            [[-4., -4., 4.], [-4., 4., 4.], [4., 4., 4.], [4., -4., 4.]],
+            [[0., 1.], [0., 0.], [0.5, 0.], [0.5, 1.]],
+            [0., 1., 0.],
+            MaterialId::new(0),
+        )],
+    };
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    assert!(gpu.region_cache.entries()[0].opaque);
+    let display = host.render_environment(
+        &mut gpu,
+        &image,
+        &camera(),
+        Environment {
+            sun_direction: [0., 0.6, -0.8],
+            ..Default::default()
+        },
+    )?;
+    let pixel = |x: usize| &display[(16 * 32 + x) * 4..][..3];
+    let dirt = pixel(8);
+    let grass = pixel(24);
+    assert!(
+        u16::from(dirt[0]) > u16::from(dirt[1]) + 16,
+        "底层保留红色 {dirt:?}"
+    );
+    assert!(
+        u16::from(grass[1]) > u16::from(grass[0]) + 16,
+        "覆盖层使用绿色tint {grass:?}"
+    );
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}

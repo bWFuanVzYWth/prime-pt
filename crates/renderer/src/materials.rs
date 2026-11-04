@@ -58,7 +58,10 @@ pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinitio
     } else {
         0
     };
-    maps | normal | emission | ((material.control[0] & 3) << 6)
+    maps | normal
+        | emission
+        | ((material.control[0] & 3) << 6)
+        | ((flags & (MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS)) << 1)
 }
 
 pub(super) fn defaults() -> Vec<MaterialDefinition> {
@@ -120,32 +123,34 @@ pub(super) fn flows(
         .try_reserve_exact(definitions.len())
         .map_err(scene_cache::Error::from)?;
     for definition in definitions {
-        let texture = definition.control[2] & MaterialDefinition::MERS != 0;
+        let flags = definition.control[2];
+        let base_mers = flags & MaterialDefinition::MERS != 0;
+        let top_mers = flags & MaterialDefinition::OVERLAY_MERS != 0;
+        let layer_mismatch = flags & MaterialDefinition::OVERLAY != 0 && base_mers != top_mers;
+        let property_range = |value, texture: Range| {
+            if layer_mismatch {
+                Ok(texture.union(Range::point(value)?))
+            } else if base_mers {
+                Ok(texture)
+            } else {
+                Range::point(value)
+            }
+        };
         let roughness = if definition.control[3] & MaterialDefinition::AUTHORED_NORMAL != 0
             && definition.control[2] & MaterialDefinition::AUXILIARY != 0
         {
             // shader将aux分布与roughness合成；未分析局部aux范围时保留全部连续/离散支持。
             Range::new(0., 1.)?
-        } else if texture {
-            textured.roughness
         } else {
-            Range::point(definition.base_roughness[3])?
+            property_range(definition.base_roughness[3], textured.roughness)?
         };
         let ranges = if definition.control[0] & 1 != 0 {
             MaterialRanges::dielectric(roughness, definition.control[0] & 2 != 0)?
         } else {
             MaterialRanges::opaque(
                 roughness,
-                if texture {
-                    textured.metalness
-                } else {
-                    Range::point(definition.surface[1])?
-                },
-                if texture {
-                    textured.subsurface
-                } else {
-                    Range::point(definition.surface[2])?
-                },
+                property_range(definition.surface[1], textured.metalness)?,
+                property_range(definition.surface[2], textured.subsurface)?,
             )?
         };
         let colors = colors[usize::from(definition.control[2] & MaterialDefinition::CUTOUT != 0)];

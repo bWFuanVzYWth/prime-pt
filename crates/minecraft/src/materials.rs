@@ -63,15 +63,10 @@ fn exact_sum(a: f64, b: f64) -> (f64, f64) {
     (sum, (a - (sum - virtual_b)) + (b - virtual_b))
 }
 
-fn affine_positions(q: &SourceQuad) -> bool {
-    (0..3).all(|axis| {
-        exact_sum(
-            f64::from(q.positions[0][axis]),
-            f64::from(q.positions[2][axis]),
-        ) == exact_sum(
-            f64::from(q.positions[1][axis]),
-            f64::from(q.positions[3][axis]),
-        )
+fn affine_quad<const N: usize>(corners: &[[f32; N]; 4]) -> bool {
+    (0..N).all(|axis| {
+        exact_sum(f64::from(corners[0][axis]), f64::from(corners[2][axis]))
+            == exact_sum(f64::from(corners[1][axis]), f64::from(corners[3][axis]))
     })
 }
 
@@ -90,7 +85,7 @@ fn bilateral(quads: &[SourceQuad]) -> (Vec<u8>, Vec<usize>) {
             let second = &quads[b];
             let mapping = [0usize, 2, 1, 3].into_iter().find_map(|shift| {
                 let map = std::array::from_fn::<_, 4, _>(|i| (shift + 4 - i) % 4);
-                (shift % 2 == 0 || affine_positions(first)).then_some(())?;
+                (shift % 2 == 0 || affine_quad(&first.positions)).then_some(())?;
                 (0..4)
                     .all(|i| first.positions[i] == second.positions[map[i]])
                     .then_some((map, shift))
@@ -117,6 +112,81 @@ fn bilateral(quads: &[SourceQuad]) -> (Vec<u8>, Vec<usize>) {
     }
     (sides, skipped)
 }
+
+#[derive(Clone, Copy)]
+enum GrassSide {
+    Ordinary,
+    Base { overlay: usize },
+    Overlay,
+}
+
+fn sprite_local(uv: [f32; 2], bounds: [f32; 4]) -> [f32; 2] {
+    std::array::from_fn(|axis| (uv[axis] - bounds[axis]) / (bounds[axis + 2] - bounds[axis]))
+}
+
+fn aligned_layers(
+    base: &SourceQuad,
+    bottom: [f32; 4],
+    top: &SourceQuad,
+    overlay: [f32; 4],
+) -> bool {
+    // 原版同面可循环重排顶点，保留绕序和每个对应顶点在各自sprite内的UV。
+    base.face == top.face
+        && (0..4).any(|shift| {
+            // 奇数起点改变三角化对角线，须证明两组坐标仍为仿射插值。
+            if shift % 2 != 0
+                && !(affine_quad(&base.positions) && affine_quad(&base.uv) && affine_quad(&top.uv))
+            {
+                return false;
+            }
+            (0..4).all(|i| {
+                let j = (i + shift) % 4;
+                base.positions[i] == top.positions[j]
+                    && sprite_local(base.uv[i], bottom)
+                        .into_iter()
+                        .zip(sprite_local(top.uv[j], overlay))
+                        .all(|(a, b)| (a - b).abs() <= 1e-4)
+            })
+        })
+}
+
+fn grass_sides(
+    quads: &[SourceQuad],
+    sprites: &HashMap<u32, SpriteSource>,
+    maps: &HashMap<u32, SpriteMaps>,
+) -> Vec<GrassSide> {
+    let mut sides = vec![GrassSide::Ordinary; quads.len()];
+    for (index, base) in quads.iter().enumerate() {
+        let bottom = &sprites[&base.sprite];
+        let bottom_maps = &maps[&base.sprite];
+        if base.tint >= 0
+            || base.layer != 0
+            || base.emission != 0
+            || bottom_maps.textured
+            || bottom_maps.auxiliary
+            || bottom.name != "minecraft:block/grass_block_side"
+        {
+            continue;
+        }
+        if let Some(overlay) = quads.iter().enumerate().position(|(i, top)| {
+            let sprite = &sprites[&top.sprite];
+            let top_maps = &maps[&top.sprite];
+            matches!(sides[i], GrassSide::Ordinary)
+                && top.tint >= 0
+                && top.layer == 1
+                && top.emission == 0
+                && !top_maps.textured
+                && !top_maps.auxiliary
+                && sprite.name == "minecraft:block/grass_block_side_overlay"
+                && aligned_layers(base, bottom.bounds, top, sprite.bounds)
+        }) {
+            sides[index] = GrassSide::Base { overlay };
+            sides[overlay] = GrassSide::Overlay;
+        }
+    }
+    sides
+}
+
 fn linear(v: u8) -> f32 {
     let v = f32::from(v) / 255.;
     if v <= 0.04045 {
@@ -396,14 +466,36 @@ impl PreparedCatalog<'_> {
                         }
                     }
                     Model::Mesh(quads) => {
+                        let grass = (state.name == "minecraft:grass_block"
+                            && state.emission == 0
+                            && state.fluid_kind == 0
+                            && state.flags & 768 == 0)
+                            .then(|| grass_sides(quads, &self.next.sprites, &maps));
                         let mut bound = Vec::with_capacity(quads.len());
                         for (index, q) in quads.iter().enumerate() {
-                            if self.next.skipped_quads.contains(&(model_id, index)) {
+                            let grass = grass
+                                .as_ref()
+                                .map_or(GrassSide::Ordinary, |sides| sides[index]);
+                            if self.next.skipped_quads.contains(&(model_id, index))
+                                || matches!(grass, GrassSide::Overlay)
+                            {
                                 continue;
                             }
                             let s = &self.next.sprites[&q.sprite];
                             let m = &maps[&q.sprite];
                             let mut v = definition(state, q, s, m);
+                            let tint = match grass {
+                                GrassSide::Base { overlay } => {
+                                    let top = &quads[overlay];
+                                    v.control[2] |= Definition::OVERLAY;
+                                    if maps[&top.sprite].mers {
+                                        v.control[2] |= Definition::OVERLAY_MERS;
+                                    }
+                                    v.overlay_bounds = self.next.sprites[&top.sprite].bounds;
+                                    top.tint
+                                }
+                                _ => q.tint,
+                            };
                             let mut area = sentinel;
                             match sides[&model_id][index] {
                                 1 => {
@@ -488,14 +580,14 @@ impl PreparedCatalog<'_> {
                             bound.push(BoundQuad {
                                 index,
                                 material: id,
-                                tint: if q.tint < 0 {
+                                tint: if tint < 0 {
                                     None
                                 } else {
                                     Some(
                                         self.next
                                             .tints()
                                             .ok_or(Error::Input("模型tint缺少准备资源"))?
-                                            .source_id(state_id, q.tint)?,
+                                            .source_id(state_id, tint)?,
                                     )
                                 },
                             });
@@ -599,6 +691,64 @@ impl PreparedCatalog<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grass_sides_bind_only_one_quad_with_the_overlay_tint() -> Result<(), Error> {
+        let mut catalog = crate::Catalog::default();
+        let mut prepared = catalog.stage_resources(&crate::fixtures::resource_packet())?;
+        prepared.next.states.get_mut(&2).unwrap().name = "minecraft:grass_block".into();
+        for (id, name) in [(1, "grass_block_side"), (2, "grass_block_side_overlay")] {
+            let sprite = prepared.next.sprites.get_mut(&id).unwrap();
+            sprite.name = format!("minecraft:block/{name}");
+            sprite.vanilla = true;
+        }
+        let Model::Mesh(quads) = prepared.next.models.get_mut(&2).unwrap() else {
+            unreachable!("固定测试模型")
+        };
+        let base = std::mem::take(quads);
+        for mut q in base {
+            if (2..6).contains(&q.face) {
+                // 四个侧面与不同顶点起点，覆盖层先于底层。
+                let first = q.face as usize % 4;
+                quads.push(SourceQuad {
+                    positions: std::array::from_fn(|i| q.positions[(i + first) % 4]),
+                    uv: std::array::from_fn(|i| {
+                        let [u, v] = q.uv[(i + first) % 4];
+                        [u + 0.5, v]
+                    }),
+                    sprite: 2,
+                    ..q
+                });
+                q.layer = 0;
+                q.tint = -1;
+            }
+            quads.push(q);
+        }
+        prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+        let state = &prepared.next.states[&2];
+        let bound = &state.leaves[0].quads;
+        assert_eq!(bound.len(), 6);
+        let Model::Mesh(quads) = &prepared.next.models[&2] else {
+            unreachable!("固定测试模型")
+        };
+        for face in bound
+            .iter()
+            .filter(|binding| quads[binding.index].face >= 2)
+        {
+            let material = prepared.next.definitions[face.material.index() as usize];
+            assert_eq!(quads[face.index].sprite, 1);
+            assert_eq!(
+                face.tint,
+                Some(prepared.next.tints().unwrap().source_id(2, 0)?)
+            );
+            assert_eq!(
+                material.control[2],
+                Definition::MERS | Definition::OVERLAY | Definition::OVERLAY_MERS
+            );
+            assert_eq!(material.overlay_bounds, [0.5, 0., 1., 1.]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn glass_midpoint_transparency_and_color_define_bt709_absorption() {

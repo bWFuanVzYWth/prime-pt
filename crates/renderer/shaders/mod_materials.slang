@@ -8,6 +8,9 @@ import bsdf.openpbr.flow;
 #define PRIMEPT_COVERAGE_MASK 40u
 #endif
 public static const uint COVERAGE_MASK = PRIMEPT_COVERAGE_MASK;
+static const uint MATERIAL_OVERLAY_FLAGS = (1u << 7u) | (1u << 8u);
+static const uint VARIANT_OVERLAY = 1u << 8u;
+static const uint VARIANT_OVERLAY_MERS = 1u << 9u;
 
 [[vk::binding(1, 0)]]
 public StructuredBuffer<uint4> quads;
@@ -16,7 +19,7 @@ public Texture2D<float4> atlas;
 [[vk::binding(3, 0)]]
 public SamplerState atlas_sampler;
 
-/// GPU派生的96B六块表；物理字段与prime_scene::MaterialDefinition保持同位。
+/// GPU派生的112B七块表，物理字段与prime_scene::MaterialDefinition保持同位。
 /// control.x低2位为源OpenPBR flags，高30位由资源准备写入callable槽，不回写CPU定义。
 public struct ModMaterial
 {
@@ -26,6 +29,7 @@ public struct ModMaterial
     public float4 emission;
     public uint4 control;
     public float4 uv_bounds;
+    public float4 overlay_bounds;
 };
 [[vk::binding(27, 0)]]
 public StructuredBuffer<ModMaterial> materials;
@@ -54,7 +58,7 @@ public float2 material_uv(uint primitive, float2 barycentrics)
     uv += (second ? uv23.zw : uv23.xy) * bary.z;
     return uv;
 }
-float4 sample_tinted_texel(uint primitive, float2 barycentrics, float2 uv)
+float3 quad_tint(uint primitive, float2 barycentrics)
 {
     float3 bary = float3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
     float3 shared_tint = asfloat(quads[(primitive >> 1) * 3u + 2u].xyz);
@@ -62,8 +66,12 @@ float4 sample_tinted_texel(uint primitive, float2 barycentrics, float2 uv)
     tint += shared_tint * bary.x;
     tint += shared_tint * bary.y;
     tint += shared_tint * bary.z;
+    return material_linear(saturate(tint));
+}
+float4 sample_tinted_texel(uint primitive, float2 barycentrics, float2 uv)
+{
     float4 value = atlas.SampleLevel(atlas_sampler, uv, 0);
-    return float4(value.xyz * material_linear(saturate(tint)), value.w);
+    return float4(value.xyz * quad_tint(primitive, barycentrics), value.w);
 }
 /// 保留旧共享tint的FP32插值顺序；覆盖alpha不乘tint。
 public float4 material_texel(uint primitive, float2 barycentrics)
@@ -150,14 +158,14 @@ public uint mapped_shading_normal(uint primitive, float2 bary, float3 local_e1, 
     return encode_shading_normal(
         normalize(tangent * local.x + bitangent * local.y + normal * local.z));
 }
-// 低8位与 materials::variant 同步。通用 guide 根据当前命中读取相同信息。
+// 能力位与 materials::variant 同步。通用 guide 根据当前命中读取相同信息。
 uint material_variant(ModMaterial material)
 {
     uint flags = material.control.z;
     uint sides = (flags & 32u) != 0 ? material.control.y & 1u : material.control.y;
     uint emission = material.emission.w > 0 ? (sides << 4u) | (flags & 4u) : 0;
     return (flags & 3u) | ((material.control.w & 1u) << 3u) | emission |
-           ((material.control.x & 3u) << 6u);
+           ((material.control.x & 3u) << 6u) | ((flags & MATERIAL_OVERLAY_FLAGS) << 1u);
 }
 
 /// 消费已通过覆盖测试的命中；callable 的 Flow 和 variant 都在资源准备时特化。
@@ -168,9 +176,6 @@ public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant
     uint mask = variant == ~0u ? material_variant(material) : variant;
     pt::SurfaceMaterial result = {};
     result.pbr.base_roughness.w = material.base_roughness.w;
-    if ((flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
-                 openpbr::FLOW_CONDUCTOR_REFLECTION)) != 0)
-        result.pbr.base_roughness.xyz = hit.texel.xyz * material.base_roughness.xyz;
     result.pbr.surface = material.surface;
     result.pbr.control.x = (mask >> 6u) & 3u;
     bool emits = (flow & openpbr::FLOW_EMISSION) != 0 &&
@@ -178,12 +183,34 @@ public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant
                   ((mask & 32u) != 0 && !hit.front));
     bool textured_emission = emits && (mask & 4u) != 0;
     float2 uv = 0;
-    if ((mask & 3u) != 0 || textured_emission)
+    if ((mask & (3u | VARIANT_OVERLAY)) != 0 || textured_emission)
         uv = material_uv(primitive, asfloat(hit.identity.yz));
+    float3 base_color = hit.texel.xyz;
+    bool reads_mers = (mask & 1u) != 0;
+    if ((mask & VARIANT_OVERLAY) != 0)
+    {
+        float2 local =
+            (uv - material.uv_bounds.xy) / (material.uv_bounds.zw - material.uv_bounds.xy);
+        float2 top_uv = lerp(material.overlay_bounds.xy, material.overlay_bounds.zw, local);
+        float4 top = atlas.SampleLevel(atlas_sampler, top_uv, 0);
+        if (top.a >= 0.5)
+        {
+            base_color = top.rgb * quad_tint(primitive, asfloat(hit.identity.yz));
+            reads_mers = (mask & VARIANT_OVERLAY_MERS) != 0;
+            uv = top_uv;
+        }
+        else
+        {
+            base_color = atlas.SampleLevel(atlas_sampler, uv, 0).rgb;
+        }
+    }
+    if ((flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
+                 openpbr::FLOW_CONDUCTOR_REFLECTION)) != 0)
+        result.pbr.base_roughness.xyz = base_color * material.base_roughness.xyz;
     float4 mers = float4(material.surface.y, 0, material.base_roughness.w, material.surface.z);
-    if ((mask & 1u) != 0 || textured_emission)
+    if (reads_mers || textured_emission)
         mers = mers_atlas.SampleLevel(atlas_sampler, uv, 0);
-    if ((mask & 1u) != 0)
+    if (reads_mers)
     {
         result.pbr.base_roughness.w = mers.z;
         result.pbr.surface.y = mers.x;

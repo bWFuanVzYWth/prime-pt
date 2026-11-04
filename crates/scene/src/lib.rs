@@ -49,7 +49,7 @@ impl From<Material> for MaterialId {
     }
 }
 
-/// 一份共享材质的96B输入；每quad仍只保存一个MaterialId。
+/// 一份共享材质的112B输入，每quad只保存一个MaterialId。
 ///
 /// 基础参数沿用引擎OpenPBR布局。MERS/aux贴图使用与albedo相同的atlas UV；
 /// uv_bounds限定当前sprite的实际源tile，供资源准备与局部法线UV翻译使用。
@@ -71,6 +71,9 @@ pub struct MaterialDefinition {
     pub control: [u32; 4],
     /// 共享atlas中实际源sprite的u0/v0/u1/v1，必须非退化。
     pub uv_bounds: [f32; 4],
+    /// 二层覆盖sprite的u0/v0/u1/v1。`OVERLAY` 时与底层共享归一化UV，
+    /// 只有覆盖层应用quad tint，透明texel保留底层。
+    pub overlay_bounds: [f32; 4],
 }
 
 impl Default for MaterialDefinition {
@@ -82,6 +85,7 @@ impl Default for MaterialDefinition {
             emission: [0.; 4],
             control: [0, 1, Self::CUTOUT, 0],
             uv_bounds: [0., 0., 1., 1.],
+            overlay_bounds: [0.; 4],
         }
     }
 }
@@ -101,11 +105,15 @@ impl MaterialDefinition {
     pub const FRONT_ONLY: u32 = 1 << 5;
     /// 同cull组、相同材质及UV的反向源对已合并为一个quad，真实双侧接受。
     pub const TWO_SIDED: u32 = 1 << 6;
+    /// 不透明的无发光底层与二值alpha覆盖层共用一个quad。
+    pub const OVERLAY: u32 = 1 << 7;
+    /// 二层覆盖sprite提供独立MERS。要求 `OVERLAY`。
+    pub const OVERLAY_MERS: u32 = 1 << 8;
     /// normalFlags的bit0表示实际源中存在作者切线法线。
     pub const AUTHORED_NORMAL: u32 = 1;
 
-    /// 输出六个16B原位属性块；不改变任何浮点位值，GPU顺序同字段声明。
-    pub const fn words(self) -> [[u32; 4]; 6] {
+    /// 输出七个16B原位属性块，GPU顺序同字段声明并保留全部浮点位值。
+    pub const fn words(self) -> [[u32; 4]; 7] {
         [
             float_words(self.base_roughness),
             float_words(self.surface),
@@ -113,6 +121,7 @@ impl MaterialDefinition {
             float_words(self.emission),
             self.control,
             float_words(self.uv_bounds),
+            float_words(self.overlay_bounds),
         ]
     }
 
@@ -125,7 +134,9 @@ impl MaterialDefinition {
             .chain(self.extinction)
             .chain(self.emission)
             .chain(self.uv_bounds)
+            .chain(self.overlay_bounds)
             .all(f32::is_finite);
+        let flags = self.control[2];
         finite
             && self
                 .base_roughness
@@ -140,9 +151,28 @@ impl MaterialDefinition {
             && self.emission.into_iter().all(|v| v >= 0.)
             && self.control[0] & !3 == 0
             && (1..=3).contains(&self.control[1])
-            && self.control[2] & !127 == 0
+            && flags & !511 == 0
             && self.uv_bounds[0] < self.uv_bounds[2]
             && self.uv_bounds[1] < self.uv_bounds[3]
+            && if flags & Self::OVERLAY != 0 {
+                self.control[0] == 0
+                    && self.control[3] == 0
+                    && flags
+                        & (Self::AUXILIARY
+                            | Self::TEXTURED_EMISSION
+                            | Self::CUTOUT
+                            | Self::TRANSLUCENT)
+                        == 0
+                    && self.emission[3] == 0.
+                    && self
+                        .overlay_bounds
+                        .into_iter()
+                        .all(|v| (0. ..=1.).contains(&v))
+                    && self.overlay_bounds[0] < self.overlay_bounds[2]
+                    && self.overlay_bounds[1] < self.overlay_bounds[3]
+            } else {
+                flags & Self::OVERLAY_MERS == 0
+            }
     }
 }
 
