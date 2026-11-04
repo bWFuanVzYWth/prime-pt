@@ -466,7 +466,8 @@ impl Scene {
                         .colors[span] = argb;
                 }
             }
-            if !pending.old {
+            // 恢复片段的源依赖由advance_sources确认，颜色回填不能代替该检查。
+            if !pending.old && !job.verify.contains(pending.fragment) {
                 finish_fragment(job, pending.fragment)?;
             }
             job.pending_tints = job
@@ -511,32 +512,30 @@ impl Scene {
                     clear(&mut remaining);
                     continue;
                 }
-                let own = job.bindings.iter().find(|entry| entry.fragment == fragment);
-                if own.is_none()
-                    && job.changed.contains(fragment)
-                    && !job.compiled.contains(fragment)
-                {
+                let old = !job.changed.contains(fragment);
+                if !old && !job.compiled.contains(fragment) {
                     continue;
                 }
-                if self.tint_remaining == 0 {
-                    requeue = true;
-                    break;
-                }
-                self.tint_remaining -= 1;
-                self.tint_used += 1;
-                let old = own.is_none();
-                let binding = own.or_else(|| {
+                let binding = if old {
                     self.state.resource(job.handle).and_then(|region| {
                         region
                             .bindings
                             .iter()
                             .find(|entry| entry.fragment == fragment)
                     })
-                });
+                } else {
+                    job.bindings.iter().find(|entry| entry.fragment == fragment)
+                };
                 let Some(binding) = binding else {
                     clear(&mut remaining);
                     continue;
                 };
+                if self.tint_remaining == 0 {
+                    requeue = true;
+                    break;
+                }
+                self.tint_remaining -= 1;
+                self.tint_used += 1;
                 let key = section(job.region, fragment / 4);
                 let mut requests = Vec::new();
                 requests.try_reserve_exact(binding.spans.len())?;

@@ -714,8 +714,13 @@ impl Scene {
                 bindings = recovered.bindings;
                 bindings.retain(|entry| !changed.contains(entry.fragment));
                 color_updates = recovered.color_updates;
-                color_updates.retain(|entry| !changed.contains(entry.fragment));
-                for group in &bindings {
+                // 重染片段用下一次回填建立补丁，不能同时继承上一候选的颜色差分。
+                let recolored = change_runtime::union(changed, mask.tints);
+                color_updates.retain(|entry| !recolored.contains(entry.fragment));
+                for group in bindings
+                    .iter()
+                    .filter(|group| !mask.tints.contains(group.fragment))
+                {
                     for (span, &color) in group.spans.iter().zip(&group.colors) {
                         tint_patches.push(prime_scene::TintPatch::new(
                             group.fragment,

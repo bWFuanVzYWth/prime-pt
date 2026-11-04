@@ -257,6 +257,50 @@ fn tint_only_invalidation_preserves_sources_and_geometry_revision() -> Result<()
 }
 
 #[test]
+fn newer_tint_replaces_unpublished_tint_candidate() -> Result<(), Error> {
+    let (mut scene, catalog) = ready_tinted()?;
+    let red = vec![0xffff_0000; scene.tint_requests().len()];
+    scene.apply_tints(&red)?;
+    publish(&mut scene, &catalog)?;
+
+    let finish_tint = |scene: &mut Scene, color| -> Result<(), Error> {
+        scene.invalidate_tints();
+        for _ in 0..128 {
+            assert!(scene.plan(&camera(), 0, 0, 4, 64)?.is_empty());
+            scene.compile_sources(&catalog)?;
+            let count = scene.tint_requests().len();
+            if count != 0 {
+                return scene.apply_tints(&vec![color; count]);
+            }
+        }
+        Err(Error::Input("颜色刷新未生成回调请求"))
+    };
+
+    finish_tint(&mut scene, 0xff00_ff00)?;
+    let handle = scene.state.find(chunk([0; 3])).unwrap();
+    assert!(scene.state.replacement(handle).is_some());
+    assert_eq!(
+        scene
+            .render_regions()
+            .next()
+            .unwrap()
+            .mesh
+            .quads()
+            .next()
+            .unwrap()
+            .tint(),
+        [1., 0., 0.],
+    );
+
+    finish_tint(&mut scene, 0xff00_00ff)?;
+    publish(&mut scene, &catalog)?;
+    let region = scene.render_regions().next().unwrap();
+    assert_eq!(region.mesh.len(), 1536);
+    assert!(region.mesh.quads().all(|quad| quad.tint() == [0., 0., 1.]));
+    Ok(())
+}
+
+#[test]
 fn generation_stage_preserves_old_until_infallible_commit() -> Result<(), Error> {
     let (mut scene, catalog) = ready_tinted()?;
     let colors = vec![0xff12_3456; scene.tint_requests().len()];

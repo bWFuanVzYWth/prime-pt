@@ -174,6 +174,72 @@ fn unchanged_actual_source_preserves_published_vectors_without_a_kernel() -> Res
 }
 
 #[test]
+fn retint_does_not_apply_published_spans_to_an_untinted_replacement() -> Result<(), Error> {
+    let catalog = fixtures::catalog()?;
+    let mut scene = Scene::with_threads(1)?;
+    scene.source_generation(catalog.generation())?;
+    drive(&mut scene, &catalog, 0)?;
+    let handle = scene.state.find(crate::chunks::chunk([0; 3])).unwrap();
+    let camera = WorldCamera {
+        origin: [0.; 3],
+        forward: [0., 0., 1., 0.],
+        right: [1., 0., 0., 0.],
+        up: [0., 1., 0., 0.],
+    };
+    let advance = |scene: &mut Scene| -> Result<usize, Error> {
+        let records: Vec<_> = scene
+            .plan(&camera, 0, 0, 4, 64)?
+            .iter()
+            .map(|request| {
+                let pattern = if request.section == [0; 3] {
+                    Pattern::Sparse
+                } else {
+                    Pattern::Air
+                };
+                (request.id, request.section, pattern)
+            })
+            .collect();
+        if records.is_empty() {
+            scene.compile_sources(&catalog)?;
+        } else {
+            scene.apply_compact(&fixtures::section_packet(&records), &catalog)?;
+        }
+        let colors = scene.tint_requests().len();
+        if colors != 0 {
+            scene.apply_tints(&vec![0xff00_ff00; colors])?;
+        }
+        Ok(colors)
+    };
+    scene.apply_changes(&[crate::SourceChange::SectionSource([0; 3])])?;
+    for _ in 0..128 {
+        assert_eq!(advance(&mut scene)?, 0);
+        if scene.state.replacement(handle).is_some() {
+            break;
+        }
+    }
+    assert!(scene.state.replacement(handle).is_some());
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+
+    scene.apply_changes(&[crate::SourceChange::WorldTint])?;
+    let mut tint_requests = 0;
+    for _ in 0..128 {
+        tint_requests += advance(&mut scene)?;
+        if scene.prepare()? {
+            scene.commit()?;
+        }
+        if !scene.pending() {
+            break;
+        }
+    }
+    assert!(!scene.pending());
+    assert_eq!(tint_requests, 0);
+    let region = scene.render_regions().next().unwrap();
+    assert_eq!(region.mesh.len(), 384);
+    assert!(region.mesh.quads().all(|quad| quad.tint() == [1.; 3]));
+    Ok(())
+}
+
+#[test]
 fn probes_leave_the_window_while_real_compilation_dependencies_remain() -> Result<(), Error> {
     use chunk_manager::Bounds;
     let mut sources = super::Sources::default();

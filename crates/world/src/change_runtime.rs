@@ -414,15 +414,7 @@ impl Scene {
                 .retain(|patch| !mask.contains(patch.fragment()));
             job.color_updates
                 .retain(|entry| !mask.contains(entry.fragment));
-            job.finished = subtract(
-                job.finished,
-                FragmentMask::from_words(std::array::from_fn(|at| {
-                    mask.words()[at] & job.compiled.words()[at] & job.changed.words()[at]
-                })),
-            );
-            for slot in 0..64 {
-                refresh_received(job, slot);
-            }
+            // tint_mask与pending_tints独立阻止发布，已完成的几何和源验证继续有效。
             let ticket = job.ticket;
             self.queue_tints(ticket)?;
         } else {
