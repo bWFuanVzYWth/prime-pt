@@ -126,8 +126,8 @@ void restir_initial()
     TinyUniformSampleGenerator generator =
         rng_for_pixel(pixel, p.temporal_reserved.x ^ p.options.x);
     ShiftSettings settings;
-    InitialResult initial = sampleInitialPath(scene, pixel, hit, generator.state, p.options.y,
-                                              settings, true, true, true);
+    InitialResult initial = sampleInitialPath<RestirScene, 2>(
+        scene, pixel, hit, generator.state, p.options.y, settings, true, true, true);
     store_reservoir(reservoirs_a, offset_for(pixel), initial.reservoir);
     if ((p.output_size.z & 8u) != 0)
         store_color(colors_a, offset_for(pixel),

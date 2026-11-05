@@ -300,6 +300,100 @@ fn scene() -> Mesh {
 }
 
 #[test]
+#[ignore = "真实Vulkan RT/compute；太阳和局部灯各自采样且条件PDF与逆向密度一致"]
+fn hardware_pt_restir_light_families_use_conditional_pdfs() -> Result<(), Box<dyn std::error::Error>>
+{
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let output = image(&mut gpu)?;
+    let receiver = MaterialDefinition::default();
+    let mut lamp = receiver;
+    lamp.emission = [1., 1., 1., 20.];
+    lamp.control[1] = 3;
+    upload(&mut gpu, &[receiver, lamp], &[], &[[u32::MAX, 0, 0, 0]; 2])?;
+    gpu.set_rendering(
+        prime_scene::RenderMode::Realtime,
+        prime_scene::RealtimeRenderer::RestirPt,
+    )?;
+    for (case, (local, sky)) in [(true, true), (false, true), (true, false), (false, false)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut mesh = scene();
+        if !local {
+            mesh.quads.truncate(1);
+        }
+        publish(&mut gpu, &mesh, case as u64 + 1, case as u64 + 1, [0.; 3])?;
+        let environment = if sky {
+            Environment::default()
+        } else {
+            Environment {
+                sun_direction: [0.; 3],
+                ..Default::default()
+            }
+        };
+        host.render_environment(&mut gpu, &output, &camera(), environment)?;
+        let readback = Buffer::new(&mut gpu.context, 32 * 32 * 32, true)?;
+        let (scene, _) = gpu.renderer_bindings(
+            gpu.view.as_ref().unwrap(),
+            &gpu.atlas,
+            &gpu.scene,
+            gpu.material_gpu,
+            gpu.lighting_gpu,
+        );
+        let bindings = gpu.restir.as_ref().unwrap().test_bindings(
+            &mut gpu.context,
+            scene,
+            gpu.restir_geometry.unwrap(),
+            gpu.restir_lut,
+            Some(readback),
+        )?;
+        let pipeline = ComputePipeline::new(
+            &mut gpu.context,
+            bindings,
+            shader(
+                include_bytes!(concat!(env!("OUT_DIR"), "/restir_light_family_probe.spv")),
+                c"restir_light_family_probe",
+            ),
+        )?;
+        let mut commands = Commands::new(&gpu.context)?;
+        commands.dispatch(pipeline, [2, 2, 1])?;
+        commands.barrier();
+        commands
+            .finish(&mut gpu.context)?
+            .submit_and_wait(&mut gpu.context)?;
+        let mut bytes = vec![0; readback.len() as usize];
+        readback.read(&mut gpu.context, 0, &mut bytes)?;
+        let mut seen = [0; 2];
+        for row in bytes.as_chunks::<32>().0 {
+            let value = |i: usize| f32::from_le_bytes(row[4 * i..4 * i + 4].try_into().unwrap());
+            for (family, enabled) in [local, sky].into_iter().enumerate() {
+                let pdf = value(2 * family);
+                let reverse = value(2 * family + 1);
+                assert!(pdf.is_finite() && reverse.is_finite());
+                if pdf > 0. {
+                    assert!(enabled, "空灯族不能改投另一族");
+                    assert!(
+                        (pdf - reverse).abs() <= 2e-4 * pdf.max(1.),
+                        "family={family}, pdf={pdf}, reverse={reverse}"
+                    );
+                    assert_eq!(value(4 + family).to_bits(), if family == 0 { 1 } else { 0 });
+                    seen[family] += 1;
+                } else if !enabled {
+                    assert_eq!(pdf, 0.);
+                }
+            }
+        }
+        for (family, enabled) in [local, sky].into_iter().enumerate() {
+            assert_eq!(seen[family] > 512, enabled, "case={case}, seen={seen:?}");
+        }
+    }
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan RT；纯tint只写变化quad且整批拒绝不部分写入"]
 fn hardware_pt_sparse_tint_publication_keeps_geometry_and_writes_only_the_patch()
 -> Result<(), Box<dyn std::error::Error>> {

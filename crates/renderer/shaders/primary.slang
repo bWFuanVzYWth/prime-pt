@@ -110,7 +110,7 @@ pt::TransportCall load_landing(uint pixel, uint2 coordinate, uint flags)
     data.path.throughput = 1;
     data.path.medium = parameters[0].initial_medium;
     data.pixel = coordinate;
-    uint count = (parameters[0].output_size.z & 1u) != 0 ? 0u : sample_counts[pixel];
+    uint count = sample_counts[pixel];
     data.sample = parameters[0].reconstruction.w > 0 || (parameters[0].output_size.z & 1u) != 0
                       ? parameters[0].rr_sample + count
                       : count;
@@ -126,7 +126,7 @@ void prefix_main()
     pt::TransportCall data = (pt::TransportCall)0;
     data.pixel = coordinate;
     bool diagnostic = (params.output_size.z & 1u) != 0;
-    uint count = diagnostic ? 0u : sample_counts[pixel];
+    uint count = sample_counts[pixel];
     data.sample = params.reconstruction.w > 0 || diagnostic ? params.rr_sample + count : count;
     if (!diagnostic && accumulation[pixel].w < 0)
     {

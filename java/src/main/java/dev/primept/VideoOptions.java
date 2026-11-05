@@ -262,7 +262,6 @@ public final class VideoOptions {
             if (realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT && slider.key.equals("samples")) slider.active = false;
             if (slider.key.equals("restir_cap") || slider.key.equals("restir_fresh"))
                 slider.active = realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT;
-            if (Settings.diagnostic() && slider.key.equals("samples")) slider.active = false;
         }
         if (ser.getValue() != Settings.requestedSer()) ser.setValue(Settings.requestedSer());
         if (rr.getValue() != Settings.requestedRr()) rr.setValue(Settings.requestedRr());

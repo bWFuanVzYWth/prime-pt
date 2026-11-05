@@ -59,6 +59,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         })
         .collect();
+    recipes.push(Recipe {
+        source: "shaders/restir_probe.slang",
+        entry: "restir_light_family_probe",
+        stage: "compute",
+        output: "restir_light_family_probe.spv",
+        target: Target::Spirv("spirv_1_4"),
+        args: &["-fp-mode", "precise"],
+    });
     for (source, entry, stage, output) in [
         (
             "shaders/restir.slang",

@@ -186,7 +186,8 @@ public struct RestirScene : restir_pt::IRestirScene
         return sampled_result(call.hit, call.incident);
     }
     public restir_pt::InitialShading shadeInitial(restir_pt::Surface surface, float3 u,
-                                                  float3 direction, bool continuation)
+                                                  float3 direction, float3 secondDirection,
+                                                  bool continuation)
     {
         uint program = (materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u) +
                        (continuation ? 0u : asuint(parameters[0].restir.z));
@@ -195,17 +196,20 @@ public struct RestirScene : restir_pt::IRestirScene
 #endif
         if (continuation)
         {
-            RestirInitialCall call = { material_hit(surface), surface.incident, surface.wo, u,
-                                       direction };
+            RestirInitialCall call = {
+                material_hit(surface), surface.incident, surface.wo, u, direction,
+                secondDirection
+            };
             CallShader(program, call);
             return call.result();
         }
-        RestirDirectCall call = { material_hit(surface), surface.wo, direction,
-                                  surface.incident.x };
+        RestirDirectCall call = { material_hit(surface), surface.wo, direction, surface.incident.x,
+                                  secondDirection };
         CallShader(program, call);
         return { {},
                  { asfloat(call.hit.identity.yzw), asfloat(call.hit.identity.x) },
-                 call.hit.normal };
+                 call.hit.normal,
+                 { call.wo, call.direction.x } };
     }
     public restir_pt::BsdfEvaluation evaluateBsdf(restir_pt::Surface surface, float3 wi,
                                                   int component)
@@ -232,18 +236,17 @@ public struct RestirScene : restir_pt::IRestirScene
         float sun = dot(direction, parameters[0].lighting.xyz) >= cosine
                         ? 1.0 / (2.0 * atmosphere::PI * (1.0 - cosine))
                         : 0;
-        return 0.5 / (4.0 * atmosphere::PI) + 0.5 * sun;
+        return sun;
     }
     public restir_pt::LightSample sampleLight(restir_pt::Surface surface, float3 u)
     {
         ModScene scene;
         bool sky = parameters[0].lighting.w > 0;
-        bool hasLocal = light_count() > 0;
-        float probability = sky ? (hasLocal ? 0.5 : 0.0) : 1.0;
         restir_pt::LightSample result = {};
-        if (u.z < probability)
+        // 初采固定两族各取一个样本；返回条件密度，不含二选一的族概率。
+        if (u.z < 0.5)
         {
-            u.z /= probability;
+            u.z *= 2.0;
             pt::LightSample quad = scene.sample_light(surface.point, u);
             if (quad.pdf <= 0)
                 return result;
@@ -252,26 +255,18 @@ public struct RestirScene : restir_pt::IRestirScene
                                            quad.emission.xy);
             result.direction = quad.direction;
             result.distance = quad.distance;
-            result.pdf = probability * quad.pdf;
+            result.pdf = quad.pdf;
             result.radiance = scene.light_emission(surface.point, quad, false);
             result.lightType = restir_pt::LIGHT_EMISSIVE;
         }
         else if (sky)
         {
-            float3 direction;
-            if (u.x < 0.5)
-                direction = scene.sample_sun(surface.point, float2(u.x * 2.0, u.y)).direction;
-            else
-            {
-                float z = 3.0 - 4.0 * u.x;
-                float r = sqrt(max(0.0, 1.0 - z * z));
-                float phi = 2.0 * atmosphere::PI * u.y;
-                direction = float3(r * cos(phi), z, r * sin(phi));
-            }
+            float3 direction = scene.sample_sun(surface.point, u.xy).direction;
+            // 与BSDF环境端点采用相同的总辐射域，太阳盘内的天空项也须配对MIS。
             pt::Environment radiance = scene.environment(direction, surface.point.position, 1);
             result.direction = direction;
             result.distance = pt::FAR;
-            result.pdf = (1.0 - probability) * environmentPdf(direction);
+            result.pdf = environmentPdf(direction);
             result.radiance = radiance.sky + radiance.sun;
             result.lightType = restir_pt::LIGHT_ENV;
         }
@@ -281,8 +276,6 @@ public struct RestirScene : restir_pt::IRestirScene
                           uint type, bool previous)
     {
         ModScene scene;
-        bool sky = parameters[0].lighting.w > 0;
-        float probability = sky ? (light_count() > 0 ? 0.5 : 0.0) : 1.0;
         if (type == restir_pt::LIGHT_EMISSIVE)
         {
             if (!restir_valid_hit(light))
@@ -290,9 +283,9 @@ public struct RestirScene : restir_pt::IRestirScene
             pt::Hit hit = {};
             hit.identity = uint4(light.data.x - 1u, light.data.yz, 0);
             hit.surface = geometry::surface_point(restir_endpoint(light));
-            return probability * scene.emission_pdf(hit, source.point.position);
+            return scene.emission_pdf(hit, source.point.position);
         }
-        return (1.0 - probability) * environmentPdf(direction);
+        return environmentPdf(direction);
     }
     public float3 environment(float3 direction, float3 origin, bool previous)
     {

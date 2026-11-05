@@ -33,9 +33,9 @@ void post_main(uint3 id: SV_DispatchThreadID)
         return;
     uint pixel = id.y * params.image.x + id.x;
     bool diagnostic = (params.output_size.z & 1u) != 0;
-    float4 sum = diagnostic ? float4(0) : accumulation[pixel];
+    float4 sum = accumulation[pixel];
     float4 tail = output_image[pixel];
-    uint count = diagnostic ? 0u : sample_counts[pixel];
+    uint count = sample_counts[pixel];
     float4 prefix = prefix_image[pixel];
     float3 radiance = prefix.xyz + tail.xyz;
     if (tail.w >= 0 && prefix.w < pt::FAR && params.lighting.w > 0)
@@ -56,11 +56,8 @@ void post_main(uint3 id: SV_DispatchThreadID)
             radiance = max(radiance, 0);
     }
     pt::accumulate_sample(sum, count, radiance, tail.w);
-    if (!diagnostic)
-    {
-        accumulation[pixel] = sum;
-        sample_counts[pixel] = count;
-    }
-    if (diagnostic || sum.w < 0 || count == params.image.z + params.image.w)
+    accumulation[pixel] = sum;
+    sample_counts[pixel] = count;
+    if (sum.w < 0 || count == params.image.z + params.image.w)
         output_image[pixel] = pt::resolve_image(sum, count, true, params.drt);
 }

@@ -1539,7 +1539,7 @@ impl Gpu {
                     entry,
                     output: "restir-flow.spv",
                     target: shader_build::Target::Spirv("spirv_1_4"),
-                    args: &["-fp-mode", "precise", sampling],
+                    args: &["-fp-mode", "precise", sampling, lights],
                 },
             )?);
         }
@@ -2578,7 +2578,7 @@ impl Gpu {
             if sky_enabled && let Some(recorded) = self.atmosphere.record(&mut self.context)? {
                 result.push(recorded);
             }
-            if batch.first() == 0 && !diagnostic {
+            if batch.first() == 0 {
                 let mut clear = Commands::new(&self.context)?;
                 clear.clear_buffer(view.accumulation)?;
                 clear.clear_buffer(view.counts)?;
@@ -2730,7 +2730,7 @@ impl Gpu {
             .as_ref()
             .is_some_and(|view| view.output_extent != extent);
         self.settings.samples =
-            if diagnostic || self.renderer_kind == prime_scene::RealtimeRenderer::RestirPt {
+            if !self.offline && self.renderer_kind == prime_scene::RealtimeRenderer::RestirPt {
                 1
             } else {
                 options.samples
@@ -2865,7 +2865,7 @@ impl Gpu {
             }
             self.collect_resources()?;
             if diagnostic {
-                self.diagnostic_sample = self.diagnostic_sample.wrapping_add(1);
+                self.diagnostic_sample = self.diagnostic_sample.wrapping_add(self.settings.samples);
             }
             self.atmosphere_pending = true;
             Ok(())

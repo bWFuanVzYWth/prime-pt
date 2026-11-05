@@ -81,7 +81,7 @@ Attach 用于连接已经通过 Nsight 启动、注入的进程。普通终端�
 /pt renderer path_trace
 ```
 
-第一组是原生分辨率、每帧1个样本、关闭RR及跨帧图像累积的普通 PT。站定预热后抓两次，保存为 `pt-raw-a1`、`pt-raw-a2`，确认同版本重复采集的差异，再切到 ReSTIR：
+第一组是原生分辨率、每帧1个样本、关闭RR及跨帧图像累积的普通 PT；这是上面的 `/pt spp 1` 所设，不是诊断模式强制。改为 `/pt spp 4` 可对照固定4 SPP。站定预热后抓两次，保存为 `pt-raw-a1`、`pt-raw-a2`，确认同版本重复采集的差异，再切到 ReSTIR：
 
 ```text
 /pt renderer restir_pt

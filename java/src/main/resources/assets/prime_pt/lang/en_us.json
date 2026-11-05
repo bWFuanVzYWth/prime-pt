@@ -59,5 +59,5 @@
   "primept.settings.restir_cv.tooltip": "Reduce ReSTIR color noise with temporal and spatial control variates. Enabled by default. Toggling starts fresh color history and preserves path history.\nCommand: /pt cv on|off",
   "primept.settings.restir_fresh.tooltip": "Choose the fresh estimate independently at this fixed probability to reduce output correlation. 0% shows reuse, 100% shows fresh. Reuse stages still run.\nCommand: /pt fresh 0..100",
   "primept.settings.diagnostic": "Native raw diagnostic",
-  "primept.settings.diagnostic.tooltip": "Native resolution, one sample per frame, no RR or frame accumulation. ReSTIR reuse and display exposure remain active. Existing quality and sample settings are preserved.\nCommand: /pt diagnostic on|off"
+  "primept.settings.diagnostic.tooltip": "Native resolution, no RR or frame accumulation. Plain PT averages the configured SPP within each frame; ReSTIR keeps one initial candidate and internal reuse. Display exposure and quality preferences remain active.\nCommand: /pt diagnostic on|off"
 }

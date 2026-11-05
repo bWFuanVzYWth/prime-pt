@@ -60,37 +60,35 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
     )?;
     let accumulation = gpu.view.as_ref().unwrap().accumulation;
     let counts = gpu.view.as_ref().unwrap().counts;
-    let before = [
-        download_buffer(&mut gpu, accumulation)?,
-        download_buffer(&mut gpu, counts)?,
-    ];
     gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., true, false)?)?;
     let mut displays = Vec::new();
-    for _ in 0..3 {
+    for frame in 0..3 {
         host.render_options(
             &mut gpu,
             &output,
             &camera(),
             Environment::default(),
-            Options::new(true, streamline::Quality::Performance, 8, 12)?,
+            Options::new(true, streamline::Quality::Performance, 4, 12)?,
         )?;
         let view = gpu.view.as_ref().unwrap();
         assert_eq!(view.extent, [32, 32]);
         assert!(!view.rr_enabled && gpu.rr_runtime.is_none());
-        assert_eq!(gpu.accumulated_samples(), 1);
+        assert_eq!(gpu.accumulated_samples(), 4);
+        assert_eq!(view.accumulation, accumulation);
+        assert_eq!(view.counts, counts);
+        assert_eq!(gpu.diagnostic_sample, (frame + 1) * 4);
+        assert!(
+            download_buffer(&mut gpu, counts)?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|v| u32::from_le_bytes(*v) == 4)
+        );
         displays.push(output.download(&mut gpu.context)?);
     }
     assert!(
         displays.windows(2).any(|pair| pair[0] != pair[1]),
         "每帧使用新的随机样本"
-    );
-    assert_eq!(
-        before,
-        [
-            download_buffer(&mut gpu, accumulation)?,
-            download_buffer(&mut gpu, counts)?
-        ],
-        "诊断不写入已有的跨帧RGB与计数"
     );
     gpu.set_render_tuning(prime_scene::RenderTuning::BASELINE)?;
     host.render_options(
@@ -102,6 +100,57 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
     )?;
     assert_eq!(gpu.accumulated_samples(), 8);
     drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT；4 SPP诊断逐像素等于同一身份的四个1 SPP帧均值"]
+fn hardware_pt_diagnostic_batch_matches_single_sample_mean()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut expected = Vec::<Vec<f64>>::new();
+    for spp in [1, 4] {
+        let mut gpu = host.gpu()?;
+        let output = image(&mut gpu)?;
+        let mut mesh = Mesh::default();
+        add_quad(&mut mesh, 2., [0.5; 2], [0.8, 0.6, 0.4], 4.);
+        publish(&mut gpu, &mesh, 1)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., true, false)?)?;
+        for frame in 0..8 / spp {
+            host.render_options(
+                &mut gpu,
+                &output,
+                &camera(),
+                Environment::default(),
+                Options::new(false, streamline::Quality::Dlaa, spp, 12)?,
+            )?;
+            let hdr = gpu.view.as_ref().unwrap().output;
+            let bytes = download_buffer(&mut gpu, hdr)?;
+            let values: Vec<_> = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f64::from(f32::from_le_bytes(*v)))
+                .collect();
+            if spp == 1 {
+                if frame % 4 == 0 {
+                    expected.push(vec![0.; values.len()]);
+                }
+                for (sum, value) in expected.last_mut().unwrap().iter_mut().zip(values) {
+                    *sum += value / 4.;
+                }
+            } else {
+                for (actual, target) in values.iter().zip(&expected[frame as usize]) {
+                    assert!(
+                        (actual - target).abs() <= 5e-6 * target.abs().max(1.),
+                        "4 SPP={actual}, 1 SPP均值={target}"
+                    );
+                }
+            }
+        }
+        assert_eq!(gpu.diagnostic_sample, 8);
+    }
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

@@ -60,6 +60,7 @@ public void store_sample(inout RestirMaterialHit hit, inout float4 medium, openp
     medium = sample.medium;
 }
 
+/// 96B双向求值与延续；返回时复用wo/u.xy存PDF，两个direction存第二响应/发光。
 public struct RestirInitialCall
 {
     public RestirMaterialHit hit;
@@ -67,10 +68,11 @@ public struct RestirInitialCall
     public float3 wo;
     public float3 u;
     public float3 direction;
+    public float3 second_direction;
 
     public restir_pt::InitialShading result()
     {
-        return { sampled_result(hit, incident), { wo, u.x }, direction };
+        return { sampled_result(hit, incident), { wo, u.x }, second_direction, { direction, u.y } };
     }
 };
 
@@ -97,4 +99,5 @@ public struct RestirDirectCall
     public float3 wo;
     public float3 direction;
     public float incident_ior;
+    public float3 second_direction;
 };

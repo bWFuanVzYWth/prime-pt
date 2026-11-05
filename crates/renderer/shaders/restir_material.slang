@@ -14,6 +14,12 @@ import bsdf.openpbr.specialized;
 #ifndef PRIMEPT_RESTIR_SAMPLE
 #define PRIMEPT_RESTIR_SAMPLE 1
 #endif
+#ifndef PRIMEPT_LIGHT_MASK
+#define PRIMEPT_LIGHT_MASK 3
+#endif
+// 普通PT按太阳/局部灯排列；初采按局部灯/太阳排列，资源世代消除不存在的灯族求值。
+static const uint INITIAL_LIGHT_MASK =
+    ((PRIMEPT_LIGHT_MASK & 2u) >> 1u) | ((PRIMEPT_LIGHT_MASK & 1u) << 1u);
 
 [shader("callable")]
 #if PRIMEPT_RESTIR_SAMPLE
@@ -23,13 +29,16 @@ void restir_initial_flow(inout RestirInitialCall call)
     ModScene scene;
     pt::SurfaceMaterial material = scene.resolve_flow(hit, OPENPBR_FLOW, call.incident);
     float3 normal = pt::shading_normal(hit, material);
-    openpbr::Batch batch = openpbr::shade_flow<OPENPBR_FLOW, openpbr::Energy, 1>(
-        scene.energy(), material.pbr, normal, call.wo, call.direction, float3(0), 1u, call.u,
-        PRIMEPT_RESTIR_SAMPLE != 0, call.incident, material.transmitted);
+    openpbr::Batch batch = openpbr::shade_flow<OPENPBR_FLOW, openpbr::Energy, INITIAL_LIGHT_MASK>(
+        scene.energy(), material.pbr, normal, call.wo, call.direction, call.second_direction,
+        INITIAL_LIGHT_MASK, call.u, PRIMEPT_RESTIR_SAMPLE != 0, call.incident,
+        material.transmitted);
     store_sample(call.hit, call.incident, batch.scattered);
     call.wo = batch.first.response;
     call.u.x = batch.first.pdf;
-    call.direction = material.emission;
+    call.direction = batch.second.response;
+    call.u.y = batch.second.pdf;
+    call.second_direction = material.emission;
 }
 #else
 void restir_initial_flow(inout RestirDirectCall call)
@@ -38,11 +47,14 @@ void restir_initial_flow(inout RestirDirectCall call)
     pt::Hit hit = to_pt_hit(call.hit);
     float4 incident = float4(call.incident_ior, 0, 0, 0);
     pt::SurfaceMaterial material = scene.resolve_flow(hit, OPENPBR_FLOW, incident);
-    openpbr::Evaluation evaluated = openpbr::evaluate_flow<OPENPBR_FLOW>(
+    openpbr::Batch batch = openpbr::shade_flow<OPENPBR_FLOW, openpbr::Energy, INITIAL_LIGHT_MASK>(
         scene.energy(), material.pbr, pt::shading_normal(hit, material), call.wo, call.direction,
-        incident, material.transmitted);
-    call.hit.identity = asuint(float4(evaluated.pdf, evaluated.response));
+        call.second_direction, INITIAL_LIGHT_MASK, float3(0), false, incident,
+        material.transmitted);
+    call.hit.identity = asuint(float4(batch.first.pdf, batch.first.response));
     call.hit.normal = material.emission;
+    call.wo = batch.second.response;
+    call.direction.x = batch.second.pdf;
 }
 #endif
 
