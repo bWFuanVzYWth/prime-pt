@@ -73,13 +73,22 @@ public struct RestirScene : restir_pt::IRestirScene
         restir_pt::Surface result = {};
         if (!restir_valid_hit(identity))
             return result;
-        uint primitive = identity.data.x - 1u;
-        result.point = geometry::surface_point(restir_endpoint(identity));
+        pt::Hit source = {};
+        source.surface = geometry::surface_point(restir_endpoint(identity));
+        source.identity = uint4(identity.data.x - 1u, identity.data.yz,
+                                restir_normal(identity, source.surface.normal));
+        return surface_from_hit(identity, source, wo);
+    }
+    public restir_pt::Surface surface_from_hit(restir_pt::HitInfo identity, pt::Hit sourceHit,
+                                               float3 wo)
+    {
+        restir_pt::Surface result = {};
+        uint primitive = sourceHit.identity.x;
+        result.point = sourceHit.surface;
         result.hit = identity;
         result.wo = wo;
         result.frontFacing = dot(wo, result.point.normal) >= 0;
-        result.identity =
-            uint4(primitive, identity.data.yz, restir_normal(identity, result.point.normal));
+        result.identity = sourceHit.identity;
         pt::Hit hit = restir_hit(result);
         // Surface只缓存算法需要的元数据；albedo由Flow叶子按需读取。
         // 这里只消费roughness/IOR/metalness/发光元数据；非发光表面不读取albedo/tint。

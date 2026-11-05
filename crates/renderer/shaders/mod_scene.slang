@@ -92,6 +92,28 @@ public float4 texel(uint primitive, float2 barycentrics)
     return material_texel(primitive, barycentrics);
 }
 
+public void finish_vertex(inout pt::TransportCall data)
+{
+    // 与材质键无关的收尾不扩大每个callable；采样身份无需跨call复制临时随机状态。
+    uint status = data.path.status;
+    if (status == pt::PATH_ACTIVE)
+    {
+        if (max(data.path.throughput.x, max(data.path.throughput.y, data.path.throughput.z)) <= 0)
+            status = pt::PATH_DONE;
+        else if (data.path.depth + 1 >= 2)
+        {
+            float survival = pt::roulette_probability(data.path.throughput, data.path.eta_scale);
+            pt::PathSampler sampler = pt::path_sampler(
+                data.pixel, data.sample, parameters[0].options.z, parameters[0].options.x);
+            if (survival == 0 || (survival < 1 && sampler.roulette(data.path.depth) >= survival))
+                status = pt::PATH_DONE;
+            else if (survival < 1)
+                data.path.throughput = pt::roulette_reweight(data.path.throughput, survival);
+        }
+    }
+    pt::finish(data.path, status);
+}
+
 /// 资源世代的完整材质在消费交点时翻译；几何误差与着色法线独立。
 public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 {
@@ -144,27 +166,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         ModTransportCall call = ModTransportCall.input(data);
         CallShader(program, call);
         data.path = call.result();
-        // 与材质键无关的收尾不扩大每个callable；采样身份无需跨call复制临时随机状态。
-        uint status = data.path.status;
-        if (status == pt::PATH_ACTIVE)
-        {
-            if (max(data.path.throughput.x, max(data.path.throughput.y, data.path.throughput.z)) <=
-                0)
-                status = pt::PATH_DONE;
-            else if (data.path.depth + 1 >= 2)
-            {
-                float survival =
-                    pt::roulette_probability(data.path.throughput, data.path.eta_scale);
-                pt::PathSampler sampler = pt::path_sampler(
-                    data.pixel, data.sample, parameters[0].options.z, parameters[0].options.x);
-                if (survival == 0 ||
-                    (survival < 1 && sampler.roulette(data.path.depth) >= survival))
-                    status = pt::PATH_DONE;
-                else if (survival < 1)
-                    data.path.throughput = pt::roulette_reweight(data.path.throughput, survival);
-            }
-        }
-        pt::finish(data.path, status);
+        finish_vertex(data);
     }
 
     public pt::SurfaceMaterial resolve(pt::Hit hit, uint capability, float4 incident)

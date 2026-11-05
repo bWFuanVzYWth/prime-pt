@@ -26,6 +26,8 @@ pub(super) struct Restir {
     )>,
     pub previous_camera: Option<crate::reconstruction::CameraFrame>,
     accepted_cv: bool,
+    #[cfg(test)]
+    timestamps: Option<simple_engine::vulkan::native::TimestampQueries>,
 }
 
 fn binding_rows(
@@ -70,6 +72,8 @@ impl Restir {
         lut: Buffer,
         hit: materials::HitFeatures,
         callables: &[super::RayShader<'_>],
+        initial_override: Option<super::RayShader<'_>>,
+        initial_hits: &[super::RayShader<'_>],
         reordered: bool,
     ) -> Result<Self, Error> {
         let buffers = Buffers::new_native(
@@ -77,14 +81,16 @@ impl Restir {
             restir_pt::Layout::with_color_estimates([1, 1], FUSION)?,
         )?;
         let bindings = Bindings::new(context, &binding_rows(scene, geometry, lut, &buffers))?;
-        let initial = shader(
-            if reordered {
-                include_bytes!(concat!(env!("OUT_DIR"), "/restir-initial-ser.spv"))
-            } else {
-                include_bytes!(concat!(env!("OUT_DIR"), "/restir-initial.spv"))
-            },
-            c"restir_initial",
-        );
+        let initial = initial_override.unwrap_or_else(|| {
+            shader(
+                if reordered {
+                    include_bytes!(concat!(env!("OUT_DIR"), "/restir-initial-ser.spv"))
+                } else {
+                    include_bytes!(concat!(env!("OUT_DIR"), "/restir-initial.spv"))
+                },
+                c"restir_initial",
+            )
+        });
         let temporal = shader(
             if reordered {
                 include_bytes!(concat!(
@@ -154,8 +160,13 @@ impl Restir {
             resolve: merge,
             miss: trace.miss,
             closest_hit: trace.closest_hit,
+            initial_hits,
             any_hit: trace.any_hit,
-            initial_callables: &callables[..2 * count],
+            initial_callables: if initial_hits.is_empty() {
+                &callables[..2 * count]
+            } else {
+                &[]
+            },
             replay_callables: &callables[2 * count..3 * count],
             evaluate_callables: &callables[3 * count..],
         };
@@ -179,6 +190,8 @@ impl Restir {
             previous_camera: None,
             pending: None,
             accepted_cv: false,
+            #[cfg(test)]
+            timestamps: None,
         })
     }
 
@@ -199,6 +212,18 @@ impl Restir {
     #[cfg(test)]
     pub fn test_buffers(&self) -> &Buffers<Buffer> {
         self.renderer.buffers()
+    }
+
+    #[cfg(test)]
+    pub fn test_stack_sizes(&self, context: &Context) -> Result<serde_json::Value, Error> {
+        Ok(serde_json::json!(self.renderer.program_stack_sizes(context)?.into_iter().map(|(stage, sizes)|
+            serde_json::json!({"stage":format!("{stage:?}"),"raygen":sizes.raygen,"closest_hit":sizes.closest_hit,
+                "any_hit":sizes.any_hit,"callable_max":sizes.callable_max,"callable_count":sizes.callable_count})).collect::<Vec<_>>()))
+    }
+
+    #[cfg(test)]
+    pub fn test_program_roots(&self, context: &Context) -> Result<String, Error> {
+        Ok(format!("{:?}", self.renderer.program_roots(context)?))
     }
 
     #[cfg(test)]
@@ -280,6 +305,8 @@ impl Restir {
             previous_camera: None,
             pending: None,
             accepted_cv: false,
+            #[cfg(test)]
+            timestamps: None,
         })
     }
 
@@ -339,6 +366,13 @@ impl Restir {
         jitter: [f32; 2],
         cv: bool,
     ) -> Result<Recorded, Error> {
+        #[cfg(test)]
+        let frame = if let Some(queries) = self.timestamps {
+            self.renderer.record_timed(context, queries)?
+        } else {
+            self.renderer.record(context)?
+        };
+        #[cfg(not(test))]
         let frame = self.renderer.record(context)?;
         self.pending = Some((frame.token, camera, jitter, cv));
         Ok(frame.commands)
@@ -371,6 +405,17 @@ impl Restir {
     }
 
     pub fn roots(&self) -> impl Iterator<Item = Resource> {
-        self.renderer.roots().chain([self.post.into()])
+        let roots = self.renderer.roots().chain([self.post.into()]);
+        #[cfg(test)]
+        let roots = roots.chain(self.timestamps.map(Resource::from));
+        roots
+    }
+
+    #[cfg(test)]
+    pub fn test_set_timestamps(
+        &mut self,
+        queries: Option<simple_engine::vulkan::native::TimestampQueries>,
+    ) {
+        self.timestamps = queries;
     }
 }

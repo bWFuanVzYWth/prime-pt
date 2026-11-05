@@ -2,14 +2,346 @@
 use super::*;
 use prime_scene::{RealtimeRenderer, RenderMode, RenderRegion, RenderView};
 
+/// 同进程完整Latin轮换；每组显式从同历史起点开始，准备和读回不计入稳态。
+#[test]
+#[ignore = "独占Vulkan RT/SER设备；PRIME_PT_DISPATCH_PROFILE须为新的输出目录"]
+fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
+    use prime_scene::{MaterialDefinition, MaterialId};
+    let directory = std::path::PathBuf::from(
+        std::env::var_os("PRIME_PT_DISPATCH_PROFILE").ok_or("缺少PRIME_PT_DISPATCH_PROFILE")?,
+    );
+    std::fs::create_dir(&directory)?;
+    let modes: Vec<u32> = std::env::var("PRIME_PT_DISPATCH_MODES")
+        .unwrap_or("0,0,1,2,3".into())
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<_, _>>()?;
+    if modes.len() < 2 || modes.iter().any(|&v| v > 7) {
+        return Err("至少两个有效实验分派".into());
+    }
+    let rounds = modes.len() * 2;
+    let extent = [960, 540];
+    let warmup = 60;
+    let samples = 120;
+    let spp: u32 = std::env::var("PRIME_PT_DISPATCH_SPP")
+        .unwrap_or_else(|_| "1".into())
+        .parse()?;
+    let options = Options::new(false, streamline::Quality::Dlaa, spp, 12)?;
+    let cases: &[(RealtimeRenderer, bool)] =
+        match std::env::var("PRIME_PT_DISPATCH_CASE").as_deref() {
+            Ok("pt") => &[(RealtimeRenderer::PathTrace, false)],
+            Ok("restir") => &[
+                (RealtimeRenderer::RestirPt, false),
+                (RealtimeRenderer::RestirPt, true),
+            ],
+            Err(std::env::VarError::NotPresent) => &[
+                (RealtimeRenderer::PathTrace, false),
+                (RealtimeRenderer::RestirPt, false),
+                (RealtimeRenderer::RestirPt, true),
+            ],
+            _ => return Err("PRIME_PT_DISPATCH_CASE须省略或为pt/restir".into()),
+        };
+    let host = Host::new_ser()?;
+    let mut definitions = vec![MaterialDefinition::default(); 6];
+    for material in &mut definitions {
+        material.control = [0, 3, 0, 0];
+    }
+    definitions[1].surface[1] = 1.;
+    definitions[1].base_roughness[3] = 0.15;
+    definitions[2].control[0] = 1;
+    definitions[2].base_roughness[3] = 0.;
+    definitions[3].control[0] = 1;
+    definitions[3].extinction = [1.33, 0.03, 0.01, 0.005];
+    definitions[3].base_roughness[3] = 0.15;
+    definitions[4].surface[2] = 0.5;
+    definitions[5].emission = [2., 1., 0.5, 1.];
+    let mut mesh = Mesh::default();
+    for y in 0..64 {
+        for x in 0..64 {
+            let id = (x / 13).min(4);
+            let x = x as f32 * 0.25 - 8.;
+            let y = y as f32 * 0.25 - 8.;
+            mesh.quads.push(Quad::with_material(
+                [
+                    [x, y, 8.],
+                    [x, y + 0.25, 8.],
+                    [x + 0.25, y + 0.25, 8.],
+                    [x + 0.25, y, 8.],
+                ],
+                [[0.5; 2]; 4],
+                [0.8, 0.7, 0.6],
+                MaterialId::new(id),
+            ));
+        }
+    }
+    // 后墙接收透射路径；相机后方灯条同时覆盖太阳和局部灯的可见性路径。
+    for (points, id) in [
+        (
+            [
+                [-12., -12., 12.],
+                [-12., 12., 12.],
+                [12., 12., 12.],
+                [12., -12., 12.],
+            ],
+            0,
+        ),
+        (
+            [[-4., 3., -2.], [4., 3., -2.], [4., 4., -2.], [-4., 4., -2.]],
+            5,
+        ),
+        (
+            [
+                [-10., -8., -3.],
+                [10., -8., -3.],
+                [10., -8., 12.],
+                [-10., -8., 12.],
+            ],
+            0,
+        ),
+    ] {
+        mesh.quads.push(Quad::with_material(
+            points,
+            [[0.5; 2]; 4],
+            [1.; 3],
+            MaterialId::new(id),
+        ));
+    }
+    let mut gpu = host.gpu()?;
+    gpu.experiment_dispatch = modes[0];
+    let started = std::time::Instant::now();
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [1, 1],
+        albedo: &[255; 4],
+        materials: &definitions,
+        mers: &[0, 0, 255, 0],
+        auxiliary: &[128, 128, 255, 128],
+        emission_alias_words: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]; 6],
+    })?;
+    let mut preparation =
+        vec![serde_json::json!({"dispatch":modes[0],"host_ns":started.elapsed().as_nanos()})];
+    let flows = materials::flows(gpu.atlas_colors, &definitions, gpu.map_ranges)?;
+    let mut variants = Vec::new();
+    for &mode in &modes[1..] {
+        let started = std::time::Instant::now();
+        gpu.experiment_dispatch = mode;
+        let (_, generation) =
+            gpu.prepare_material_generation(gpu.atlas, gpu.material_gpu, &flows, &definitions)?;
+        let previous = gpu.generation.replace(generation).unwrap();
+        gpu.test_roots.extend(previous.roots());
+        variants.push(Some(previous));
+        preparation
+            .push(serde_json::json!({"dispatch":mode,"host_ns":started.elapsed().as_nanos()}));
+    }
+    let last = gpu.generation.take().unwrap();
+    gpu.test_roots.extend(last.roots());
+    variants.push(Some(last));
+    gpu.generation = variants[0].take();
+    let mut active = 0;
+    gpu.set_regions(RenderView {
+        generation: gpu.resource_generation,
+        anchor: [0.; 3],
+        regions: &[RenderRegion {
+            key: [0; 3],
+            geometry_revision: 1,
+            content_revision: 1,
+            mesh: (&mesh).into(),
+        }],
+    })?;
+    let output = Image::new(
+        &mut gpu.context,
+        [extent[0], extent[1], 1],
+        ImageFormat::Rgba8Unorm,
+    )?;
+    let pair = [
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+    ];
+    gpu.test_roots.push(output.into());
+    gpu.test_roots
+        .extend(pair.map(vulkan::native::Resource::from));
+    let stage_queries = if std::env::var_os("PRIME_PT_DISPATCH_STAGES").is_some() {
+        let queries = vulkan::native::TimestampQueries::new(&mut gpu.context, 20)?;
+        gpu.test_roots.push(queries.into());
+        Some(queries)
+    } else {
+        None
+    };
+    let gpu = &mut gpu;
+    let mut records = Vec::new();
+    for &(renderer, cv) in cases {
+        for round in 0..rounds {
+            for step in 0..modes.len() {
+                let position = if (round / modes.len()) % 2 == 0 {
+                    step
+                } else {
+                    modes.len() - 1 - step
+                };
+                let index = (position + round % modes.len()) % modes.len();
+                if index != active {
+                    variants[active] = gpu.generation.replace(variants[index].take().unwrap());
+                    active = index;
+                    gpu.renderer = None;
+                    gpu.restir_dirty = true;
+                }
+                gpu.set_rendering(RenderMode::Realtime, renderer)?;
+                gpu.set_regions(RenderView {
+                    generation: gpu.resource_generation,
+                    anchor: [0.; 3],
+                    regions: &[RenderRegion {
+                        key: [0; 3],
+                        geometry_revision: 1,
+                        content_revision: 1,
+                        mesh: (&mesh).into(),
+                    }],
+                })?;
+                gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., false, cv)?)?;
+                for _ in 0..20 {
+                    host.render_profiled(
+                        gpu,
+                        &output,
+                        &camera(),
+                        Environment::default(),
+                        options,
+                        None,
+                    )?;
+                }
+                if renderer == RealtimeRenderer::RestirPt {
+                    gpu.restir
+                        .as_mut()
+                        .ok_or("缺少ReSTIR")?
+                        .test_set_timestamps(stage_queries);
+                }
+                gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+                let mut timings = Vec::new();
+                let mut stage_timings = Vec::new();
+                for frame in 0..warmup + samples {
+                    if renderer == RealtimeRenderer::PathTrace {
+                        gpu.transition_history(history::Event::Accumulation(
+                            history::AccumulationEvent::ExplicitRequested,
+                        ))?;
+                    }
+                    let timing = host.render_profiled(
+                        gpu,
+                        &output,
+                        &camera(),
+                        Environment::default(),
+                        options,
+                        Some(pair),
+                    )?;
+                    if frame >= warmup {
+                        timings.push(timing);
+                        if renderer == RealtimeRenderer::RestirPt
+                            && let Some(queries) = stage_queries
+                        {
+                            let ticks = queries
+                                .read(&gpu.context)?
+                                .ok_or("完成后阶段timestamp仍未ready")?;
+                            let mut row = Vec::with_capacity(10);
+                            for stage in 0..10 {
+                                row.push(queries.elapsed_ns(
+                                    &gpu.context,
+                                    ticks[stage * 2],
+                                    ticks[stage * 2 + 1],
+                                )?);
+                            }
+                            stage_timings.push(row);
+                        }
+                    }
+                }
+                let hdr = gpu.view.as_ref().unwrap().output;
+                let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;
+                hdr.copy_prefix_to(&mut gpu.context, &readback, hdr.len())?;
+                let mut pixels = vec![0; hdr.len() as usize];
+                readback.read(&mut gpu.context, 0, &mut pixels)?;
+                if !pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|w| f32::from_le_bytes(*w).is_finite())
+                {
+                    return Err("HDR包含非有限值".into());
+                }
+                let image = format!("{renderer:?}-cv{cv}-r{round}-v{index}.rgba32fle");
+                std::fs::write(directory.join(&image), &pixels)?;
+                let stacks = gpu
+                    .restir
+                    .as_ref()
+                    .map(|r| r.test_stack_sizes(&gpu.context))
+                    .transpose()?;
+                let program_roots = gpu
+                    .restir
+                    .as_ref()
+                    .map(|r| r.test_program_roots(&gpu.context))
+                    .transpose()?;
+                let mut parameter_bytes = vec![0; gpu.view.as_ref().unwrap().params.len() as usize];
+                gpu.view.as_ref().unwrap().params.read(
+                    &mut gpu.context,
+                    0,
+                    &mut parameter_bytes,
+                )?;
+                let row = serde_json::json!({"renderer":format!("{renderer:?}"),"cv":cv,"round":round,"position":step,
+                    "driver_stack_bytes":stacks,"immutable_programs":program_roots,"frame_parameters":parameter_bytes.as_chunks::<4>().0.iter().map(|w|u32::from_le_bytes(*w)).collect::<Vec<_>>(),
+                    "variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
+                std::fs::write(
+                    directory.join(format!("{renderer:?}-cv{cv}-r{round}-v{index}.json")),
+                    serde_json::to_vec_pretty(&row)?,
+                )?;
+                records.push(row);
+                eprintln!(
+                    "dispatch profile {renderer:?} CV={cv} round={round} variant={index} mode={}",
+                    modes[index]
+                );
+            }
+        }
+    }
+    std::fs::write(
+        directory.join("results.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"modes":modes,"rounds":rounds,
+        "extent":extent,"warmup":warmup,"samples":samples,"spp":spp,"bounces":12,"ser":true,"rr":false,
+        "preparation":preparation,"scope":"CPU draw录制含回收；GPU完整draw；准备/场景更新/读回/窗口不计入稳态",
+        "stage_order":simple_engine::restir_pt::Stage::sequence(true).map(|stage|format!("{stage:?}")).collect::<Vec<_>>(),
+        "stage_markers":stage_queries.is_some(),
+        "records":records}))?,
+    )?;
+    let _ = gpu;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
 #[test]
 #[ignore = "独占Vulkan RT/SER设备；PRIME_PT_RENDER_BENCH_OUTPUT须指向新的JSON文件"]
 fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::var_os("PRIME_PT_RENDER_BENCH_OUTPUT")
         .ok_or("缺少PRIME_PT_RENDER_BENCH_OUTPUT")?;
     let host = Host::new_ser()?;
+    let bounces = std::env::var("PRIME_PT_EXPERIMENT_BOUNCES")
+        .ok()
+        .map(|v| v.parse())
+        .transpose()?
+        .unwrap_or(12);
     let mut gpu = host.gpu()?;
-    let output = Image::new(&mut gpu.context, [960, 540, 1], ImageFormat::Rgba8Unorm)?;
+    if let Some(mode) = std::env::var_os("PRIME_PT_EXPERIMENT_DISPATCH") {
+        gpu.experiment_dispatch = mode.to_str().ok_or("实验分派须为0..5")?.parse()?;
+        if gpu.experiment_dispatch > 5 {
+            return Err("实验分派须为0..5".into());
+        }
+        gpu.set_atlas(1, 1, &[255; 4])?;
+    }
+    if std::env::var_os("PRIME_PT_EXPERIMENT_NO_SER").is_some() {
+        gpu.set_ser(false)?;
+    }
+    let extent = if std::env::var_os("PRIME_PT_EXPERIMENT_SMALL").is_some() {
+        [32, 32]
+    } else {
+        [960, 540]
+    };
+    let output = Image::new(
+        &mut gpu.context,
+        [extent[0], extent[1], 1],
+        ImageFormat::Rgba8Unorm,
+    )?;
     gpu.test_roots.push(output.into());
     let queries = [
         vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
@@ -41,8 +373,22 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         (RealtimeRenderer::RestirPt, false),
         (RealtimeRenderer::RestirPt, true),
     ] {
+        eprintln!(
+            "开始case {renderer:?} CV={cv} dispatch={}",
+            gpu.experiment_dispatch
+        );
         gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., false, cv)?)?;
         gpu.set_rendering(RenderMode::Realtime, renderer)?;
+        gpu.set_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor: [0.; 3],
+            regions: &[RenderRegion {
+                key: [0; 3],
+                geometry_revision: 1,
+                content_revision: 1,
+                mesh: (&mesh).into(),
+            }],
+        })?;
         gpu.set_regions(RenderView {
             generation: gpu.resource_generation,
             anchor: [0.; 3],
@@ -67,7 +413,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
                 &output,
                 &camera(),
                 Environment::default(),
-                Options::new(false, streamline::Quality::Dlaa, 1, 12)?,
+                Options::new(false, streamline::Quality::Dlaa, 1, bounces)?,
                 Some(queries),
             )?;
             if frame >= 64 && warmup.elapsed() >= std::time::Duration::from_secs(2) {
@@ -83,6 +429,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
             "cv_color_bytes":gpu.restir.as_ref().map(|r|2*r.test_buffers().layout().memory().color_estimate),
             "display_blake3":blake3::hash(&pixels).to_hex().as_str()}),
         );
+        eprintln!("完成case {renderer:?} CV={cv}");
     }
     drop(gpu);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);

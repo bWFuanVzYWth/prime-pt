@@ -1,5 +1,9 @@
 /// point ReSTIR PT：融合初采、双向时间shift、paired三邻居空间shift和最终合并。
 module restir;
+// Hit Group仅用于初采新命中；其他raygen不实例化或保存硬件命中上下文。
+#ifdef PRIMEPT_INITIAL_HIT
+import initial_hit;
+#endif
 import restir_scene;
 import restir_call;
 import mod_scene;
@@ -114,7 +118,14 @@ void restir_initial()
     RestirScene scene;
     HitInfo hit;
     float distance;
+#ifdef PRIMEPT_INITIAL_HIT
+    InitialHitTrace tracer;
+    HitObject traced;
+    tracer.trace(scene, traced, scene.initialOrigin(pixel), scene.initialDirection(pixel), hit,
+                 distance);
+#else
     scene.trace(scene.initialOrigin(pixel), scene.initialDirection(pixel), false, hit, distance);
+#endif
     primary_current[offset_for(pixel)] = hit.data;
     if ((p.output_size.z & 8u) != 0)
     {
@@ -126,8 +137,14 @@ void restir_initial()
     TinyUniformSampleGenerator generator =
         rng_for_pixel(pixel, p.temporal_reserved.x ^ p.options.x);
     ShiftSettings settings = {};
+#ifdef PRIMEPT_INITIAL_HIT
+    InitialResult initial = sampleInitialPathTraced<RestirScene, HitObject, InitialHitTrace, 2>(
+        scene, tracer, traced, pixel, hit, generator.state, p.options.y, settings, true, true,
+        true);
+#else
     InitialResult initial = sampleInitialPath<RestirScene, 2>(
         scene, pixel, hit, generator.state, p.options.y, settings, true, true, true);
+#endif
     store_reservoir(reservoirs_a, offset_for(pixel), initial.reservoir);
     if ((p.output_size.z & 8u) != 0)
         store_color(colors_a, offset_for(pixel),
