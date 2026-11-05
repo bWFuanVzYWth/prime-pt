@@ -12,6 +12,7 @@
 
 use super::*;
 use serde_json::{Value, json};
+use simple_engine::{pt, shader_build};
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -659,7 +660,7 @@ fn hardware_pt_scene_baseline() -> Result {
         .open(root.join("samples.jsonl"))?;
     let mut captures = Vec::new();
     for round in 0..ROUNDS {
-        gpu.view.as_mut().ok_or("视图缺失")?.progress.reset();
+        gpu.restart_accumulation()?;
         for frame in 0..FRAMES {
             let frame_started = Instant::now();
             let manager_started = Instant::now();

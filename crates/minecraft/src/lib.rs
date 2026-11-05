@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 #![feature(portable_simd)]
 
+use simple_engine::light_sampling;
 mod biome;
 mod biome_source;
 pub mod tint;

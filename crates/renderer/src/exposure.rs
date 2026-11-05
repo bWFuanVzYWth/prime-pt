@@ -4,7 +4,8 @@ use simple_engine::display::exposure::{
     Frame,
     gpu::{Exposure, Programs},
 };
-use vulkan::{
+use simple_engine::vulkan::{
+    self,
     interop::RayShader,
     native::{Binding, Buffer, Context, Image, Recorded, Resource},
 };

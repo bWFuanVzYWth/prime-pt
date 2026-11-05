@@ -18,6 +18,31 @@ public final class Settings {
 
     private Settings() {}
 
+    public static boolean enabled() { return Holder.CONFIG.selection().enabled(); }
+    public static RenderMode mode() { return Holder.CONFIG.selection().mode(); }
+    public static RealtimeRenderer realtimeRenderer() { return Holder.CONFIG.selection().renderer(); }
+    public static boolean offline() { return Holder.CONFIG.selection().offline(); }
+    static RenderTuning tuning() { return Holder.CONFIG.tuning(); }
+    public static boolean diagnostic() { return tuning().diagnosticActive(Holder.CONFIG.selection()); }
+    static void setHistoryCap(int value) throws IOException {
+        Holder.CONFIG.setTuning(new RenderTuning(value, tuning().freshPercent(), tuning().diagnostic()));
+    }
+    static void setFreshPercent(int value) throws IOException {
+        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), value, tuning().diagnostic()));
+    }
+    static void setDiagnostic(boolean value) throws IOException {
+        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), value));
+    }
+    public static void setEnabled(boolean value) throws IOException {
+        Holder.CONFIG.setSelection(new RenderSelection(value, mode(), realtimeRenderer()));
+    }
+    public static void setMode(RenderMode value) throws IOException {
+        Holder.CONFIG.setSelection(new RenderSelection(enabled(), value, realtimeRenderer()));
+    }
+    public static void setRealtimeRenderer(RealtimeRenderer value) throws IOException {
+        Holder.CONFIG.setSelection(new RenderSelection(enabled(), mode(), value));
+    }
+
     public static float exposure() { return Holder.CONFIG.ev(); }
     public static boolean requestedRr() { return Holder.CONFIG.rr(); }
     public static boolean requestedSer() { return Holder.CONFIG.ser(); }
@@ -28,7 +53,7 @@ public final class Settings {
     static SolarSettings solar() { return Holder.CONFIG.solar(); }
     static DisplaySettings display() { return Holder.CONFIG.display(); }
     static LightingSettings lighting() { return Holder.CONFIG.lighting(); }
-    static boolean rr() { return requestedRr() && StreamlineBootstrap.available(); }
+    static boolean rr() { return enabled() && !offline() && !diagnostic() && requestedRr() && StreamlineBootstrap.available(); }
 
     /** 保存成功后才发布新值；输入无效抛出 IllegalArgumentException，IO 失败抛出 IOException。 */
     public static void setExposure(float value) throws IOException { Holder.CONFIG.setExposure(value); }

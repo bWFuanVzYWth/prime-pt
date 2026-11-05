@@ -1,8 +1,37 @@
 //! Minecraft 场景适配与公共 PT 算法编译为 Slang 原生 SPIR-V。
 
-use shader_build::{Recipe, Target, build};
+use simple_engine::shader_build::{Recipe, Target, build};
+use simple_engine::shader_library;
+use std::path::{Path, PathBuf};
 
-fn main() -> Result<(), shader_build::Error> {
+fn relative_path(path: &Path, base: &Path) -> Result<PathBuf, &'static str> {
+    let common = base
+        .ancestors()
+        .find(|ancestor| path.starts_with(ancestor))
+        .ok_or("开发 shader 路径与应用源码须位于同一文件系统根")?;
+    let mut relative = PathBuf::new();
+    for _ in base
+        .strip_prefix(common)
+        .map_err(|_| "开发源码基目录无效")?
+        .components()
+    {
+        relative.push("..");
+    }
+    relative.push(
+        path.strip_prefix(common)
+            .map_err(|_| "引擎 shader 目录无效")?,
+    );
+    Ok(relative)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")?;
+    let relative = relative_path(Path::new(shader_library::root()), Path::new(&manifest))?;
+    println!(
+        "cargo::rustc-env=PRIME_ENGINE_SHADERS_RELATIVE={}",
+        relative.display()
+    );
+    let exposure_source = format!("{}/display/exposure_compute.slang", shader_library::root());
     let stages = [
         ("prefix_main", "raygeneration", "prefix.spv"),
         ("render_main", "raygeneration", "render.spv"),
@@ -30,6 +59,79 @@ fn main() -> Result<(), shader_build::Error> {
             },
         })
         .collect();
+    for (source, entry, stage, output) in [
+        (
+            "shaders/restir.slang",
+            "restir_initial",
+            "raygeneration",
+            "restir-initial.spv",
+        ),
+        (
+            "shaders/restir.slang",
+            "restir_temporal_direction",
+            "raygeneration",
+            "restir-temporal-direction.spv",
+        ),
+        (
+            "shaders/restir.slang",
+            "restir_spatial_direction",
+            "raygeneration",
+            "restir-spatial-direction.spv",
+        ),
+        (
+            "shaders/restir.slang",
+            "restir_merge",
+            "compute",
+            "restir-merge.spv",
+        ),
+        (
+            "shaders/restir.slang",
+            "restir_temporal_combine",
+            "compute",
+            "restir-temporal-combine.spv",
+        ),
+        (
+            "shaders/restir.slang",
+            "restir_spatial_work",
+            "compute",
+            "restir-spatial-work.spv",
+        ),
+    ] {
+        recipes.push(Recipe {
+            source,
+            entry,
+            stage,
+            output,
+            target: Target::Spirv("spirv_1_4"),
+            args: &["-fp-mode", "precise"],
+        });
+    }
+    for (entry, output) in [
+        ("restir_initial", "restir-initial-ser.spv"),
+        (
+            "restir_temporal_direction",
+            "restir-temporal-direction-ser.spv",
+        ),
+        (
+            "restir_spatial_direction",
+            "restir-spatial-direction-ser.spv",
+        ),
+    ] {
+        recipes.push(Recipe {
+            source: "shaders/restir.slang",
+            entry,
+            stage: "raygeneration",
+            output,
+            target: Target::Spirv("spirv_1_4"),
+            args: &[
+                "-fp-mode",
+                "precise",
+                "-DPRIMEPT_SER=1",
+                "-capability",
+                "spvShaderInvocationReorderEXT",
+            ],
+        });
+    }
     for (output, args) in [
         (
             "anyhit-cutout.spv",
@@ -89,6 +191,16 @@ fn main() -> Result<(), shader_build::Error> {
             "region_primitive_probe.spv",
         ),
         ("shaders/post.slang", "post_main", "post.spv"),
+        (
+            "shaders/restir_probe.slang",
+            "restir_donor_probe",
+            "restir_donor_probe.spv",
+        ),
+        (
+            "shaders/restir_probe.slang",
+            "restir_identity_probe",
+            "restir_identity_probe.spv",
+        ),
         ("shaders/present.slang", "present_main", "present.spv"),
         ("shaders/rr.slang", "pack_main", "rr_pack.spv"),
         ("shaders/rr.slang", "present_main", "rr_present.spv"),
@@ -130,7 +242,7 @@ fn main() -> Result<(), shader_build::Error> {
         ("update_main", "exposure.update.spv", &[][..]),
     ] {
         recipes.push(Recipe {
-            source: "../../../../shaders/display/exposure_compute.slang",
+            source: &exposure_source,
             entry,
             stage: "compute",
             output,
@@ -138,5 +250,6 @@ fn main() -> Result<(), shader_build::Error> {
             args,
         });
     }
-    build(&recipes, &["shaders", "../../../../shaders"], &["src"])
+    build(&recipes, &["shaders", shader_library::root()], &["src"])?;
+    Ok(())
 }

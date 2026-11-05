@@ -5,6 +5,7 @@
 - [安装、构建与开发运行](build.md)
 - [视频设置与本地命令](settings.md)
 - [诊断、测试与性能测量](diagnostics.md)
+- [用 Nsight 抓取 GPU 帧](nsight.md)
 
 ## 生成文档
 

@@ -1,7 +1,7 @@
 //! 资源准备阶段的材质发光功率校准。采样包络和实际 MERS 发光遮罩独立于校准。
 
 use crate::Error;
-use light_sampling::emitter::triangle_texel_fractions;
+use simple_engine::light_sampling::emitter::triangle_texel_fractions;
 
 const EXACT_AXIS_LIMIT: u32 = 64;
 const HALVES: [[usize; 3]; 2] = [[0, 1, 2], [0, 2, 3]];

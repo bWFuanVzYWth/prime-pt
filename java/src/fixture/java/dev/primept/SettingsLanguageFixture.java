@@ -64,11 +64,13 @@ final class SettingsLanguageFixture {
                 try (var resources = new MultiPackResourceManager(PackType.CLIENT_RESOURCES, List.of(vanilla, pack))) {
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us"), false));
                     requireText("render", "PT rendering");
+                    requireRenderingHierarchy("Prime PT", "Rendering mode", "Offline snapshot", "Realtime renderer");
                     requireWidgetText("Samples per frame", "DLSS quality", "Performance (2×)");
                     requireAutoExposure("Auto exposure strength");
                     requireLighting("Sun intensity", "Block emission intensity");
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "PT 渲染");
+                    requireRenderingHierarchy("Prime PT 开关", "渲染模式", "离线快照", "实时渲染器");
                     requireWidgetText("每帧采样数", "DLSS 质量", "性能（2×）");
                     requireAutoExposure("自动曝光强度");
                     requireLighting("太阳强度", "方块发光强度");
@@ -115,6 +117,23 @@ final class SettingsLanguageFixture {
 
     private static void require(boolean condition, String message) {
         if (!condition) throw new AssertionError(message);
+    }
+
+    private static void requireRenderingHierarchy(String enabled, String mode, String offline, String renderer) {
+        var toggle = CycleButton.onOffBuilder(true).create(0, 0, 310, 20,
+                Component.translatable("primept.settings.enabled"), (button, value) -> {});
+        require(toggle.getMessage().getString().equals(CommonComponents.optionNameValue(
+                Component.literal(enabled), CommonComponents.OPTION_ON).getString()), "Mod 开关本地化标题只出现一次");
+        var modes = CycleButton.builder((RenderMode value) -> Component.translatable("primept.settings.mode." + value.key), RenderMode.OFFLINE)
+                .withValues(List.of(RenderMode.values())).create(0, 0, 310, 20,
+                        Component.translatable("primept.settings.mode"), (button, value) -> {});
+        require(modes.getMessage().getString().equals(CommonComponents.optionNameValue(
+                Component.literal(mode), Component.literal(offline)).getString()), "离线模式控件从游戏资源栈读取翻译");
+        var renderers = CycleButton.builder((RealtimeRenderer value) -> Component.translatable("primept.settings.realtime_renderer." + value.key), RealtimeRenderer.RESTIR_PT)
+                .withValues(List.of(RealtimeRenderer.values())).create(0, 0, 310, 20,
+                        Component.translatable("primept.settings.realtime_renderer"), (button, value) -> {});
+        require(renderers.getMessage().getString().equals(CommonComponents.optionNameValue(
+                Component.literal(renderer), Component.literal("ReSTIR PT Enhanced")).getString()), "实时渲染器控件标题和值只组合一次");
     }
 
     private static void requireAutoExposure(String caption) {

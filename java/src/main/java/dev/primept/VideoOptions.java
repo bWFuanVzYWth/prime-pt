@@ -23,7 +23,7 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
+    enum Row { RESET, RENDER, ENABLED, MODE, REALTIME_RENDERER, RESTIR_CAP, RESTIR_FRESH, DIAGNOSTIC, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
         LATITUDE, SOLAR_LONGITUDE,
         DISPLAY, EXPOSURE, AUTO_EXPOSURE, DRT_SATURATION, DRT_HUE, DRT_COMPRESSION_START }
 
@@ -54,6 +54,10 @@ public final class VideoOptions {
     private final Screen screen;
     private final Runnable rebuild;
     private final List<Slider> sliders = new ArrayList<>();
+    private CycleButton<Boolean> enabled;
+    private CycleButton<RenderMode> mode;
+    private CycleButton<RealtimeRenderer> realtimeRenderer;
+    private CycleButton<Boolean> diagnostic;
     private CycleButton<Boolean> rr;
     private CycleButton<Boolean> ser;
     private CycleButton<Quality> quality;
@@ -69,6 +73,7 @@ public final class VideoOptions {
     public static VideoOptions addTo(OptionsList list, Screen screen, Runnable rebuild) {
         var owner = new VideoOptions(list, screen, rebuild);
         for (var row : Row.values()) owner.add(row);
+        owner.tick();
         return owner;
     }
 
@@ -80,6 +85,45 @@ public final class VideoOptions {
                 if (change(Settings::reset)) rebuild.run();
             }).build());
             case RENDER -> list.addHeader(text("render"));
+            case ENABLED -> {
+                enabled = cycle(CycleButton.onOffBuilder(Settings.enabled())
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("enabled.tooltip"))),
+                        text("enabled"), Settings::enabled, value -> {
+                            if (applyPendingSliders()) Settings.setEnabled(value);
+                        }, this::failed);
+                list.addBig(enabled);
+            }
+            case MODE -> {
+                mode = cycle(CycleButton.builder((RenderMode value) -> text("mode." + value.key), Settings.mode())
+                        .withValues(List.of(RenderMode.values()))
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("mode.tooltip"))),
+                        text("mode"), Settings::mode, value -> {
+                            if (applyPendingSliders()) Settings.setMode(value);
+                        }, this::failed);
+                list.addBig(mode);
+            }
+            case REALTIME_RENDERER -> {
+                realtimeRenderer = cycle(CycleButton.builder(
+                                (RealtimeRenderer value) -> text("realtime_renderer." + value.key), Settings.realtimeRenderer())
+                        .withValues(List.of(RealtimeRenderer.values()))
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("realtime_renderer.tooltip"))),
+                        text("realtime_renderer"), Settings::realtimeRenderer, value -> {
+                            if (applyPendingSliders()) Settings.setRealtimeRenderer(value);
+                        }, this::failed);
+                list.addBig(realtimeRenderer);
+            }
+            case RESTIR_CAP -> addSlider("restir_cap", 1, 100, 1,
+                    () -> Settings.tuning().historyCap(), value -> Settings.setHistoryCap((int)value), ValueFormat.INTEGER);
+            case RESTIR_FRESH -> addSlider("restir_fresh", 0, 100, 1,
+                    () -> Settings.tuning().freshPercent(), value -> Settings.setFreshPercent((int)value), ValueFormat.PERCENT);
+            case DIAGNOSTIC -> {
+                diagnostic = cycle(CycleButton.onOffBuilder(Settings.tuning().diagnostic())
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("diagnostic.tooltip"))),
+                        text("diagnostic"), () -> Settings.tuning().diagnostic(), value -> {
+                            if (applyPendingSliders()) Settings.setDiagnostic(value);
+                        }, this::failed);
+                list.addBig(diagnostic);
+            }
             case SER -> {
                 ser = cycle(CycleButton.onOffBuilder(Settings.requestedSer())
                         .withTooltip(value -> Tooltip.create(text("ser.tooltip").copy()
@@ -186,6 +230,29 @@ public final class VideoOptions {
 
     /** 同步命令或其它入口的修改，不触发保存或曝光量化。 */
     public void tick() {
+        if (enabled.getValue() != Settings.enabled()) enabled.setValue(Settings.enabled());
+        if (mode.getValue() != Settings.mode()) mode.setValue(Settings.mode());
+        if (realtimeRenderer.getValue() != Settings.realtimeRenderer()) realtimeRenderer.setValue(Settings.realtimeRenderer());
+        mode.active = Settings.enabled();
+        boolean realtime = Settings.enabled() && !Settings.offline();
+        realtimeRenderer.active = realtime;
+        ser.active = realtime;
+        diagnostic.active = realtime;
+        if (diagnostic.getValue() != Settings.tuning().diagnostic()) diagnostic.setValue(Settings.tuning().diagnostic());
+        rr.active = realtime && !Settings.diagnostic();
+        quality.active = realtime && !Settings.diagnostic() && Settings.requestedRr();
+        updateBudget.active = realtime;
+        for (var slider : sliders) {
+            boolean display = switch (slider.key) {
+                case "exposure", "auto_exposure", "drt_saturation", "drt_hue", "drt_compression_start" -> true;
+                default -> false;
+            };
+            slider.active = Settings.enabled() && (!Settings.offline() || display || slider.key.equals("samples"));
+            if (realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT && slider.key.equals("samples")) slider.active = false;
+            if (slider.key.equals("restir_cap") || slider.key.equals("restir_fresh"))
+                slider.active = realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT;
+            if (Settings.diagnostic() && slider.key.equals("samples")) slider.active = false;
+        }
         if (ser.getValue() != Settings.requestedSer()) ser.setValue(Settings.requestedSer());
         if (rr.getValue() != Settings.requestedRr()) rr.setValue(Settings.requestedRr());
         if (quality.getValue() != Settings.quality()) quality.setValue(Settings.quality());
@@ -199,6 +266,7 @@ public final class VideoOptions {
 
     /** 鼠标拖动只预览标签和滑块，松开后提交，键盘单步即时提交。 */
     static final class Slider extends AbstractSliderButton {
+        private final String key;
         private final Component caption;
         private final double minimum, maximum, step;
         private final DoubleSupplier read;
@@ -211,6 +279,7 @@ public final class VideoOptions {
         Slider(String key, double minimum, double maximum, double step, DoubleSupplier read,
                 ValueSetter write, Consumer<Exception> failed, ValueFormat format) {
             super(0, 0, 310, 20, Component.empty(), (read.getAsDouble() - minimum) / (maximum - minimum));
+            this.key = key;
             this.caption = text(key);
             this.minimum = minimum;
             this.maximum = maximum;

@@ -1,6 +1,7 @@
 //! 纯颜色发布直接定位变化region；不构造完整场景目录或扫描几何、光源。
 use super::{Error, Gpu, SceneUpdateTiming, elapsed_ns};
 use prime_scene::RenderChange;
+use simple_engine::{scene_cache, vulkan};
 
 impl Gpu {
     /// 尝试共同发布有序唯一的纯tint变化与其内容版本。
@@ -30,7 +31,7 @@ impl Gpu {
         {
             return Err(Error::Invalid("属性变化须按region有序唯一"));
         }
-        if anchor != self.anchor || self.lighting_dirty {
+        if anchor != self.anchor || self.scene_resources_dirty() {
             return Ok(false);
         }
         let started = std::time::Instant::now();
@@ -133,13 +134,14 @@ impl Gpu {
         for (index, revision) in versions {
             self.attribute_revisions[index].1 = revision;
         }
-        if metrics.changed
-            && let Some(view) = &mut self.view
-        {
-            view.progress.reset();
+        if metrics.changed {
+            self.transition_history(super::history::Event::Accumulation(
+                super::history::AccumulationEvent::SceneChanged,
+            ))?;
         }
         metrics.publish_ns = elapsed_ns(started);
         metrics.resources_ns += metrics.publish_ns;
+        self.restir_dirty |= metrics.changed;
         self.scene_update = Some(metrics);
         Ok(true)
     }

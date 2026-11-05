@@ -26,6 +26,12 @@ public StructuredBuffer<int4> light_regions;
 [[vk::binding(35, 0)]]
 StructuredBuffer<uint> emission_alias_words;
 
+/// 本帧已发布的活动灯数；策略权重不依赖单次面积proposal的接受结果。
+public uint light_count()
+{
+    return light_alias[0].x;
+}
+
 uint light_hash(uint key)
 {
     key ^= key >> 16u;

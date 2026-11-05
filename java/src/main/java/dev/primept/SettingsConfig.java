@@ -16,10 +16,12 @@ final class SettingsConfig {
 
     private record Values(float ev, boolean rr, Quality quality, int samples, int bounces, boolean ser,
                           UpdateBudget updateBudget, SolarSettings solar, DisplaySettings display,
-                          LightingSettings lighting) {
+                          LightingSettings lighting, RenderSelection selection, RenderTuning tuning) {
         private Values {
             if (!Float.isFinite(ev) || ev < MIN_EV || ev > MAX_EV)
                 throw new IllegalArgumentException("曝光必须为 [-16, 16] 内的有限 EV");
+            if (selection == null) throw new IllegalArgumentException("渲染选择不能为空");
+            if (tuning == null) throw new IllegalArgumentException("输出采样设置不能为空");
             if (quality == null) throw new IllegalArgumentException("质量档不能为空");
             if (updateBudget == null) throw new IllegalArgumentException("场景更新档位不能为空");
             range(samples, MIN_SAMPLES, MAX_SAMPLES, "SPP");
@@ -28,7 +30,7 @@ final class SettingsConfig {
     }
 
     private static final Values DEFAULTS = new Values(0, true, Quality.PERFORMANCE, 1, 12, true,
-            UpdateBudget.BALANCED, SolarSettings.DEFAULT, DisplaySettings.DEFAULT, LightingSettings.DEFAULT);
+            UpdateBudget.BALANCED, SolarSettings.DEFAULT, DisplaySettings.DEFAULT, LightingSettings.DEFAULT, RenderSelection.DEFAULT, RenderTuning.DEFAULT);
     private final Path file;
     private Values values = DEFAULTS;
 
@@ -39,7 +41,7 @@ final class SettingsConfig {
     SettingsConfig(Path file, boolean defaultSer) {
         this.file = file;
         values = new Values(0, true, Quality.PERFORMANCE, 1, 12, defaultSer,
-                UpdateBudget.BALANCED, SolarSettings.DEFAULT, DisplaySettings.DEFAULT, LightingSettings.DEFAULT);
+                UpdateBudget.BALANCED, SolarSettings.DEFAULT, DisplaySettings.DEFAULT, LightingSettings.DEFAULT, RenderSelection.DEFAULT, RenderTuning.DEFAULT);
         Path source = file;
         if (!Files.exists(source) && source.getFileName().toString().equals("prime_pt.properties"))
             source = file.resolveSibling("primary_rt.properties");
@@ -54,7 +56,11 @@ final class SettingsConfig {
                     UpdateBudget.parse(properties.getProperty("update_budget", "balanced")),
                     new SolarSettings(Integer.parseInt(properties.getProperty("astronomy.latitude_degrees", "30")),
                             Integer.parseInt(properties.getProperty("astronomy.solar_longitude_degrees", "0"))),
-                    readDisplay(properties), readLighting(properties));
+                    readDisplay(properties), readLighting(properties), new RenderSelection(
+                            parseBoolean(properties, "enabled", true), RenderMode.REALTIME,
+                            RealtimeRenderer.parse(properties.getProperty("realtime_renderer", "path_trace"))),
+                    new RenderTuning(readInt(properties, "restir.history_cap", 20),
+                        readInt(properties, "restir.fresh_percent", 40), parseBoolean(properties, "diagnostic.raw", false)));
         } catch (IOException | IllegalArgumentException error) {
             System.getLogger("prime_pt").log(System.Logger.Level.WARNING, "PT 配置无效，使用默认值", error);
         }
@@ -73,52 +79,65 @@ final class SettingsConfig {
 
     void setExposure(float ev) throws IOException {
         store(new Values(ev, values.rr, values.quality, values.samples, values.bounces, values.ser,
-                values.updateBudget, values.solar, values.display, values.lighting));
+                values.updateBudget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setRequestedRr(boolean rr) throws IOException {
         store(new Values(values.ev, rr, values.quality, values.samples, values.bounces, values.ser,
-                values.updateBudget, values.solar, values.display, values.lighting));
+                values.updateBudget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setRequestedSer(boolean ser) throws IOException {
         store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, ser,
-                values.updateBudget, values.solar, values.display, values.lighting));
+                values.updateBudget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setQuality(Quality quality) throws IOException {
         store(new Values(values.ev, values.rr, quality, values.samples, values.bounces, values.ser,
-                values.updateBudget, values.solar, values.display, values.lighting));
+                values.updateBudget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setSamples(int samples) throws IOException {
         store(new Values(values.ev, values.rr, values.quality, samples, values.bounces, values.ser,
-                values.updateBudget, values.solar, values.display, values.lighting));
+                values.updateBudget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setBounces(int bounces) throws IOException {
         store(new Values(values.ev, values.rr, values.quality, values.samples, bounces, values.ser,
-                values.updateBudget, values.solar, values.display, values.lighting));
+                values.updateBudget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setUpdateBudget(UpdateBudget budget) throws IOException {
         store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser,
-                budget, values.solar, values.display, values.lighting));
+                budget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setSolar(SolarSettings solar) throws IOException {
         store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser,
-                values.updateBudget, solar, values.display, values.lighting));
+                values.updateBudget, solar, values.display, values.lighting, values.selection, values.tuning));
     }
 
     void setDisplay(DisplaySettings display) throws IOException {
         store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser,
-                values.updateBudget, values.solar, display, values.lighting));
+                values.updateBudget, values.solar, display, values.lighting, values.selection, values.tuning));
     }
 
     void setLighting(LightingSettings lighting) throws IOException {
         store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser,
-                values.updateBudget, values.solar, values.display, lighting));
+                values.updateBudget, values.solar, values.display, lighting, values.selection, values.tuning));
+    }
+
+    RenderSelection selection() { return values.selection; }
+    RenderTuning tuning() { return values.tuning; }
+
+    void setTuning(RenderTuning tuning) throws IOException {
+        store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser,
+                values.updateBudget, values.solar, values.display, values.lighting, values.selection, tuning));
+    }
+
+    void setSelection(RenderSelection selection) throws IOException {
+        store(new Values(values.ev, values.rr, values.quality, values.samples, values.bounces, values.ser,
+                values.updateBudget, values.solar, values.display, values.lighting, selection, values.tuning));
     }
 
     void reset() throws IOException { store(DEFAULTS); }
@@ -174,6 +193,37 @@ final class SettingsConfig {
         if (parts.length > 3) return usage();
         try {
             switch (parts[1]) {
+                case "diagnostic" -> {
+                    if (parts.length == 3) {
+                        if (!parts[2].equals("on") && !parts[2].equals("off")) throw new IllegalArgumentException("诊断开关必须为on或off");
+                        setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), parts[2].equals("on")));
+                    }
+                    return "原生无累积诊断：" + (tuning().diagnostic() ? "on" : "off");
+                }
+                case "mcap" -> {
+                    if (parts.length == 3) setTuning(new RenderTuning(Integer.parseInt(parts[2]), tuning().freshPercent(), tuning().diagnostic()));
+                    return "ReSTIR历史M上限：" + tuning().historyCap();
+                }
+                case "fresh" -> {
+                    if (parts.length == 3) setTuning(new RenderTuning(tuning().historyCap(), Integer.parseInt(parts[2]), tuning().diagnostic()));
+                    return "ReSTIR初采输出比例：" + tuning().freshPercent() + "%";
+                }
+                case "enabled" -> {
+                    if (parts.length == 3) {
+                        if (!parts[2].equals("on") && !parts[2].equals("off"))
+                            throw new IllegalArgumentException("Mod 开关必须为 on 或 off");
+                        setSelection(new RenderSelection(parts[2].equals("on"), selection().mode(), selection().renderer()));
+                    }
+                    return "Prime PT：" + (selection().enabled() ? "on" : "off");
+                }
+                case "mode" -> {
+                    if (parts.length == 3) setSelection(new RenderSelection(selection().enabled(), RenderMode.parse(parts[2]), selection().renderer()));
+                    return "Prime PT 模式：" + selection().mode().key;
+                }
+                case "renderer" -> {
+                    if (parts.length == 3) setSelection(new RenderSelection(selection().enabled(), selection().mode(), RealtimeRenderer.parse(parts[2])));
+                    return "Prime PT 实时渲染器：" + selection().renderer().key;
+                }
                 case "ser" -> {
                     if (parts.length == 3) {
                         if (!parts[2].equals("on") && !parts[2].equals("off"))
@@ -228,8 +278,9 @@ final class SettingsConfig {
     }
 
     private String status() {
-        return "SER " + (ser() ? "on" : "off") + " / RR " + (rr() ? "on" : "off") + " / " + quality().key() + " / " + ev()
-                + " EV / " + samples() + " SPP / " + bounces() + " 顶点";
+        return "Prime " + selection().enabled() + " / " + selection().mode().key + " / " + selection().renderer().key + " / SER " + (ser() ? "on" : "off") + " / RR " + (rr() ? "on" : "off") + " / " + quality().key() + " / " + ev()
+                + " EV / " + samples() + " SPP / " + bounces() + " 顶点 / M cap " + tuning().historyCap()
+                + " / fresh " + tuning().freshPercent() + "% / 原生诊断 " + (tuning().diagnostic() ? "on" : "off");
     }
 
     private void store(Values next) throws IOException {
@@ -237,7 +288,10 @@ final class SettingsConfig {
         Files.createDirectories(target.getParent());
         var temporary = Files.createTempFile(target.getParent(), "prime-pt-", ".properties");
         try {
-            Files.writeString(temporary, "exposure_ev=" + next.ev + "\nrr=" + next.rr
+            Files.writeString(temporary, "enabled=" + next.selection.enabled()
+                    + "\nrestir.history_cap=" + next.tuning.historyCap() + "\nrestir.fresh_percent=" + next.tuning.freshPercent()
+                    + "\ndiagnostic.raw=" + next.tuning.diagnostic()
+                    + "\nrealtime_renderer=" + next.selection.renderer().key + "\nexposure_ev=" + next.ev + "\nrr=" + next.rr
                     + "\nquality=" + next.quality.key() + "\nsamples=" + next.samples + "\nbounces=" + next.bounces
                     + "\nser=" + next.ser + "\nupdate_budget=" + next.updateBudget.key
                     + "\nastronomy.latitude_degrees=" + next.solar.latitude()
@@ -275,7 +329,7 @@ final class SettingsConfig {
     }
 
     private static String usage() {
-        return "用法：/pt ser [on|off]；/pt rr [on|off]；/pt quality [dlaa|quality|balanced|performance|ultra_performance]；"
-                + "/pt ev [EV]；/pt spp [1..64]；/pt bounces [1..64]；/pt reset";
+        return "用法：/pt enabled [on|off]；/pt mode [realtime|offline]；/pt renderer [path_trace|restir_pt]；/pt ser [on|off]；/pt rr [on|off]；/pt quality [dlaa|quality|balanced|performance|ultra_performance]；"
+                + "/pt ev [EV]；/pt spp [1..64]；/pt bounces [1..64]；/pt mcap [1..100]；/pt fresh [0..100]；/pt diagnostic [on|off]；/pt reset";
     }
 }

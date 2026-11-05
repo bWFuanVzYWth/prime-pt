@@ -1,6 +1,8 @@
 /// 只负责硬件命中和 K1/K2 交接；路径推进完全使用引擎 pt.integrator。
 module primary;
 import mod_scene;
+import mod_call;
+import mod_guides;
 import params;
 import pt.integrator;
 import pt.denoise;
@@ -45,77 +47,8 @@ RWStructuredBuffer<float> landing_distance;
 [[vk::binding(15, 0)]]
 RWStructuredBuffer<float4> prefix_image;
 
-[[vk::binding(19, 0)]]
-[[vk::image_format("r32f")]]
-RWTexture2D<float> guide_depth;
-[[vk::binding(20, 0)]]
-[[vk::image_format("rg16f")]]
-RWTexture2D<float2> guide_motion;
-[[vk::binding(21, 0)]]
-[[vk::image_format("rgba16f")]]
-RWTexture2D<float4> guide_normal;
-[[vk::binding(22, 0)]]
-[[vk::image_format("rgba16f")]]
-RWTexture2D<float4> guide_diffuse;
-[[vk::binding(23, 0)]]
-[[vk::image_format("rgba16f")]]
-RWTexture2D<float4> guide_specular;
-[[vk::binding(24, 0)]]
-[[vk::image_format("r32f")]]
-RWTexture2D<float> guide_distance;
-[[vk::binding(25, 0)]]
-[[vk::image_format("rg16f")]]
-RWTexture2D<float2> guide_specular_motion;
 [[vk::binding(26, 0)]]
 RWStructuredBuffer<uint4> landing_identity;
-
-public struct Guides : pt::IPrefixGuides
-{
-    public uint2 coordinate;
-    public float2 film;
-    public pt::DenoiseCamera current;
-    public pt::DenoiseCamera previous;
-
-    public void surface(pt::TransportCall data)
-    {
-        ModScene provider;
-        Params p = parameters[0];
-        pt::GuideEndpoint endpoint = pt::trace_guide(provider, data, p.options.y);
-        pt::GuideProjection projection = pt::project_guide(endpoint, current, previous, film,
-                                                           p.image.xy, p.reconstruction.z > 0);
-        pt::DenoiseGuides guides = pt::guide_albedos(provider.energy(), endpoint);
-        guide_depth[coordinate] = projection.depth;
-        guide_motion[coordinate] = projection.motion;
-        guide_normal[coordinate] = float4(projection.normal, guides.normal_roughness.w);
-        guide_diffuse[coordinate] = float4(guides.diffuse_albedo, 0);
-        guide_specular[coordinate] = float4(guides.specular_albedo, 0);
-
-        pt::GuideEndpoint reflection = pt::trace_reflection_guide(provider, data, p.options.y);
-        pt::GuideProjection reflected = pt::project_guide(reflection, current, previous, film,
-                                                          p.image.xy, p.reconstruction.z > 0);
-        guide_distance[coordinate] =
-            (reflection.flags & pt::GUIDE_SKY) != 0 ? 0 : reflection.distance;
-        guide_specular_motion[coordinate] =
-            (reflected.flags & pt::GUIDE_INVALID) != 0 ? projection.motion : reflected.motion;
-    }
-
-    public void environment(pt::TransportCall data)
-    {
-        guide_depth[coordinate] = pt::DENOISE_SKY_DEPTH;
-        float2 pixels = 0;
-        if (parameters[0].reconstruction.z > 0 &&
-            (!pt::denoise_motion(previous, film, data.path.direction, true, parameters[0].image.xy,
-                                 pixels) ||
-             any(abs(pixels) > 65504)))
-            pixels = 0;
-        guide_motion[coordinate] = pixels;
-        guide_normal[coordinate] = float4(0, 0, 0, 1);
-        guide_diffuse[coordinate] = float4(0.5, 0.5, 0.5, 0);
-        guide_specular[coordinate] = float4(0.5, 0.5, 0.5, 0);
-        guide_distance[coordinate] = 0;
-        guide_specular_motion[coordinate] = pixels;
-    }
-};
 
 [shader("miss")]
 void primary_miss(inout TracePayload payload)
@@ -179,9 +112,10 @@ pt::TransportCall load_landing(uint pixel, uint2 coordinate, float4 rgb_header)
     data.path.throughput = 1;
     data.path.medium = parameters[0].initial_medium;
     data.pixel = coordinate;
-    data.sample = parameters[0].reconstruction.w > 0
-                      ? parameters[0].rr_sample + sample_counts[pixel]
-                      : sample_counts[pixel];
+    uint count = (parameters[0].output_size.z & 1u) != 0 ? 0u : sample_counts[pixel];
+    data.sample = parameters[0].reconstruction.w > 0 || (parameters[0].output_size.z & 1u) != 0
+                      ? parameters[0].rr_sample + count
+                      : count;
     return data;
 }
 
@@ -193,9 +127,10 @@ void prefix_main()
     uint pixel = coordinate.y * params.image.x + coordinate.x;
     pt::TransportCall data = (pt::TransportCall)0;
     data.pixel = coordinate;
-    data.sample = params.reconstruction.w > 0 ? params.rr_sample + sample_counts[pixel]
-                                              : sample_counts[pixel];
-    if (accumulation[pixel].w < 0)
+    bool diagnostic = (params.output_size.z & 1u) != 0;
+    uint count = diagnostic ? 0u : sample_counts[pixel];
+    data.sample = params.reconstruction.w > 0 || diagnostic ? params.rr_sample + count : count;
+    if (!diagnostic && accumulation[pixel].w < 0)
     {
         data.path.status =
             accumulation[pixel].w == -3 ? pt::PATH_DIELECTRIC_LIMIT : pt::PATH_INVALID;
@@ -256,9 +191,11 @@ void render_main()
 }
 
 [shader("callable")]
-void shade_opaque(inout pt::TransportCall data)
+void shade_opaque(inout ModTransportCall call)
 {
+    pt::TransportCall data = call.unpack();
     ModScene provider;
     pt::process_flow<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(provider, data,
                                                                  settings(parameters[0]));
+    call.store(data.path);
 }

@@ -25,6 +25,9 @@ public final class Bootstrap {
             "deviceAddressCommands", VkPhysicalDeviceDeviceAddressCommandsFeaturesKHR.DEVICEADDRESSCOMMANDS);
     private static final VulkanFeature SYNCHRONIZATION = new VulkanFeature(
             VulkanFeatureSets.SYNC2_FEATURES_STRUCT, "synchronization2", VkPhysicalDeviceSynchronization2Features.SYNCHRONIZATION2);
+    private static final VulkanFeature SUBGROUP = new VulkanFeature(
+            new VulkanPNextStruct(VkPhysicalDeviceSubgroupSizeControlFeatures.class),
+            "subgroupSizeControl", VkPhysicalDeviceSubgroupSizeControlFeatures.SUBGROUPSIZECONTROL);
     private static final List<String> RR_EXTENSIONS = List.of("VK_NVX_binary_import", "VK_NVX_image_view_handle",
             "VK_KHR_push_descriptor", "VK_KHR_buffer_device_address", "VK_KHR_synchronization2");
     private static final VulkanFeature PRIVATE_DATA = new VulkanFeature(
@@ -79,8 +82,9 @@ public final class Bootstrap {
             var pipeline = VkPhysicalDeviceRayTracingPipelineFeaturesKHR.calloc(stack).sType$Default();
             var query = VkPhysicalDeviceRayQueryFeaturesKHR.calloc(stack).sType$Default();
             var position = VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR.calloc(stack).sType$Default();
+            var subgroup = VkPhysicalDeviceSubgroupSizeControlFeatures.calloc(stack).sType$Default();
             var available = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default()
-                    .pNext(address).pNext(commands).pNext(synchronization).pNext(acceleration).pNext(pipeline).pNext(query).pNext(position);
+                    .pNext(address).pNext(commands).pNext(synchronization).pNext(acceleration).pNext(pipeline).pNext(query).pNext(position).pNext(subgroup);
             VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), available);
             if (!address.bufferDeviceAddress() || !acceleration.accelerationStructure() || !pipeline.rayTracingPipeline() || !query.rayQuery())
                 throw new IllegalStateException("Prime PT 缺少 bufferDeviceAddress / accelerationStructure / rayTracingPipeline / rayQuery");
@@ -88,6 +92,8 @@ public final class Bootstrap {
                 throw new IllegalStateException("Prime PT 需要 deviceAddressCommands / synchronization2");
             if (!position.rayTracingPositionFetch())
                 throw new IllegalStateException("Prime PT 需要 rayTracingPositionFetch；不保留 shader 顶点副本回退");
+            if (!subgroup.subgroupSizeControl())
+                throw new IllegalStateException("Prime PT 的 ReSTIR 方向调度需要 subgroupSizeControl");
             if (!available.features().shaderStorageImageExtendedFormats())
                 throw new IllegalStateException("Prime PT 降噪辅助量需要 shaderStorageImageExtendedFormats");
             boolean supported = physical.hasDeviceExtension(SER_EXTENSION);
@@ -139,6 +145,7 @@ public final class Bootstrap {
         features.add(POSITION_FETCH);
         features.add(DEVICE_COMMANDS);
         features.add(SYNCHRONIZATION);
+        features.add(SUBGROUP);
         return new FeatureSet(original.name(), Set.copyOf(extensions), Set.copyOf(features), original.condition());
     }
 
@@ -146,7 +153,8 @@ public final class Bootstrap {
     public static void created(FeatureSet enabled, VkDevice device) {
         if (!device.getPhysicalDevice().getInstance().getCapabilities().Vulkan14
                 || !enabled.extensions().containsAll(EXTENSIONS) || !enabled.features().contains(POSITION_FETCH)
-                || !enabled.features().contains(DEVICE_COMMANDS) || !enabled.features().contains(SYNCHRONIZATION))
+                || !enabled.features().contains(DEVICE_COMMANDS) || !enabled.features().contains(SYNCHRONIZATION)
+                || !enabled.features().contains(SUBGROUP))
             throw new IllegalStateException("宿主逻辑设备未启用强制 RT / position fetch 能力");
         serDevice = 0;
         if (serPhysical == device.getPhysicalDevice().address() && enabled.extensions().contains(SER_EXTENSION)

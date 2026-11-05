@@ -1,7 +1,7 @@
 //! Minecraft 光照源到通用渲染环境的帧输入边界。
 
 use crate::{Environment, Error};
-use atmosphere::SolarOrbit;
+use simple_engine::atmosphere::SolarOrbit;
 
 /// 宿主的 16 B 环境包，依次为太阳时角（f32 度）、曝光（f32 EV）、世界海平面（f32 米）
 /// 和天空开关（u32，0 禁用或 1 启用）。海平面由宿主给出，太阳方向由准备好的轨迹计算。

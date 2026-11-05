@@ -41,6 +41,127 @@ fn publish(
 }
 
 #[test]
+#[ignore = "真实Vulkan RT；资源准备后进入、退出世界仍可使用所有已准备渲染器"]
+fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn std::error::Error>>
+{
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let output = image(&mut gpu)?;
+    let mut mesh = Mesh::default();
+    add_quad(&mut mesh, 2., [0.5; 2], [0.8; 3], 4.);
+    upload(
+        &mut gpu,
+        &[MaterialDefinition::default()],
+        &[],
+        &[[u32::MAX, 0, 0, 0]],
+    )?;
+    for renderer in [
+        prime_scene::RealtimeRenderer::PathTrace,
+        prime_scene::RealtimeRenderer::RestirPt,
+    ] {
+        gpu.clear_world()?;
+        gpu.set_rendering(prime_scene::RenderMode::Realtime, renderer)?;
+        publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+        host.render_options(
+            &mut gpu,
+            &output,
+            &camera(),
+            Environment::default(),
+            Options::new(false, streamline::Quality::Dlaa, 1, 6)?,
+        )?;
+        let pixels = output.download(&mut gpu.context)?;
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[..3].iter().any(|&channel| channel != 0))
+        );
+    }
+    gpu.clear_world()?;
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT；超过八种材质能力仍可执行ReSTIR的独立操作叶子"]
+fn hardware_pt_restir_many_material_variants() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let output = image(&mut gpu)?;
+    let definitions: Vec<_> = (0..12)
+        .map(|index| {
+            let mut material = MaterialDefinition {
+                control: [[0, 1, 3][index % 3], 3, 0, 0],
+                ..Default::default()
+            };
+            material.base_roughness[3] = if (index / 3) & 1 == 0 { 0. } else { 0.6 };
+            if index >= 6 {
+                material.emission = [0.25, 0.5, 0.75, 1.];
+            }
+            material
+        })
+        .collect();
+    upload(&mut gpu, &definitions, &[], &[[u32::MAX, 0, 0, 0]; 12])?;
+    assert!(
+        gpu.generation
+            .as_ref()
+            .unwrap()
+            .programs
+            .plan()
+            .keys()
+            .len()
+            > 8
+    );
+    let mut mesh = Mesh::default();
+    for index in 0..12 {
+        let x = (index % 4) as f32 - 2.;
+        let y = (index / 4) as f32 - 1.5;
+        mesh.quads.push(Quad::with_material(
+            [
+                [x, y, 4.],
+                [x, y + 1., 4.],
+                [x + 1., y + 1., 4.],
+                [x + 1., y, 4.],
+            ],
+            [[0.5; 2]; 4],
+            [1.; 3],
+            MaterialId::new(index),
+        ));
+    }
+    gpu.set_rendering(
+        prime_scene::RenderMode::Realtime,
+        prime_scene::RealtimeRenderer::RestirPt,
+    )?;
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    for _ in 0..3 {
+        host.render_options(
+            &mut gpu,
+            &output,
+            &camera(),
+            Environment::default(),
+            Options::new(false, streamline::Quality::Dlaa, 1, 6)?,
+        )?;
+    }
+    let hdr = gpu.view.as_ref().unwrap().output;
+    let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;
+    hdr.copy_prefix_to(&mut gpu.context, &readback, hdr.len())?;
+    let mut bytes = vec![0; hdr.len() as usize];
+    readback.read(&mut gpu.context, 0, &mut bytes)?;
+    assert!(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|word| f32::from_le_bytes(*word).is_finite())
+    );
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan compute；以两个基址验证全局图元索引跨过24位"]
 fn hardware_pt_region_primitive_index_keeps_full_quad_base()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -544,7 +665,7 @@ fn hardware_pt_rejected_resource_domain_preserves_the_published_generation()
 #[ignore = "真实Vulkan RT；资源期texel alias与过程非共面quad的正逆PDF逐样本一致"]
 fn hardware_pt_static_emission_alias_and_dynamic_area_match_reverse_pdf()
 -> Result<(), Box<dyn std::error::Error>> {
-    use light_sampling::emitter::{Coverage, EmissionProposal, EmitterAlias};
+    use simple_engine::light_sampling::emitter::{Coverage, EmissionProposal, EmitterAlias};
     let host = Host::new()?;
     let mut gpu = host.gpu()?;
     let image = image(&mut gpu)?;

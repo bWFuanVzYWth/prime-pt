@@ -3,8 +3,8 @@
 
 use crate::ready_queue::ReadyQueue;
 use crate::{Error, spatial};
-use chunk_manager::Bounds;
 use prime_minecraft::{SectionSource, SectionStorage};
+use simple_engine::chunk_manager::Bounds;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 pub(crate) type Key = [i32; 3];

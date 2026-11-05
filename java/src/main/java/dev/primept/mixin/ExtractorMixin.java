@@ -22,27 +22,29 @@ abstract class ExtractorMixin {
 
     @Inject(method = "extract", at = @At("HEAD"), cancellable = true)
     private void primept$extract(DeltaTracker delta, Camera camera, float partial, CallbackInfo callback) {
+        if (!Renderer.active()) return;
         levelRenderState.reset();
         levelRenderState.worldPartialTicks = partial;
         Renderer.environment(level, camera, partial);
         extractPlayerState(camera, delta, partial, levelRenderState.playerRenderState);
         if (level != null) level.getChunkSource().flipUpdateTrackingSets();
-        callback.cancel();
+        if (Renderer.active()) callback.cancel();
     }
 
     @Inject(method = {"blockChanged", "setSectionRangeDirty", "setSectionDirty(IIIZ)V"},
             at = @At("HEAD"), cancellable = true)
     private void primept$skipRasterDirty(CallbackInfo callback) {
         // 方块、整列和 biome 的实际写入已各自通知 Prime。光栅失效无须重捕获。
-        callback.cancel();
+        if (Renderer.active()) callback.cancel();
     }
 
     @Inject(method = "allChanged", at = @At("HEAD"), cancellable = true)
     private void primept$invalidate(CallbackInfo callback) {
+        if (!Renderer.active()) return;
         if (level != null) level.clearTintCaches();
-        callback.cancel();
+        if (Renderer.active()) callback.cancel();
     }
 
     @Inject(method = "queueTransientBlock", at = @At("HEAD"), cancellable = true)
-    private void primept$skipTransient(CallbackInfo callback) { callback.cancel(); }
+    private void primept$skipTransient(CallbackInfo callback) { if (Renderer.active()) callback.cancel(); }
 }

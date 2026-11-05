@@ -1,5 +1,7 @@
 package dev.primept.mixin;
 
+import dev.primept.Settings;
+
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.Hud;
@@ -16,6 +18,10 @@ abstract class CrosshairMixin {
             "Lnet/minecraft/client/gui/GuiGraphicsExtractor;blitSprite(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;Lnet/minecraft/resources/Identifier;IIII)V"))
     private void primept$drawCrosshair(GuiGraphicsExtractor graphics, RenderPipeline pipeline,
             Identifier sprite, int x, int y, int width, int height) {
+        if (!Settings.enabled()) {
+            graphics.blitSprite(pipeline, sprite, x, y, width, height);
+            return;
+        }
         // 原版反相混合在中灰处没有对比。描边与图案分层，确保重叠像素由图案覆盖。
         var textured = RenderPipelines.GUI_TEXTURED;
         int outline = 0xff000000;

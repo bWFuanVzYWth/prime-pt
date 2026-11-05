@@ -6,6 +6,7 @@ use ash::{
     Entry, vk,
     vk::{Handle, TaggedStructure},
 };
+use simple_engine::{openpbr, shader_build, vulkan};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -14,6 +15,12 @@ mod scene_bench;
 
 #[path = "features_tests.rs"]
 mod features_tests;
+#[path = "history_tests.rs"]
+mod history_tests;
+#[path = "render_bench.rs"]
+mod render_bench;
+#[path = "rendering_tests.rs"]
+mod rendering_tests;
 
 struct Host {
     _entry: Entry,
@@ -250,6 +257,7 @@ impl Host {
                 let supported = features.features;
                 if core12.buffer_device_address == 0
                     || core13.synchronization2 == 0
+                    || core13.subgroup_size_control == 0
                     || commands.device_address_commands == 0
                     || acceleration.acceleration_structure == 0
                     || tracing.ray_tracing_pipeline == 0
@@ -287,6 +295,7 @@ impl Host {
                     .descriptor_indexing(rr);
                 let mut core13 = vk::PhysicalDeviceVulkan13Features::default()
                     .synchronization2(true)
+                    .subgroup_size_control(true)
                     .private_data(rr);
                 let mut reorder =
                     vk::PhysicalDeviceRayTracingInvocationReorderFeaturesEXT::default()
@@ -447,11 +456,10 @@ impl Host {
             gpu.complete_previous()?;
             self.device.destroy_command_pool(pool, None);
             if result.is_err() {
-                if let Some(view) = &mut gpu.view {
-                    view.progress.reset();
-                }
-                gpu.rr_previous = None;
                 gpu.cancel_recordings(records)?;
+                gpu.transition_history(history::Event::Accumulation(
+                    history::AccumulationEvent::RecordingCancelled,
+                ))?;
             } else {
                 gpu.atmosphere.submitted();
             }
@@ -489,7 +497,26 @@ impl Host {
         environment: Environment,
         options: Options,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.render_profiled(gpu, output, camera, environment, options, None)?;
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "与实际draw输入共用宿主提交及完成边界"
+    )]
+    fn render_profiled(
+        &self,
+        gpu: &mut Gpu,
+        output: &Image,
+        camera: &Camera,
+        environment: Environment,
+        options: Options,
+        queries: Option<[vulkan::native::TimestampQueries; 2]>,
+    ) -> Result<[u64; 2], Box<dyn std::error::Error>> {
         let raw = output.raw(&gpu.context)?;
+        let mut cpu_ns = 0;
+        let mut markers = Vec::new();
         // SAFETY: 测试独占 graphics/compute queue，并在回读或更新前完成命令和 Flight。
         unsafe {
             let pool = self.device.create_command_pool(
@@ -505,6 +532,14 @@ impl Host {
                 )?[0];
                 self.device
                     .begin_command_buffer(command, &vk::CommandBufferBeginInfo::default())?;
+                if let Some([query, _]) = queries {
+                    let mut before = Commands::new(&gpu.context)?;
+                    before.reset_timestamps(query)?;
+                    before.write_timestamp(query, 0)?;
+                    let before = before.finish(&mut gpu.context)?;
+                    markers.push(before.encode(&mut gpu.context, command.as_raw())?);
+                }
+                let started = std::time::Instant::now();
                 gpu.draw(
                     command.as_raw(),
                     raw.image,
@@ -514,6 +549,14 @@ impl Host {
                     environment,
                     options,
                 )?;
+                cpu_ns = started.elapsed().as_nanos() as u64;
+                if let Some([_, query]) = queries {
+                    let mut after = Commands::new(&gpu.context)?;
+                    after.reset_timestamps(query)?;
+                    after.write_timestamp(query, 0)?;
+                    let after = after.finish(&mut gpu.context)?;
+                    markers.push(after.encode(&mut gpu.context, command.as_raw())?);
+                }
                 self.device.end_command_buffer(command)?;
                 self.device.queue_submit(
                     self.queue,
@@ -528,11 +571,21 @@ impl Host {
             if result.is_err() {
                 gpu.display_timeline.cancel();
             }
+            for marker in markers {
+                gpu.context.complete(marker)?;
+            }
             gpu.complete_previous()?;
             self.device.destroy_command_pool(pool, None);
             result?;
         }
-        Ok(())
+        let gpu_ns = if let Some([before, after]) = queries {
+            let start = before.read(&gpu.context)?.ok_or("完成后timestamp未ready")?[0];
+            let end = after.read(&gpu.context)?.ok_or("完成后timestamp未ready")?[0];
+            before.elapsed_ns(&gpu.context, start, end)?
+        } else {
+            0
+        };
+        Ok([cpu_ns, gpu_ns])
     }
 }
 
@@ -816,7 +869,7 @@ fn hardware_pt_material_reload() -> Result<(), Box<dyn std::error::Error>> {
         Err(Error::MaterialPrograms(openpbr::program::Error::Shader(_)))
     ));
     gpu.compiler = compiler;
-    gpu.view.as_mut().unwrap().progress.reset();
+    gpu.restart_accumulation()?;
     let retained = host.render(&mut gpu, &image, &camera())?;
     assert_eq!(black, retained);
     gpu.set_atlas(1, 1, &[255; 4])?;
@@ -919,7 +972,7 @@ fn hardware_pt_sample_batching() -> Result<(), Box<dyn std::error::Error>> {
     gpu.set_scene(&mesh)?;
     gpu.settings.samples = 8;
     let batched = host.render(&mut gpu, &image, &camera())?;
-    gpu.view.as_mut().unwrap().progress.reset();
+    gpu.restart_accumulation()?;
     gpu.settings.samples = 1;
     let mut split = Vec::new();
     for _ in 0..8 {
@@ -1016,7 +1069,7 @@ fn hardware_pt_camera_resets_history() -> Result<(), Box<dyn std::error::Error>>
     let mut shifted = camera();
     shifted.origin[0] = 100.;
     let changed = host.render(&mut gpu, &image, &shifted)?;
-    gpu.view.as_mut().unwrap().progress.reset();
+    gpu.restart_accumulation()?;
     let fresh = host.render(&mut gpu, &image, &shifted)?;
     assert_eq!(changed, fresh);
     drop(gpu);
@@ -1154,7 +1207,7 @@ fn hardware_pt_exposure_preserves_history() -> Result<(), Box<dyn std::error::Er
         .unwrap()
         .accumulation
         .read(&mut gpu.context, 0, &mut exposed_hdr)?;
-    gpu.view.as_mut().unwrap().progress.reset();
+    gpu.restart_accumulation()?;
     gpu.settings.samples = 192;
     environment.exposure_ev = 0.;
     host.render_environment(&mut gpu, &image, &camera(), environment)?;

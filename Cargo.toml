@@ -2,6 +2,9 @@
 resolver = "3"
 members = ["native", "crates/scene", "crates/world", "crates/renderer", "crates/minecraft"]
 
+[workspace.dependencies]
+simple_engine = { path = "../..", default-features = false }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

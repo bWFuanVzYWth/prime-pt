@@ -1,6 +1,7 @@
 //! 完整 LOD0 ticket 路径的 GPU 窗口消费者，不使用 PRT1 fixture 旁路。
 
 use super::*;
+use simple_engine::vulkan;
 
 fn blases(gpu: &Gpu) -> std::collections::BTreeMap<[i32; 3], Option<vulkan::TriangleBlas>> {
     gpu.region_cache

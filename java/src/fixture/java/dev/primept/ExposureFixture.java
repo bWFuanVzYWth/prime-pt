@@ -9,6 +9,7 @@ final class ExposureFixture {
         var file = Path.of(arguments[0]);
         Files.deleteIfExists(file);
         defaults(file);
+        renderHierarchy(file);
         commandBoundary(file);
         sharedModel(file);
         rejectedInputs(file);
@@ -20,6 +21,24 @@ final class ExposureFixture {
         failedSave(file);
         Files.deleteIfExists(file);
         System.out.println("PT settings command/persistence fixture passed");
+    }
+
+    private static void renderHierarchy(Path file) throws Exception {
+        var config = new SettingsConfig(file);
+        config.command("pt renderer restir_pt");
+        config.command("pt mode offline");
+        config.command("pt enabled off");
+        require(!config.selection().enabled() && !config.selection().offline()
+                && config.selection().mode() == RenderMode.OFFLINE
+                && config.selection().renderer() == RealtimeRenderer.RESTIR_PT,
+                "关闭 Mod 保留下层偏好，同时停止离线有效状态");
+        config.command("pt enabled on");
+        require(config.selection().offline(), "本次会话重新启用保留离线选择");
+        var loaded = new SettingsConfig(file);
+        require(loaded.selection().enabled() && loaded.selection().mode() == RenderMode.REALTIME
+                && loaded.selection().renderer() == RealtimeRenderer.RESTIR_PT,
+                "重新加载只恢复 Mod 开关和实时选择，离线快照不跨会话恢复");
+        config.reset();
     }
 
     private static void defaults(Path file) {

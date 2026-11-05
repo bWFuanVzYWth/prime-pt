@@ -19,18 +19,19 @@ Vulkan 是游戏调用显卡的接口。Prime PT 需要 Vulkan 1.4 loader 和实
 
 - 光追管线、用于组织场景几何的加速结构、RayQuery（着色器内查询光线与几何的交点）。
 - `VK_KHR_ray_tracing_position_fetch` 和 `VK_KHR_device_address_commands`。
+- `subgroupSizeControl`，compute可以请求32线程的subgroup（着色器内一起执行的一组线程）。
 - buffer device address、synchronization2 和 extended storage image formats。
 
 可查驱动的 Vulkan 能力报告；已有 `vulkaninfo` 工具时，可用 `vulkaninfo --summary` 查看实际设备及 API 版本，用 `vulkaninfo` 的完整输出搜索扩展名。使用多显卡时以游戏实际选择的设备和启动日志为准。DLSS Ray Reconstruction 另需支持该功能的 NVIDIA 显卡和驱动，属于可选画质功能。
 
 ## 准备源码环境
 
-Prime PT 是独立项目，构建时从上两级目录读取 simple_engine 源码。目录布局应是 `simple_engine/app/prime_pt`。在 **PowerShell 7** 中切换到 Prime PT 根目录，也就是能看到 `gradlew.bat` 的那一层。
+Prime PT 保持独立 Cargo workspace（一组共同构建的 Rust 包），在根 `Cargo.toml` 的 `workspace.dependencies.simple_engine` 中统一指定引擎路径，各包继承该入口并选择所需功能。默认目录布局是 `simple_engine/app/prime_pt`；发行打包和工具准备脚本也使用这个布局。在 **PowerShell 7** 中切换到 Prime PT 根目录，也就是能看到 `gradlew.bat` 的那一层。
 
 ```powershell
 Set-Location 'D:/projects/simple_engine/app/prime_pt'
 Test-Path ./gradlew.bat
-Test-Path ../../crates/vulkan/Cargo.toml
+Test-Path ../../Cargo.toml
 ```
 
 两条都应显示 `True`。第二条为 `False` 时先确认引擎和 Mod 的相对位置。

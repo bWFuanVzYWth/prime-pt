@@ -2,6 +2,7 @@
 module mod_scene;
 
 import pt.scene;
+import mod_call;
 __exported import mod_materials;
 import mod_lights;
 import pt.reconstruction;
@@ -136,7 +137,9 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
-        CallShader(program, data);
+        ModTransportCall call = ModTransportCall.input(data);
+        CallShader(program, call);
+        data.path = call.result();
     }
 
     public pt::SurfaceMaterial resolve(pt::Hit hit, uint capability, float4 incident)

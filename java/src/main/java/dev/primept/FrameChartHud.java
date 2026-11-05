@@ -10,7 +10,7 @@ public final class FrameChartHud {
     /** 有世界和 native 有效帧时替代原版 FPS 图，沿用宿主图表坐标系。 */
     public static boolean draw(GuiGraphicsExtractor graphics, int x, int bottom) {
         var minecraft = Minecraft.getInstance();
-        if (minecraft.level == null) return false;
+        if (!Settings.enabled() || minecraft.level == null) return false;
         FrameChart.requestSnapshot();
         if (!FrameChart.ready()) return false;
         var window = minecraft.getWindow();

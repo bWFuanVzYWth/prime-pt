@@ -1,6 +1,6 @@
 //! 发布、候选与退役的精确逻辑账；这里只保存键和计数，不拥有第二份网格。
 use crate::spatial::{Key, SpatialIndex, contains, difference};
-use chunk_manager::{Bounds, Handle};
+use simple_engine::chunk_manager::{Bounds, Handle};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy)]

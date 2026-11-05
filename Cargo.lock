@@ -698,9 +698,9 @@ checksum = "e8cf8e6a8aa66ce33f63993ffc4ea4271eb5b0530a9002db8455ea6050c77bfa"
 name = "prime_minecraft"
 version = "0.1.0"
 dependencies = [
- "light_sampling",
  "png",
  "prime_scene",
+ "simple_engine",
  "thiserror",
 ]
 
@@ -708,12 +708,11 @@ dependencies = [
 name = "prime_pt"
 version = "0.1.0"
 dependencies = [
- "atmosphere",
- "frame_loop",
  "prime_minecraft",
  "prime_renderer",
  "prime_scene",
  "prime_world",
+ "simple_engine",
  "thiserror",
 ]
 
@@ -722,21 +721,13 @@ name = "prime_renderer"
 version = "0.1.0"
 dependencies = [
  "ash 0.38.0+1.4.352",
- "atmosphere",
  "blake3",
  "bytemuck",
- "camera",
- "light_sampling",
- "openpbr",
  "prime_scene",
  "prime_world",
- "pt",
- "scene_cache",
  "serde_json",
- "shader_build",
  "simple_engine",
  "thiserror",
- "vulkan",
 ]
 
 [[package]]
@@ -744,7 +735,7 @@ name = "prime_scene"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "camera",
+ "simple_engine",
  "thiserror",
 ]
 
@@ -753,11 +744,11 @@ name = "prime_world"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "chunk_manager",
  "prime_minecraft",
  "prime_scene",
  "rayon",
  "serde_json",
+ "simple_engine",
  "thiserror",
 ]
 
@@ -851,6 +842,15 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
+
+[[package]]
+name = "restir_pt"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "vulkan",
+ "wgpu",
+]
 
 [[package]]
 name = "rustc-hash"
@@ -947,6 +947,16 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 name = "simple_engine"
 version = "0.1.0"
 dependencies = [
+ "atmosphere",
+ "camera",
+ "chunk_manager",
+ "frame_loop",
+ "light_sampling",
+ "openpbr",
+ "pt",
+ "restir_pt",
+ "scene_cache",
+ "shader_build",
  "thiserror",
  "vulkan",
  "wgpu",

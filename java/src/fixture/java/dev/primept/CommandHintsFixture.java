@@ -31,7 +31,7 @@ final class CommandHintsFixture {
 
     private static void nextKeyword(CommandDispatcher<Object> dispatcher) {
         require(Set.copyOf(texts(suggestions(dispatcher, "/pt ")))
-                .equals(Set.of("ser", "rr", "quality", "ev", "exposure", "spp", "bounces", "reset")),
+                .equals(Set.of("enabled", "mode", "renderer", "diagnostic", "mcap", "fresh", "ser", "rr", "quality", "ev", "exposure", "spp", "bounces", "reset")),
                 "空格后显示全部下级关键字");
         var suggestions = suggestions(dispatcher, "/pt qual");
         require(texts(suggestions).equals(List.of("quality"))

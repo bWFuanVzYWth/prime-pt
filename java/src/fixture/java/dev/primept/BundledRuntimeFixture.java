@@ -23,17 +23,26 @@ final class BundledRuntimeFixture {
         try (var arena = Arena.ofConfined()) {
             var symbols = NativeRuntime.open(bundle, arena);
             require(symbols.find("prime_create").isPresent(), "JAR 内原生 DLL 缺少会话入口");
+            require(symbols.find("prime_set_rendering").isPresent(), "JAR 内原生 DLL 缺少渲染模式入口");
+            require(symbols.find("prime_set_render_tuning").isPresent(), "JAR 内原生 DLL 缺少采样设置入口");
             require(SymbolLookup.libraryLookup(root.resolve("sl.interposer.dll"), arena).find("slInit").isPresent(),
                     "JAR 内 Streamline 缺少初始化入口");
         }
 
         var output = Files.createTempFile(cache, "callable-", ".spv");
         try {
-            var builder = new ProcessBuilder(root.resolve("slang/slangc.exe").toString(), source.toString(),
-                    "-entry", "shade_opaque", "-stage", "callable", "-I", root.resolve("shaders/prime").toString(),
+            for (var stage : new String[][] {
+                    {"primary.slang", "shade_opaque", "1"},
+                    {"restir_material.slang", "restir_initial_flow", "1"},
+                    {"restir_material.slang", "restir_initial_flow", "0"},
+                    {"restir_material.slang", "restir_replay_flow", "1"},
+                    {"restir_material.slang", "restir_evaluate_flow", "0"}}) {
+            var builder = new ProcessBuilder(root.resolve("slang/slangc.exe").toString(), root.resolve("shaders/prime/" + stage[0]).toString(),
+                    "-entry", stage[1], "-stage", "callable", "-I", root.resolve("shaders/prime").toString(),
                     "-I", root.resolve("shaders/engine").toString(), "-std", "2026", "-target", "spirv",
                     "-profile", "spirv_1_4", "-emit-spirv-directly", "-fvk-use-entrypoint-name", "-O3", "-g0",
                     "-fp-mode", "precise", "-DOPENPBR_FLOW=0", "-DOPENPBR_VARIANT=0", "-DPRIMEPT_LIGHT_MASK=1",
+                    "-DPRIMEPT_RESTIR_SAMPLE=" + stage[2],
                     "-DPRIMEPT_COVERAGE_MASK=0", "-o", output.toString());
             builder.directory(cache.toFile());
             builder.environment().remove("SLANGC");
@@ -46,6 +55,7 @@ final class BundledRuntimeFixture {
                 throw new AssertionError("发行包内 Slang 编译超时");
             }
             require(compiler.exitValue() == 0 && Files.size(output) > 20, "发行包内 Slang 未生成 callable SPIR-V");
+            }
         } finally {
             Files.deleteIfExists(output);
         }

@@ -6,7 +6,7 @@
 //! 诊断读取不提交 GPU 命令或等待设备。
 
 use crate::Error;
-use frame_loop::timing::{FrameAttribution, FrameSample, FrameStats};
+use simple_engine::frame_loop::timing::{FrameAttribution, FrameSample, FrameStats};
 use std::time::Duration;
 
 pub(crate) const STAGES: usize = 14;

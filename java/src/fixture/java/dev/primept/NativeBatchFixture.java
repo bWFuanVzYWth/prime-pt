@@ -21,6 +21,10 @@ final class NativeBatchFixture {
             var error=linker.downcallHandle(symbols.find("prime_error").orElseThrow(),FunctionDescriptor.of(ADDRESS));
             var profile=linker.downcallHandle(symbols.find("prime_profile").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_LONG,JAVA_LONG,ADDRESS,ADDRESS,JAVA_INT,JAVA_INT));
             var display = Native.bindDisplayOptions(symbols);
+            var tuning = Native.bindRenderTuning(symbols);
+            if (Native.invokeRenderTuning(tuning, 0L, new RenderTuning(100, 40, true)) != -1
+                    || !message(error).equals("无效 native 句柄"))
+                throw new AssertionError("输出采样参数须通过实际FFM入口并抵达会话查找");
             if (Native.invokeDisplayOptions(display, 0L, DisplaySettings.DEFAULT) != -1 || !message(error).equals("无效 native 句柄"))
                 throw new AssertionError("显示参数须通过 FFM 并抵达会话查找");
             var lighting = Native.bindLightingOptions(symbols);

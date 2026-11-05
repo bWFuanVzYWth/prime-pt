@@ -26,10 +26,12 @@ use crate::ledger::{Contribution, Ledger};
 use crate::region::{BindingColor, FragmentBindings, PartialRegion, RegionMesh};
 use crate::{Budget, Error, Pressure, PressureKind};
 use crate::{SourceChange, WorkBudget, WorkProgress, WorkStats};
-use chunk_manager::{self as cm, Bounds, Change, Chunk, Handle, Patch, State, Target, Ticket};
 use prime_scene::{FragmentMask, MeshParts};
 use prime_scene::{MeshView, RenderRegion};
 use rayon::prelude::*;
+use simple_engine::chunk_manager::{
+    self as cm, Bounds, Change, Chunk, Handle, Patch, State, Target, Ticket,
+};
 use std::collections::{BTreeMap, VecDeque};
 #[path = "capacity.rs"]
 mod capacity;

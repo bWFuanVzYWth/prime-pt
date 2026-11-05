@@ -1,4 +1,5 @@
 //! 发光实例的增量目录；静态texel alias属于资源世代，运行期只注册活动quad。
+use simple_engine::light_sampling;
 #[path = "light_registry.rs"]
 mod registry;
 

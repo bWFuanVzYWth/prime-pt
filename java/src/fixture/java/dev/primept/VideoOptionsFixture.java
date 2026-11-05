@@ -52,7 +52,9 @@ final class VideoOptionsFixture {
 
     private static void layout() {
         require(Arrays.asList(VideoOptions.Row.values()).equals(List.of(
-                VideoOptions.Row.RESET, VideoOptions.Row.RENDER, VideoOptions.Row.SER, VideoOptions.Row.RR,
+                VideoOptions.Row.RESET, VideoOptions.Row.RENDER, VideoOptions.Row.ENABLED, VideoOptions.Row.MODE,
+                VideoOptions.Row.REALTIME_RENDERER, VideoOptions.Row.RESTIR_CAP, VideoOptions.Row.RESTIR_FRESH,
+                VideoOptions.Row.DIAGNOSTIC, VideoOptions.Row.SER, VideoOptions.Row.RR,
                 VideoOptions.Row.QUALITY, VideoOptions.Row.SAMPLES, VideoOptions.Row.BOUNCES,
                 VideoOptions.Row.UPDATE_BUDGET, VideoOptions.Row.LIGHTING, VideoOptions.Row.SUN_EV,
                 VideoOptions.Row.BLOCK_EMISSION_EV, VideoOptions.Row.LATITUDE,

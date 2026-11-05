@@ -17,13 +17,13 @@ abstract class LevelMixin {
     private void primept$block(BlockPos pos, BlockState previous,BlockState current,CallbackInfo callback) {
         if(previous!=current)Renderer.dirty((ClientLevel) (Object) this,pos);
         // 此入口是Level.setBlock的真实源变化通知；截断下游27次Java网格依赖枚举。
-        callback.cancel();
+        if (Renderer.active()) callback.cancel();
     }
 
     @Inject(method = "setSectionDirtyWithNeighbors", at = @At("HEAD"),cancellable=true)
     private void primept$skipLightPacketDirty(CallbackInfo callback) {
         // 原版光照包更新的是光照层，Prime 只捕获方块状态源。
-        callback.cancel();
+        if (Renderer.active()) callback.cancel();
     }
 
     @Inject(method = "onChunkLoaded", at = @At("RETURN"))

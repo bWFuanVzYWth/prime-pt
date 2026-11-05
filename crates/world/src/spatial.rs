@@ -3,7 +3,7 @@
 //! 选择几何跨度最短的轴范围，再过滤另外两轴；代价取决于该轴候选数，
 //! 共面或密度不均时最坏仍可能检查全部存活键，不声称严格按最终命中数计费。
 //! 调用者的region/section坐标已由i32 block协议域约束，远离i32端点。
-use chunk_manager::Bounds;
+use simple_engine::chunk_manager::Bounds;
 use std::collections::BTreeSet;
 
 pub(crate) type Key = [i32; 3];

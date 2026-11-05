@@ -5,7 +5,7 @@ edition = "2024"
 [dependencies]
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
-camera = { path = "../../../../crates/camera" }
+simple_engine = { workspace = true, features = ["camera"] }
 
 [lints.rust]
 missing_docs = "deny"

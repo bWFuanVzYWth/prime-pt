@@ -6,6 +6,7 @@ Minecraft Java 版的路径追踪 mod，基于 Vulkan 硬件光追管线。
 
 - 写实风格，追求物理正确与色彩还原
 - 部分支持 Lab PBR 标准的资源包
+- 实时可选普通 PT 或 ReSTIR PT Enhanced；离线快照固定场景和相机后持续累积
 
 ## 需求
 
@@ -13,7 +14,7 @@ Minecraft Java 版的路径追踪 mod，基于 Vulkan 硬件光追管线。
 | --- | --- |
 | 系统和处理器 | Windows x64。当前源码的 Windows 发行构建默认要求支持 `x86-64-v3`，这组 CPU 指令包含 AVX2 等。 |
 | 游戏与加载器 | Minecraft Java 版 **26.3**、Java **25** 和 Fabric Loader **0.19.5 或更新版本**。Fabric Loader 负责让游戏加载 Mod。 |
-| 显卡与驱动 | 能运行 Vulkan **1.4**，并支持硬件光追管线、射线查询（RayQuery）、`VK_KHR_ray_tracing_position_fetch` 和 `VK_KHR_device_address_commands`。详细能力见[设备检查](manual/build.md#检查显卡与驱动)。 |
+| 显卡与驱动 | 能运行 Vulkan **1.4**，并支持硬件光追管线、射线查询（RayQuery）、`VK_KHR_ray_tracing_position_fetch`、`VK_KHR_device_address_commands` 和可请求32线程组的 `subgroupSizeControl`。详细能力见[设备检查](manual/build.md#检查显卡与驱动)。 |
 | 启动方式 | 把 JAR 放入该游戏实例的 `mods/`，并以 `--graphicsBackend VULKAN` 启动。具体步骤见[安装发行包](manual/build.md#安装发行包)。 |
 | 可选的画面重建 | DLSS RR 需要支持该功能的 NVIDIA 显卡和驱动。设备缺少 RR 能力时可用原始路径追踪，基础 Vulkan 光追仍是必需条件。当前不提供 DLSS 帧生成。 |
 
@@ -24,6 +25,7 @@ Minecraft Java 版的路径追踪 mod，基于 Vulkan 硬件光追管线。
 - [安装与运行](manual/build.md)
 - [视频设置](manual/settings.md)
 - [诊断手册](manual/diagnostics.md)
+- [Nsight 抓帧手册](manual/nsight.md)
 - [开发手册](manual/README.md)
 
 ## 协议

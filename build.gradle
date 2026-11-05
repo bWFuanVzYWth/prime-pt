@@ -151,12 +151,13 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'slang'
     }
     from('crates/renderer/shaders') {
-        include 'primary.slang', 'params.slang', 'mod_*.slang'
+        include 'primary.slang', 'params.slang', 'mod_*.slang', 'restir_*.slang'
+        exclude 'restir_probe.slang'
         into 'shaders/prime'
     }
     from('../../shaders') {
         include 'atmosphere/*.slang', 'bsdf/openpbr/**/*.slang', 'color/*.slang',
-                'display/prime_drt.slang', 'geometry/*.slang', 'pt/*.slang'
+                'display/prime_drt.slang', 'geometry/*.slang', 'pt/*.slang', 'restir_pt/*.slang'
         into 'shaders/engine'
     }
     doLast {
@@ -235,6 +236,19 @@ tasks.register('cameraFixture', JavaExec) {
     mainClass = 'dev.primept.CameraFixture'
 }
 
+tasks.register('terrainSnapshotFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.TerrainSnapshotFixture'
+}
+
+tasks.register('renderTuningFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.RenderTuningFixture'
+    args rootProject.file('target/render-tuning-fixture.properties').absolutePath
+}
+
 tasks.register('environmentFixture', JavaExec) {
     dependsOn fixtureClasses
     classpath = sourceSets.fixture.runtimeClasspath
@@ -304,6 +318,8 @@ tasks.register('frameChartFixture', JavaExec) {
 }
 
 tasks.named('check') {
+    dependsOn tasks.named('terrainSnapshotFixture')
+    dependsOn tasks.named('renderTuningFixture')
     dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),
             tasks.named('videoOptionsFixture'), tasks.named('settingsLanguageFixture'), tasks.named('commandHintsFixture'),
             tasks.named('sourceChangesFixture'), tasks.named('frameChartFixture')

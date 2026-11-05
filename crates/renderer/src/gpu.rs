@@ -13,6 +13,9 @@
 
 use crate::scene::{Camera, Environment, Mesh};
 use prime_scene::MaterialDefinition;
+use simple_engine::{
+    atmosphere, camera, light_sampling, openpbr, pt, scene_cache, shader_build, vulkan,
+};
 #[path = "attribute_update.rs"]
 mod attribute_update;
 #[path = "lighting.rs"]
@@ -21,6 +24,10 @@ mod lighting;
 mod materials;
 #[path = "region_match.rs"]
 mod region_match;
+#[path = "restir.rs"]
+mod restir;
+#[path = "restir_geometry.rs"]
+mod restir_geometry;
 use crate::{reconstruction::CameraFrame, streamline};
 use std::path::{Path, PathBuf};
 #[path = "exposure.rs"]
@@ -28,8 +35,8 @@ mod exposure;
 #[path = "history.rs"]
 mod history;
 pub use history::GlobalReset;
-use pt::gpu::{Programs, Renderer};
-use vulkan::{
+use simple_engine::pt::gpu::{Programs, Renderer};
+use simple_engine::vulkan::{
     AccelerationStructure, TriangleInstance,
     interop::RayShader,
     native::{
@@ -44,6 +51,12 @@ pub enum Error {
     /// 资源槽或发布事务失败。
     #[error(transparent)]
     SceneCache(#[from] scene_cache::Error),
+    /// ReSTIR 工作集或帧事务失败。
+    #[error(transparent)]
+    Restir(#[from] simple_engine::restir_pt::Error),
+    /// ReSTIR 原生程序、资源或录制失败。
+    #[error(transparent)]
+    RestirGpu(#[from] simple_engine::restir_pt::gpu::Error),
     /// 场景输入校验失败。
     #[error(transparent)]
     Scene(#[from] prime_scene::Error),
@@ -184,6 +197,7 @@ impl LightingGpu {
 struct RegionGpu {
     key: [i32; 3],
     revision: u64,
+    identity: u32,
     range: std::ops::Range<u32>,
     blas: Option<vulkan::TriangleBlas>,
     opaque: bool,
@@ -256,7 +270,8 @@ struct View {
     counts: Buffer,
     landing: Vec<Buffer>,
     prefix: Buffer,
-    progress: pt::Progress<[u32; 25]>,
+    progress: history::Accumulation,
+    jitter: [f32; 2],
     present: ComputePipeline,
     rr_enabled: bool,
     quality: streamline::Quality,
@@ -394,7 +409,7 @@ impl View {
             .map(|stride| Buffer::new(context, pixels * stride, false))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
-        let params = Buffer::new(context, 704, true)?;
+        let params = Buffer::new(context, 720, true)?;
         let output = Buffer::new(context, pixels * 16, false)?;
         let rr = RrImages::new(
             context,
@@ -504,7 +519,8 @@ impl View {
             counts: Buffer::new(context, pixels * 4, false)?,
             landing,
             prefix: Buffer::new(context, pixels * 16, false)?,
-            progress: pt::Progress::new(),
+            progress: history::Accumulation::new(),
+            jitter: [0.; 2],
             present,
             rr_enabled,
             quality,
@@ -579,11 +595,26 @@ struct MaterialGeneration {
     hit: materials::HitFeatures,
     regular: Renderer,
     reordered: Option<Renderer>,
+    restir: restir::Restir,
+    restir_reordered: Option<restir::Restir>,
+}
+
+impl MaterialGeneration {
+    fn roots(&self) -> impl Iterator<Item = vulkan::native::Resource> {
+        self.regular
+            .roots()
+            .into_iter()
+            .chain(self.reordered.iter().flat_map(Renderer::roots))
+            .chain(self.restir.roots())
+            .chain(self.restir_reordered.iter().flat_map(restir::Restir::roots))
+    }
 }
 
 #[cfg(test)]
 fn atlas_flow(pixels: &[u8]) -> Result<openpbr::FlowKey, Error> {
-    use openpbr::resource::{ColorScan, Coverage, Filtering, MaterialBinding, Texels};
+    use simple_engine::openpbr::resource::{
+        ColorScan, Coverage, Filtering, MaterialBinding, Texels,
+    };
     // 源适配只声明实际LOD0/nearest与alpha规则；范围扫描和闭包推导由引擎维护。
     let mut scan = ColorScan::new(Coverage::AlphaAtLeast(0.5), Filtering::Nearest)?;
     scan.extend(Texels::Srgb8Rgba(pixels))?;
@@ -637,6 +668,10 @@ impl Options {
 
 /// 独占场景、管线、工作缓冲和SDK；所有入口及销毁前宿主须完成旧命令并独占队列。
 pub struct Gpu {
+    history_audit: history::Audit,
+    next_geometry_identity: u32,
+    tuning: prime_scene::RenderTuning,
+    diagnostic_sample: u32,
     // feature 必须先于 SDK 借用的 image 和设备退役。
     rr_runtime: Option<streamline::Runtime>,
     rr_unavailable: Option<streamline::Error>,
@@ -682,6 +717,12 @@ pub struct Gpu {
     shader_source: PathBuf,
     generation: Option<MaterialGeneration>,
     renderer: Option<Renderer>,
+    renderer_kind: prime_scene::RealtimeRenderer,
+    restir: Option<restir::Restir>,
+    restir_geometry: Option<Buffer>,
+    restir_placeholder: Buffer,
+    restir_lut: Buffer,
+    restir_dirty: bool,
     flights: Vec<Flight>,
     // 测试宿主持有的native输出；生产输出由宿主管理，不进入资源表。
     #[cfg(test)]
@@ -691,9 +732,166 @@ pub struct Gpu {
     display_origin: std::time::Instant,
     display_timeline: simple_engine::display::exposure::Timeline,
     display_drt: simple_engine::display::PrimeDrtParameters,
+    offline: bool,
+    offline_metered: bool,
 }
 
 impl Gpu {
+    /// 宿主完成旧命令后发布固定采样偏好；输出概率/M cap热切换保留路径历史。
+    /// 诊断仅在实时生效，切换时重启RGB累积，离线快照继续普通PT。
+    /// # Errors
+    /// 底层完成或资源状态错误原样返回。
+    pub fn set_render_tuning(&mut self, tuning: prime_scene::RenderTuning) -> Result<(), Error> {
+        if self.tuning.diagnostic() != tuning.diagnostic() && !self.offline {
+            self.complete_previous()?;
+            self.transition_history(history::Event::Accumulation(
+                history::AccumulationEvent::OutputModeChanged,
+            ))?;
+        }
+        self.tuning = tuning;
+        Ok(())
+    }
+
+    const fn diagnostic(&self) -> bool {
+        self.tuning.diagnostic() && !self.offline
+    }
+    /// 统一设置模式及实时积分器偏好；离线强制普通 PT，不接入 RR。
+    /// 本入口维护模式与有效积分器的对应，宿主另负责冻结场景和相机；调用前须完成旧命令。
+    pub fn set_rendering(
+        &mut self,
+        mode: prime_scene::RenderMode,
+        renderer: prime_scene::RealtimeRenderer,
+    ) -> Result<(), Error> {
+        let offline = mode == prime_scene::RenderMode::Offline;
+        let renderer = if offline {
+            prime_scene::RealtimeRenderer::PathTrace
+        } else {
+            renderer
+        };
+        if self.offline == offline && self.renderer_kind == renderer {
+            return Ok(());
+        }
+        self.complete_previous()?;
+        let inherited_exposure = offline
+            && self
+                .view
+                .as_ref()
+                .is_some_and(|v| v.progress.samples() != 0);
+        self.transition_history(history::Event::Global(GlobalReset::RenderDomainChanged))?;
+        if self.renderer_kind != renderer {
+            self.renderer_kind = renderer;
+            self.renderer = None;
+            self.restir = None;
+            self.restir_dirty = true;
+            if renderer == prime_scene::RealtimeRenderer::PathTrace {
+                self.restir_geometry = None;
+            }
+        }
+        self.offline = offline;
+        self.offline_metered = inherited_exposure;
+        self.collect_resources()
+    }
+
+    /// 当前独立累积域已接受的样本数；尚无视图时为零，RR 和 ReSTIR 每帧重开累积域。
+    pub const fn accumulated_samples(&self) -> u32 {
+        match &self.view {
+            Some(view) => view.progress.samples(),
+            None => 0,
+        }
+    }
+
+    /// 世界退出后释放场景及模式工作集，保留已准备的资源世代；宿主须先完成旧命令。
+    pub fn clear_world(&mut self) -> Result<(), Error> {
+        self.complete_previous()?;
+        self.invalidate_history(GlobalReset::WorldReplaced)?;
+        self.scene = Scene {
+            top: self.program_scene.top,
+            quads: self.program_scene.quads,
+            instance_quad_bases: self.program_scene.instance_quad_bases,
+        };
+        self.region_cache = scene_cache::Cache::new()?;
+        self.attribute_revisions.clear();
+        self.lighting = lighting::Lighting::new()?;
+        self.lighting_gpu = self.program_lighting;
+        self.lighting_dirty = true;
+        self.restir = None;
+        self.restir_geometry = None;
+        self.restir_dirty = true;
+        self.view = None;
+        self.offline_metered = false;
+        self.anchor = [0.; 3];
+        self.collect_resources()
+    }
+
+    /// 明确请求重新开始静态RGB累积；保留RR/ReSTIR、绝对随机序列及曝光。
+    pub fn restart_accumulation(&mut self) -> Result<(), Error> {
+        self.complete_previous()?;
+        self.transition_history(history::Event::Accumulation(
+            history::AccumulationEvent::ExplicitRequested,
+        ))
+    }
+
+    fn prepare_restir_view(&mut self) -> Result<(), Error> {
+        let view = self.view.as_ref().expect("已准备视图");
+        let extent = view.extent;
+        if !self.restir_dirty && self.restir.as_ref().is_some_and(|r| r.extent() == extent) {
+            return Ok(());
+        }
+        let (scene, post) = self.renderer_bindings(
+            view,
+            &self.atlas,
+            &self.scene,
+            self.material_gpu,
+            self.lighting_gpu,
+        );
+        let post = Bindings::new(&mut self.context, &post)?;
+        let geometry = self
+            .restir_geometry
+            .ok_or(Error::Invalid("ReSTIR需要已发布的交点恢复几何"))?;
+        if let Some(renderer) = &mut self.restir
+            && renderer.extent() == extent
+        {
+            let generation = self.generation.as_ref().expect("完整资源世代");
+            let template = if self.invocation_reorder {
+                generation.restir_reordered.as_ref().expect("已准备SER变体")
+            } else {
+                &generation.restir
+            };
+            renderer.rebind(
+                &mut self.context,
+                scene,
+                post,
+                geometry,
+                self.restir_lut,
+                template,
+            )?;
+        } else {
+            let storage_event = if self.restir.is_some() {
+                history::StorageEvent::ExtentChanged
+            } else {
+                history::StorageEvent::Initial
+            };
+            let generation = self.generation.as_ref().expect("完整资源世代");
+            let template = if self.invocation_reorder {
+                generation.restir_reordered.as_ref().expect("已准备SER变体")
+            } else {
+                &generation.restir
+            };
+            let next = template.resize(
+                &mut self.context,
+                scene,
+                post,
+                geometry,
+                self.restir_lut,
+                extent,
+            )?;
+            self.transition_history(history::Event::RestirStorage(storage_event))?;
+            self.restir = Some(next);
+        }
+        self.restir_dirty = false;
+        Ok(())
+    }
+
     /// 单个 quad 属性缓冲允许的槽数，按分配器使用的二次幂容量向下取整。
     /// 空洞、场景内其他缓冲和实际可用显存另计。
     pub const fn attribute_slot_limit(&self) -> u32 {
@@ -701,7 +899,7 @@ impl Gpu {
     }
 
     /// # Safety
-    /// 句柄属于同一活动 Vulkan 1.2 设备，已启用 RT pipeline、RayQuery 和 device address。
+    /// 句柄属于同一活动 Vulkan 1.4 设备，已启用 RT pipeline、RayQuery、device address 与 subgroupSizeControl。
     /// 另须启用 KHR position fetch 扩展及 feature；没有无 position fetch 的回退路径。
     /// 宿主保留设备至本对象销毁，在每次调用和 drop 前等待全部旧命令完成；调用期间独占 queue。
     #[cfg(test)]
@@ -727,7 +925,7 @@ impl Gpu {
         family: u32,
         queue_index: u32,
     ) -> Result<Self, Error> {
-        // SAFETY: 沿用宿主契约，旧入口不声明额外设备特性。
+        // SAFETY: 沿用宿主契约，设备已启用固定32-lane调度所需特性。
         unsafe {
             Self::attach_options(
                 instance,
@@ -749,6 +947,7 @@ impl Gpu {
     /// 句柄属于同一活动设备，已启用 RT pipeline、RayQuery、device address 与 position fetch；family/index
     /// 对应借出的 queue。宿主独占 queue，并在每次调用和销毁前等待前次命令完成。
     /// invocation_reorder 为 true 时设备须另启用 EXT SER 扩展与特性。
+    /// 设备须启用 Vulkan 1.3 subgroupSizeControl，compute 支持请求32-lane subgroup。
     /// ser_requested 为当前偏好；关闭不抹去逻辑设备能力。
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn attach_options(
@@ -777,7 +976,8 @@ impl Gpu {
             (
                 root.join("target"),
                 root.join("crates/renderer/shaders"),
-                root.join("../../shaders"),
+                root.join("crates/renderer")
+                    .join(env!("PRIME_ENGINE_SHADERS_RELATIVE")),
             )
         };
         let includes = [prime_shaders.as_path(), engine_shaders.as_path()];
@@ -800,7 +1000,7 @@ impl Gpu {
             queue,
             queue_family: family,
             api_version: (1 << 22) | (4 << 12),
-            subgroup_size_control: false,
+            subgroup_size_control: true,
             capabilities: Capabilities {
                 ray_tracing: true,
                 position_fetch: true,
@@ -860,7 +1060,16 @@ impl Gpu {
         let mut display_timeline = simple_engine::display::exposure::Timeline::default();
         display_timeline
             .set_compensation(simple_engine::display::exposure::DEFAULT_COMPENSATION)?;
+        let restir_placeholder = Buffer::mapped_device_local(&mut context, 64)?;
+        let restir_lut = Buffer::upload(
+            &mut context,
+            simple_engine::shader_library::restir_paired_neighbors(),
+        )?;
         let gpu = Self {
+            history_audit: history::Audit::default(),
+            next_geometry_identity: 1,
+            tuning: prime_scene::RenderTuning::BASELINE,
+            diagnostic_sample: 0,
             rr_runtime: None,
             rr_unavailable: None,
             rr_init: streamline::Init {
@@ -910,6 +1119,12 @@ impl Gpu {
             shader_source,
             generation: None,
             renderer: None,
+            renderer_kind: prime_scene::RealtimeRenderer::PathTrace,
+            restir: None,
+            restir_geometry: None,
+            restir_placeholder,
+            restir_lut,
+            restir_dirty: true,
             flights: Vec::new(),
             #[cfg(test)]
             test_roots: Vec::new(),
@@ -918,6 +1133,8 @@ impl Gpu {
             display_origin: std::time::Instant::now(),
             display_timeline,
             display_drt: simple_engine::display::PrimeDrtSettings::DEFAULT.prepare(1.0)?,
+            offline: false,
+            offline_metered: false,
         };
         #[cfg(test)]
         let gpu = {
@@ -942,7 +1159,11 @@ impl Gpu {
         let drt =
             simple_engine::display::PrimeDrtSettings::new(1.0, hue, saturation, compression_start)?
                 .prepare(1.0)?;
+        let changed = self.display_timeline.compensation() != auto_exposure;
         self.display_timeline.set_compensation(auto_exposure)?;
+        if changed {
+            self.offline_metered = false;
+        }
         self.display_drt = drt;
         Ok(())
     }
@@ -1034,26 +1255,26 @@ impl Gpu {
         }
         self.invocation_reorder = enabled;
         self.renderer = None;
+        self.restir_dirty = true;
         Ok(())
     }
 
     /// 资源变化后重绑阶段并重启静态PT积分；RR重投影与曝光适应继续使用已接受历史。
+    #[cfg(test)]
     fn invalidate(&mut self) -> Result<(), Error> {
         self.complete_previous()?;
         self.renderer = None;
-        if let Some(view) = &mut self.view {
-            view.progress.reset();
-        }
-        Ok(())
+        self.restir_dirty = true;
+        self.transition_history(history::Event::Accumulation(
+            history::AccumulationEvent::SceneChanged,
+        ))
     }
 
     /// 调用者确认整个历史域失效；普通section、相机、照明和积分设置变化不调用。
     /// 保留曝光适应状态；入口仍要求宿主先完成旧命令并独占队列。
     pub fn invalidate_history(&mut self, reason: GlobalReset) -> Result<(), Error> {
-        self.invalidate()?;
-        history::record_global(reason, self.rr_previous.is_some());
-        self.rr_previous = None;
-        Ok(())
+        self.complete_previous()?;
+        self.transition_history(history::Event::Global(reason))
     }
 
     fn complete_previous(&mut self) -> Result<(), Error> {
@@ -1067,6 +1288,9 @@ impl Gpu {
             self.atmosphere.submitted();
         }
         self.display_timeline.submitted();
+        if let Some(restir) = &mut self.restir {
+            restir.completed()?;
+        }
         Ok(())
     }
 
@@ -1098,12 +1322,14 @@ impl Gpu {
         atlas.upload(&mut self.context, pixels)?;
         let (resources, generation) =
             self.prepare_material_generation(atlas, self.material_gpu, &flows, &definitions)?;
-        self.invalidate()?;
+        self.invalidate_history(GlobalReset::SceneDomainReplaced)?;
         self.atlas = atlas;
         self.atlas_colors = colors;
         self.material_gpu = resources;
         self.material_coverage = definitions.iter().map(materials::tests_coverage).collect();
         self.generation = Some(generation);
+        self.restir = None;
+        self.restir_dirty = true;
         Ok(())
     }
 
@@ -1195,18 +1421,11 @@ impl Gpu {
             };
             let (resources, generation) =
                 self.prepare_material_generation(atlas, resources, &flows, definitions)?;
-            let mut candidates = generation.regular.roots().to_vec();
-            if let Some(program) = &generation.reordered {
-                candidates.extend(program.roots());
-            }
+            let candidates: Vec<_> = generation.roots().collect();
             self.collect_with(&candidates)?;
             // 此后只移动已经准备的所有者；不得以清理失败向宿主报告“保留旧世代”。
             self.renderer = None;
-            if let Some(view) = &mut self.view {
-                view.progress.reset();
-            }
-            history::record_global(GlobalReset::SceneDomainReplaced, self.rr_previous.is_some());
-            self.rr_previous = None;
+            self.transition_history(history::Event::Global(GlobalReset::SceneDomainReplaced))?;
             self.atlas = atlas;
             self.atlas_colors = colors;
             self.material_gpu = resources;
@@ -1223,6 +1442,8 @@ impl Gpu {
             self.map_ranges = ranges;
             self.resource_generation = source.generation;
             self.generation = Some(generation);
+            self.restir = None;
+            self.restir_dirty = true;
             self.lighting_dirty = true;
             Ok(())
         })();
@@ -1289,6 +1510,70 @@ impl Gpu {
             resources,
             self.program_lighting,
         );
+        let restir_post = Bindings::new(&mut self.context, &descriptors.1)?;
+        let restir_source = self.shader_source.with_file_name("restir_material.slang");
+        let mut restir_sets = Vec::with_capacity(4);
+        for (entry, sampling) in [
+            ("restir_initial_flow", "-DPRIMEPT_RESTIR_SAMPLE=1"),
+            ("restir_initial_flow", "-DPRIMEPT_RESTIR_SAMPLE=0"),
+            ("restir_replay_flow", "-DPRIMEPT_RESTIR_SAMPLE=1"),
+            ("restir_evaluate_flow", "-DPRIMEPT_RESTIR_SAMPLE=0"),
+        ] {
+            restir_sets.push(openpbr::program::ProgramSet::compile_variants(
+                &self.compiler,
+                programs.plan().keys().iter().copied(),
+                openpbr::program::Template {
+                    source: restir_source
+                        .to_str()
+                        .ok_or(Error::Invalid("shader路径不是UTF-8"))?,
+                    entry,
+                    output: "restir-flow.spv",
+                    target: shader_build::Target::Spirv("spirv_1_4"),
+                    args: &["-fp-mode", "precise", sampling],
+                },
+            )?);
+        }
+        let restir_callables: Vec<_> = restir_sets
+            .iter()
+            .enumerate()
+            .flat_map(|(index, set)| {
+                set.artifacts().iter().map(move |artifact| RayShader {
+                    spirv: artifact.bytes(),
+                    entry: match index {
+                        0 | 1 => c"restir_initial_flow",
+                        2 => c"restir_replay_flow",
+                        _ => c"restir_evaluate_flow",
+                    },
+                })
+            })
+            .collect();
+        let restir = restir::Restir::prepare(
+            &mut self.context,
+            descriptors.0.clone(),
+            restir_post,
+            self.restir_placeholder,
+            self.restir_lut,
+            hit,
+            &restir_callables,
+            false,
+        )?;
+        let restir_reordered = self
+            .context
+            .capabilities()
+            .invocation_reorder
+            .then(|| {
+                restir::Restir::prepare(
+                    &mut self.context,
+                    descriptors.0.clone(),
+                    restir_post,
+                    self.restir_placeholder,
+                    self.restir_lut,
+                    hit,
+                    &restir_callables,
+                    true,
+                )
+            })
+            .transpose()?;
         let (trace, post) = self.allocate_bindings(descriptors)?;
         let same_code = self
             .generation
@@ -1345,6 +1630,8 @@ impl Gpu {
                 hit,
                 regular,
                 reordered,
+                restir,
+                restir_reordered,
             },
         ))
     }
@@ -1360,9 +1647,9 @@ impl Gpu {
         }
         if self.initial_medium != medium {
             self.initial_medium = medium;
-            if let Some(view) = &mut self.view {
-                view.progress.reset();
-            }
+            self.transition_history(history::Event::Accumulation(
+                history::AccumulationEvent::MediumChanged,
+            ))?;
         }
         Ok(())
     }
@@ -1370,6 +1657,8 @@ impl Gpu {
     /// 材质域更新后，即使管理器没有几何patch，也须重新准备发光分布。
     pub const fn scene_resources_dirty(&self) -> bool {
         self.lighting_dirty
+            || (matches!(self.renderer_kind, prime_scene::RealtimeRenderer::RestirPt)
+                && self.restir_geometry.is_none())
     }
 
     #[cfg(test)]
@@ -1445,7 +1734,11 @@ impl Gpu {
             .iter()
             .map(|r| (r.key, r.content_revision))
             .eq(self.attribute_revisions.iter().copied());
-        if same_geometry && same_content && source.anchor == self.anchor && !self.lighting_dirty {
+        if same_geometry
+            && same_content
+            && source.anchor == self.anchor
+            && !self.scene_resources_dirty()
+        {
             self.scene_update = Some(metrics);
             return Ok(());
         }
@@ -1525,7 +1818,12 @@ impl Gpu {
                 triangles.extend([[a, b, c], [a, c, d]]);
             }
             pending.push((entries.len(), start..triangles.len()));
+            let identity = self.next_geometry_identity;
+            self.next_geometry_identity = identity
+                .checked_add(1)
+                .ok_or(Error::Invalid("几何历史身份耗尽"))?;
             entries.push(scene_cache::Prepared::Built(RegionGpu {
+                identity,
                 key: region.key,
                 revision: region.geometry_revision,
                 range,
@@ -1759,7 +2057,13 @@ impl Gpu {
         } else {
             self.scene.instance_quad_bases
         };
-        let bindings_changed = top != self.scene.top
+        let geometry_started = std::time::Instant::now();
+        let restir_geometry = self.prepare_restir_geometry(source, entries, end)?;
+        metrics.geometry_ns += elapsed_ns(geometry_started);
+        let geometry_writes = restir_geometry.writes();
+        let geometry_buffer = restir_geometry.buffer.unwrap_or(self.restir_placeholder);
+        let bindings_changed = restir_geometry.buffer != self.restir_geometry
+            || top != self.scene.top
             || quads != self.scene.quads
             || instance_quad_bases != self.scene.instance_quad_bases
             || lighting_gpu != self.lighting_gpu;
@@ -1770,6 +2074,7 @@ impl Gpu {
                 vulkan::native::Resource::from(top),
                 quads.into(),
                 instance_quad_bases.into(),
+                geometry_buffer.into(),
             ]);
             self.collect_with(&candidates)?;
             metrics.collect_ns = elapsed_ns(collecting);
@@ -1804,12 +2109,13 @@ impl Gpu {
             * 16;
 
         let writes_attributes = !writes.is_empty() || base_write.is_some();
-        if writes_attributes || light_patch_bytes != 0 {
+        if writes_attributes || light_patch_bytes != 0 || !geometry_writes.is_empty() {
             let writing = std::time::Instant::now();
             Buffer::write_scattered_batches(
                 &mut self.context,
                 &[
                     (&quads, &writes),
+                    (&geometry_buffer, &geometry_writes),
                     (&instance_quad_bases, base_write.as_slice()),
                     (&lighting_gpu.alias, &alias_writes),
                     (&lighting_gpu.meta, &meta_writes),
@@ -1832,7 +2138,8 @@ impl Gpu {
         }
         metrics.attribute_upload_ns += allocation_ns;
         metrics.attribute_upload_bytes =
-            (attributes.len() * 48 + base_write.map_or(0, |(_, bytes)| bytes.len())) as u64;
+            (attributes.len() * 48 + base_write.map_or(0, |(_, bytes)| bytes.len())) as u64
+                + restir_geometry.written_bytes();
         metrics.resources_ns += metrics.attribute_upload_ns;
         let publishing = std::time::Instant::now();
         publication.commit();
@@ -1845,14 +2152,16 @@ impl Gpu {
             quads,
             instance_quad_bases,
         };
+        self.restir_geometry = restir_geometry.buffer;
+        self.restir_dirty = true;
         self.anchor = source.anchor;
         self.attribute_revisions = versions;
         if bindings_changed {
             self.renderer = None;
         }
-        if let Some(view) = &mut self.view {
-            view.progress.reset();
-        }
+        self.transition_history(history::Event::Accumulation(
+            history::AccumulationEvent::SceneChanged,
+        ))?;
         metrics.publish_ns = elapsed_ns(publishing);
         metrics.resources_ns += metrics.publish_ns;
         metrics.changed = true;
@@ -1902,13 +2211,16 @@ impl Gpu {
             roots.extend(view.roots());
         }
         if let Some(generation) = &self.generation {
-            roots.extend(generation.regular.roots());
-            if let Some(program) = &generation.reordered {
-                roots.extend(program.roots());
-            }
+            roots.extend(generation.roots());
         }
         if let Some(renderer) = &self.renderer {
             roots.extend(renderer.roots());
+        }
+        roots
+            .extend([self.restir_lut, self.restir_placeholder].map(vulkan::native::Resource::from));
+        roots.extend(self.restir_geometry.map(vulkan::native::Resource::from));
+        if let Some(restir) = &self.restir {
+            roots.extend(restir.roots());
         }
         #[cfg(test)]
         roots.extend(self.test_roots.iter().copied());
@@ -2025,10 +2337,12 @@ impl Gpu {
         rr_enabled: bool,
     ) -> Result<Vec<Recorded>, Error> {
         self.complete_previous()?;
+        let diagnostic = self.diagnostic();
         if extent.into_iter().any(|n| n == 0 || n > 65536) {
             return Err(Error::Invalid("视图尺寸须属于 1..=65536"));
         }
         let mut result = Vec::with_capacity(4);
+        let mut rr_reconfigured = false;
         let recording = (|| -> Result<(), Error> {
             let sky_enabled = environment.enabled();
             let solar_scale = if sky_enabled {
@@ -2075,22 +2389,21 @@ impl Gpu {
                     }
                     Some(_) => history::StorageEvent::RuntimeRecreated,
                 };
-                let history_valid = self.rr_previous.is_some();
                 // configure 与替换前，入口契约已确认前次 evaluate 完成。
                 let input = if rr_enabled {
                     if self.rr_runtime.is_none() {
                         let init = streamline::Init { ..self.rr_init };
                         self.rr_runtime = Some(unsafe { streamline::Runtime::new(init)? });
                     }
+                    rr_reconfigured = true;
                     self.rr_runtime
                         .as_mut()
                         .unwrap()
                         .configure(extent, self.rr_quality)?
                 } else {
-                    self.rr_runtime = None;
                     extent
                 };
-                self.view = Some(View::new_scaled(
+                let next = View::new_scaled(
                     &mut self.context,
                     input,
                     extent,
@@ -2102,17 +2415,37 @@ impl Gpu {
                             .map_or(&self.program_view.display, |view| &view.display),
                     ),
                     Some(&self.program_view),
-                )?);
-                history::record_storage(storage_event, history_valid);
-                self.rr_previous = None;
+                )?;
+                if !rr_enabled {
+                    self.rr_runtime = None;
+                }
+                self.transition_history(history::Event::ViewStorage(storage_event))?;
+                self.view = Some(next);
                 self.renderer = None;
+                self.restir_dirty = true;
             }
-            if self.renderer.is_none() {
+            let using_restir = self.renderer_kind == prime_scene::RealtimeRenderer::RestirPt;
+            if using_restir {
+                self.prepare_restir_view()?;
+            } else if self.renderer.is_none() {
                 self.renderer = Some(self.create_renderer()?);
             }
+            let restir_frame = if using_restir {
+                Some(self.restir.as_ref().unwrap().frame()?)
+            } else {
+                None
+            };
+            let previous_camera = if using_restir {
+                self.restir
+                    .as_ref()
+                    .unwrap()
+                    .previous_camera
+                    .or(self.rr_previous)
+            } else {
+                self.rr_previous
+            };
+            let previous_jitter = self.restir.as_ref().map_or([0.; 2], |r| r.previous_jitter);
             let current = CameraFrame::new(camera, self.anchor)?;
-            let view = self.view.as_mut().unwrap();
-            let extent = view.extent;
             let vectors = [camera.origin, camera.forward, camera.right, camera.up];
             let key = std::array::from_fn(|i| {
                 if i < 16 {
@@ -2131,10 +2464,10 @@ impl Gpu {
                     ][i - 16]
                 }
             });
-            if rr_enabled {
-                view.progress.reset();
-            }
-            let batch = view.progress.begin(key, self.settings.samples)?;
+            self.prepare_accumulation_history(key, rr_enabled || using_restir || diagnostic)?;
+            let view = self.view.as_mut().unwrap();
+            let extent = view.extent;
+            let batch = view.progress.begin(self.settings.samples)?;
             let mut words: Vec<u32> = vectors.into_iter().flatten().map(f32::to_bits).collect();
             words[3] = environment.sea_level.to_bits();
             words.extend([extent[0], extent[1], batch.first(), batch.samples()]);
@@ -2164,7 +2497,9 @@ impl Gpu {
                 self.rr_index,
                 view.extent[0],
                 view.output_extent[0],
+                rr_enabled,
             )?;
+            view.jitter = jitter;
             words.extend(
                 [
                     jitter[0],
@@ -2174,36 +2509,74 @@ impl Gpu {
                 ]
                 .map(f32::to_bits),
             );
-            words.extend([self.rr_sample, block_emission_scale.to_bits(), 0, 0]);
+            words.extend([
+                if diagnostic {
+                    self.diagnostic_sample
+                } else {
+                    self.rr_sample
+                },
+                block_emission_scale.to_bits(),
+                restir_frame.map_or(0, |f| f.frame_index),
+                restir_frame.map_or(0, |f| u32::from(f.history_valid)),
+            ]);
             words.extend(
-                self.rr_previous
+                previous_camera
                     .as_ref()
                     .unwrap_or(&current)
                     .camera_words(self.anchor)?
                     .map(f32::to_bits),
             );
-            words.extend([view.output_extent[0], view.output_extent[1], 0, 0]);
+            words.extend([
+                view.output_extent[0],
+                view.output_extent[1],
+                u32::from(diagnostic)
+                    | (u32::from(using_restir) << 1)
+                    | (u32::from(
+                        self.generation
+                            .as_ref()
+                            .is_some_and(|g| g.hit.authored_normals),
+                    ) << 2),
+                self.tuning.history_cap(),
+            ]);
             words.extend(self.anchor.map(|v| ((v / 64.) as i32) as u32));
             words.push(0);
             words.extend(self.initial_medium.map(f32::to_bits));
+            words.extend([
+                previous_jitter[0].to_bits(),
+                previous_jitter[1].to_bits(),
+                self.generation
+                    .as_ref()
+                    .unwrap()
+                    .programs
+                    .plan()
+                    .keys()
+                    .len() as u32,
+                self.tuning.fresh_probability().to_bits(),
+            ]);
             view.params
                 .write(&mut self.context, 0, bytemuck::cast_slice(&words))?;
             if sky_enabled && let Some(recorded) = self.atmosphere.record(&mut self.context)? {
                 result.push(recorded);
             }
-            if batch.first() == 0 {
+            if batch.first() == 0 && !diagnostic {
                 let mut clear = Commands::new(&self.context)?;
                 clear.clear_buffer(view.accumulation)?;
                 clear.clear_buffer(view.counts)?;
                 clear.barrier();
                 result.push(clear.finish(&mut self.context)?);
             }
-            result.push(
-                self.renderer
-                    .as_ref()
-                    .unwrap()
-                    .record(&mut self.context, batch.samples())?,
-            );
+            if using_restir {
+                let restir = self.restir.as_mut().unwrap();
+                result.push(restir.record(&mut self.context, current, jitter)?);
+                result.push(restir.post(&mut self.context)?);
+            } else {
+                result.push(
+                    self.renderer
+                        .as_ref()
+                        .unwrap()
+                        .record(&mut self.context, batch.samples())?,
+                );
+            }
             if rr_enabled {
                 let mut pack = Commands::new(&self.context)?;
                 pack.barrier();
@@ -2224,16 +2597,28 @@ impl Gpu {
                 ],
             )?;
             let pipeline = view.present.rebind(&mut self.context, bindings)?;
-            let frame =
+            let frame = if self.offline {
+                simple_engine::display::exposure::Frame::new(
+                    extent,
+                    true,
+                    0.,
+                    false,
+                    true,
+                    self.display_timeline.compensation(),
+                )?
+            } else {
                 self.display_timeline
-                    .prepare(extent, true, self.display_origin.elapsed())?;
-            if let Some(exposure) = view.display.record(
-                &mut self.context,
-                frame,
-                false,
-                self.display_timeline.enabled(),
-            )? {
+                    .prepare(extent, true, self.display_origin.elapsed())?
+            };
+            let meter = self.display_timeline.enabled() && (!self.offline || !self.offline_metered);
+            if let Some(exposure) = view
+                .display
+                .record(&mut self.context, frame, false, meter)?
+            {
                 result.push(exposure);
+            }
+            if self.offline {
+                self.offline_metered = true;
             }
             let mut present = Commands::new(&self.context)?;
             present.barrier();
@@ -2246,8 +2631,10 @@ impl Gpu {
         if let Err(error) = recording {
             self.display_timeline.cancel();
             // SDK 配置可能已改变；宿主已确认前次完成，下一帧必须重建并重新配置。
-            if rr_enabled {
-                self.rr_runtime = None;
+            if rr_reconfigured && self.rr_runtime.take().is_some() {
+                self.transition_history(history::Event::RrStorage(
+                    history::StorageEvent::RuntimeRecreated,
+                ))?;
             }
             self.cancel_recordings(result)?;
             return Err(error);
@@ -2256,8 +2643,14 @@ impl Gpu {
     }
 
     fn cancel_recordings(&mut self, recordings: Vec<Recorded>) -> Result<(), Error> {
+        if self.offline {
+            self.offline_metered = false;
+        }
         for recorded in recordings {
             self.context.cancel(recorded)?;
+        }
+        if let Some(restir) = &mut self.restir {
+            restir.cancelled()?;
         }
         self.collect_resources()
     }
@@ -2309,13 +2702,19 @@ impl Gpu {
         // SAFETY: prime_draw 借出本设备的 GENERAL storage view，并保活至本次命令完成。
         let target =
             unsafe { ExternalBinding::new(&self.context, view, ExternalKind::StorageImage)? };
-        let rr = options.rr;
+        let diagnostic = self.diagnostic();
+        let rr = options.rr && !self.offline && !diagnostic;
         let quality_changed = self.rr_quality != options.quality;
         let output_changed = self
             .view
             .as_ref()
             .is_some_and(|view| view.output_extent != extent);
-        self.settings.samples = options.samples;
+        self.settings.samples =
+            if diagnostic || self.renderer_kind == prime_scene::RealtimeRenderer::RestirPt {
+                1
+            } else {
+                options.samples
+            };
         self.settings.max_vertices = options.bounces;
         self.rr_quality = options.quality;
         if !rr || quality_changed || output_changed {
@@ -2345,6 +2744,7 @@ impl Gpu {
             }
             Err(error) => return Err(error),
         };
+        let mut rr_touched = false;
         let result = (|| -> Result<(), Error> {
             let rr = self.view.as_ref().unwrap().rr_enabled;
             let next_index = if rr {
@@ -2373,21 +2773,17 @@ impl Gpu {
                     command,
                     self.rr_index,
                     reset,
-                    crate::reconstruction::jitter(
-                        self.rr_index,
-                        view.extent[0],
-                        view.output_extent[0],
-                    )?,
+                    view.jitter,
                     self.rr_previous.as_ref().unwrap_or(&current),
                     view.rr.resources(&self.context)?,
                 )?;
+                rr_touched = true;
                 let evaluated = match unsafe { self.rr_runtime.as_mut().unwrap().evaluate(&frame) }
                 {
                     Ok(()) => true,
                     Err(error) if error.unsafe_recording() => return Err(error.source.into()),
                     Err(error) => {
                         eprintln!("RR 本帧回退：{error}");
-                        history::record_recovery(self.rr_previous.is_some());
                         false
                     }
                 };
@@ -2439,19 +2835,30 @@ impl Gpu {
                 unsafe {
                     self.encode_recordings(std::mem::take(&mut recordings), command)?;
                 }
-                self.rr_previous = evaluated.then_some(current);
+                if evaluated {
+                    self.rr_previous = Some(current);
+                } else {
+                    self.transition_history(history::Event::RrEvaluationFailed)?;
+                }
                 self.rr_index = next_index;
                 self.rr_sample = next_sample;
             }
             self.collect_resources()?;
+            if diagnostic {
+                self.diagnostic_sample = self.diagnostic_sample.wrapping_add(1);
+            }
             self.atmosphere_pending = true;
             Ok(())
         })();
         if result.is_err() {
             self.display_timeline.cancel();
-            self.view.as_mut().unwrap().progress.reset();
-            self.rr_previous = None;
             self.cancel_recordings(recordings)?;
+            self.transition_history(history::Event::Accumulation(
+                history::AccumulationEvent::RecordingCancelled,
+            ))?;
+            if rr_touched {
+                self.transition_history(history::Event::RrEvaluationFailed)?;
+            }
         }
         result
     }
@@ -2554,6 +2961,8 @@ mod smoke;
 
 #[cfg(test)]
 mod tests {
+    use simple_engine::openpbr;
+
     #[test]
     fn invisible_atlas_color_cannot_enable_a_diffuse_path() {
         let flow = super::atlas_flow(&[255, 255, 255, 127, 0, 0, 0, 255]).unwrap();

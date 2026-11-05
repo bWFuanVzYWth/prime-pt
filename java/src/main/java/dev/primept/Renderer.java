@@ -30,6 +30,10 @@ public final class Renderer {
     private static final ByteBuffer STAGES = ByteBuffer.allocateDirect(FrameChart.STAGES * 8).order(ByteOrder.LITTLE_ENDIAN);
     private static final ByteBuffer PROFILE = ByteBuffer.allocateDirect(FrameChart.CAPACITY).order(ByteOrder.LITTLE_ENDIAN);
     private static Native renderer;
+    private static boolean active = true;
+    private static ClientLevel vanillaRestore;
+    private static boolean hasFrame;
+    private static boolean frozen;
     private static VulkanCommandEncoder encoder;
     private static long generation = -1;
     private static volatile boolean resetRequested;
@@ -43,8 +47,42 @@ public final class Renderer {
     public static void prepareResources(){
         RenderSystem.assertOnRenderThread();
         ensureRenderer();await();
+        renderer.rendering(RenderMode.REALTIME, Settings.realtimeRenderer());
+        frozen=false;hasFrame=false;
         var next=SourceResources.prepareReload(Minecraft.getInstance());
         Atlas.send(renderer);renderer.sources(next.packet());next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;CHANGES.clear();
+    }
+
+    /** 在外层提取边界交接原版与 Prime；完成证明后才改变 native 模式。 */
+    public static void beginFrame() {
+        if (active != Settings.enabled()) {
+            if (renderer != null) {
+                await();
+                renderer.rendering(RenderMode.REALTIME, Settings.realtimeRenderer());
+                if (!Settings.enabled()) renderer.reset();
+            }
+            active = Settings.enabled();
+            frozen = false;
+            hasFrame = false;
+            lastCompleted = 0;
+            FrameChart.clear();
+            resetRequested = true;
+            CHANGES.clear();
+            var minecraft = Minecraft.getInstance();
+            vanillaRestore = active ? null : minecraft.level;
+            minecraft.levelExtractor.allChanged();
+        }
+    }
+
+    public static boolean frozen() { return frozen; }
+    public static boolean active() { return active; }
+
+    /** 在原版新建可见性图之后恢复现有区块；不向共享事件日志重复投递。 */
+    public static void restoreVanilla(ClientLevel level, net.minecraft.client.renderer.SectionOcclusionGraph graph) {
+        if (!active && level != null && vanillaRestore == level) {
+            ((TerrainSnapshot.Cache) level.getChunkSource()).primept$restoreTerrain(graph);
+            vanillaRestore = null;
+        }
     }
 
     private static void ensureRenderer(){
@@ -93,13 +131,14 @@ public final class Renderer {
         if(renderer==null)throw new IllegalStateException("首次资源加载尚未准备Prime资源所有者");
         var updateBudget = Settings.updateBudget();
         boolean resetWorld = CAPTURE.select(minecraft.level) || resetRequested;
+        boolean resume = frozen && !Settings.offline();
         long started = System.nanoTime();
         try (var fence = encoder.createFence()) {
             encoder.submit();
             long submitting = System.nanoTime() - started;
             try {
                 // 同一帧内先推进纯CPU阶段。重置、程序切换和绘制才消费GPU完成保证。
-                if (!resetWorld) prepareFrame(minecraft, updateBudget);
+                if (!resetWorld && !resume && !(Settings.offline() && hasFrame)) prepareFrame(minecraft, updateBudget);
             } finally {
                 long waiting = System.nanoTime();
                 if (!fence.awaitCompletion(5_000_000_000L)) throw fenceTimeout();
@@ -107,8 +146,13 @@ public final class Renderer {
             }
         }
         long stage = System.nanoTime();
-        renderer.ser(Settings.requestedSer());
+        renderer.rendering(resetWorld ? RenderMode.REALTIME : Settings.mode(), Settings.realtimeRenderer());
+        renderer.updateRenderTuning(Settings.tuning());
+        frozen = !resetWorld && Settings.offline() && hasFrame;
+        if (!frozen) renderer.ser(Settings.requestedSer());
         if (resetWorld) {
+            hasFrame = false;
+            frozen = false;
             renderer.reset();
             biomeWorld=null;
             resetRequested = false;
@@ -116,9 +160,13 @@ public final class Renderer {
             FrameChart.clear();
         }
         STAGES.putLong(8, STAGES.getLong(8) + System.nanoTime() - stage);
-        if (resetWorld) prepareFrame(minecraft, updateBudget);
+        if (resetWorld) {
+            prepareFrame(minecraft, updateBudget);
+            renderer.rendering(Settings.mode(), Settings.realtimeRenderer());
+        } else if (resume) prepareFrame(minecraft, updateBudget);
+        renderer.updateDisplayOptions(Settings.display());
         int medium=switch(minecraft.gameRenderer.mainCamera().getFluidInCamera()){case WATER->1;case LAVA->2;default->0;};
-        renderer.cameraMedium(medium);
+        if (!frozen) renderer.cameraMedium(medium);
         if (!(target.getColorTexture() instanceof VulkanGpuTexture texture)
                 || !(target.getColorTextureView() instanceof VulkanGpuTextureView view)
                 || texture.getFormat() != GpuFormat.RGBA8_UNORM || (texture.usage() & STORAGE) == 0)
@@ -128,6 +176,7 @@ public final class Renderer {
         ENVIRONMENT.putFloat(EnvironmentPacket.EXPOSURE_OFFSET, Settings.exposure());
         renderer.draw(command.address(), texture.vkImage(), view.vkImageView(), target.width, target.height,
                 CAMERA, ENVIRONMENT, Settings.rr(), Settings.quality(), Settings.samples(), Settings.bounces());
+        hasFrame = true;
         int status = VK10.vkEndCommandBuffer(command);
         if (status != VK10.VK_SUCCESS) throw new IllegalStateException("vkEndCommandBuffer: " + status);
         STAGES.putLong(88, System.nanoTime() - stage);
@@ -188,27 +237,29 @@ public final class Renderer {
     }
 
     /** 世界替换延迟到下次 render 的完成边界处理。 */
-    public static void reset() { resetRequested = true; }
+    public static void reset() { resetRequested = true; vanillaRestore = null; }
     /** tint 和模型源刷新保留旧覆盖，分步重捕获；不切换世界域。 */
-    public static void invalidate(ClientLevel level) { CHANGES.all(level); }
+    public static void invalidate(ClientLevel level) { if (active) CHANGES.all(level); }
     /** 与宿主天空使用同一个相机 attribute probe 和插值时刻。 */
     public static void environment(ClientLevel level, Camera camera, float partial) {
+        if (frozen) return;
         EnvironmentPacket.write(level, camera, partial, ENVIRONMENT);
     }
     /** 仅捕获实际block源范围；邻域及slab依赖由Rust统一推导一次。 */
     public static void dirty(ClientLevel level, BlockPos pos) {
-        CHANGES.block(level,pos.getX(),pos.getY(),pos.getZ());
+        if (active) CHANGES.block(level,pos.getX(),pos.getY(),pos.getZ());
     }
     /** chunk 加载和卸载统一替换对应 section 源。 */
     public static void column(ClientLevel level, int x, int z) {
-        CHANGES.column(level,x,z,level.getMinSectionY(),level.getMaxSectionY()+1,true);
+        if (active) CHANGES.column(level,x,z,level.getMinSectionY(),level.getMaxSectionY()+1,true);
     }
     /** 已加载chunk收到独立biome数据，不清其压缩block源。 */
-    public static void biomeColumn(ClientLevel level,int x,int z){CHANGES.biome(level,x,z);}
+    public static void biomeColumn(ClientLevel level,int x,int z){if (active) CHANGES.biome(level,x,z);}
     /** 必须在宿主 VulkanDevice.close 之前调用。 */
     public static void close() {
+        vanillaRestore = null;
         if (renderer == null) return;
         await(); renderer.close(); renderer = null; generation = -1; CAPTURE.invalidate(); resetRequested = false;biomeWorld=null;
-        lastCompleted = 0; FrameChart.clear();
+        lastCompleted = 0; FrameChart.clear(); frozen = false; hasFrame = false;
     }
 }

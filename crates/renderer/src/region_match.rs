@@ -1,5 +1,6 @@
 //! 两份有序目录单次合并；避免对同一region反复二分旧目录。
 use super::{Error, RegionGpu};
+use simple_engine::scene_cache;
 
 pub(super) struct Matched {
     pub reuse: Option<usize>,

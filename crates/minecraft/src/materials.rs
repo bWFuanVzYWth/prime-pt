@@ -7,11 +7,11 @@ use crate::{
     emission_power::{PowerMoments, textured_amplitude},
     resources::{BoundQuad, Model, ModelBinding, SourceQuad, State},
 };
-use light_sampling::{
+use prime_scene::{MaterialDefinition as Definition, MaterialId};
+use simple_engine::light_sampling::{
     QuadArea,
     emitter::{Coverage, EmissionProposal, EmitterAlias, MAX_TEXELS},
 };
-use prime_scene::{MaterialDefinition as Definition, MaterialId};
 use std::collections::{HashMap, HashSet};
 
 /// 一次全局资源准备产物；CPU像素在GPU接受后释放，不按section复制。

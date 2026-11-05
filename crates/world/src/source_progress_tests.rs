@@ -4,6 +4,7 @@ use prime_minecraft::{
     Catalog,
     fixtures::{self, Pattern},
 };
+use simple_engine::chunk_manager;
 
 fn camera() -> WorldCamera {
     WorldCamera {
@@ -445,7 +446,7 @@ fn returning_to_a_pending_unload_keeps_cover_and_applies_new_tint() -> Result<()
 
 #[test]
 fn probes_leave_the_window_while_real_compilation_dependencies_remain() -> Result<(), Error> {
-    use chunk_manager::Bounds;
+    use simple_engine::chunk_manager::Bounds;
     let mut sources = super::Sources::default();
     sources.clear(1);
     sources.set_window(Bounds::new([0; 3], [4; 3])?);

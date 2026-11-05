@@ -1,4 +1,5 @@
 //! 引擎区块调度的LOD0所有者；源编译、准备和GPU确认后的发布分别处理。
+use simple_engine::chunk_manager;
 mod budget;
 #[cfg(test)]
 mod budget_tests;

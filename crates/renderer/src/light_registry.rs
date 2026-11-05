@@ -1,5 +1,6 @@
 //! 稳定数据槽、紧凑活动序列与稀疏反查的单一CPU所有者；准备不修改已发布表。
 
+use simple_engine::{light_sampling, scene_cache};
 use std::collections::HashMap;
 
 use crate::gpu::Error;

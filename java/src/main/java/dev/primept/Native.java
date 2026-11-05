@@ -23,6 +23,11 @@ final class Native implements AutoCloseable {
     private final MethodHandle setLightingOptions;
     private LightingSettings lighting;
     private boolean serRequested;
+    private final MethodHandle setRendering;
+    private final MethodHandle setRenderTuning;
+    private RenderTuning tuning;
+    private RenderMode renderMode;
+    private RealtimeRenderer realtimeRenderer;
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex) {
         this(instance, physical, device, queue, family, queueIndex, false);
@@ -56,6 +61,8 @@ final class Native implements AutoCloseable {
         invalidateTints = bind(symbols,"prime_invalidate_tints",FunctionDescriptor.of(JAVA_INT,JAVA_LONG));
         invalidateBatch=bind(symbols,"prime_invalidate_batch",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_LONG));
         failCapture = bind(symbols, "prime_fail_capture", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG));
+        setRendering = bind(symbols, "prime_set_rendering", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT));
+        setRenderTuning = bindRenderTuning(symbols);
         setSer = bind(symbols, "prime_set_ser", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         setUpdateBudget = bind(symbols, "prime_set_update_budget", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         setSolarOrbit = bind(symbols, "prime_set_solar_orbit", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT));
@@ -87,8 +94,33 @@ final class Native implements AutoCloseable {
         return Linker.nativeLinker().downcallHandle(symbols.find(name).orElseThrow(), type);
     }
 
+    void rendering(RenderMode mode, RealtimeRenderer renderer) {
+        if (mode == renderMode && renderer == realtimeRenderer) return;
+        try {
+            check((int) setRendering.invokeExact(handle, mode.wireId, renderer.wireId));
+            renderMode = mode;
+            realtimeRenderer = renderer;
+        } catch (Throwable e) { throw unchecked(e); }
+    }
+
     void reset() {
         try { check((int) reset.invokeExact(handle)); } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    void updateRenderTuning(RenderTuning next) {
+        if (next.equals(tuning)) return;
+        try { check(invokeRenderTuning(setRenderTuning, handle, next)); tuning = next; }
+        catch (Throwable failure) { throw unchecked(failure); }
+    }
+
+    static MethodHandle bindRenderTuning(SymbolLookup symbols) {
+        return bind(symbols, "prime_set_render_tuning", FunctionDescriptor.of(JAVA_INT,
+                JAVA_LONG, JAVA_INT, JAVA_FLOAT, JAVA_INT));
+    }
+
+    static int invokeRenderTuning(MethodHandle target, long id, RenderTuning options) throws Throwable {
+        return (int) target.invokeExact(id, options.historyCap(), options.freshPercent()/100.0f,
+                options.diagnostic() ? 1 : 0);
     }
 
     void updateBudget(UpdateBudget next) {

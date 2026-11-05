@@ -1,4 +1,7 @@
 //! 宿主无关的quad、材质身份及相机输入；不拥有游戏源、调度器或GPU资源。
+mod rendering;
+pub use rendering::{RealtimeRenderer, RenderMode, RenderTuning};
+use simple_engine::camera;
 /// 场景输入域校验失败；相机数学保留底层来源。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -185,15 +188,16 @@ const fn float_words(values: [f32; 4]) -> [u32; 4] {
     ]
 }
 
-/// CPU quad：UV32、共享 tint/material16、四角 P48，共96B；shader 仅常驻前三块48B。
+/// CPU quad：UV32、共享 tint/material16、四角 P48，共96B；普通 PT 的 shader 属性常驻前三块48B。
 ///
 /// 固定两片 012/023；允许任意朝向、非共面和非平行四边形。三角面以 `[A,B,C,C]`
 /// 表示，并复制第四角全部属性；AS 始终保留两输入槽，使 primitive>>1 直接寻址。
 /// tint 为 quad 共享的未照明 sRGB；不支持逐顶点颜色、smooth normal 或第二组 UV。
 /// 这些能力需要明确扩展格式，不能从 quad 假设推导。位置和 UV 保留全部 FP32 位值；
 /// 不重建第四点，不使用体素坐标或隐式轴向。material 是真实预设选择，不作为对齐填充。
-/// GPU 强制 KHR position fetch，通过 AS 获取实际三角位置；不另建常驻 P48 副本。
-/// 48B 属性记录以 primitive>>1 直接寻址；AS 构建临时输入不属于此常驻属性预算。
+/// 主查询强制 KHR position fetch，通过 AS 获取实际三角位置。需要恢复历史交点的 ReSTIR
+/// 另持有局部四角和 region 键，其独立工作集见渲染 crate。48B 属性记录以 primitive>>1
+/// 直接寻址；AS 构建临时输入不属于此常驻属性预算。
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Quad {

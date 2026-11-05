@@ -1,6 +1,7 @@
 //! 材质世代的真实资源范围分析；同一atlas只扫描一次，不按材质重复扫描整图。
 use crate::gpu::Error;
 use prime_scene::MaterialDefinition;
+use simple_engine::{openpbr, scene_cache};
 
 /// 只有这些覆盖规则会拒绝硬件三角候选；透明度和光学透射彼此独立。
 pub(super) const fn tests_coverage(definition: &MaterialDefinition) -> bool {
@@ -72,7 +73,7 @@ pub(super) fn defaults() -> Vec<MaterialDefinition> {
 }
 
 pub(super) fn colors(pixels: &[u8]) -> Result<[openpbr::resource::ColorRanges; 2], Error> {
-    use openpbr::resource::{ColorScan, Coverage, Filtering, Texels};
+    use simple_engine::openpbr::resource::{ColorScan, Coverage, Filtering, Texels};
     let unit = openpbr::Range::new(0., 1.)?;
     let scan = |coverage| -> Result<_, Error> {
         let mut colors = ColorScan::new(coverage, Filtering::Nearest)?;
@@ -113,8 +114,8 @@ pub(super) fn flows(
     definitions: &[MaterialDefinition],
     textured: MapRanges,
 ) -> Result<Vec<openpbr::FlowKey>, Error> {
-    use openpbr::resource::{ColorRanges, MaterialBinding};
-    use openpbr::{InterfaceIor, MaterialRanges, Range};
+    use simple_engine::openpbr::resource::{ColorRanges, MaterialBinding};
+    use simple_engine::openpbr::{InterfaceIor, MaterialRanges, Range};
     if definitions.is_empty() || definitions.iter().any(|m| !m.valid()) {
         return Err(Error::Invalid("材质表为空或字段不符合OpenPBR输入域"));
     }

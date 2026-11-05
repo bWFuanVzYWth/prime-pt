@@ -1,6 +1,9 @@
 //! Prime PT 的 Streamline 应用身份；通用接入由引擎 Vulkan crate 拥有。
 
-pub use vulkan::streamline::{Error, EvaluationFailure, Frame, Init, Quality, Resource, shutdown};
+use simple_engine::vulkan;
+pub use simple_engine::vulkan::streamline::{
+    Error, EvaluationFailure, Frame, Init, Quality, Resource, shutdown,
+};
 
 const APPLICATION: vulkan::streamline::Application<'static> = vulkan::streamline::Application {
     engine_version: c"prime_pt",

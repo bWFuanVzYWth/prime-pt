@@ -2,6 +2,6 @@
   "required": true,
   "package": "dev.primept.mixin",
   "compatibilityLevel": "JAVA_25",
-  "client": ["DeviceAccess", "VulkanDeviceMixin", "VulkanInstanceMixin", "BackendMixin", "StreamlineBootstrapMixin", "StreamlineSurfaceMixin", "TextureMixin", "MainTargetMixin", "TargetMixin", "GameRendererMixin", "AtlasMixin", "ModelResourcesMixin", "SpriteAccess", "LevelMixin", "BiomeSourceMixin", "ExtractorMixin", "CommandMixin", "VideoSettingsScreenMixin", "FrameChartMixin", "CrosshairMixin"],
+  "client": ["DeviceAccess", "VulkanDeviceMixin", "VulkanInstanceMixin", "BackendMixin", "StreamlineBootstrapMixin", "StreamlineSurfaceMixin", "TextureMixin", "MainTargetMixin", "TargetMixin", "GameRendererMixin", "AtlasMixin", "ModelResourcesMixin", "SpriteAccess", "LevelMixin", "BiomeSourceMixin", "ExtractorMixin", "CommandMixin", "VideoSettingsScreenMixin", "FrameChartMixin", "CrosshairMixin", "ChunkCacheMixin", "ChunkStorageMixin", "LevelRendererMixin"],
   "injectors": {"defaultRequire": 1}
 }

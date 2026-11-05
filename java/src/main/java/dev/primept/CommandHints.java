@@ -24,6 +24,18 @@ public final class CommandHints {
     static <S> void install(CommandDispatcher<S> dispatcher, Supplier<String> exposure,
             IntSupplier samples, IntSupplier bounces) {
         var root = CommandHints.<S>command("pt");
+        root.then(CommandHints.<S>command("enabled").then(command("on")).then(command("off")));
+        var mode = CommandHints.<S>command("mode");
+        for (var value : RenderMode.values()) mode.then(command(value.key));
+        root.then(mode);
+        var renderer = CommandHints.<S>command("renderer");
+        for (var value : RealtimeRenderer.values()) renderer.then(command(value.key));
+        root.then(renderer);
+        root.then(CommandHints.<S>command("diagnostic").then(command("on")).then(command("off")));
+        root.then(CommandHints.<S>command("mcap").then(RequiredArgumentBuilder.<S, Integer>argument("历史M上限",
+                IntegerArgumentType.integer(1, 100)).executes(context -> 0)));
+        root.then(CommandHints.<S>command("fresh").then(RequiredArgumentBuilder.<S, Integer>argument("初采输出百分比",
+                IntegerArgumentType.integer(0, 100)).executes(context -> 0)));
         root.then(CommandHints.<S>command("rr").then(command("on")).then(command("off")));
         root.then(CommandHints.<S>command("ser").then(command("on")).then(command("off")));
         var quality = CommandHints.<S>command("quality");

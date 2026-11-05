@@ -18,21 +18,24 @@
 //! 源包只在调用内借用；palette/资源字典解码成自持输入，section编译及tint续接分阶段发布。
 //! 一个64m region合并4³个section；缺源section保留旧片段，已完成片段可发布。
 //! 使用 [`Quad`] 的直接寻址属性 ABI：任意四角、固定012/023、三角面退化为quad，
-//! 不要求轴对齐。位置只由 AS position fetch 提供，不保留 shader 顶点/索引副本。
+//! 不要求轴对齐。普通 PT 的主查询只用 AS position fetch；ReSTIR 另按历史交点恢复需求
+//! 保存局部四角和 region 键，其所有者与释放边界见渲染 crate。
 //! 宿主必须启用 [KHR position fetch] 扩展和 feature，无回退；能力边界见 [`Quad`]。
 //!
 //! [KHR position fetch]: https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_ray_tracing_position_fetch.html
 
 #![recursion_limit = "256"]
 
+use simple_engine::{atmosphere, frame_loop};
 mod changes;
 mod diagnostics;
 mod frame_environment;
+mod rendering;
 mod runtime;
-use atmosphere::SolarOrbit;
 use prime_renderer as gpu;
 use prime_renderer::streamline;
 use prime_world as scene;
+use simple_engine::atmosphere::SolarOrbit;
 
 pub use frame_environment::FrameEnvironment;
 pub use prime_scene::{Camera, Environment, Material, Mesh, Quad, WorldCamera};
@@ -95,6 +98,7 @@ struct Engine {
     tint_radius: Option<u32>,
     tint_columns: std::collections::HashSet<(i32, i32)>,
     tint_invalidate_all: bool,
+    rendering: rendering::State,
     solar_orbit: SolarOrbit,
     profile: diagnostics::Profile,
 }
@@ -198,6 +202,59 @@ fn with_engine(
     Ok(0)
 }
 
+fn with_live_engine(
+    id: u64,
+    action: impl FnOnce(&mut Engine) -> Result<(), Error>,
+) -> Result<i32, Error> {
+    with_engine(id, |engine| {
+        engine.rendering.require_live()?;
+        action(engine)?;
+        engine.rendering.changed();
+        Ok(())
+    })
+}
+
+/// 请求渲染模式和实时积分器；0/1 分别为实时/离线和普通 PT/ReSTIR PT。
+/// 离线等待首个有效帧，冻结后拒绝实时源修改；退出保留实时积分器偏好。
+///
+/// # Safety
+/// 宿主已确认此前全部 GPU 命令完成，调用期间独占会话及队列。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_set_rendering(id: u64, mode: u32, renderer: u32) -> i32 {
+    guarded(-1, || {
+        let mode = prime_scene::RenderMode::try_from(mode)?;
+        let renderer = prime_scene::RealtimeRenderer::try_from(renderer)?;
+        with_engine(id, |engine| {
+            engine.gpu.set_rendering(mode, renderer)?;
+            engine.rendering.select(mode);
+            Ok(())
+        })
+    })
+}
+
+/// 设置历史M cap、固定fresh替换概率和原生无累积诊断；参数统一校验后发布。
+/// 诊断0/1；不修改用户的RR、SPP、画质偏好，离线时不启用诊断。
+/// # Safety
+/// 宿主已完成旧GPU命令，并独占会话及队列。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_set_render_tuning(
+    id: u64,
+    cap: u32,
+    probability: f32,
+    diagnostic: u32,
+) -> i32 {
+    guarded(-1, || {
+        if diagnostic > 1 {
+            return Err(Error::Input("诊断开关须为0或1"));
+        }
+        let tuning = prime_scene::RenderTuning::new(cap, probability, diagnostic != 0)?;
+        with_engine(id, |engine| {
+            engine.gpu.set_render_tuning(tuning)?;
+            Ok(())
+        })
+    })
+}
+
 /// 返回当前线程最后一次失败信息；UTF-8 指针有效至该线程下一次失败。
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_error() -> *const c_char {
@@ -251,8 +308,8 @@ pub extern "C" fn prime_streamline_shutdown() -> i32 {
 ///
 /// # Safety
 /// Vulkan 实例和物理设备须支持 1.4；句柄来自同一活动设备，queue 对应 family/index，支持 graphics/compute。
-/// 设备须启用 deviceAddressCommands、synchronization2、bufferDeviceAddress、accelerationStructure、rayTracingPipeline、rayQuery、
-/// rayTracingPositionFetch 及其扩展；BLAS 必须使用 ALLOW_DATA_ACCESS，无顶点副本回退。
+/// 设备须启用 subgroupSizeControl（compute可请求32-lane）、deviceAddressCommands、synchronization2、bufferDeviceAddress、accelerationStructure、rayTracingPipeline、rayQuery、
+/// rayTracingPositionFetch 及其扩展；BLAS 必须使用 ALLOW_DATA_ACCESS，不支持无 position fetch 的设备回退。
 /// K1 图像格式需要 shaderStorageImageExtendedFormats；RR 的设备能力由 Java Bootstrap 协商。
 /// 宿主独占 queue 的调用线程，且不得在会话销毁前销毁设备或实例。
 #[unsafe(no_mangle)]
@@ -332,6 +389,7 @@ pub unsafe extern "C" fn prime_create_options(
                     tint_radius: None,
                     tint_columns: std::collections::HashSet::new(),
                     tint_invalidate_all: false,
+                    rendering: rendering::State::default(),
                     solar_orbit: SolarOrbit::default(),
                     profile: diagnostics::Profile::default(),
                 },
@@ -386,15 +444,14 @@ pub unsafe extern "C" fn prime_destroy(id: u64) -> i32 {
 pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
     guarded(-1, || {
         with_engine(id, |engine| {
+            engine.rendering.changed();
             engine.scene.clear();
             engine.tint_world = None;
             engine.tint_pending = None;
             engine.tint_radius = None;
             engine.tint_columns.clear();
             engine.tint_invalidate_all = false;
-            engine
-                .gpu
-                .invalidate_history(gpu::GlobalReset::WorldReplaced)?;
+            engine.gpu.clear_world()?;
             Ok(())
         })
     })
@@ -430,7 +487,7 @@ pub extern "C" fn prime_set_update_budget(id: u64, preset: u32) -> i32 {
 pub extern "C" fn prime_set_solar_orbit(id: u64, latitude: i32, ecliptic_longitude: u32) -> i32 {
     guarded(-1, || {
         let orbit = SolarOrbit::from_degrees(latitude, ecliptic_longitude)?;
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine.solar_orbit = orbit;
             Ok(())
         })
@@ -463,7 +520,7 @@ pub extern "C" fn prime_set_display_options(
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_set_lighting_options(id: u64, sun_ev: f32, block_emission_ev: f32) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine.gpu.set_lighting_options(sun_ev, block_emission_ev)?;
             Ok(())
         })
@@ -496,7 +553,7 @@ pub unsafe extern "C" fn prime_plan(
         // SAFETY: 调用者借出完整相机，不要求对齐。
         let camera = unsafe { camera.read_unaligned() };
         let mut count = 0;
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine.grow_view_budget(view_distance)?;
             let planned: &[scene::CaptureRequest] = engine.scene.plan(
                 &camera,
@@ -538,7 +595,7 @@ pub unsafe extern "C" fn prime_plan(
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_invalidate_section(id: u64, sx: i32, sy: i32, sz: i32) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine.tint_pending = None;
             Ok(engine.scene.invalidate_section([sx, sy, sz])?)
         })
@@ -558,7 +615,7 @@ pub unsafe extern "C" fn prime_invalidate_batch(id: u64, data: *const u8, len: u
         // SAFETY: 调用者保持完整借用，上方已校验长度。
         let input = unsafe { std::slice::from_raw_parts(data, len) };
         let changes = changes::decode(input)?;
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine.scene.apply_changes(&changes)?;
             engine.tint_pending = None;
             for change in &changes {
@@ -590,7 +647,7 @@ pub unsafe extern "C" fn prime_invalidate_batch(id: u64, data: *const u8, len: u
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_invalidate_all(id: u64) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine.scene.invalidate_all();
             engine.tint_pending = None;
             engine.tint_invalidate_all = true;
@@ -603,7 +660,7 @@ pub extern "C" fn prime_invalidate_all(id: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| Ok(engine.scene.fail_capture(request)?))
+        with_live_engine(id, |engine| Ok(engine.scene.fail_capture(request)?))
     })
 }
 
@@ -689,7 +746,7 @@ pub unsafe extern "C" fn prime_batch(id: u64, data: *const u8, len: u64) -> i32 
         }
         // SAFETY: 调用者保证整段内存只读且在调用内活动；上方限制长度。
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             if bytes.starts_with(&0x33545250u32.to_le_bytes()) {
                 engine.scene.apply_compact(bytes, &engine.catalog)?;
                 engine.retire_tint_sources();
@@ -730,7 +787,7 @@ pub unsafe extern "C" fn prime_atlas(
         }
         // SAFETY: 调用者保证在调用内借出的完整 atlas 内存；长度已验证。
         let bytes = unsafe { std::slice::from_raw_parts(pixels, len as usize) };
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             let mut pixels = Vec::new();
             pixels
                 .try_reserve_exact(bytes.len())
@@ -756,7 +813,7 @@ pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i3
         }
         // SAFETY: 调用者保持源包只读活动，上方校验了完整长度。
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             let (extent, albedo) = engine
                 .pending_albedo
                 .as_ref()
@@ -795,7 +852,7 @@ pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i3
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_camera_medium(id: u64, kind: u32) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine
                 .gpu
                 .set_initial_medium(engine.catalog.camera_medium(kind)?)?;
@@ -808,7 +865,7 @@ pub extern "C" fn prime_camera_medium(id: u64, kind: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_invalidate_tints(id: u64) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             engine.scene.invalidate_tints();
             engine.tint_pending = None;
             if let Some(world) = &mut engine.tint_world {
@@ -831,7 +888,7 @@ pub unsafe extern "C" fn prime_biome_world(id: u64, data: *const u8, len: u64) -
         }
         // SAFETY: 长度已校验，调用者保持完整只读借用。
         let bytes = unsafe { std::slice::from_raw_parts(data, len) };
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             let resources = engine
                 .catalog
                 .tints()
@@ -851,7 +908,7 @@ pub unsafe extern "C" fn prime_biome_world(id: u64, data: *const u8, len: u64) -
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_tint_begin(id: u64, radius: u32) -> i32 {
     guarded(-1, || {
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             if radius > 7 {
                 return Err(Error::Input("tint半径须0..=7"));
             }
@@ -936,7 +993,7 @@ pub unsafe extern "C" fn prime_biome_samples(id: u64, ids: *const u32, count: u3
         if ids.is_null() && count != 0 {
             return Err(Error::Input("biome响应指针为空"));
         }
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             let pending = engine
                 .tint_pending
                 .as_mut()
@@ -1010,7 +1067,7 @@ pub unsafe extern "C" fn prime_tints(id: u64, colors: *const u32, count: u32) ->
         if colors.is_null() && count != 0 {
             return Err(Error::Input("tint颜色指针为空"));
         }
-        with_engine(id, |engine| {
+        with_live_engine(id, |engine| {
             let pending = engine
                 .tint_pending
                 .as_mut()
@@ -1044,6 +1101,10 @@ pub unsafe extern "C" fn prime_tints(id: u64, colors: *const u32, count: u32) ->
 /// rr=0 使用原始累积，rr=1 使用已完成早期 SDK 接入的 RR；其余值拒绝。
 /// quality=0..=4 对应 DLAA/Quality/Balanced/Performance/UltraPerformance；SDK 决定输入尺寸。
 /// samples=1..=64；RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为路径顶点预算。
+/// [`prime_set_rendering`] 选择离线时固定最近已接受帧的场景、相机、光照和路径预算，
+/// 只接受当前曝光、尺寸和每帧采样量；没有已接受帧时先绘制并接受首帧。离线禁用 RR，
+/// 实时 ReSTIR 固定每帧一个初始候选，其余实时模式使用 samples。
+/// 离线累积在超过 2^24 个样本前重开独立轮次，避免长期 float32 求和失去单位增量。
 /// 宿主已确认前次 draw 完成，并独占 graphics queue；mesh 更新会同步提交构建命令。
 /// 返回成功后宿主负责提交该 command，并在任何资源替换/销毁前等待完成。
 #[unsafe(no_mangle)]
@@ -1073,8 +1134,8 @@ pub unsafe extern "C" fn prime_draw(
         }
         // SAFETY: 调用者借出至少一份 WorldCamera；不要求源指针对齐。
         let source = unsafe { camera.read_unaligned() };
-        let anchor = source.anchor()?;
-        let camera = source.relative(anchor)?;
+        let source_anchor = source.anchor()?;
+        source.relative(source_anchor)?;
         // SAFETY: 调用者借出完整帧环境包，不要求源指针对齐。
         let source_environment = unsafe { environment.read_unaligned() };
         let options = gpu::Options::new(
@@ -1084,15 +1145,37 @@ pub unsafe extern "C" fn prime_draw(
             bounces,
         )?;
         with_engine(id, |engine| {
-            let environment = source_environment.resolve(engine.solar_orbit, anchor[1])?;
+            let incoming = source_environment.resolve(engine.solar_orbit, source_anchor[1])?;
+            let frozen = engine.rendering.frozen();
+            let frame = engine.rendering.choose(rendering::Frame {
+                camera: source,
+                environment: incoming,
+                bounces,
+            });
+            let anchor = frame.camera.anchor()?;
+            let camera = frame.camera.relative(anchor)?;
+            let environment = frame.environment;
+            let options = if engine.rendering.mode() == prime_scene::RenderMode::Offline {
+                gpu::Options::new(
+                    false,
+                    streamline::Quality::try_from(quality)?,
+                    samples,
+                    frame.bounces,
+                )?
+            } else {
+                options
+            };
             if !engine.atlas_ready {
                 return Err(Error::Input("draw 前需要上传 atlas"));
             }
             engine.profile.scene = [0; 7];
             engine.profile.update = None;
             let prepare_started = std::time::Instant::now();
-            engine.scene.rebase(anchor);
-            let changed = engine.scene.prepare()? || engine.gpu.scene_resources_dirty();
+            if !frozen {
+                engine.scene.rebase(anchor);
+            }
+            let changed =
+                !frozen && (engine.scene.prepare()? || engine.gpu.scene_resources_dirty());
             engine.profile.scene[0] = elapsed_ns(prepare_started);
             if changed {
                 let scene_started = std::time::Instant::now();
@@ -1143,6 +1226,13 @@ pub unsafe extern "C" fn prime_draw(
                     attribute_ns: timing.attribute_upload_ns + timing.light_upload_ns,
                 });
             }
+            if engine.rendering.mode() == prime_scene::RenderMode::Offline
+                && engine.gpu.accumulated_samples() > (1 << 24) - samples
+            {
+                return Err(Error::Input(
+                    "离线样本达到精确累积上限；请显式重新进入离线模式",
+                ));
+            }
             engine.gpu.draw(
                 command,
                 image,
@@ -1152,6 +1242,7 @@ pub unsafe extern "C" fn prime_draw(
                 environment,
                 options,
             )?;
+            engine.rendering.accepted(frame);
             Ok(())
         })
     })

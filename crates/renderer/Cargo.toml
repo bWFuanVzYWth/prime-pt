@@ -4,18 +4,22 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-light_sampling = { path = "../../../../crates/light_sampling" }
 prime_scene = { path = "../scene" }
-camera = { path = "../../../../crates/camera" }
 thiserror = "2"
-scene_cache = { path = "../../../../crates/scene_cache" }
 bytemuck = { version = "1", features = ["derive"] }
-pt = { path = "../../../../crates/pt", features = ["vulkan"] }
-vulkan = { path = "../../../../crates/vulkan", features = ["dlss_rr"] }
-openpbr = { path = "../../../../crates/openpbr", features = ["program"] }
-shader_build = { path = "../../../../crates/shader_build" }
-atmosphere = { path = "../../../../crates/atmosphere", default-features = false, features = ["native"] }
-simple_engine = { path = "../../../../", features = ["display", "vulkan"] }
+simple_engine = { workspace = true, features = [
+    "light_sampling",
+    "camera",
+    "scene_cache",
+    "pt_gpu",
+    "restir_pt_gpu",
+    "dlss_rr",
+    "openpbr_program",
+    "shader_build",
+    "shader_library",
+    "atmosphere_native",
+    "display",
+] }
 
 [dev-dependencies]
 prime_world = { path = "../world", features = ["test-fixtures"] }
@@ -24,7 +28,7 @@ blake3 = "1.8.7"
 serde_json = "1.0.154"
 
 [build-dependencies]
-shader_build = { path = "../../../../crates/shader_build" }
+simple_engine = { workspace = true, features = ["shader_build", "shader_library"] }
 
 [lints.rust]
 missing_docs = "deny"

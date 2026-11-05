@@ -3,7 +3,7 @@
 //! 相机运动、FOV和anchor变化不自行宣布整个历史域失效，重置事件由GPU所有者决定。
 
 use crate::{scene::Camera, streamline};
-use camera::{Frame, Jitter, Projection, Relative};
+use simple_engine::camera::{self, Frame, Jitter, Projection, Relative};
 
 const NEAR: f32 = 0.01;
 const FAR: f32 = 1_000_000.0;
@@ -92,12 +92,16 @@ impl CameraFrame {
     }
 }
 
-/// Mod 的输入/输出宽度选择引擎 Halton 周期；尺寸错误显式上抛。
+/// RR用统一帧序列生成Halton偏移；关闭重建时固定像素中心，不引入全屏子像素平移。
 pub(crate) const fn jitter(
     index: u32,
     input_width: u32,
     output_width: u32,
+    enabled: bool,
 ) -> Result<[f32; 2], camera::Error> {
+    if !enabled {
+        return Ok([0.; 2]);
+    }
     match Jitter::new(input_width, output_width) {
         Ok(sequence) => Ok(sequence.sample(index)),
         Err(error) => Err(error),
@@ -120,7 +124,7 @@ mod tests {
     #[test]
     fn sdk_receives_negative_input_pixel_jitter_and_unjittered_projection() {
         let camera = CameraFrame::new(&camera(), [0.; 3]).unwrap();
-        let jitter = jitter(3, 960, 1920).unwrap();
+        let jitter = jitter(3, 960, 1920, true).unwrap();
         let frame = camera
             .frame(
                 1,
@@ -137,6 +141,13 @@ mod tests {
             camera.projection.view_to_clip().to_array()
         );
         assert_eq!(frame.aspect, 2.0);
+    }
+
+    #[test]
+    fn raw_rendering_keeps_the_pixel_center_across_frames() {
+        for index in [0, 1, 7, 31] {
+            assert_eq!(jitter(index, 960, 960, false).unwrap(), [0.; 2]);
+        }
     }
 
     #[test]

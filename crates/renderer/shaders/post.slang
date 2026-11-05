@@ -32,16 +32,20 @@ void post_main(uint3 id: SV_DispatchThreadID)
     if (any(id.xy >= params.image.xy))
         return;
     uint pixel = id.y * params.image.x + id.x;
-    float4 sum = accumulation[pixel], tail = output_image[pixel];
-    uint count = sample_counts[pixel];
+    bool diagnostic = (params.output_size.z & 1u) != 0;
+    float4 sum = diagnostic ? float4(0) : accumulation[pixel];
+    float4 tail = output_image[pixel];
+    uint count = diagnostic ? 0u : sample_counts[pixel];
     float4 prefix = prefix_image[pixel];
     float3 radiance = prefix.xyz + tail.xyz;
     if (tail.w >= 0 && prefix.w < pt::FAR && params.lighting.w > 0)
     {
         pt::PathSampler sampler =
-            pt::path_sampler(id.xy, count, params.options.z, params.options.x);
-        float2 offset =
-            params.reconstruction.w > 0 ? 0.5 + params.reconstruction.xy : sampler.film();
+            pt::path_sampler(id.xy, count + (diagnostic ? params.rr_sample : 0u), params.options.z,
+                             params.options.x);
+        float2 offset = params.reconstruction.w > 0 || (params.output_size.z & 2u) != 0
+                            ? 0.5 + params.reconstruction.xy
+                            : sampler.film();
         float2 film = (float2(id.xy) + offset) / float2(params.image.xy);
         atmosphere::AerialSample aerial =
             atmosphere::aerial_sample(aerial_light, aerial_transmittance, linear_sampler, film,
@@ -51,8 +55,11 @@ void post_main(uint3 id: SV_DispatchThreadID)
                        0);
     }
     pt::accumulate_sample(sum, count, radiance, tail.w);
-    accumulation[pixel] = sum;
-    sample_counts[pixel] = count;
-    if (sum.w < 0 || count == params.image.z + params.image.w)
+    if (!diagnostic)
+    {
+        accumulation[pixel] = sum;
+        sample_counts[pixel] = count;
+    }
+    if (diagnostic || sum.w < 0 || count == params.image.z + params.image.w)
         output_image[pixel] = pt::resolve_image(sum, count, true, params.drt);
 }
