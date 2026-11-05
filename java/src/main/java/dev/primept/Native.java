@@ -115,12 +115,12 @@ final class Native implements AutoCloseable {
 
     static MethodHandle bindRenderTuning(SymbolLookup symbols) {
         return bind(symbols, "prime_set_render_tuning", FunctionDescriptor.of(JAVA_INT,
-                JAVA_LONG, JAVA_INT, JAVA_FLOAT, JAVA_INT));
+                JAVA_LONG, JAVA_INT, JAVA_FLOAT, JAVA_INT, JAVA_INT));
     }
 
     static int invokeRenderTuning(MethodHandle target, long id, RenderTuning options) throws Throwable {
         return (int) target.invokeExact(id, options.historyCap(), options.freshPercent()/100.0f,
-                options.diagnostic() ? 1 : 0);
+                options.diagnostic() ? 1 : 0, options.restirCv() ? 1 : 0);
     }
 
     void updateBudget(UpdateBudget next) {

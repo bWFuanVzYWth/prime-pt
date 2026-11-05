@@ -232,8 +232,8 @@ pub unsafe extern "C" fn prime_set_rendering(id: u64, mode: u32, renderer: u32) 
     })
 }
 
-/// 设置历史M cap、固定fresh替换概率和原生无累积诊断；参数统一校验后发布。
-/// 诊断0/1；不修改用户的RR、SPP、画质偏好，离线时不启用诊断。
+/// 设置历史M cap、固定fresh概率、原生诊断和ReSTCV；参数统一校验后发布。
+/// 诊断/CV均为0或1；CV只影响ReSTIR颜色历史，不清路径、RR或普通PT历史。
 /// # Safety
 /// 宿主已完成旧GPU命令，并独占会话及队列。
 #[unsafe(no_mangle)]
@@ -242,12 +242,14 @@ pub unsafe extern "C" fn prime_set_render_tuning(
     cap: u32,
     probability: f32,
     diagnostic: u32,
+    restir_cv: u32,
 ) -> i32 {
     guarded(-1, || {
-        if diagnostic > 1 {
-            return Err(Error::Input("诊断开关须为0或1"));
+        if diagnostic > 1 || restir_cv > 1 {
+            return Err(Error::Input("诊断和ReSTCV开关须为0或1"));
         }
-        let tuning = prime_scene::RenderTuning::new(cap, probability, diagnostic != 0)?;
+        let tuning =
+            prime_scene::RenderTuning::new(cap, probability, diagnostic != 0, restir_cv != 0)?;
         with_engine(id, |engine| {
             engine.gpu.set_render_tuning(tuning)?;
             Ok(())

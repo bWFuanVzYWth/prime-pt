@@ -8,6 +8,7 @@ pub struct RenderTuning {
     history_cap: u32,
     fresh_probability: f32,
     diagnostic: bool,
+    restir_cv: bool,
 }
 
 impl Default for RenderTuning {
@@ -17,15 +18,17 @@ impl Default for RenderTuning {
 }
 
 impl RenderTuning {
-    /// 窗口默认与game相同：历史M上限20、fresh替换概率0.4，关闭诊断。
+    /// 窗口默认与game相同：历史M上限20、fresh替换概率0.4、开启ReSTCV，关闭诊断。
     pub const DEFAULT: Self = Self {
         history_cap: 20,
         fresh_probability: 0.4,
         diagnostic: false,
+        restir_cv: true,
     };
-    /// 离屏算法基线不替换输出，其他值同默认。
+    /// 离屏路径算法基线关闭CV和fresh替换，保留独立估计对照。
     pub const BASELINE: Self = Self {
         fresh_probability: 0.,
+        restir_cv: false,
         ..Self::DEFAULT
     };
 
@@ -36,6 +39,7 @@ impl RenderTuning {
         history_cap: u32,
         fresh_probability: f32,
         diagnostic: bool,
+        restir_cv: bool,
     ) -> Result<Self, Error> {
         if history_cap < 1 || history_cap > 100 {
             return Err(Error::Input("ReSTIR历史M上限须为1..=100"));
@@ -47,6 +51,7 @@ impl RenderTuning {
             history_cap,
             fresh_probability,
             diagnostic,
+            restir_cv,
         })
     }
     /// temporal MIS对历史M应用的固定上限，不修改源UCW。
@@ -60,6 +65,10 @@ impl RenderTuning {
     /// 原生分辨率、关闭重建且不跨帧累积RGB的实时诊断偏好。
     pub const fn diagnostic(self) -> bool {
         self.diagnostic
+    }
+    /// 启用像素颜色控制变量估计；仅ReSTIR消费，切换保留路径历史。
+    pub const fn restir_cv(self) -> bool {
+        self.restir_cv
     }
 }
 
@@ -112,16 +121,16 @@ mod tests {
     use super::*;
     #[test]
     fn tuning_accepts_probability_and_mass_endpoints() {
-        assert!(RenderTuning::new(1, 0., true).is_ok());
-        assert!(RenderTuning::new(100, 1., false).is_ok());
+        assert!(RenderTuning::new(1, 0., true, false).is_ok());
+        assert!(RenderTuning::new(100, 1., false, false).is_ok());
     }
     #[test]
     fn tuning_rejects_invalid_mass_or_nonfinite_probability() {
         for cap in [0, 101] {
-            assert!(RenderTuning::new(cap, 0.4, false).is_err());
+            assert!(RenderTuning::new(cap, 0.4, false, false).is_err());
         }
         for probability in [-0.1, 1.1, f32::NAN, f32::INFINITY] {
-            assert!(RenderTuning::new(20, probability, false).is_err());
+            assert!(RenderTuning::new(20, probability, false, false).is_err());
         }
     }
 }

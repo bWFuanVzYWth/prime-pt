@@ -36,7 +36,12 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let mut cases = Vec::new();
-    for renderer in [RealtimeRenderer::PathTrace, RealtimeRenderer::RestirPt] {
+    for (renderer, cv) in [
+        (RealtimeRenderer::PathTrace, false),
+        (RealtimeRenderer::RestirPt, false),
+        (RealtimeRenderer::RestirPt, true),
+    ] {
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., false, cv)?)?;
         gpu.set_rendering(RenderMode::Realtime, renderer)?;
         gpu.set_regions(RenderView {
             generation: gpu.resource_generation,
@@ -73,7 +78,9 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         let pixels = output.download(&mut gpu.context)?;
         assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[..3] != [0; 3]));
         cases.push(
-            serde_json::json!({"renderer":format!("{renderer:?}"), "cpu_gpu_ns":samples, "frames":frame,
+            serde_json::json!({"renderer":format!("{renderer:?}"), "cv":cv, "cpu_gpu_ns":samples, "frames":frame,
+            "restir_requested_bytes":gpu.restir.as_ref().map(|r|r.test_buffers().requested_bytes()),
+            "cv_color_bytes":gpu.restir.as_ref().map(|r|2*r.test_buffers().layout().memory().color_estimate),
             "display_blake3":blake3::hash(&pixels).to_hex().as_str()}),
         );
     }

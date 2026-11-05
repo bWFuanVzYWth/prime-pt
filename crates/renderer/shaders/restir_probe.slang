@@ -6,7 +6,7 @@ import restir_pt.types;
 import mod_scene;
 import params;
 
-[[vk::binding(45, 0)]]
+[[vk::binding(47, 0)]]
 RWStructuredBuffer<uint4> donor_output;
 
 [shader("compute")]
@@ -30,4 +30,12 @@ void restir_identity_probe()
         uint4(restir_valid_hit(hit), scene.loadSurface(hit, float3(0, 0, -1), true).hit.isValid(),
               scene.loadSurfaceFromOrigin(hit, float3(0), true).hit.isValid(),
               scene.loadSurface(hit, float3(0, 0, -1), true).identity.w);
+}
+
+/// 只导出生产paired地址，CPU以独立f64公式核对颜色，不复制邻居调度。
+[shader("compute")]
+[numthreads(16, 16, 1)]
+void restir_cv_neighbors(uint3 id: SV_DispatchThreadID)
+{
+    donor_output[id.y * 32u + id.x] = cv_spatial_indices(id.xy);
 }

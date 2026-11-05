@@ -55,6 +55,8 @@
   "primept.settings.restir_cap": "ReSTIR history M cap",
   "primept.settings.restir_cap.tooltip": "Limit temporal reservoir history to 1–100. This preserves each source path's sampling weight.\nCommand: /pt mcap 1..100",
   "primept.settings.restir_fresh": "ReSTIR fresh output",
+  "primept.settings.restir_cv": "ReSTCV color estimate",
+  "primept.settings.restir_cv.tooltip": "Reduce ReSTIR color noise with temporal and spatial control variates. Enabled by default. Toggling starts fresh color history and preserves path history.\nCommand: /pt cv on|off",
   "primept.settings.restir_fresh.tooltip": "Choose the fresh estimate independently at this fixed probability to reduce output correlation. 0% shows reuse, 100% shows fresh. Reuse stages still run.\nCommand: /pt fresh 0..100",
   "primept.settings.diagnostic": "Native raw diagnostic",
   "primept.settings.diagnostic.tooltip": "Native resolution, one sample per frame, no RR or frame accumulation. ReSTIR reuse and display exposure remain active. Existing quality and sample settings are preserved.\nCommand: /pt diagnostic on|off"

@@ -1,8 +1,8 @@
 package dev.primept;
 
 /** 固定ReSTIR输出概率、历史上限与实时原生诊断；不会改写RR、SPP或画质偏好。 */
-record RenderTuning(int historyCap, int freshPercent, boolean diagnostic) {
-    static final RenderTuning DEFAULT = new RenderTuning(20, 40, false);
+record RenderTuning(int historyCap, int freshPercent, boolean diagnostic, boolean restirCv) {
+    static final RenderTuning DEFAULT = new RenderTuning(20, 40, false, true);
 
     RenderTuning {
         if (historyCap < 1 || historyCap > 100)

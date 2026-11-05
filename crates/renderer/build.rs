@@ -193,6 +193,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("shaders/post.slang", "post_main", "post.spv"),
         (
             "shaders/restir_probe.slang",
+            "restir_cv_neighbors",
+            "restir_cv_neighbors.spv",
+        ),
+        (
+            "shaders/restir_probe.slang",
             "restir_donor_probe",
             "restir_donor_probe.spv",
         ),

@@ -23,7 +23,7 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, ENABLED, MODE, REALTIME_RENDERER, RESTIR_CAP, RESTIR_FRESH, DIAGNOSTIC, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
+    enum Row { RESET, RENDER, ENABLED, MODE, REALTIME_RENDERER, RESTIR_CAP, RESTIR_FRESH, RESTIR_CV, DIAGNOSTIC, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
         LATITUDE, SOLAR_LONGITUDE,
         DISPLAY, EXPOSURE, AUTO_EXPOSURE, DRT_SATURATION, DRT_HUE, DRT_COMPRESSION_START }
 
@@ -58,6 +58,7 @@ public final class VideoOptions {
     private CycleButton<RenderMode> mode;
     private CycleButton<RealtimeRenderer> realtimeRenderer;
     private CycleButton<Boolean> diagnostic;
+    private CycleButton<Boolean> restirCv;
     private CycleButton<Boolean> rr;
     private CycleButton<Boolean> ser;
     private CycleButton<Quality> quality;
@@ -116,6 +117,14 @@ public final class VideoOptions {
                     () -> Settings.tuning().historyCap(), value -> Settings.setHistoryCap((int)value), ValueFormat.INTEGER);
             case RESTIR_FRESH -> addSlider("restir_fresh", 0, 100, 1,
                     () -> Settings.tuning().freshPercent(), value -> Settings.setFreshPercent((int)value), ValueFormat.PERCENT);
+            case RESTIR_CV -> {
+                restirCv = cycle(CycleButton.onOffBuilder(Settings.tuning().restirCv())
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("restir_cv.tooltip"))),
+                        text("restir_cv"), () -> Settings.tuning().restirCv(), value -> {
+                            if (applyPendingSliders()) Settings.setRestirCv(value);
+                        }, this::failed);
+                list.addBig(restirCv);
+            }
             case DIAGNOSTIC -> {
                 diagnostic = cycle(CycleButton.onOffBuilder(Settings.tuning().diagnostic())
                         .withTooltip(OptionInstance.cachedConstantTooltip(text("diagnostic.tooltip"))),
@@ -236,6 +245,8 @@ public final class VideoOptions {
         mode.active = Settings.enabled();
         boolean realtime = Settings.enabled() && !Settings.offline();
         realtimeRenderer.active = realtime;
+        restirCv.active = realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT;
+        if (restirCv.getValue() != Settings.tuning().restirCv()) restirCv.setValue(Settings.tuning().restirCv());
         ser.active = realtime;
         diagnostic.active = realtime;
         if (diagnostic.getValue() != Settings.tuning().diagnostic()) diagnostic.setValue(Settings.tuning().diagnostic());

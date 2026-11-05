@@ -31,7 +31,8 @@ public struct Params
     public float4 previous_forward;
     public float4 previous_right;
     public float4 previous_up;
-    /// xy=输出尺寸；z bit0为原生无累积诊断、bit1为ReSTIR、bit2为资源含作者法线；w为历史M cap。
+    /// xy=输出尺寸；z bit0诊断、bit1 ReSTIR、bit2作者法线、bit3 CV、bit4已接受CV历史；w为历史M
+    /// cap。
     public uint4 output_size;
     /// 当前64m anchor的整数region坐标；光源保持region-local不随anchor重打包。
     public int4 anchor_region;

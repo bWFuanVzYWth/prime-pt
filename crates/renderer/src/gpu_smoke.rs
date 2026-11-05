@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[path = "scene_bench.rs"]
 mod scene_bench;
 
+#[path = "cv_tests.rs"]
+mod cv_tests;
 #[path = "features_tests.rs"]
 mod features_tests;
 #[path = "history_tests.rs"]

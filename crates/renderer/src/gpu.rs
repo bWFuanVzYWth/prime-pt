@@ -404,7 +404,7 @@ impl View {
             return Err(Error::Invalid("视图尺寸须属于 1..=65536"));
         }
         let pixels = u64::from(extent[0]) * u64::from(extent[1]);
-        // 五个命中plane另加16B identity；着色法线/纹理与发光反向PDF使用原命中身份。
+        // 五个命中plane另加16B identity；ReSTIR与PT互斥，复用normal plane缓存当帧CV代理。
         let landing = [16, 16, 4, 8, 4, 16]
             .map(|stride| Buffer::new(context, pixels * stride, false))
             .into_iter()
@@ -738,10 +738,14 @@ pub struct Gpu {
 
 impl Gpu {
     /// 宿主完成旧命令后发布固定采样偏好；输出概率/M cap热切换保留路径历史。
-    /// 诊断仅在实时生效，切换时重启RGB累积，离线快照继续普通PT。
+    /// CV切换只显式失效颜色历史。诊断仅在实时生效，切换时重启RGB累积，离线继续普通PT。
     /// # Errors
     /// 底层完成或资源状态错误原样返回。
     pub fn set_render_tuning(&mut self, tuning: prime_scene::RenderTuning) -> Result<(), Error> {
+        if self.tuning.restir_cv() != tuning.restir_cv() {
+            self.complete_previous()?;
+            self.transition_history(history::Event::RestirColorModeChanged)?;
+        }
         if self.tuning.diagnostic() != tuning.diagnostic() && !self.offline {
             self.complete_previous()?;
             self.transition_history(history::Event::Accumulation(
@@ -2452,6 +2456,13 @@ impl Gpu {
                 self.rr_previous
             };
             let previous_jitter = self.restir.as_ref().map_or([0.; 2], |r| r.previous_jitter);
+            let cv_enabled = using_restir && self.tuning.restir_cv();
+            let cv_history = cv_enabled
+                && restir_frame.is_some_and(|f| f.history_valid)
+                && self
+                    .restir
+                    .as_ref()
+                    .is_some_and(|r| r.color_history_valid());
             let current = CameraFrame::new(camera, self.anchor)?;
             let vectors = [camera.origin, camera.forward, camera.right, camera.up];
             let key = std::array::from_fn(|i| {
@@ -2542,7 +2553,9 @@ impl Gpu {
                         self.generation
                             .as_ref()
                             .is_some_and(|g| g.hit.authored_normals),
-                    ) << 2),
+                    ) << 2)
+                    | (u32::from(cv_enabled) << 3)
+                    | (u32::from(cv_history) << 4),
                 self.tuning.history_cap(),
             ]);
             words.extend(self.anchor.map(|v| ((v / 64.) as i32) as u32));
@@ -2574,7 +2587,7 @@ impl Gpu {
             }
             if using_restir {
                 let restir = self.restir.as_mut().unwrap();
-                result.push(restir.record(&mut self.context, current, jitter)?);
+                result.push(restir.record(&mut self.context, current, jitter, cv_enabled)?);
                 result.push(restir.post(&mut self.context)?);
             } else {
                 result.push(

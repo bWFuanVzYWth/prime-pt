@@ -1,4 +1,9 @@
-//! 原生 ReSTIR 工作集与准备好的阶段程序；场景和完成边界仍归 Gpu。
+//! 原生ReSTIR工作集与ReSTCV颜色事务；场景和显式失效边界仍归Gpu。
+//!
+//! 两份颜色各12N字节，颜色属于像素，不跟随路径赢家或fresh输出选择。
+//! 当帧反射率代理复用PT的normal暂存区，initial先写merge再读；不增加存储或跨SER活跃状态。
+//! 只允许连续成功提交的CV帧读取旧颜色；开关事件仅令颜色冷启动。
+//! 静态场景下的线性控制变量性质沿用引擎control_variate契约；当前场景重放不保证动态无偏。
 
 use super::{Error, materials, shader};
 use simple_engine::restir_pt;
@@ -17,8 +22,10 @@ pub(super) struct Restir {
         restir_pt::FrameToken,
         crate::reconstruction::CameraFrame,
         [f32; 2],
+        bool,
     )>,
     pub previous_camera: Option<crate::reconstruction::CameraFrame>,
+    accepted_cv: bool,
 }
 
 fn binding_rows(
@@ -39,6 +46,14 @@ fn binding_rows(
     scene.extend(
         [*buffers.neighbor_mask(), *buffers.precomputed(), lut].map(Binding::StorageBuffer),
     );
+    scene.extend(
+        buffers
+            .color_estimates()
+            .expect("布局含独立CV颜色")
+            .iter()
+            .copied()
+            .map(Binding::StorageBuffer),
+    );
     scene
 }
 
@@ -57,8 +72,10 @@ impl Restir {
         callables: &[super::RayShader<'_>],
         reordered: bool,
     ) -> Result<Self, Error> {
-        let buffers =
-            Buffers::new_native(context, restir_pt::Layout::with_fusion([1, 1], FUSION)?)?;
+        let buffers = Buffers::new_native(
+            context,
+            restir_pt::Layout::with_color_estimates([1, 1], FUSION)?,
+        )?;
         let bindings = Bindings::new(context, &binding_rows(scene, geometry, lut, &buffers))?;
         let initial = shader(
             if reordered {
@@ -161,6 +178,7 @@ impl Restir {
             previous_jitter: [0.; 2],
             previous_camera: None,
             pending: None,
+            accepted_cv: false,
         })
     }
 
@@ -176,6 +194,25 @@ impl Restir {
     #[cfg(test)]
     pub fn primary_history(&self) -> Buffer {
         self.renderer.buffers().primary_hits()[1]
+    }
+
+    #[cfg(test)]
+    pub fn test_buffers(&self) -> &Buffers<Buffer> {
+        self.renderer.buffers()
+    }
+
+    #[cfg(test)]
+    pub fn test_bindings(
+        &self,
+        context: &mut Context,
+        scene: Vec<Binding>,
+        geometry: Buffer,
+        lut: Buffer,
+        output: Option<Buffer>,
+    ) -> Result<Bindings, Error> {
+        let mut rows = binding_rows(scene, geometry, lut, self.renderer.buffers());
+        rows.extend(output.map(Binding::StorageBuffer));
+        Ok(Bindings::new(context, &rows)?)
     }
 
     #[cfg(test)]
@@ -231,8 +268,10 @@ impl Restir {
         lut: Buffer,
         extent: [u32; 2],
     ) -> Result<Self, Error> {
-        let buffers =
-            Buffers::new_native(context, restir_pt::Layout::with_fusion(extent, FUSION)?)?;
+        let buffers = Buffers::new_native(
+            context,
+            restir_pt::Layout::with_color_estimates(extent, FUSION)?,
+        )?;
         let bindings = Bindings::new(context, &binding_rows(scene, geometry, lut, &buffers))?;
         Ok(Self {
             renderer: self.renderer.prepare_resize(context, bindings, buffers)?,
@@ -240,6 +279,7 @@ impl Restir {
             previous_jitter: [0.; 2],
             previous_camera: None,
             pending: None,
+            accepted_cv: false,
         })
     }
 
@@ -277,6 +317,14 @@ impl Restir {
         self.pending.is_some()
     }
 
+    pub const fn color_history_valid(&self) -> bool {
+        self.accepted_cv
+    }
+
+    pub fn invalidate_color(&mut self, _: super::history::ResetPermit) {
+        self.accepted_cv = false;
+    }
+
     pub fn invalidate(&mut self, _: super::history::ResetPermit) -> Result<(), Error> {
         self.renderer.reset_history()?;
         self.previous_camera = None;
@@ -289,9 +337,10 @@ impl Restir {
         context: &mut Context,
         camera: crate::reconstruction::CameraFrame,
         jitter: [f32; 2],
+        cv: bool,
     ) -> Result<Recorded, Error> {
         let frame = self.renderer.record(context)?;
-        self.pending = Some((frame.token, camera, jitter));
+        self.pending = Some((frame.token, camera, jitter, cv));
         Ok(frame.commands)
     }
 
@@ -305,16 +354,17 @@ impl Restir {
     }
 
     pub fn completed(&mut self) -> Result<(), Error> {
-        if let Some((token, camera, jitter)) = self.pending.take() {
+        if let Some((token, camera, jitter, cv)) = self.pending.take() {
             self.renderer.commit(token)?;
             self.previous_camera = Some(camera);
             self.previous_jitter = jitter;
+            self.accepted_cv = cv;
         }
         Ok(())
     }
 
     pub fn cancelled(&mut self) -> Result<(), Error> {
-        if let Some((token, _, _)) = self.pending.take() {
+        if let Some((token, _, _, _)) = self.pending.take() {
             self.renderer.reject(token)?;
         }
         Ok(())

@@ -36,18 +36,19 @@ cargo test --locked -p prime_renderer --lib hardware_pt_restir_ -- --ignored --n
 
 ## 时间历史的显式管理
 
-普通PT的静态图像累积、RR重建与ReSTIR路径复用是三个不同消费者。失效由同一个事件入口管理，不在参数查询或描述符重绑时暗中清零。
+普通PT的静态图像累积、RR重建、ReSTIR路径复用和ReSTCV颜色估计分别维护历史。失效由同一个事件入口管理，不在参数查询或描述符重绑时暗中清零。
 
 | 事件 | 影响范围 |
 | --- | --- |
-| 切换世界、模型/材质身份域整体替换、切换渲染模式/积分器、显式请求全局失效 | 丢弃三个消费者的历史，保留曝光适应；绝对RR样本与jitter序号不回退。 |
+| 切换世界、模型/材质身份域整体替换、切换渲染模式/积分器、显式请求全局失效 | 丢弃四个消费者的历史，保留曝光适应；绝对RR样本与jitter序号不回退。 |
 | 相机/FOV、anchor、日照、介质、seed/路径预算、区块/属性变化 | 普通PT静态均值显式重新开始；RR和ReSTIR继续，失效mesh按稳定身份局部拒绝。 |
 | RR、ReSTIR或诊断模式的逐帧图像输出 | 每帧显式重开RGB样本域，保留时间复用历史。 |
 | SER、M cap、fresh输出比例变化 | 保留路径工作集与时间历史。 |
+| ReSTCV开关变化 | 只显式失效颜色历史；不清路径、RR或普通PT均值。首个成功提交的启用帧建立新颜色历史。 |
 | 实际视图或SDK存储替换 | 分别记录冷启动；ReSTIR只有输入尺寸改变才更换其工作集，同尺寸重绑保留历史。 |
 | RR求值失败 | 显式失效RR，保留ReSTIR；未提交帧的取消不清除已接受路径或相机。 |
 
-在游戏日志中搜索`pt.history`、`rr.history`和`restir.history`。`action=reset`表示封闭全局事件，`storage_cold`表示实际存储冷启动，`recovery_reset`表示RR失败恢复；`valid`记录此前是否存在已接受历史。每帧RGB样本域与静态均值的局部失效只计数，不逐帧打印日志。代码契约从[GPU模块文档](../target/doc/prime_renderer/gpu/index.html)查看。
+在游戏日志中搜索`pt.history`、`rr.history`、`restir.history`和`restcv.history`。`action=reset`表示显式失效，颜色消费者还可由`mode_changed`单独失效；`storage_cold`表示实际存储冷启动，`recovery_reset`表示RR失败恢复。`valid`记录此前是否存在已接受历史。每帧RGB样本域与静态均值的局部失效只计数，不逐帧打印日志。代码契约从[GPU模块文档](../target/doc/prime_renderer/gpu/index.html)查看。
 
 ReSTIR保留了缓存后缀的入射辐射，不保证任意动态光照下没有鬼影或完全无偏；M cap约束样本量，不是历史存活帧数。离线样本到达精确累积上限会报错，需显式重新进入离线模式，不自动清空图像。
 
@@ -78,4 +79,4 @@ $env:PRIME_PT_RENDER_BENCH_OUTPUT = Join-Path (Get-Location).Path "temp/render-$
 cargo test --locked --release -p prime_renderer --lib hardware_pt_render_profile -- --ignored --nocapture --test-threads=1
 ```
 
-JSON 保存每帧 CPU 录制时间和 GPU 时间戳跨度。输入是 960×540、4096 个四边形、每帧一个样本和12顶点预算；不包含 RR、Java 捕获、场景更新和窗口呈现，不能换算为 Minecraft 帧率。编译后首次运行还会建立驱动缓存，应保留记录并单独重跑校准。
+JSON 保存普通PT、ReSTIR关闭CV及开启CV三组的每帧CPU录制时间和GPU时间戳跨度。输入是960×540、4096个四边形、每帧一个样本和12顶点预算；各组至少预热两秒，不包含RR、Java捕获、场景更新和窗口呈现，不能换算为Minecraft帧率。编译后首次运行还会建立驱动缓存，应保留记录并单独重跑校准。

@@ -64,7 +64,7 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
         download_buffer(&mut gpu, accumulation)?,
         download_buffer(&mut gpu, counts)?,
     ];
-    gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., true)?)?;
+    gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., true, false)?)?;
     let mut displays = Vec::new();
     for _ in 0..3 {
         host.render_options(
@@ -123,7 +123,12 @@ fn hardware_pt_restir_fresh_selection_preserves_path_history()
             prime_scene::RenderMode::Realtime,
             RealtimeRenderer::RestirPt,
         )?;
-        gpu.set_render_tuning(prime_scene::RenderTuning::new(20, probability, false)?)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(
+            20,
+            probability,
+            false,
+            false,
+        )?)?;
         publish(&mut gpu, &mesh, 1)?;
         for _ in 0..8 {
             host.render_options(
@@ -160,7 +165,7 @@ fn hardware_pt_restir_history_cap_limits_temporal_mass() -> Result<(), Box<dyn s
             prime_scene::RenderMode::Realtime,
             RealtimeRenderer::RestirPt,
         )?;
-        gpu.set_render_tuning(prime_scene::RenderTuning::new(cap, 0., false)?)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(cap, 0., false, false)?)?;
         publish(&mut gpu, &mesh, 1)?;
         for _ in 0..8 {
             host.render_options(

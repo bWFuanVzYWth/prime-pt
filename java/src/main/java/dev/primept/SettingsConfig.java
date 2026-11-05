@@ -60,7 +60,8 @@ final class SettingsConfig {
                             parseBoolean(properties, "enabled", true), RenderMode.REALTIME,
                             RealtimeRenderer.parse(properties.getProperty("realtime_renderer", "path_trace"))),
                     new RenderTuning(readInt(properties, "restir.history_cap", 20),
-                        readInt(properties, "restir.fresh_percent", 40), parseBoolean(properties, "diagnostic.raw", false)));
+                        readInt(properties, "restir.fresh_percent", 40), parseBoolean(properties, "diagnostic.raw", false),
+                        parseBoolean(properties, "restir.cv", true)));
         } catch (IOException | IllegalArgumentException error) {
             System.getLogger("prime_pt").log(System.Logger.Level.WARNING, "PT 配置无效，使用默认值", error);
         }
@@ -193,19 +194,27 @@ final class SettingsConfig {
         if (parts.length > 3) return usage();
         try {
             switch (parts[1]) {
+                case "cv" -> {
+                    if (parts.length == 3) {
+                        if (!parts[2].equals("on") && !parts[2].equals("off"))
+                            throw new IllegalArgumentException("ReSTCV开关必须为on或off");
+                        setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), tuning().diagnostic(), parts[2].equals("on")));
+                    }
+                    return "ReSTCV：" + (tuning().restirCv() ? "on" : "off");
+                }
                 case "diagnostic" -> {
                     if (parts.length == 3) {
                         if (!parts[2].equals("on") && !parts[2].equals("off")) throw new IllegalArgumentException("诊断开关必须为on或off");
-                        setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), parts[2].equals("on")));
+                        setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), parts[2].equals("on"), tuning().restirCv()));
                     }
                     return "原生无累积诊断：" + (tuning().diagnostic() ? "on" : "off");
                 }
                 case "mcap" -> {
-                    if (parts.length == 3) setTuning(new RenderTuning(Integer.parseInt(parts[2]), tuning().freshPercent(), tuning().diagnostic()));
+                    if (parts.length == 3) setTuning(new RenderTuning(Integer.parseInt(parts[2]), tuning().freshPercent(), tuning().diagnostic(), tuning().restirCv()));
                     return "ReSTIR历史M上限：" + tuning().historyCap();
                 }
                 case "fresh" -> {
-                    if (parts.length == 3) setTuning(new RenderTuning(tuning().historyCap(), Integer.parseInt(parts[2]), tuning().diagnostic()));
+                    if (parts.length == 3) setTuning(new RenderTuning(tuning().historyCap(), Integer.parseInt(parts[2]), tuning().diagnostic(), tuning().restirCv()));
                     return "ReSTIR初采输出比例：" + tuning().freshPercent() + "%";
                 }
                 case "enabled" -> {
@@ -280,7 +289,8 @@ final class SettingsConfig {
     private String status() {
         return "Prime " + selection().enabled() + " / " + selection().mode().key + " / " + selection().renderer().key + " / SER " + (ser() ? "on" : "off") + " / RR " + (rr() ? "on" : "off") + " / " + quality().key() + " / " + ev()
                 + " EV / " + samples() + " SPP / " + bounces() + " 顶点 / M cap " + tuning().historyCap()
-                + " / fresh " + tuning().freshPercent() + "% / 原生诊断 " + (tuning().diagnostic() ? "on" : "off");
+                + " / fresh " + tuning().freshPercent() + "% / ReSTCV " + (tuning().restirCv() ? "on" : "off")
+                + " / 原生诊断 " + (tuning().diagnostic() ? "on" : "off");
     }
 
     private void store(Values next) throws IOException {
@@ -291,6 +301,7 @@ final class SettingsConfig {
             Files.writeString(temporary, "enabled=" + next.selection.enabled()
                     + "\nrestir.history_cap=" + next.tuning.historyCap() + "\nrestir.fresh_percent=" + next.tuning.freshPercent()
                     + "\ndiagnostic.raw=" + next.tuning.diagnostic()
+                    + "\nrestir.cv=" + next.tuning.restirCv()
                     + "\nrealtime_renderer=" + next.selection.renderer().key + "\nexposure_ev=" + next.ev + "\nrr=" + next.rr
                     + "\nquality=" + next.quality.key() + "\nsamples=" + next.samples + "\nbounces=" + next.bounces
                     + "\nser=" + next.ser + "\nupdate_budget=" + next.updateBudget.key
@@ -330,6 +341,6 @@ final class SettingsConfig {
 
     private static String usage() {
         return "用法：/pt enabled [on|off]；/pt mode [realtime|offline]；/pt renderer [path_trace|restir_pt]；/pt ser [on|off]；/pt rr [on|off]；/pt quality [dlaa|quality|balanced|performance|ultra_performance]；"
-                + "/pt ev [EV]；/pt spp [1..64]；/pt bounces [1..64]；/pt mcap [1..100]；/pt fresh [0..100]；/pt diagnostic [on|off]；/pt reset";
+                + "/pt ev [EV]；/pt spp [1..64]；/pt bounces [1..64]；/pt mcap [1..100]；/pt fresh [0..100]；/pt cv [on|off]；/pt diagnostic [on|off]；/pt reset";
     }
 }

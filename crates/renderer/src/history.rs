@@ -73,6 +73,7 @@ pub(super) enum Event {
     ViewStorage(StorageEvent),
     RrStorage(StorageEvent),
     RestirStorage(StorageEvent),
+    RestirColorModeChanged,
     RrEvaluationFailed,
 }
 
@@ -105,6 +106,7 @@ pub(super) struct Audit {
     pub accumulation_resets: u64,
     pub rr_resets: u64,
     pub restir_resets: u64,
+    pub restir_color_resets: u64,
     pub view_storage: u64,
     pub restir_storage: u64,
     pub last_accumulation: Option<AccumulationEvent>,
@@ -118,7 +120,9 @@ impl Gpu {
     /// 唯一失效执行点。调用者已完成旧帧，取消时须先reject待接受的路径帧。
     pub(super) fn transition_history(&mut self, event: Event) -> Result<(), Error> {
         let global = matches!(event, Event::Global(_));
-        if global && self.restir.as_ref().is_some_and(|r| r.has_pending()) {
+        if (global || matches!(event, Event::RestirColorModeChanged))
+            && self.restir.as_ref().is_some_and(|r| r.has_pending())
+        {
             return Err(simple_engine::restir_pt::Error::PendingFrame.into());
         }
         let accumulation =
@@ -168,11 +172,32 @@ impl Gpu {
             }
             self.history_audit.restir_resets = self.history_audit.restir_resets.saturating_add(1);
         }
+        if global || matches!(event, Event::RestirColorModeChanged) {
+            let name = if let Event::Global(reason) = event {
+                reason.name()
+            } else {
+                "mode_changed"
+            };
+            if let Some(restir) = &mut self.restir {
+                record("restcv", name, "reset", restir.color_history_valid());
+                restir.invalidate_color(ResetPermit(()));
+            }
+            self.history_audit.restir_color_resets =
+                self.history_audit.restir_color_resets.saturating_add(1);
+        }
         match event {
             Event::ViewStorage(_) => {
                 self.history_audit.view_storage = self.history_audit.view_storage.saturating_add(1)
             }
             Event::RestirStorage(reason) => {
+                record(
+                    "restcv",
+                    reason.name(),
+                    "storage_cold",
+                    self.restir
+                        .as_ref()
+                        .is_some_and(|r| r.color_history_valid()),
+                );
                 record(
                     "restir",
                     reason.name(),

@@ -12,17 +12,20 @@ final class RenderTuningFixture {
         var config = new SettingsConfig(path);
         require(config.tuning().equals(RenderTuning.DEFAULT), "默认M cap=20、fresh=40%、关闭诊断");
         config.command("pt mcap 100");
+        require(config.tuning().restirCv(), "默认开启ReSTCV");
+        config.command("pt cv off");
         config.command("pt fresh 100");
         config.command("pt diagnostic on");
         config.setSamples(8);
         config.setQuality(Quality.BALANCED);
         var saved = new SettingsConfig(path);
-        require(saved.tuning().equals(new RenderTuning(100, 100, true)), "命令保存新设置，其他setter保留它们");
+        require(saved.tuning().equals(new RenderTuning(100, 100, true, false)), "命令保存CV开关，其他setter保留它们");
         require(saved.rr() && saved.samples() == 8 && saved.quality() == Quality.BALANCED,
                 "诊断保留请求的RR、SPP及画质偏好");
         var before = saved.tuning();
         saved.command("pt mcap 0");
         saved.command("pt fresh 101");
+        saved.command("pt cv invalid");
         require(saved.tuning().equals(before), "越界命令不部分发布设置");
         saved.command("pt mode offline");
         require(!saved.tuning().diagnosticActive(saved.selection()) && saved.tuning().diagnostic(),

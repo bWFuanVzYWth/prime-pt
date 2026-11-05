@@ -50,9 +50,10 @@ void post_main(uint3 id: SV_DispatchThreadID)
         atmosphere::AerialSample aerial =
             atmosphere::aerial_sample(aerial_light, aerial_transmittance, linear_sampler, film,
                                       prefix.w * 0.001, params.atmosphere_settings.w);
-        radiance = max(color::rec2020_to_bt709(aerial.radiance + color::bt709_to_rec2020(radiance) *
-                                                                     aerial.transmittance),
-                       0);
+        radiance = color::rec2020_to_bt709(aerial.radiance + color::bt709_to_rec2020(radiance) *
+                                                                 aerial.transmittance);
+        if ((params.output_size.z & 8u) == 0)
+            radiance = max(radiance, 0);
     }
     pt::accumulate_sample(sum, count, radiance, tail.w);
     if (!diagnostic)

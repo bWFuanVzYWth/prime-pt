@@ -25,13 +25,16 @@ public final class Settings {
     static RenderTuning tuning() { return Holder.CONFIG.tuning(); }
     public static boolean diagnostic() { return tuning().diagnosticActive(Holder.CONFIG.selection()); }
     static void setHistoryCap(int value) throws IOException {
-        Holder.CONFIG.setTuning(new RenderTuning(value, tuning().freshPercent(), tuning().diagnostic()));
+        Holder.CONFIG.setTuning(new RenderTuning(value, tuning().freshPercent(), tuning().diagnostic(), tuning().restirCv()));
     }
     static void setFreshPercent(int value) throws IOException {
-        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), value, tuning().diagnostic()));
+        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), value, tuning().diagnostic(), tuning().restirCv()));
     }
     static void setDiagnostic(boolean value) throws IOException {
-        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), value));
+        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), value, tuning().restirCv()));
+    }
+    static void setRestirCv(boolean value) throws IOException {
+        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), tuning().diagnostic(), value));
     }
     public static void setEnabled(boolean value) throws IOException {
         Holder.CONFIG.setSelection(new RenderSelection(value, mode(), realtimeRenderer()));

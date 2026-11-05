@@ -112,7 +112,12 @@ fn hardware_pt_restir_history_survives_frame_inputs() -> Result<(), Box<dyn std:
         camera.right[0] *= 1.001;
         gpu.settings.seed += 1;
         gpu.set_initial_medium([1. + angle, 0., 0., 0.])?;
-        gpu.set_render_tuning(prime_scene::RenderTuning::new(20 + frame, 0.4, false)?)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(
+            20 + frame,
+            0.4,
+            false,
+            false,
+        )?)?;
         if frame == 4 {
             publish(&mut gpu, &mesh, [64., 0., 0.])?;
             camera.origin[0] -= 64.;

@@ -64,12 +64,14 @@ final class SettingsLanguageFixture {
                 try (var resources = new MultiPackResourceManager(PackType.CLIENT_RESOURCES, List.of(vanilla, pack))) {
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us"), false));
                     requireText("render", "PT rendering");
+                    requireText("restir_cv", "ReSTCV color estimate");
                     requireRenderingHierarchy("Prime PT", "Rendering mode", "Offline snapshot", "Realtime renderer");
                     requireWidgetText("Samples per frame", "DLSS quality", "Performance (2×)");
                     requireAutoExposure("Auto exposure strength");
                     requireLighting("Sun intensity", "Block emission intensity");
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "PT 渲染");
+                    requireText("restir_cv", "ReSTCV 颜色估计");
                     requireRenderingHierarchy("Prime PT 开关", "渲染模式", "离线快照", "实时渲染器");
                     requireWidgetText("每帧采样数", "DLSS 质量", "性能（2×）");
                     requireAutoExposure("自动曝光强度");
