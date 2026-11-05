@@ -50,6 +50,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         })?;
         let mut samples = Vec::new();
         let mut frame = 0;
+        let warmup = std::time::Instant::now();
         while samples.len() < 64 {
             if renderer == RealtimeRenderer::PathTrace {
                 gpu.transition_history(history::Event::Accumulation(
@@ -64,7 +65,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
                 Options::new(false, streamline::Quality::Dlaa, 1, 12)?,
                 Some(queries),
             )?;
-            if frame >= 64 {
+            if frame >= 64 && warmup.elapsed() >= std::time::Duration::from_secs(2) {
                 samples.push(timing);
             }
             frame += 1;
@@ -72,7 +73,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         let pixels = output.download(&mut gpu.context)?;
         assert!(pixels.as_chunks::<4>().0.iter().any(|p| p[..3] != [0; 3]));
         cases.push(
-            serde_json::json!({"renderer":format!("{renderer:?}"), "cpu_gpu_ns":samples,
+            serde_json::json!({"renderer":format!("{renderer:?}"), "cpu_gpu_ns":samples, "frames":frame,
             "display_blake3":blake3::hash(&pixels).to_hex().as_str()}),
         );
     }
@@ -86,6 +87,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         file,
         &serde_json::json!({
             "extent":[960,540], "quads":4096, "samples":1, "bounces":12, "ser":true, "rr":false,
+            "warmup_ms":2000,
             "scope":"CPU draw录制含回收；GPU timestamp包围完整draw；不含Java、场景更新与窗口呈现",
             "cases":cases
         }),

@@ -16,6 +16,7 @@ import bsdf.openpbr.specialized;
 #endif
 
 [shader("callable")]
+#if PRIMEPT_RESTIR_SAMPLE
 void restir_initial_flow(inout RestirInitialCall call)
 {
     pt::Hit hit = to_pt_hit(call.hit);
@@ -30,6 +31,20 @@ void restir_initial_flow(inout RestirInitialCall call)
     call.u.x = batch.first.pdf;
     call.direction = material.emission;
 }
+#else
+void restir_initial_flow(inout RestirDirectCall call)
+{
+    ModScene scene;
+    pt::Hit hit = to_pt_hit(call.hit);
+    float4 incident = float4(call.incident_ior, 0, 0, 0);
+    pt::SurfaceMaterial material = scene.resolve_flow(hit, OPENPBR_FLOW, incident);
+    openpbr::Evaluation evaluated = openpbr::evaluate_flow<OPENPBR_FLOW>(
+        scene.energy(), material.pbr, pt::shading_normal(hit, material), call.wo, call.direction,
+        incident, material.transmitted);
+    call.hit.identity = asuint(float4(evaluated.pdf, evaluated.response));
+    call.hit.normal = material.emission;
+}
+#endif
 
 [shader("callable")]
 void restir_replay_flow(inout RestirReplayCall call)
@@ -48,9 +63,10 @@ void restir_evaluate_flow(inout RestirEvaluateCall call)
 {
     pt::Hit hit = to_pt_hit(call.hit);
     ModScene scene;
-    pt::SurfaceMaterial material = scene.resolve_flow(hit, OPENPBR_FLOW, call.incident);
+    float4 incident = float4(call.incident_ior, 0, 0, 0);
+    pt::SurfaceMaterial material = scene.resolve_flow(hit, OPENPBR_FLOW, incident);
     openpbr::Evaluation evaluated = openpbr::evaluate_flow<OPENPBR_FLOW>(
         scene.energy(), material.pbr, pt::shading_normal(hit, material), call.wo, call.direction,
-        call.incident, material.transmitted);
-    call.hit.texel = float4(evaluated.response, evaluated.pdf);
+        incident, material.transmitted);
+    call.hit.identity = asuint(float4(evaluated.pdf, evaluated.response));
 }

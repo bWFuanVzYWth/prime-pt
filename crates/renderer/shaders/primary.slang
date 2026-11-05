@@ -29,17 +29,17 @@ RWStructuredBuffer<float4> accumulation;
 [[vk::binding(9, 0)]]
 RWStructuredBuffer<uint> sample_counts;
 
-/// prefix=false交接：原60B几何/方向/RGB与新增16B identity独立plane。
-/// 三个 16B plane、一个 8B plane、一个 4B plane 都有消费者；RGB/header 首读一次。
+/// prefix=false交接：几何、方向、状态和稳定identity采用独立plane。
+/// 两个16B plane、一个8B plane、两个4B plane和独立identity；不交接材质纹素。
 /// position/offset、normal、direction、distance 保留原 FP32；quad 任意朝向和非共面。
 /// throughput=1、eta=1、medium=相机实际介质、depth/events=0 来自 K1 不消费顶点，
-/// 非体素假设。未来增加 delta、介质或发光等能力须发布新 pipeline/资源 ABI。
+/// 非体素假设；材质纹素由叶子按键读取，不跨K1/K2交接。
 [[vk::binding(10, 0)]]
 RWStructuredBuffer<float4> landing_position;
 [[vk::binding(11, 0)]]
 RWStructuredBuffer<float4> landing_normal_direction_x;
 [[vk::binding(12, 0)]]
-RWStructuredBuffer<float4> landing_rgb_header;
+RWStructuredBuffer<uint> landing_header;
 [[vk::binding(13, 0)]]
 RWStructuredBuffer<float2> landing_direction_yz;
 [[vk::binding(14, 0)]]
@@ -85,7 +85,7 @@ void primary_closesthit(inout TracePayload payload,
 void store_landing(uint pixel, pt::TransportCall data)
 {
     uint flags = data.hit.capability | (uint(data.hit.front) << 8) | (data.path.status << 16);
-    landing_rgb_header[pixel] = float4(data.hit.texel.rgb, asfloat(flags));
+    landing_header[pixel] = flags;
     if (data.path.status != pt::PATH_ACTIVE)
         return;
     landing_position[pixel] = float4(data.hit.surface.position, data.hit.surface.offset);
@@ -95,16 +95,14 @@ void store_landing(uint pixel, pt::TransportCall data)
     landing_identity[pixel] = data.hit.identity;
 }
 
-pt::TransportCall load_landing(uint pixel, uint2 coordinate, float4 rgb_header)
+pt::TransportCall load_landing(uint pixel, uint2 coordinate, uint flags)
 {
     pt::TransportCall data = (pt::TransportCall)0;
-    uint flags = asuint(rgb_header.w);
     float4 position = landing_position[pixel];
     float4 normal_direction = landing_normal_direction_x[pixel];
     data.hit.surface = { position.xyz, normal_direction.xyz, position.w };
     data.hit.capability = flags & 255u;
     data.hit.front = (flags & 256u) != 0;
-    data.hit.texel = float4(rgb_header.xyz, 1);
     data.hit.distance = landing_distance[pixel];
     data.hit.identity = landing_identity[pixel];
     data.path.direction = float3(normal_direction.w, landing_direction_yz[pixel]);
@@ -171,8 +169,8 @@ void render_main()
     Params params = parameters[0];
     uint2 coordinate = DispatchRaysIndex().xy;
     uint pixel = coordinate.y * params.image.x + coordinate.x;
-    float4 rgb_header = landing_rgb_header[pixel];
-    uint status = (asuint(rgb_header.w) >> 16) & 3u;
+    uint header = landing_header[pixel];
+    uint status = (header >> 16) & 3u;
     if (status != pt::PATH_ACTIVE)
     {
         output_image[pixel] = float4(0, 0, 0,
@@ -181,7 +179,7 @@ void render_main()
                                                                            : 0);
         return;
     }
-    pt::TransportCall data = load_landing(pixel, coordinate, rgb_header);
+    pt::TransportCall data = load_landing(pixel, coordinate, header);
     ModScene provider;
     pt::trace_tail(provider, data);
     output_image[pixel] =
@@ -195,7 +193,7 @@ void shade_opaque(inout ModTransportCall call)
 {
     pt::TransportCall data = call.unpack();
     ModScene provider;
-    pt::process_flow<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(provider, data,
-                                                                 settings(parameters[0]));
-    call.store(data.path);
+    pt::process_flow<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, false>(provider, data,
+                                                                        settings(parameters[0]));
+    call.store<OPENPBR_FLOW>(data.path);
 }

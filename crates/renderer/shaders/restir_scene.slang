@@ -78,10 +78,16 @@ public struct RestirScene : restir_pt::IRestirScene
         result.hit = identity;
         result.wo = wo;
         result.frontFacing = dot(wo, result.point.normal) >= 0;
-        result.texel = material_texel(primitive, asfloat(identity.data.yz));
         result.identity =
             uint4(primitive, identity.data.yz, restir_normal(identity, result.point.normal));
         pt::Hit hit = restir_hit(result);
+        // Surface只缓存算法需要的元数据；albedo由Flow叶子按需读取。
+        // 这里只消费roughness/IOR/metalness/发光元数据；非发光表面不读取albedo/tint。
+        ModMaterial source = materials[material_id(primitive)];
+        uint side = result.frontFacing ? 1u : 2u;
+        if (source.emission.w > 0 && (source.control.y & side) != 0 &&
+            ((source.control.z & 32u) == 0 || result.frontFacing))
+            hit.texel = material_texel(primitive, asfloat(identity.data.yz));
         pt::SurfaceMaterial material =
             resolve_material(hit, ~0u, ~0u, parameters[0].block_emission_scale);
         result.emission = material.emission;
@@ -171,38 +177,47 @@ public struct RestirScene : restir_pt::IRestirScene
     }
     public restir_pt::BsdfSample sampleBsdf(restir_pt::Surface surface, float3 u)
     {
-        RestirReplayCall call = { material_hit(surface), surface.incident, surface.wo, u };
         uint program = materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u;
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
+        RestirReplayCall call = { material_hit(surface), surface.incident, surface.wo, u };
         CallShader(program, call);
         return sampled_result(call.hit, call.incident);
     }
     public restir_pt::InitialShading shadeInitial(restir_pt::Surface surface, float3 u,
                                                   float3 direction, bool continuation)
     {
-        RestirInitialCall call = { material_hit(surface), surface.incident, surface.wo, u,
-                                   direction };
         uint program = (materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u) +
                        (continuation ? 0u : asuint(parameters[0].restir.z));
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
+        if (continuation)
+        {
+            RestirInitialCall call = { material_hit(surface), surface.incident, surface.wo, u,
+                                       direction };
+            CallShader(program, call);
+            return call.result();
+        }
+        RestirDirectCall call = { material_hit(surface), surface.wo, direction,
+                                  surface.incident.x };
         CallShader(program, call);
-        return call.result();
+        return { {},
+                 { asfloat(call.hit.identity.yzw), asfloat(call.hit.identity.x) },
+                 call.hit.normal };
     }
     public restir_pt::BsdfEvaluation evaluateBsdf(restir_pt::Surface surface, float3 wi,
                                                   int component)
     {
-        RestirEvaluateCall call = { material_hit(surface), surface.wo, wi, surface.incident };
         uint program = (materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u) +
                        asuint(parameters[0].restir.z);
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
+        RestirEvaluateCall call = { material_hit(surface), surface.wo, wi, surface.incident.x };
         CallShader(program, call);
-        return { call.hit.texel.xyz, call.hit.texel.w };
+        return { asfloat(call.hit.identity.yzw), asfloat(call.hit.identity.x) };
     }
     public bool isSampleRough(restir_pt::Surface surface, uint component, float pdf,
                               float threshold)
@@ -272,9 +287,10 @@ public struct RestirScene : restir_pt::IRestirScene
         {
             if (!restir_valid_hit(light))
                 return 0;
-            return probability *
-                   scene.emission_pdf(restir_hit(loadSurface(light, -direction, previous)),
-                                      source.point.position);
+            pt::Hit hit = {};
+            hit.identity = uint4(light.data.x - 1u, light.data.yz, 0);
+            hit.surface = geometry::surface_point(restir_endpoint(light));
+            return probability * scene.emission_pdf(hit, source.point.position);
         }
         return (1.0 - probability) * environmentPdf(direction);
     }

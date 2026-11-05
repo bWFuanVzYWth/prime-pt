@@ -405,7 +405,7 @@ impl View {
         }
         let pixels = u64::from(extent[0]) * u64::from(extent[1]);
         // 五个命中plane另加16B identity；着色法线/纹理与发光反向PDF使用原命中身份。
-        let landing = [16, 16, 16, 8, 4, 16]
+        let landing = [16, 16, 4, 8, 4, 16]
             .map(|stride| Buffer::new(context, pixels * stride, false))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
@@ -1098,7 +1098,7 @@ impl Gpu {
             light_areas: vec![[u32::MAX, 0, 0, 0]; definitions.len()],
             light_sides: vec![0; definitions.len()],
             has_emission: false,
-            map_ranges: materials::map_ranges(&[0, 0, 255, 0])?,
+            map_ranges: materials::map_ranges(&[0, 0, 255, 0], &[128, 128, 255, 128])?,
             resource_generation: 0,
             lighting: lighting::Lighting::new()?,
             lighting_gpu,
@@ -1374,7 +1374,7 @@ impl Gpu {
             let lighting = lighting::Lighting::new()?;
             let definitions = source.materials;
             let colors = materials::colors(source.albedo)?;
-            let ranges = materials::map_ranges(source.mers)?;
+            let ranges = materials::map_ranges(source.mers, source.auxiliary)?;
             let flows = materials::flows(colors, definitions, ranges)?;
             let mut light_sides = Vec::new();
             light_sides
@@ -1521,7 +1521,13 @@ impl Gpu {
         ] {
             restir_sets.push(openpbr::program::ProgramSet::compile_variants(
                 &self.compiler,
-                programs.plan().keys().iter().copied(),
+                programs.plan().keys().iter().copied().map(|key| {
+                    if entry == "restir_replay_flow" || entry == "restir_evaluate_flow" {
+                        materials::scattering_key(key)
+                    } else {
+                        key
+                    }
+                }),
                 openpbr::program::Template {
                     source: restir_source
                         .to_str()
@@ -1537,8 +1543,9 @@ impl Gpu {
             .iter()
             .enumerate()
             .flat_map(|(index, set)| {
-                set.artifacts().iter().map(move |artifact| RayShader {
-                    spirv: artifact.bytes(),
+                // 每段保留PT槽的地址空间；编译产物按操作键去重，由同一计划恢复槽映射。
+                set.plan().bindings().iter().map(move |&slot| RayShader {
+                    spirv: set.artifacts()[slot as usize].bytes(),
                     entry: match index {
                         0 | 1 => c"restir_initial_flow",
                         2 => c"restir_replay_flow",

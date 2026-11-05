@@ -65,6 +65,13 @@ pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinitio
         | ((flags & (MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS)) << 1)
 }
 
+/// 重放/求值不消费发光，不能让发光面、朝向和贴图位扩大它们的程序键。
+pub(super) const fn scattering_key(
+    (flow, variant): (openpbr::FlowKey, u32),
+) -> (openpbr::FlowKey, u32) {
+    (flow.without_emission(), variant & !(4 | 16 | 32))
+}
+
 pub(super) fn defaults() -> Vec<MaterialDefinition> {
     let rough = MaterialDefinition::default();
     let mut smooth = rough;
@@ -89,9 +96,10 @@ pub(super) struct MapRanges {
     metalness: openpbr::Range,
     subsurface: openpbr::Range,
     emission: openpbr::Range,
+    normal_distribution: openpbr::Range,
 }
 
-pub(super) fn map_ranges(mers: &[u8]) -> Result<MapRanges, Error> {
+pub(super) fn map_ranges(mers: &[u8], auxiliary: &[u8]) -> Result<MapRanges, Error> {
     let unit = openpbr::Range::new(0., 1.)?;
     let mut scans = [openpbr::RangeScan::new(); 4];
     for pixel in mers.as_chunks::<4>().0 {
@@ -101,11 +109,16 @@ pub(super) fn map_ranges(mers: &[u8]) -> Result<MapRanges, Error> {
     }
     let [metalness, emission, roughness, subsurface] =
         scans.map(|scan| scan.finish().unwrap_or(unit));
+    let mut distribution = openpbr::RangeScan::new();
+    for pixel in auxiliary.as_chunks::<4>().0 {
+        distribution.extend(&[f32::from(pixel[2]) / 255.])?;
+    }
     Ok(MapRanges {
         roughness,
         metalness,
         subsurface,
         emission,
+        normal_distribution: distribution.finish().unwrap_or(unit),
     })
 }
 
@@ -137,13 +150,13 @@ pub(super) fn flows(
                 Range::point(value)
             }
         };
+        let roughness = property_range(definition.base_roughness[3], textured.roughness)?;
         let roughness = if definition.control[3] & MaterialDefinition::AUTHORED_NORMAL != 0
             && definition.control[2] & MaterialDefinition::AUXILIARY != 0
         {
-            // shader将aux分布与roughness合成；未分析局部aux范围时保留全部连续/离散支持。
-            Range::new(0., 1.)?
+            roughness.with_normal_distribution(textured.normal_distribution)?
         } else {
-            property_range(definition.base_roughness[3], textured.roughness)?
+            roughness
         };
         let ranges = if definition.control[0] & 1 != 0 {
             MaterialRanges::dielectric(roughness, definition.control[0] & 2 != 0)?
@@ -193,7 +206,7 @@ mod tests {
             flows(
                 colors,
                 &[material],
-                map_ranges(&[0, emission, 255, 0]).unwrap(),
+                map_ranges(&[0, emission, 255, 0], &[]).unwrap(),
             )
             .unwrap()[0]
         };
@@ -210,9 +223,48 @@ mod tests {
         let flow = flows(
             colors(&[255; 4]).unwrap(),
             &[material],
-            map_ranges(&[]).unwrap(),
+            map_ranges(&[], &[]).unwrap(),
         )
         .unwrap();
         assert_ne!(flow[0].bits() & openpbr::FlowKey::CONTINUOUS_REFLECTION, 0);
+    }
+
+    #[test]
+    fn rough_authored_normal_material_excludes_delta_reflection() {
+        let mut material = MaterialDefinition::default();
+        material.control[3] = MaterialDefinition::AUTHORED_NORMAL;
+        material.control[2] |= MaterialDefinition::AUXILIARY;
+        let flow = flows(
+            colors(&[255; 4]).unwrap(),
+            &[material],
+            map_ranges(&[], &[128, 128, 0, 85]).unwrap(),
+        )
+        .unwrap()[0];
+        assert_eq!(flow.bits() & openpbr::FlowKey::DELTA_REFLECTION, 0);
+    }
+
+    #[test]
+    fn smooth_normal_distribution_excludes_continuous_reflection() {
+        let mut material = MaterialDefinition::default();
+        material.base_roughness[3] = 0.;
+        material.control[3] = MaterialDefinition::AUTHORED_NORMAL;
+        material.control[2] |= MaterialDefinition::AUXILIARY;
+        let flow = flows(
+            colors(&[255; 4]).unwrap(),
+            &[material],
+            map_ranges(&[], &[128, 128, 0, 85]).unwrap(),
+        )
+        .unwrap()[0];
+        assert_eq!(flow.bits() & openpbr::FlowKey::CONTINUOUS_REFLECTION, 0);
+    }
+
+    #[test]
+    fn scattering_program_ignores_emission_but_keeps_material_maps() {
+        let flow = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 0.)
+            .unwrap()
+            .flow(true);
+        let (key, variant) = scattering_key((flow, 1 | 2 | 4 | 8 | 16 | 32));
+        assert!(!key.emits());
+        assert_eq!(variant, 1 | 2 | 8);
     }
 }

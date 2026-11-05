@@ -2,14 +2,13 @@
 module mod_call;
 import pt.scene;
 import geometry.ray;
+import bsdf.openpbr.flow;
 
 public struct ModTransportCall
 {
     public geometry::SurfacePoint point;
-    public float4 texel;
     public uint4 identity;
     public uint state;
-    public float distance;
     public float3 direction;
     public float3 throughput;
     public float3 radiance;
@@ -24,11 +23,9 @@ public struct ModTransportCall
     {
         ModTransportCall call;
         call.point = data.hit.surface;
-        call.texel = data.hit.texel;
         call.identity = data.hit.identity;
         call.state =
             uint(data.hit.front) | (data.path.depth << 1) | (data.path.dielectric_events << 8);
-        call.distance = data.hit.distance;
         call.direction = data.path.direction;
         call.throughput = data.path.throughput;
         call.radiance = data.path.radiance;
@@ -45,10 +42,8 @@ public struct ModTransportCall
     {
         pt::TransportCall data = {};
         data.hit.surface = point;
-        data.hit.texel = texel;
         data.hit.identity = identity;
         data.hit.front = (state & 1u) != 0;
-        data.hit.distance = distance;
         data.path = result();
         data.path.origin = 0;
         data.path.status = pt::PATH_ACTIVE;
@@ -77,16 +72,21 @@ public struct ModTransportCall
     }
 
     [mutating]
-    public void store(pt::PathState path)
+    public void store<let Flow : uint>(pt::PathState path)
     {
         point.position = path.origin;
         state = path.status | (path.depth << 2) | (path.dielectric_events << 9);
         direction = path.direction;
         throughput = path.throughput;
-        radiance = path.radiance;
-        medium = path.medium;
+        if (openpbr::flow_continuous<Flow>() || (Flow & openpbr::FLOW_EMISSION) != 0)
+            radiance = path.radiance;
+        // 不变字段留在交接内存中，避免叶子为回写而读取并保活它们。
+        if ((Flow & openpbr::FLOW_SOLID_TRANSMISSION) != 0)
+        {
+            medium = path.medium;
+            eta_scale = path.eta_scale;
+        }
         previous = path.previous;
         previous_pdf = path.previous_pdf;
-        eta_scale = path.eta_scale;
     }
 };

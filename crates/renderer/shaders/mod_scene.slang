@@ -2,6 +2,9 @@
 module mod_scene;
 
 import pt.scene;
+import pt.integrator;
+import pt.transport;
+import pt.roulette;
 import mod_call;
 __exported import mod_materials;
 import mod_lights;
@@ -100,6 +103,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public pt::SurfaceMaterial guide_material(pt::Hit hit, float4 incident)
     {
+        hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
         return resolve_material(hit, ~openpbr::FLOW_EMISSION, ~0u, 1.0);
     }
 
@@ -117,7 +121,6 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         hit.capability = 0;
         hit.distance = payload.distance;
         hit.front = dot(direction, hit.surface.normal) < 0;
-        hit.texel = texel(payload.primitive, payload.bary);
         return true;
     }
 
@@ -132,6 +135,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public void shade(inout pt::TransportCall data)
     {
+        data.path.throughput *= pt::segment_transmittance(data.path.medium.yzw, data.hit.distance);
         // GPU派生表的高30位为资源期按真实Flow去重后的callable槽；不是源OpenPBR flags。
         uint program = materials[material_id(data.hit.identity.x)].control.x >> 2u;
 #ifdef PRIMEPT_SER
@@ -140,15 +144,41 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         ModTransportCall call = ModTransportCall.input(data);
         CallShader(program, call);
         data.path = call.result();
+        // 与材质键无关的收尾不扩大每个callable；采样身份无需跨call复制临时随机状态。
+        uint status = data.path.status;
+        if (status == pt::PATH_ACTIVE)
+        {
+            if (max(data.path.throughput.x, max(data.path.throughput.y, data.path.throughput.z)) <=
+                0)
+                status = pt::PATH_DONE;
+            else if (data.path.depth + 1 >= 2)
+            {
+                float survival =
+                    pt::roulette_probability(data.path.throughput, data.path.eta_scale);
+                pt::PathSampler sampler = pt::path_sampler(
+                    data.pixel, data.sample, parameters[0].options.z, parameters[0].options.x);
+                if (survival == 0 ||
+                    (survival < 1 && sampler.roulette(data.path.depth) >= survival))
+                    status = pt::PATH_DONE;
+                else if (survival < 1)
+                    data.path.throughput = pt::roulette_reweight(data.path.throughput, survival);
+            }
+        }
+        pt::finish(data.path, status);
     }
 
     public pt::SurfaceMaterial resolve(pt::Hit hit, uint capability, float4 incident)
     {
+        hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
         return resolve_material(hit, ~0u, ~0u, parameters[0].block_emission_scale);
     }
 
     public pt::SurfaceMaterial resolve_flow(pt::Hit hit, uint flow, float4 incident)
     {
+        // 光学介质不以atlas颜色调制；由材质键裁掉无消费者的UV/颜色/tint读取。
+        if ((flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
+                     openpbr::FLOW_CONDUCTOR_REFLECTION | openpbr::FLOW_EMISSION)) != 0)
+            hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
         return resolve_material(hit, flow, OPENPBR_VARIANT, parameters[0].block_emission_scale);
     }
 
