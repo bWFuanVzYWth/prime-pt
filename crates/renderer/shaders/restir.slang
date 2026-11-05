@@ -96,7 +96,7 @@ Surface current_surface(RestirScene scene, uint2 pixel)
 PrecomputedShiftData shifted(RestirScene scene, Surface destination, PathReservoir source,
                              uint2 pixel, bool previous)
 {
-    ShiftSettings settings;
+    ShiftSettings settings = {};
     PrecomputedShiftData result = {};
     result.pathThroughput = shiftPath(scene, destination, source,
                                       scene.primaryRayFootprint(destination, pixel, previous),
@@ -125,7 +125,7 @@ void restir_initial()
     }
     TinyUniformSampleGenerator generator =
         rng_for_pixel(pixel, p.temporal_reserved.x ^ p.options.x);
-    ShiftSettings settings;
+    ShiftSettings settings = {};
     InitialResult initial = sampleInitialPath<RestirScene, 2>(
         scene, pixel, hit, generator.state, p.options.y, settings, true, true, true);
     store_reservoir(reservoirs_a, offset_for(pixel), initial.reservoir);
