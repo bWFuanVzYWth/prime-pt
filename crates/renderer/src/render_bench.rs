@@ -3,6 +3,8 @@ use super::*;
 use prime_scene::{RealtimeRenderer, RenderMode, RenderRegion, RenderView};
 
 /// 同进程完整Latin轮换；每组显式从同历史起点开始，准备和读回不计入稳态。
+/// 设置PRIME_PT_DISPATCH_QUALITY_MEAN时只跑单轮，逐帧回读并以f64导出120帧均值；
+/// 此独立质量运行不记录计时或阶段标记，原始末帧输出仍保留。
 #[test]
 #[ignore = "独占Vulkan RT/SER设备；PRIME_PT_DISPATCH_PROFILE须为新的输出目录"]
 fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,7 +21,8 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
     if modes.len() < 2 || modes.iter().any(|&v| v > 8) {
         return Err("至少两个有效实验分派".into());
     }
-    let rounds = modes.len() * 2;
+    let quality_mean = std::env::var_os("PRIME_PT_DISPATCH_QUALITY_MEAN").is_some();
+    let rounds = if quality_mean { 1 } else { modes.len() * 2 };
     let extent = [960, 540];
     let warmup = 60;
     let samples = 120;
@@ -154,14 +157,20 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
         [extent[0], extent[1], 1],
         ImageFormat::Rgba8Unorm,
     )?;
-    let pair = [
-        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
-        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
-    ];
+    let pair = if quality_mean {
+        None
+    } else {
+        Some([
+            vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+            vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+        ])
+    };
     gpu.test_roots.push(output.into());
-    gpu.test_roots
-        .extend(pair.map(vulkan::native::Resource::from));
-    let stage_queries = if std::env::var_os("PRIME_PT_DISPATCH_STAGES").is_some() {
+    if let Some(pair) = pair {
+        gpu.test_roots
+            .extend(pair.map(vulkan::native::Resource::from));
+    }
+    let stage_queries = if !quality_mean && std::env::var_os("PRIME_PT_DISPATCH_STAGES").is_some() {
         let queries = vulkan::native::TimestampQueries::new(&mut gpu.context, 20)?;
         gpu.test_roots.push(queries.into());
         Some(queries)
@@ -217,6 +226,19 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                 gpu.test_restart_sample_sequence(0)?;
                 let mut timings = Vec::new();
                 let mut stage_timings = Vec::new();
+                let mut quality_sum = Vec::new();
+                let mut quality_pixels = Vec::new();
+                let quality_root_start = gpu.test_roots.len();
+                let quality_readback = if quality_mean {
+                    let hdr = gpu.view.as_ref().unwrap().output;
+                    quality_sum.resize(hdr.len() as usize / 4, 0.0f64);
+                    quality_pixels.resize(hdr.len() as usize, 0u8);
+                    let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;
+                    gpu.test_roots.push(readback.into());
+                    Some(readback)
+                } else {
+                    None
+                };
                 for frame in 0..warmup + samples {
                     if renderer == RealtimeRenderer::PathTrace {
                         gpu.transition_history(history::Event::Accumulation(
@@ -229,10 +251,26 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                         &camera(),
                         Environment::default(),
                         options,
-                        Some(pair),
+                        pair,
                     )?;
                     if frame >= warmup {
-                        timings.push(timing);
+                        if let Some(readback) = quality_readback {
+                            let hdr = gpu.view.as_ref().unwrap().output;
+                            hdr.copy_prefix_to(&mut gpu.context, &readback, hdr.len())?;
+                            readback.read(&mut gpu.context, 0, &mut quality_pixels)?;
+                            for (sum, value) in quality_sum
+                                .iter_mut()
+                                .zip(quality_pixels.as_chunks::<4>().0)
+                            {
+                                let value = f32::from_le_bytes(*value);
+                                if !value.is_finite() {
+                                    return Err("质量均值的HDR帧包含非有限值".into());
+                                }
+                                *sum += f64::from(value);
+                            }
+                        } else {
+                            timings.push(timing);
+                        }
                         if renderer == RealtimeRenderer::RestirPt
                             && let Some(queries) = stage_queries
                         {
@@ -251,11 +289,16 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 }
-                let hdr = gpu.view.as_ref().unwrap().output;
-                let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;
-                hdr.copy_prefix_to(&mut gpu.context, &readback, hdr.len())?;
-                let mut pixels = vec![0; hdr.len() as usize];
-                readback.read(&mut gpu.context, 0, &mut pixels)?;
+                let pixels = if quality_mean {
+                    quality_pixels
+                } else {
+                    let hdr = gpu.view.as_ref().unwrap().output;
+                    let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;
+                    hdr.copy_prefix_to(&mut gpu.context, &readback, hdr.len())?;
+                    let mut pixels = vec![0; hdr.len() as usize];
+                    readback.read(&mut gpu.context, 0, &mut pixels)?;
+                    pixels
+                };
                 if !pixels
                     .as_chunks::<4>()
                     .0
@@ -266,6 +309,18 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let image = format!("{renderer:?}-cv{cv}-r{round}-v{index}.rgba32fle");
                 std::fs::write(directory.join(&image), &pixels)?;
+                let (mean_image, mean_blake3) = if quality_mean {
+                    let name = format!("{renderer:?}-cv{cv}-r{round}-v{index}.mean120.rgba64fle");
+                    let averaged: Vec<u8> = quality_sum
+                        .iter()
+                        .flat_map(|&sum| (sum / f64::from(samples)).to_le_bytes())
+                        .collect();
+                    let digest = blake3::hash(&averaged).to_hex().to_string();
+                    std::fs::write(directory.join(&name), averaged)?;
+                    (Some(name), Some(digest))
+                } else {
+                    (None, None)
+                };
                 let stacks = gpu
                     .restir
                     .as_ref()
@@ -309,12 +364,16 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
                 let row = serde_json::json!({"renderer":format!("{renderer:?}"),"cv":cv,"round":round,"position":step,
                     "driver_stack_bytes":stacks,"immutable_programs":program_roots,"material_programs":material_programs,"frame_parameters":parameter_bytes.as_chunks::<4>().0.iter().map(|w|u32::from_le_bytes(*w)).collect::<Vec<_>>(),
-                    "variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
+                    "variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"quality_only":quality_mean,"mean_frames":if quality_mean {samples} else {0},"mean_image":mean_image,"mean_blake3":mean_blake3,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
                 std::fs::write(
                     directory.join(format!("{renderer:?}-cv{cv}-r{round}-v{index}.json")),
                     serde_json::to_vec_pretty(&row)?,
                 )?;
                 records.push(row);
+                // 每帧draw会回收资源；本组独占追加的readback根在所有提交和读取完成后释放。
+                if quality_mean {
+                    gpu.test_roots.truncate(quality_root_start);
+                }
                 eprintln!(
                     "dispatch profile {renderer:?} CV={cv} round={round} variant={index} mode={}",
                     modes[index]
@@ -326,7 +385,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
         directory.join("results.json"),
         serde_json::to_vec_pretty(&serde_json::json!({"modes":modes,"rounds":rounds,
         "extent":extent,"warmup":warmup,"samples":samples,"spp":spp,"bounces":12,"ser":true,"rr":false,
-        "preparation":preparation,"scope":"CPU draw录制含回收；GPU完整draw；准备/场景更新/读回/窗口不计入稳态",
+        "preparation":preparation,"quality_only":quality_mean,"scope":if quality_mean {"独立质量运行；逐帧readback，以f64导出120帧线性HDR均值，不可用于性能计时"} else {"CPU draw录制含回收；GPU完整draw；准备/场景更新/读回/窗口不计入稳态"},
         "stage_order":simple_engine::restir_pt::Stage::sequence(true).map(|stage|format!("{stage:?}")).collect::<Vec<_>>(),
         "stage_markers":stage_queries.is_some(),
         "records":records}))?,
