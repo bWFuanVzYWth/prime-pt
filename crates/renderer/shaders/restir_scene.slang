@@ -7,56 +7,67 @@ import params;
 import bsdf.openpbr.api;
 import pt.scene;
 import geometry.ray;
+import geometry.identity;
 import restir_pt.scene;
 import restir_pt.types;
+import restir_pt.admission;
 import geometry.camera;
 import pt.light_sampling;
 import atmosphere.parameters;
 import atmosphere.sampling;
 
 [[vk::binding(37, 0)]]
-StructuredBuffer<float4> restir_positions;
+StructuredBuffer<uint4> restir_positions;
 
-public bool restir_valid_hit(restir_pt::HitInfo hit)
+/// 头部后的quad数据与容量尾部的活动域目录在同一事务发布。
+uint4 restir_domain(uint token)
+{
+    uint base = restir_positions[0].y;
+    uint index = geometry::identity_index(restir_positions, base, token);
+    return index == 0xffffffffu ? uint4(0) : restir_positions[base + 1u + index];
+}
+public uint restir_primitive(restir_pt::HitInfo hit)
 {
     if (!hit.isValid())
-        return false;
-    uint count, stride;
-    restir_positions.GetDimensions(count, stride);
-    uint slot = (hit.data.x - 1u) >> 1u;
-    if (slot >= count / 4u || hit.data.w == 0)
-        return false;
-    return asuint(restir_positions[slot * 4u + 3u].w) == hit.data.w;
+        return 0xffffffffu;
+    uint4 domain = restir_domain(hit.data.x);
+    return domain.w == hit.data.x && (hit.data.y >> 1u) < domain.y ? domain.x * 2u + hit.data.y
+                                                                   : 0xffffffffu;
 }
-
+public bool restir_valid_hit(restir_pt::HitInfo hit)
+{
+    return restir_primitive(hit) != 0xffffffffu;
+}
 public restir_pt::HitInfo restir_stable_hit(uint primitive, float2 bary)
 {
-    return { uint4(primitive + 1u, asuint(bary),
-                   asuint(restir_positions[(primitive >> 1u) * 4u + 3u].w)) };
+    uint token = restir_positions[1u + (primitive >> 1u) * 4u + 3u].w;
+    uint4 domain = restir_domain(token);
+    if (token == 0u || domain.w != token)
+        return {};
+    return { uint4(token, primitive - domain.x * 2u, asuint(bary)) };
 }
 
-uint restir_normal(restir_pt::HitInfo hit, float3 normal)
+uint restir_normal(uint primitive, float2 bary, float3 normal)
 {
     if ((parameters[0].output_size.z & 4u) == 0)
         return 0;
-    uint primitive = hit.data.x - 1u;
-    uint start = (primitive >> 1u) * 4u;
-    pt::LightQuadVertices vertices = pt::light_quad_vertices(
-        restir_positions[start], restir_positions[start + 1u], restir_positions[start + 2u]);
+    uint start = 1u + (primitive >> 1u) * 4u;
+    pt::LightQuadVertices vertices = pt::light_quad_vertices(asfloat(restir_positions[start]),
+                                                             asfloat(restir_positions[start + 1u]),
+                                                             asfloat(restir_positions[start + 2u]));
     bool second = (primitive & 1u) != 0;
-    return mapped_shading_normal(primitive, asfloat(hit.data.yz),
-                                 (second ? vertices.c : vertices.b) - vertices.a,
+    return mapped_shading_normal(primitive, bary, (second ? vertices.c : vertices.b) - vertices.a,
                                  (second ? vertices.d : vertices.c) - vertices.a,
                                  float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1), normal);
 }
 
-public geometry::TriangleEndpoint restir_endpoint(restir_pt::HitInfo identity)
+public geometry::TriangleEndpoint restir_endpoint(uint primitive, float2 bary)
 {
-    uint primitive = identity.data.x - 1u;
-    uint start = (primitive >> 1u) * 4u;
-    pt::LightQuadVertices vertices = pt::light_quad_vertices(
-        restir_positions[start], restir_positions[start + 1u], restir_positions[start + 2u]);
-    pt::QuadAreaSample sample = { primitive & 1u, asfloat(identity.data.yz), 0 };
+    uint start = 1u + (primitive >> 1u) * 4u;
+    pt::LightQuadVertices vertices = pt::light_quad_vertices(asfloat(restir_positions[start]),
+                                                             asfloat(restir_positions[start + 1u]),
+                                                             asfloat(restir_positions[start + 2u]));
+    pt::QuadAreaSample sample = { primitive & 1u, bary, 0 };
     float3 translation =
         float3(asint(restir_positions[start + 3u].xyz) - parameters[0].anchor_region.xyz) * 64.0;
     float3x4 transform =
@@ -66,17 +77,39 @@ public geometry::TriangleEndpoint restir_endpoint(restir_pt::HitInfo identity)
     return pt::quad_endpoint(vertices, sample, transform, inverse);
 }
 
+public geometry::TriangleEndpoint restir_endpoint(restir_pt::HitInfo identity)
+{
+    return restir_endpoint(restir_primitive(identity), asfloat(identity.data.zw));
+}
+
+/// 准入读取源能力，不合并两种宿主的材质解码。MERS含未知SSS时保守放宽候选。
+public restir_pt::AdmissionSurface reuse_geometry(restir_pt::HitInfo hit,
+                                                  geometry::SurfacePoint point)
+{
+    ModMaterial material = materials[material_id(restir_primitive(hit))];
+    bool bothSides = (material.control.z & (64u | 1u | 256u)) != 0 ||
+                     (material.control.x & 2u) != 0 || material.surface.z > 0.0;
+    return restir_pt::admission_surface(point, parameters[0].origin.xyz, bothSides);
+}
+
 public struct RestirScene : restir_pt::IRestirScene
 {
     public restir_pt::Surface loadSurface(restir_pt::HitInfo identity, float3 wo, bool previous)
     {
-        restir_pt::Surface result = {};
-        if (!restir_valid_hit(identity))
-            return result;
+        uint primitive = restir_primitive(identity);
+        if (primitive == 0xffffffffu)
+            return {};
+        geometry::SurfacePoint point =
+            geometry::surface_point(restir_endpoint(primitive, asfloat(identity.data.zw)));
+        return surface_from_resolved(identity, primitive, point, wo);
+    }
+    restir_pt::Surface surface_from_resolved(restir_pt::HitInfo identity, uint primitive,
+                                             geometry::SurfacePoint point, float3 wo)
+    {
         pt::Hit source = {};
-        source.surface = geometry::surface_point(restir_endpoint(identity));
-        source.identity = uint4(identity.data.x - 1u, identity.data.yz,
-                                restir_normal(identity, source.surface.normal));
+        source.surface = point;
+        source.identity = uint4(primitive, identity.data.zw,
+                                restir_normal(primitive, asfloat(identity.data.zw), point.normal));
         return surface_from_hit(identity, source, wo);
     }
     public restir_pt::Surface surface_from_hit(restir_pt::HitInfo identity, pt::Hit sourceHit,
@@ -96,7 +129,7 @@ public struct RestirScene : restir_pt::IRestirScene
         uint side = result.frontFacing ? 1u : 2u;
         if (source.emission.w > 0 && (source.control.y & side) != 0 &&
             ((source.control.z & 32u) == 0 || result.frontFacing))
-            hit.texel = material_texel(primitive, asfloat(identity.data.yz));
+            hit.texel = material_texel(primitive, asfloat(identity.data.zw));
         pt::SurfaceMaterial material =
             resolve_material(hit, ~0u, ~0u, parameters[0].block_emission_scale);
         result.emission = material.emission;
@@ -117,13 +150,16 @@ public struct RestirScene : restir_pt::IRestirScene
     public restir_pt::Surface loadSurfaceFromOrigin(restir_pt::HitInfo hit, float3 origin,
                                                     bool previous)
     {
-        if (!restir_valid_hit(hit))
+        uint primitive = restir_primitive(hit);
+        if (primitive == 0xffffffffu)
             return {};
-        float3 position = geometry::surface_point(restir_endpoint(hit)).position;
-        float3 delta = origin - position;
+        geometry::SurfacePoint point =
+            geometry::surface_point(restir_endpoint(primitive, asfloat(hit.data.zw)));
+        float3 delta = origin - point.position;
         float distance = length(delta);
-        // 观察方向决定界面两侧介质和有向发光；重建位置与身份不变。
-        return loadSurfaceWithDistance(hit, delta / distance, previous, distance);
+        restir_pt::Surface result = surface_from_resolved(hit, primitive, point, delta / distance);
+        result.distance = distance;
+        return result;
     }
     public restir_pt::Surface loadSurfaceWithDistance(restir_pt::HitInfo hit, float3 wo,
                                                       bool previous, float distance)
@@ -160,7 +196,8 @@ public struct RestirScene : restir_pt::IRestirScene
     public bool visible(restir_pt::Surface source, restir_pt::Surface target, bool previous)
     {
         geometry::Ray ray;
-        if (!geometry::connection_ray(source.point, restir_endpoint(target.hit), ray))
+        if (!geometry::connection_ray(
+                source.point, restir_endpoint(target.identity.x, asfloat(target.hit.data.zw)), ray))
             return false;
         ModScene scene;
         return !scene.occluded(ray);
@@ -186,7 +223,7 @@ public struct RestirScene : restir_pt::IRestirScene
     }
     public restir_pt::BsdfSample sampleBsdf(restir_pt::Surface surface, float3 u)
     {
-        uint program = materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u;
+        uint program = materials[material_id(surface.identity.x)].control.x >> 2u;
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
@@ -198,7 +235,7 @@ public struct RestirScene : restir_pt::IRestirScene
                                                   float3 direction, float3 secondDirection,
                                                   bool continuation)
     {
-        uint program = (materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u) +
+        uint program = (materials[material_id(surface.identity.x)].control.x >> 2u) +
                        (continuation ? 0u : asuint(parameters[0].restir.z));
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
@@ -223,7 +260,7 @@ public struct RestirScene : restir_pt::IRestirScene
     public restir_pt::BsdfEvaluation evaluateBsdf(restir_pt::Surface surface, float3 wi,
                                                   int component)
     {
-        uint program = (materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u) +
+        uint program = (materials[material_id(surface.identity.x)].control.x >> 2u) +
                        asuint(parameters[0].restir.z);
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
@@ -253,9 +290,8 @@ public struct RestirScene : restir_pt::IRestirScene
         bool sky = parameters[0].lighting.w > 0;
         restir_pt::LightSample result = {};
         // 初采固定两族各取一个样本；返回条件密度，不含二选一的族概率。
-        if (u.z < 0.5)
+        if (pt::local_light_family(u))
         {
-            u.z *= 2.0;
             pt::LightSample quad = scene.sample_light(surface.point, u);
             if (quad.pdf <= 0)
                 return result;
@@ -287,11 +323,13 @@ public struct RestirScene : restir_pt::IRestirScene
         ModScene scene;
         if (type == restir_pt::LIGHT_EMISSIVE)
         {
-            if (!restir_valid_hit(light))
+            uint primitive = restir_primitive(light);
+            if (primitive == 0xffffffffu)
                 return 0;
             pt::Hit hit = {};
-            hit.identity = uint4(light.data.x - 1u, light.data.yz, 0);
-            hit.surface = geometry::surface_point(restir_endpoint(light));
+            hit.identity = uint4(primitive, light.data.zw, 0);
+            hit.surface =
+                geometry::surface_point(restir_endpoint(primitive, asfloat(light.data.zw)));
             return scene.emission_pdf(hit, source.point.position);
         }
         return environmentPdf(direction);

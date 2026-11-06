@@ -9,29 +9,7 @@
 use super::{Error, Gpu};
 use simple_engine::pt;
 
-/// 确认整个语义域不可继续使用的封闭事件；常规帧更新不能构造其他理由。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum GlobalReset {
-    /// 切换世界，旧帧不再属于同一世界。
-    WorldReplaced,
-    /// 模型/材质身份命名空间整体替换。
-    SceneDomainReplaced,
-    /// 实时/离线或积分器切换，整个输出域改变。
-    RenderDomainChanged,
-    /// 调用者明确请求丢弃全部时间历史。
-    ExplicitRequested,
-}
-
-impl GlobalReset {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::WorldReplaced => "world_replaced",
-            Self::SceneDomainReplaced => "scene_domain_replaced",
-            Self::RenderDomainChanged => "render_domain_changed",
-            Self::ExplicitRequested => "explicit_request",
-        }
-    }
-}
+pub use simple_engine::pt::history::{GlobalReset, Histories, History, Invalidation};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AccumulationEvent {
@@ -69,6 +47,7 @@ impl StorageEvent {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Event {
     Global(GlobalReset),
+    Selected(Invalidation),
     Accumulation(AccumulationEvent),
     ViewStorage(StorageEvent),
     RrStorage(StorageEvent),
@@ -78,11 +57,17 @@ pub(super) enum Event {
 }
 
 /// 只有本模块能创建；路径工作集不接受无理由的reset调用。
-pub(super) struct ResetPermit(());
+pub(super) struct ResetPermit(Invalidation);
+
+impl ResetPermit {
+    pub const fn request(self) -> Invalidation {
+        self.0
+    }
+}
 
 /// 只用固定键推进样本；输入比较和重置由Gpu的显式事件入口负责。
 pub(super) struct Accumulation {
-    progress: pt::Progress<()>,
+    progress: pt::Progress,
     key: Option<[u32; 25]>,
 }
 
@@ -96,8 +81,8 @@ impl Accumulation {
     pub const fn samples(&self) -> u32 {
         self.progress.samples()
     }
-    pub fn begin(&mut self, samples: u32) -> Result<pt::Batch<'_, ()>, pt::Error> {
-        self.progress.begin((), samples)
+    pub fn begin(&mut self, samples: u32) -> Result<pt::Batch<'_>, pt::Error> {
+        self.progress.begin(samples)
     }
 }
 
@@ -119,27 +104,37 @@ fn record(consumer: &str, event: &str, action: &str, valid: bool) {
 impl Gpu {
     /// 唯一失效执行点。调用者已完成旧帧，取消时须先reject待接受的路径帧。
     pub(super) fn transition_history(&mut self, event: Event) -> Result<(), Error> {
-        let global = matches!(event, Event::Global(_));
-        if (global || matches!(event, Event::RestirColorModeChanged))
+        let request = match event {
+            Event::Global(reason) => Some(Invalidation::all(reason)),
+            Event::Selected(request) => Some(request),
+            _ => None,
+        };
+        let selected = request.map_or(Histories::NONE, Invalidation::histories);
+        if (selected.contains(History::Paths)
+            || selected.contains(History::Color)
+            || matches!(event, Event::RestirColorModeChanged))
             && self.restir.as_ref().is_some_and(|r| r.has_pending())
         {
             return Err(simple_engine::restir_pt::Error::PendingFrame.into());
         }
-        let accumulation =
-            global || matches!(event, Event::Accumulation(_) | Event::ViewStorage(_));
+        let accumulation = selected.contains(History::Accumulation)
+            || matches!(event, Event::Accumulation(_) | Event::ViewStorage(_));
         if accumulation {
             if let Some(view) = &mut self.view {
-                match event {
-                    Event::Global(reason) => {
-                        record("pt", reason.name(), "reset", view.progress.samples() != 0)
-                    }
-                    Event::ViewStorage(reason) => record(
+                if let Some(request) = request {
+                    record(
+                        "pt",
+                        request.reason().name(),
+                        "reset",
+                        view.progress.samples() != 0,
+                    );
+                } else if let Event::ViewStorage(reason) = event {
+                    record(
                         "pt",
                         reason.name(),
                         "storage_cold",
                         view.progress.samples() != 0,
-                    ),
-                    _ => {}
+                    );
                 }
                 view.progress.progress.reset();
                 view.progress.key = None;
@@ -147,40 +142,48 @@ impl Gpu {
             self.history_audit.accumulation_resets =
                 self.history_audit.accumulation_resets.saturating_add(1);
         }
-        if global
+        if selected.contains(History::Reconstruction)
             || matches!(
                 event,
                 Event::ViewStorage(_) | Event::RrStorage(_) | Event::RrEvaluationFailed
             )
         {
-            let (name, action) = match event {
-                Event::Global(reason) => (reason.name(), "reset"),
-                Event::ViewStorage(reason) | Event::RrStorage(reason) => {
-                    (reason.name(), "storage_cold")
+            let (name, action) = if let Some(request) = request {
+                (request.reason().name(), "reset")
+            } else {
+                match event {
+                    Event::ViewStorage(reason) | Event::RrStorage(reason) => {
+                        (reason.name(), "storage_cold")
+                    }
+                    Event::RrEvaluationFailed => ("evaluation_failed", "recovery_reset"),
+                    _ => unreachable!("仅上述事件影响RR"),
                 }
-                Event::RrEvaluationFailed => ("evaluation_failed", "recovery_reset"),
-                _ => unreachable!("仅上述事件影响RR"),
             };
             record("rr", name, action, self.rr_previous.is_some());
             self.rr_previous = None;
             self.history_audit.rr_resets = self.history_audit.rr_resets.saturating_add(1);
         }
-        if let Event::Global(reason) = event {
+        if selected.contains(History::Paths) {
+            let request = request.expect("指定路径失效范围的请求");
             if let Some(restir) = &mut self.restir {
-                record("restir", reason.name(), "reset", restir.has_history());
-                restir.invalidate(ResetPermit(()))?;
+                record(
+                    "restir",
+                    request.reason().name(),
+                    "reset",
+                    restir.has_history(),
+                );
+                restir.invalidate(ResetPermit(request))?;
             }
             self.history_audit.restir_resets = self.history_audit.restir_resets.saturating_add(1);
         }
-        if global || matches!(event, Event::RestirColorModeChanged) {
-            let name = if let Event::Global(reason) = event {
-                reason.name()
-            } else {
-                "mode_changed"
-            };
+        if selected.contains(History::Color) || matches!(event, Event::RestirColorModeChanged) {
+            let name = request.map_or("mode_changed", |r| r.reason().name());
             if let Some(restir) = &mut self.restir {
                 record("restcv", name, "reset", restir.color_history_valid());
-                restir.invalidate_color(ResetPermit(()));
+                restir.invalidate_color(ResetPermit(request.unwrap_or(Invalidation::new(
+                    Histories::one(History::Color),
+                    GlobalReset::ExplicitRequested,
+                ))))?;
             }
             self.history_audit.restir_color_resets =
                 self.history_audit.restir_color_resets.saturating_add(1);

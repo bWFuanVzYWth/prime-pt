@@ -3,6 +3,7 @@
 //! 两份颜色各12N字节，颜色属于像素，不跟随路径赢家或fresh输出选择。
 //! 当帧反射率代理复用PT的normal暂存区，initial先写merge再读；不增加存储或跨SER活跃状态。
 //! 只允许连续成功提交的CV帧读取旧颜色；开关事件仅令颜色冷启动。
+//! 引擎FrameToken共同接受路径与ColorOutput生产结果，应用不另持有颜色连续性有效位。
 //! 静态场景下的线性控制变量性质沿用引擎control_variate契约；当前场景重放不保证动态无偏。
 
 use super::{Error, materials, shader};
@@ -22,10 +23,9 @@ pub(super) struct Restir {
         restir_pt::FrameToken,
         crate::reconstruction::CameraFrame,
         [f32; 2],
-        bool,
+        restir_pt::ColorOutput,
     )>,
     pub previous_camera: Option<crate::reconstruction::CameraFrame>,
-    accepted_cv: bool,
     #[cfg(test)]
     timestamps: Option<simple_engine::vulkan::native::TimestampQueries>,
 }
@@ -189,7 +189,6 @@ impl Restir {
             previous_jitter: [0.; 2],
             previous_camera: None,
             pending: None,
-            accepted_cv: false,
             #[cfg(test)]
             timestamps: None,
         })
@@ -304,7 +303,6 @@ impl Restir {
             previous_jitter: [0.; 2],
             previous_camera: None,
             pending: None,
-            accepted_cv: false,
             #[cfg(test)]
             timestamps: None,
         })
@@ -345,17 +343,25 @@ impl Restir {
     }
 
     pub const fn color_history_valid(&self) -> bool {
-        self.accepted_cv
+        self.renderer.color_history_valid()
     }
 
-    pub fn invalidate_color(&mut self, _: super::history::ResetPermit) {
-        self.accepted_cv = false;
+    pub fn invalidate_color(&mut self, permit: super::history::ResetPermit) -> Result<(), Error> {
+        use super::history::{Histories, History, Invalidation};
+        self.renderer.invalidate_history(Invalidation::new(
+            Histories::one(History::Color),
+            permit.request().reason(),
+        ))?;
+        Ok(())
     }
 
-    pub fn invalidate(&mut self, _: super::history::ResetPermit) -> Result<(), Error> {
-        self.renderer.reset_history()?;
+    pub fn invalidate(&mut self, permit: super::history::ResetPermit) -> Result<(), Error> {
+        use super::history::{Histories, History, Invalidation};
+        self.renderer.invalidate_history(Invalidation::new(
+            Histories::one(History::Paths),
+            permit.request().reason(),
+        ))?;
         self.previous_camera = None;
-        self.previous_jitter = [0.; 2];
         Ok(())
     }
 
@@ -374,7 +380,12 @@ impl Restir {
         };
         #[cfg(not(test))]
         let frame = self.renderer.record(context)?;
-        self.pending = Some((frame.token, camera, jitter, cv));
+        let color = if cv {
+            restir_pt::ColorOutput::Produced
+        } else {
+            restir_pt::ColorOutput::Omitted
+        };
+        self.pending = Some((frame.token, camera, jitter, color));
         Ok(frame.commands)
     }
 
@@ -388,11 +399,10 @@ impl Restir {
     }
 
     pub fn completed(&mut self) -> Result<(), Error> {
-        if let Some((token, camera, jitter, cv)) = self.pending.take() {
-            self.renderer.commit(token)?;
+        if let Some((token, camera, jitter, color)) = self.pending.take() {
+            self.renderer.commit_with_color(token, color)?;
             self.previous_camera = Some(camera);
             self.previous_jitter = jitter;
-            self.accepted_cv = cv;
         }
         Ok(())
     }

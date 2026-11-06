@@ -160,7 +160,7 @@ fn hardware_pt_history_explicit_reset_scope() -> Result<(), Box<dyn std::error::
     // 此夹具只验证RR已接受元数据的失效范围，不声称执行SDK evaluate。
     gpu.rr_previous = Some(CameraFrame::new(&camera(), gpu.anchor)?);
     gpu.rr_index = 17;
-    gpu.rr_sample = 33;
+    gpu.absolute_sample = 33;
     let state = gpu.restir.as_ref().unwrap().frame()?;
     let resets = [gpu.history_audit.rr_resets, gpu.history_audit.restir_resets];
     let exposure = gpu.view.as_ref().unwrap().display.state();
@@ -178,14 +178,18 @@ fn hardware_pt_history_explicit_reset_scope() -> Result<(), Box<dyn std::error::
         GlobalReset::RenderDomainChanged,
         GlobalReset::ExplicitRequested,
     ] {
+        let sequence = gpu.restir.as_ref().unwrap().frame()?.frame_index;
+        let absolute = gpu.absolute_sample;
+        let jitter = gpu.restir.as_ref().unwrap().previous_jitter;
         gpu.invalidate_history(reason)?;
         assert_eq!(gpu.accumulated_samples(), 0);
         assert!(gpu.rr_previous.is_none());
         let restir = gpu.restir.as_ref().unwrap();
         assert!(!restir.frame()?.history_valid);
-        assert_eq!(restir.frame()?.frame_index, 0);
+        assert_eq!(restir.frame()?.frame_index, sequence);
+        assert_eq!(restir.previous_jitter, jitter);
         assert!(restir.previous_camera.is_none());
-        assert_eq!((gpu.rr_index, gpu.rr_sample), (17, 33));
+        assert_eq!((gpu.rr_index, gpu.absolute_sample), (17, absolute));
         assert_eq!(bytes(&mut gpu, exposure)?, accepted_exposure);
         host.render_options(
             &mut gpu,
@@ -195,6 +199,62 @@ fn hardware_pt_history_explicit_reset_scope() -> Result<(), Box<dyn std::error::
             options()?,
         )?;
         gpu.rr_previous = Some(CameraFrame::new(&camera(), gpu.anchor)?);
+    }
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT；四种消费者只按显式选择失效"]
+fn hardware_pt_history_consumers_invalidate_independently() -> Result<(), Box<dyn std::error::Error>>
+{
+    use simple_engine::pt::history::{Histories, History, Invalidation};
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let output = image(&mut gpu)?;
+    setup(&mut gpu)?;
+    gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., false, true)?)?;
+    for selected in [
+        History::Paths,
+        History::Color,
+        History::Reconstruction,
+        History::Accumulation,
+    ] {
+        host.render_options(
+            &mut gpu,
+            &output,
+            &camera(),
+            Environment::default(),
+            options()?,
+        )?;
+        gpu.rr_previous = Some(CameraFrame::new(&camera(), gpu.anchor)?);
+        let sequence = gpu.restir.as_ref().unwrap().frame()?.frame_index;
+        let jitter = gpu.restir.as_ref().unwrap().previous_jitter;
+        let samples = gpu.accumulated_samples();
+        assert!(gpu.restir.as_ref().unwrap().frame()?.history_valid);
+        assert!(gpu.restir.as_ref().unwrap().color_history_valid());
+        gpu.invalidate_histories(Invalidation::new(
+            Histories::one(selected),
+            GlobalReset::ExplicitRequested,
+        ))?;
+        let restir = gpu.restir.as_ref().unwrap();
+        assert_eq!(restir.frame()?.history_valid, selected != History::Paths);
+        assert_eq!(restir.color_history_valid(), selected != History::Color);
+        assert_eq!(
+            gpu.rr_previous.is_some(),
+            selected != History::Reconstruction
+        );
+        assert_eq!(
+            gpu.accumulated_samples(),
+            if selected == History::Accumulation {
+                0
+            } else {
+                samples
+            }
+        );
+        assert_eq!(restir.frame()?.frame_index, sequence);
+        assert_eq!(restir.previous_jitter, jitter);
     }
     drop(gpu);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
@@ -305,6 +365,7 @@ fn hardware_pt_restir_identity_rejects_removed_and_reused_slots()
     )?;
     let range = gpu.region_cache.entries()[0].range.clone();
     let identity = gpu.region_cache.entries()[0].identity;
+    let token = gpu.geometry_identities.records()[0].token;
     let primary = gpu.restir.as_ref().unwrap().primary_history();
     let primary = bytes(&mut gpu, primary)?;
     let old = primary
@@ -316,7 +377,7 @@ fn hardware_pt_restir_identity_rejects_removed_and_reused_slots()
                 u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap())
             })
         })
-        .find(|hit| hit[0] != 0 && range.contains(&((hit[0] - 1) / 2)) && hit[3] == identity)
+        .find(|hit| hit[0] == token)
         .ok_or("没有命中待删除mesh")?;
     assert_eq!(probe_identity(&mut gpu, old)?[..3], [1; 3]);
     let reset_count = gpu.history_audit.restir_resets;
@@ -325,6 +386,13 @@ fn hardware_pt_restir_identity_rejects_removed_and_reused_slots()
         anchor: [0.; 3],
         regions: &both(1)[1..],
     })?;
+    assert_eq!(gpu.geometry_identities.records().len(), 1);
+    assert!(
+        gpu.geometry_identities
+            .records()
+            .iter()
+            .all(|record| record.token != old[0])
+    );
     host.render_options(
         &mut gpu,
         &output,
@@ -348,10 +416,10 @@ fn hardware_pt_restir_identity_rejects_removed_and_reused_slots()
     let current = &gpu.region_cache.entries()[0];
     assert_eq!(current.range, range, "夹具必须实际复用旧属性槽");
     assert_ne!(current.identity, identity);
-    let next_identity = current.identity;
+    let next_token = gpu.geometry_identities.records()[0].token;
     assert_eq!(probe_identity(&mut gpu, old)?[..3], [0; 3]);
     let mut fresh = old;
-    fresh[3] = next_identity;
+    fresh[0] = next_token;
     assert_eq!(probe_identity(&mut gpu, fresh)?[..3], [1; 3]);
     assert_eq!(gpu.restir.as_ref().unwrap().frame()?.frame_index, 3);
     assert_eq!(gpu.history_audit.restir_resets, reset_count);
@@ -425,7 +493,7 @@ fn hardware_pt_restir_stable_hit_preserves_authored_normal()
                 u32::from_le_bytes(v[4 * i..4 * i + 4].try_into().unwrap())
             })
         })
-        .find(|h| h[0] != 0 && h[3] != 0)
+        .find(|h| h[0] != 0)
         .ok_or("ReSTIR没有命中")?;
     assert_eq!(probe_identity(&mut gpu, hit)?[3], reference);
     drop(gpu);
@@ -482,6 +550,93 @@ fn hardware_pt_restir_cancel_preserves_accepted_history() -> Result<(), Box<dyn 
     )?;
     assert_eq!(gpu.restir.as_ref().unwrap().frame()?.frame_index, 2);
     drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实shader：单slab编辑后未改域跨属性槽搬移仍能恢复旧命中"]
+fn hardware_pt_restir_unchanged_slab_keeps_its_history_after_region_rebuild()
+-> Result<(), Box<dyn std::error::Error>> {
+    use prime_scene::{FragmentMask, MeshParts, PreparedParts};
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let output = image(&mut gpu)?;
+    let mesh = setup(&mut gpu)?;
+    let mut parts = MeshParts::default();
+    parts.insert(
+        0,
+        Mesh {
+            quads: mesh.quads.clone(),
+        },
+    )?;
+    parts.insert(
+        1,
+        Mesh {
+            quads: mesh.quads.clone(),
+        },
+    )?;
+    let publish_parts = |gpu: &mut Gpu, view, revision| {
+        gpu.set_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor: [0.; 3],
+            regions: &[RenderRegion {
+                key: [0; 3],
+                geometry_revision: revision,
+                content_revision: revision,
+                mesh: view,
+            }],
+        })
+    };
+    // 故意令dense的局部版本等于稀疏源版本，验证两种来源不能误复用。
+    let source_revision = parts.view().fragment_revision(0).unwrap();
+    publish_parts(&mut gpu, (&mesh).into(), source_revision)?;
+    let dense_token = gpu.geometry_identities.records()[0].token;
+    publish_parts(&mut gpu, parts.view(), source_revision + 1)?;
+    assert_ne!(
+        gpu.geometry_identities.records()[0].token,
+        dense_token,
+        "连续和稀疏源版本不能互相冒充"
+    );
+    host.render_options(
+        &mut gpu,
+        &output,
+        &camera(),
+        Environment::default(),
+        options()?,
+    )?;
+    let old = gpu.geometry_identities.records();
+    let changed = [old[0].token, 0, 0.25_f32.to_bits(), 0.25_f32.to_bits()];
+    let unchanged = [old[1].token, 0, 0.25_f32.to_bits(), 0.25_f32.to_bits()];
+    let old_base = old[1].source.location[0];
+    assert_eq!(probe_identity(&mut gpu, unchanged)?[..3], [1; 3]);
+    let reset_count = gpu.history_audit.restir_resets;
+    let mut next = MeshParts::default();
+    let mut edited = Mesh {
+        quads: mesh.quads.clone(),
+    };
+    edited.quads.push(mesh.quads[0]);
+    next.insert(0, edited)?;
+    let mut mask = FragmentMask::empty();
+    mask.set(0)?;
+    let candidate = PreparedParts::prepare(&parts, next, mask)?;
+    publish_parts(&mut gpu, candidate.view(&parts), source_revision + 2)?;
+    let current = gpu.geometry_identities.records();
+    assert_eq!(current[1].token, unchanged[0]);
+    assert_ne!(
+        current[1].source.location[0], old_base,
+        "夹具必须搬移未改域属性范围"
+    );
+    host.render_options(
+        &mut gpu,
+        &output,
+        &camera(),
+        Environment::default(),
+        options()?,
+    )?;
+    assert_eq!(probe_identity(&mut gpu, changed)?[..3], [0; 3]);
+    assert_eq!(probe_identity(&mut gpu, unchanged)?[..3], [1; 3]);
+    assert_eq!(gpu.history_audit.restir_resets, reset_count);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

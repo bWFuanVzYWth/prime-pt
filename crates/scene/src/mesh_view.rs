@@ -7,6 +7,19 @@ enum Source<'a> {
     Sparse(&'a [Fragment]),
 }
 impl<'a> Source<'a> {
+    fn revision(self, slot: usize) -> Option<u64> {
+        match self {
+            Self::Dense(meshes) => meshes.get(slot).map(|_| 0),
+            Self::Sparse(fragments) => u16::try_from(slot)
+                .ok()
+                .and_then(|slot| {
+                    fragments
+                        .binary_search_by_key(&slot, |fragment| fragment.slot)
+                        .ok()
+                })
+                .map(|index| fragments[index].revision),
+        }
+    }
     fn at(self, i: usize) -> Option<(usize, &'a Mesh)> {
         match self {
             Self::Dense(v) => v.get(i).map(|m| (i, m)),
@@ -88,6 +101,17 @@ impl<'a> MeshView<'a> {
             self.overlay.and_then(|v| v.get(slot))
         } else {
             self.base.get(slot)
+        }
+    }
+    /// 精确的源片段版本；只替换该片段才变化，颜色覆盖保留版本。
+    ///
+    /// 稀疏MeshParts由所有者发行单调版本；兼容连续mesh返回0，调用者须以其
+    /// 整体geometry_revision作为保守回退。缺失片段返回None，不用地址或hash推测。
+    pub fn fragment_revision(self, slot: usize) -> Option<u64> {
+        if self.changed.contains(slot) {
+            self.overlay.and_then(|source| source.revision(slot))
+        } else {
+            self.base.revision(slot)
         }
     }
     /// 实际quad量，O(1)。

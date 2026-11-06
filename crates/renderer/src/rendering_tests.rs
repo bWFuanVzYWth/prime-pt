@@ -41,6 +41,43 @@ fn download_buffer(gpu: &mut Gpu, source: Buffer) -> Result<Vec<u8>, Error> {
 }
 
 #[test]
+#[ignore = "真实Vulkan RT；未编码和取消记录不能发布绝对随机身份"]
+fn hardware_pt_cancelled_recording_keeps_absolute_sample_sequence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    let output = image(&mut gpu)?;
+    gpu.settings.samples = 2;
+    let records = gpu.record(
+        [32, 32],
+        &camera(),
+        Environment::default(),
+        Binding::StorageImage(output),
+    )?;
+    assert_eq!(gpu.absolute_sample, 0);
+    assert!(matches!(
+        gpu.complete_previous(),
+        Err(Error::Settings(pt::Error::PendingBatch))
+    ));
+    assert!(
+        gpu.record(
+            [32, 32],
+            &camera(),
+            Environment::default(),
+            Binding::StorageImage(output)
+        )
+        .is_err()
+    );
+    gpu.cancel_recordings(records)?;
+    assert_eq!(gpu.absolute_sample, 0);
+    host.render(&mut gpu, &output, &camera())?;
+    assert_eq!(gpu.absolute_sample, 2);
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan RT；原生诊断拒绝RR和跨帧RGB写入，保持逐帧独立采样"]
 fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -61,6 +98,7 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
     let accumulation = gpu.view.as_ref().unwrap().accumulation;
     let counts = gpu.view.as_ref().unwrap().counts;
     gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., true, false)?)?;
+    let sequence_start = gpu.absolute_sample;
     let mut displays = Vec::new();
     for frame in 0..3 {
         host.render_options(
@@ -76,7 +114,7 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
         assert_eq!(gpu.accumulated_samples(), 4);
         assert_eq!(view.accumulation, accumulation);
         assert_eq!(view.counts, counts);
-        assert_eq!(gpu.diagnostic_sample, (frame + 1) * 4);
+        assert_eq!(gpu.absolute_sample, sequence_start + (frame + 1) * 4);
         assert!(
             download_buffer(&mut gpu, counts)?
                 .as_chunks::<4>()
@@ -149,7 +187,7 @@ fn hardware_pt_diagnostic_batch_matches_single_sample_mean()
                 }
             }
         }
-        assert_eq!(gpu.diagnostic_sample, 8);
+        assert_eq!(gpu.absolute_sample, 8);
     }
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
@@ -527,6 +565,7 @@ fn hardware_pt_rr_restir_storage_preserves_path_history() -> Result<(), Box<dyn 
         )?;
         for record in records {
             record.submit_and_wait(&mut gpu.context)?;
+            gpu.recording_encoded();
         }
         gpu.complete_previous()?;
         let restir = gpu.restir.as_ref().unwrap();
@@ -570,6 +609,7 @@ fn hardware_pt_rr_restir_jitter_donor_is_stationary() -> Result<(), Box<dyn std:
         )?;
         for record in records {
             record.submit_and_wait(&mut gpu.context)?;
+            gpu.recording_encoded();
         }
         gpu.complete_previous()?;
         gpu.atmosphere.submitted();

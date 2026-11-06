@@ -15,6 +15,8 @@ import restir_pt.rng;
 import restir_pt.reservoir;
 import restir_pt.shift;
 import restir_pt.storage;
+import restir_pt.admission;
+import restir_pt.merge;
 import restir_pt.resampling;
 import restir_pt.schedule;
 import restir_pt.paired;
@@ -31,9 +33,10 @@ using namespace restir_pt;
 RWStructuredBuffer<float4> restir_output;
 [[vk::binding(15, 0)]]
 RWStructuredBuffer<float4> restir_residual;
-/// 与普通PT互斥使用landing normal plane；只在本帧initial写入、merge读取，不跨帧保存。
+/// 与普通PT互斥使用landing normal plane；只消费其前12B/像素的紧凑RGB域。
+/// 本帧initial写入、merge读取，不跨帧保存。
 [[vk::binding(11, 0)]]
-RWStructuredBuffer<float4> cv_proxy;
+RWByteAddressBuffer cv_proxy;
 [[vk::binding(38, 0)]]
 RWByteAddressBuffer reservoirs_a;
 [[vk::binding(39, 0)]]
@@ -53,20 +56,10 @@ RWByteAddressBuffer colors_a;
 [[vk::binding(46, 0)]]
 RWByteAddressBuffer colors_b;
 
-float3 load_color(RWByteAddressBuffer buffer, uint offset)
-{
-    return asfloat(buffer.Load3(12u * offset));
-}
-
-void store_color(RWByteAddressBuffer buffer, uint offset, float3 color)
-{
-    buffer.Store3(12u * offset, asuint(color));
-}
-
 // 与game相同，系数只依赖固定primary的UV/tint纹理代理，不读取随机路径辐射。
 float3 cv_reflectance(uint2 pixel)
 {
-    return cv_proxy[pixel.y * parameters[0].image.x + pixel.x].xyz;
+    return load_color(cv_proxy, pixel.y * parameters[0].image.x + pixel.x);
 }
 
 uint offset_for(uint2 pixel)
@@ -97,16 +90,13 @@ Surface current_surface(RestirScene scene, uint2 pixel)
     return result;
 }
 
-PrecomputedShiftData shifted(RestirScene scene, Surface destination, PathReservoir source,
-                             uint2 pixel, bool previous)
+PrecomputedShiftData shifted(RestirScene scene, Surface destination, RWByteAddressBuffer source,
+                             uint index, uint2 pixel, bool previous)
 {
     ShiftSettings settings = {};
-    PrecomputedShiftData result = {};
-    result.pathThroughput = shiftPath(scene, destination, source,
-                                      scene.primaryRayFootprint(destination, pixel, previous),
-                                      settings, true, true, true, previous, result.Jacobian);
-    result.reconnectionJacobian = source.reconnectionJacobian;
-    return result;
+    return shiftPathLoaded(scene, destination, source, index,
+                           scene.primaryRayFootprint(destination, pixel, previous), settings, true,
+                           true, true, previous);
 }
 
 [shader("raygeneration")]
@@ -129,10 +119,11 @@ void restir_initial()
     primary_current[offset_for(pixel)] = hit.data;
     if ((p.output_size.z & 8u) != 0)
     {
-        float3 proxy = hit.isValid()
-                           ? max(material_texel(hit.data.x - 1u, asfloat(hit.data.yz)).xyz, 0.04)
-                           : float3(0.04);
-        cv_proxy[linear] = float4(proxy, 0);
+        float3 proxy =
+            hit.isValid()
+                ? max(material_texel(restir_primitive(hit), asfloat(hit.data.zw)).xyz, 0.04)
+                : float3(0.04);
+        store_color(cv_proxy, linear, proxy);
     }
     TinyUniformSampleGenerator generator =
         rng_for_pixel(pixel, p.temporal_reserved.x ^ p.options.x);
@@ -187,19 +178,13 @@ public bool temporal_donor(uint2 pixel, out uint2 donor)
                                 p.previous_up };
     geometry::CameraProjection projected =
         geometry::camera_project(camera, point.position, p.image.xy);
-    // 静止点的投影含当前射线jitter；扣当前值保持同像素donor，前帧偏移只用于重放。
-    float2 position = projected.pixel - p.reconstruction.xy;
-    if (!projected.valid || any(position < 0) || any(position >= float2(p.image.xy)))
+    if (!temporal_candidate(projected.pixel, projected.valid, p.image.xy, p.reconstruction.xy,
+                            donor))
         return false;
-    donor = uint2(position);
     HitInfo previous;
     previous.data = primary_history[offset_for(donor)];
-    if (!restir_valid_hit(previous) || previous.data.x != current.data.x ||
-        previous.data.w != current.data.w)
-        return false;
-    geometry::SurfacePoint old = geometry::surface_point(restir_endpoint(previous));
-    return paired_geometry_valid(point.normal, length(point.position - p.previous_position.xyz),
-                                 old.normal, length(old.position - p.previous_position.xyz));
+    // donor只须仍能重建；跨面/材质/区块可以作为候选，精确shift负责零支持和失效路径。
+    return restir_valid_hit(previous);
 }
 
 [shader("raygeneration")]
@@ -215,25 +200,23 @@ void restir_temporal_direction()
     if (!valid)
         return;
     RestirScene scene;
-    PathReservoir canonical = load_reservoir(reservoirs_a, offset);
-    PathReservoir history = load_reservoir(reservoirs_b, offset_for(donor));
-    PrecomputedShiftData shift = {};
-    if (canonical.M > 0 && history.M > 0)
+    bool previous = direction == 0;
+    uint2 targetPixel = previous ? donor : pixel;
+    uint sourceIndex = previous ? offset : offset_for(donor);
+    Surface target;
+    if (previous)
     {
-        if (direction == 0)
-        {
-            HitInfo hit;
-            hit.data = primary_history[offset_for(donor)];
-            Surface target =
-                scene.loadSurfaceFromOrigin(hit, parameters[0].previous_position.xyz, true);
-            shift = shifted(scene, target, canonical, donor, true);
-        }
-        else
-        {
-            history.M = min(history.M, float(parameters[0].output_size.w));
-            shift = shifted(scene, current_surface(scene, pixel), history, pixel, false);
-        }
+        HitInfo hit;
+        hit.data = primary_history[offset_for(donor)];
+        target = scene.loadSurfaceFromOrigin(hit, parameters[0].previous_position.xyz, true);
     }
+    else
+        target = current_surface(scene, pixel);
+    ShiftSettings settings = {};
+    PrecomputedShiftData shift =
+        shiftPathLoaded(scene, target, reservoirs_a, reservoirs_b, sourceIndex, !previous,
+                        scene.primaryRayFootprint(target, targetPixel, previous), settings, true,
+                        true, true, previous);
     store_precomputed(shifts, temporal_address(offset, direction), shift);
 }
 
@@ -249,24 +232,25 @@ void restir_temporal_combine(uint3 id: SV_DispatchThreadID)
     if (mask.x == 0)
         return;
     uint2 donor = uint2(mask.y & 0xfffu, mask.y >> 12);
-    PathReservoir canonical = load_reservoir(reservoirs_a, offset);
-    PathReservoir history = load_reservoir(reservoirs_b, offset_for(donor));
-    if (canonical.M <= 0 || history.M <= 0)
-        return;
-    history.M = min(history.M, float(p.output_size.w));
+    uint historyOffset = offset_for(donor);
+    PathReservoir canonical = load_merge_source(reservoirs_a, offset);
+    PathReservoir history = load_merge_source(reservoirs_b, historyOffset);
     PrecomputedShiftData canonicalAtHistory = load_precomputed(shifts, temporal_address(offset, 0));
     PrecomputedShiftData historyAtCanonical = load_precomputed(shifts, temporal_address(offset, 1));
     if ((p.output_size.z & 16u) != 0)
         store_color(colors_a, offset,
                     cv_temporal(canonical.integrand * canonical.weight,
-                                load_color(colors_b, offset_for(donor)), canonical, history,
+                                load_color(colors_b, historyOffset), canonical, history,
                                 canonicalAtHistory, historyAtCanonical, 1.0,
                                 float(p.output_size.w)));
     TinyUniformSampleGenerator generator =
         rng_for_pixel(id.xy, p.temporal_reserved.x ^ p.options.x ^ 0x632be59bu);
-    store_reservoir(reservoirs_a, offset,
-                    temporal_resample(canonical, history, canonicalAtHistory, historyAtCanonical,
-                                      generator.next2D(), float(p.output_size.w)));
+    MergeSelection selected =
+        temporal_selection(canonical, history, canonicalAtHistory, historyAtCanonical, offset,
+                           historyOffset, generator.next2D(), float(p.output_size.w));
+    PathReservoir result = selected.canonical ? load_selection(reservoirs_a, selected)
+                                              : load_selection(reservoirs_b, selected);
+    store_reservoir(reservoirs_a, offset, result);
 }
 
 [shader("compute")]
@@ -278,7 +262,7 @@ void restir_spatial_work(uint3 id: SV_DispatchThreadID)
     if (any(pixel >= p.image.xy))
         return;
     uint offset = offset_for(pixel);
-    PathReservoir canonical = load_reservoir(reservoirs_a, offset);
+    PathReservoir canonical = load_merge_source(reservoirs_a, offset);
     uint mask = 0;
     float sum = canonical.M;
     PairedNeighborTransform transform = transform_for_frame();
@@ -286,7 +270,7 @@ void restir_spatial_work(uint3 id: SV_DispatchThreadID)
     if (hit.isValid())
     {
         geometry::SurfacePoint point = geometry::surface_point(restir_endpoint(hit));
-        float distance = length(p.origin.xyz - point.position);
+        AdmissionSurface central = reuse_geometry(hit, point);
         for (uint slot = 0; slot < 3; ++slot)
         {
             int2 donor = paired_neighbor(paired_lut, transform, slot, pixel);
@@ -296,9 +280,8 @@ void restir_spatial_work(uint3 id: SV_DispatchThreadID)
             if (!neighborHit.isValid())
                 continue;
             geometry::SurfacePoint neighbor = geometry::surface_point(restir_endpoint(neighborHit));
-            PathReservoir source = load_reservoir(reservoirs_a, offset_for(uint2(donor)));
-            if (source.M > 0 && paired_geometry_valid(point.normal, distance, neighbor.normal,
-                                                      length(p.origin.xyz - neighbor.position)))
+            PathReservoir source = load_merge_source(reservoirs_a, offset_for(uint2(donor)));
+            if (spatial_candidate(central, reuse_geometry(neighborHit, neighbor)))
             {
                 mask |= 1u << slot;
                 sum += source.M;
@@ -335,9 +318,8 @@ void restir_spatial_direction()
         return;
     uint2 donor = uint2(paired_neighbor(paired_lut, transform_for_frame(), slot, pixel));
     RestirScene scene;
-    PrecomputedShiftData shift =
-        shifted(scene, current_surface(scene, pixel),
-                load_reservoir(reservoirs_a, offset_for(donor)), pixel, false);
+    PrecomputedShiftData shift = shifted(scene, current_surface(scene, pixel), reservoirs_a,
+                                         offset_for(donor), pixel, false);
     store_precomputed(shifts, paired_address(offset, slot), shift);
 }
 
@@ -349,18 +331,20 @@ void restir_merge(uint3 id: SV_DispatchThreadID)
     if (any(id.xy >= p.image.xy))
         return;
     uint offset = offset_for(id.xy);
-    PathReservoir canonical = load_reservoir(reservoirs_a, offset);
     uint2 mask = neighbor_masks[offset];
+    bool reuse = mask.x != 0 && asfloat(mask.y) > 0.0;
+    // 没有邻居时直接传完整记录；不先读热20B再为相同源回读80B。
+    PathReservoir canonical =
+        reuse ? load_merge_source(reservoirs_a, offset) : load_reservoir(reservoirs_a, offset);
     PathReservoir result = canonical;
     bool cv = (p.output_size.z & 8u) != 0;
     float3 color = cv ? load_color(colors_a, offset) : float3(0);
     CVAccumulator colors;
     colors.init(color, canonical.M);
-    if (canonical.M > 0 && mask.x != 0)
+    if (reuse)
     {
-        PairwiseFactor factor = { asfloat(mask.y), canonical.M };
-        float canonicalWeight = spatial_begin(factor);
-        result = empty_reservoir();
+        SpatialSelection selection;
+        selection.init(canonical, asfloat(mask.y));
         PairedNeighborTransform transform = transform_for_frame();
         float3 reflectance = cv ? cv_reflectance(id.xy) : float3(1);
         TinyUniformSampleGenerator generator =
@@ -372,17 +356,17 @@ void restir_merge(uint3 id: SV_DispatchThreadID)
                 continue;
             uint2 donor = uint2(paired_neighbor(paired_lut, transform, slot, id.xy));
             uint other = offset_for(donor);
-            PathReservoir source = load_reservoir(reservoirs_a, other);
+            PathReservoir source = load_merge_source(reservoirs_a, other);
             PrecomputedShiftData forward = load_precomputed(shifts, paired_address(offset, slot));
             PrecomputedShiftData reverse = load_precomputed(shifts, paired_address(other, slot));
             if (cv && source.M > 0)
                 colors.add(cv_from_neighbor(load_color(colors_a, other), canonical, source, forward,
                                             reverse, cv_alpha(reflectance, cv_reflectance(donor))),
                            source.M);
-            spatial_merge_neighbor(result, canonical, source, forward, reverse, factor,
-                                   canonicalWeight, sample);
+            selection.add(source, other, forward, reverse, sample);
         }
-        spatial_finish(result, canonical, canonicalWeight, generator.next1D());
+        selection.finish(offset, generator.next1D());
+        result = load_selection(reservoirs_a, selection.selected);
     }
     store_reservoir(reservoirs_b, offset, result);
     primary_history[offset] = primary_current[offset];

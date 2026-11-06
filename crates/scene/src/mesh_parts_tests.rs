@@ -159,3 +159,26 @@ fn sparse_fragment_order_matches_legacy_dense_overlay() -> Result<(), Error> {
     ));
     Ok(())
 }
+
+#[test]
+fn slab_geometry_revision_survives_neighbor_and_tint_publication() -> Result<(), Error> {
+    let mut base = MeshParts::default();
+    base.insert(1, mesh([1.; 3]))?;
+    base.insert(2, mesh([1.; 3]))?;
+    let versions = [
+        base.view().fragment_revision(1),
+        base.view().fragment_revision(2),
+    ];
+    let mut next = MeshParts::default();
+    next.insert(1, mesh([0.5; 3]))?;
+    let mut changed = FragmentMask::empty();
+    changed.set(1)?;
+    let prepared = PreparedParts::prepare(&base, next, changed)?
+        .with_tints(&base, vec![TintPatch::new(2, 0, 1, 0xff12_3456)?])?;
+    let view = prepared.view(&base);
+    assert_ne!(view.fragment_revision(1), versions[0]);
+    assert_eq!(view.fragment_revision(2), versions[1]);
+    let published = prepared.finish(&mut base);
+    assert_eq!(published.view().fragment_revision(2), versions[1]);
+    Ok(())
+}

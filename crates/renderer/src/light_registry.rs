@@ -1,6 +1,6 @@
 //! 稳定数据槽、紧凑活动序列与稀疏反查的单一CPU所有者；准备不修改已发布表。
 
-use simple_engine::{light_sampling, scene_cache};
+use simple_engine::{light_bvh, light_sampling, scene_cache};
 use std::collections::HashMap;
 
 use crate::gpu::Error;
@@ -9,6 +9,7 @@ const INITIAL_CAPACITY: usize = 16;
 const META: u8 = 1;
 const VERTICES: u8 = 2;
 const REGION: u8 = 4;
+const POWER: u8 = 8;
 
 /// 五个GPU缓冲的完整容量镜像；只在显式容量增长时产生。
 pub(crate) struct Tables {
@@ -34,6 +35,7 @@ pub(super) struct Record {
     pub meta: [u32; 4],
     pub vertices: [[f32; 4]; 3],
     pub region: [u32; 4],
+    pub power: f32,
 }
 
 struct Edit {
@@ -50,7 +52,32 @@ pub(super) struct Registry {
     meta: Vec<[u32; 4]>,
     vertices: Vec<[f32; 4]>,
     regions: Vec<[u32; 4]>,
+    powers: Vec<f32>,
     inverse: Vec<[u32; 4]>,
+    proposal: Proposal,
+}
+
+#[derive(Default)]
+struct Proposal {
+    anchor: [u32; 3],
+    words: Vec<u32>,
+}
+
+fn tree_base(capacity: usize) -> usize {
+    2 + capacity.div_ceil(4)
+}
+
+fn selection_rows(capacity: usize) -> Result<usize, Error> {
+    let packets = capacity.saturating_sub(1);
+    let tree_words = packets
+        .checked_mul(10)
+        .and_then(|v| v.checked_add(7))
+        .map(|v| v & !7)
+        .and_then(|v| v.checked_add(capacity * 8))
+        .ok_or(Error::Invalid("发光位置树容量溢出"))?;
+    tree_base(capacity)
+        .checked_add(tree_words / 4)
+        .ok_or(Error::Invalid("发光选择表容量溢出"))
 }
 
 pub(super) struct Delta {
@@ -65,6 +92,7 @@ pub(super) struct Delta {
     added_active: Vec<u32>,
     added_start: usize,
     inverse: HashMap<usize, [u32; 4]>,
+    proposal: Option<Proposal>,
 }
 
 pub(super) struct Writer<'a> {
@@ -115,17 +143,21 @@ impl Registry {
                     .unwrap_or_default()
             }),
             region: self.regions.get(index).copied().unwrap_or_default(),
+            power: self.powers.get(index).copied().unwrap_or_default(),
         }
     }
 
     pub(super) fn reserve(&mut self, delta: &Delta, tables: Option<&Tables>) -> Result<(), Error> {
+        self.powers
+            .try_reserve_exact(delta.capacity.saturating_sub(self.powers.len()))
+            .map_err(allocation)?;
         if delta.capacity != self.capacity {
             let tables = tables.ok_or(Error::Invalid("发光增长阶段缺少完整表"))?;
             if tables.meta.len() != delta.capacity
                 || tables.vertices.len() != delta.capacity * 3
                 || tables.regions.len() != delta.capacity
                 || tables.inverse.len() != delta.capacity * 2 + 1
-                || tables.selection.len() != 1 + delta.capacity.div_ceil(4)
+                || tables.selection.len() != selection_rows(delta.capacity)?
                 || tables.selection[0][0] as usize != delta.count
             {
                 return Err(Error::Invalid("发光完整表与准备容量不匹配"));
@@ -153,7 +185,19 @@ impl Registry {
             && self.active.capacity() < delta.capacity
     }
 
-    pub(super) fn commit(&mut self, delta: Delta, tables: Option<Tables>) {
+    pub(super) fn commit(&mut self, mut delta: Delta, tables: Option<Tables>) {
+        self.powers.resize(delta.span as usize, 0.);
+        for (&id, edit) in &delta.records {
+            if edit.mask & POWER != 0 {
+                self.powers[id as usize] = edit.record.power;
+            }
+        }
+        for &(id, record) in &delta.additions {
+            self.powers[id as usize] = record.power;
+        }
+        if let Some(proposal) = delta.proposal.take() {
+            self.proposal = proposal;
+        }
         if self.moves_active(&delta) {
             self.active = delta.added_active;
         } else {
@@ -226,6 +270,7 @@ impl<'a> Writer<'a> {
                 added_active: Vec::new(),
                 added_start: current.active.len(),
                 inverse: HashMap::new(),
+                proposal: None,
             },
             removals: Vec::new(),
             insertions: Vec::new(),
@@ -264,7 +309,8 @@ impl<'a> Writer<'a> {
                 old.vertices.map(|r| r.map(f32::to_bits))
                     != record.vertices.map(|r| r.map(f32::to_bits)),
             ) * VERTICES)
-            | (u8::from(old.region != record.region) * REGION);
+            | (u8::from(old.region != record.region) * REGION)
+            | (u8::from(old.power.to_bits() != record.power.to_bits()) * POWER);
         if mask == 0 {
             self.delta.records.remove(&id);
             Ok(())
@@ -378,6 +424,18 @@ impl<'a> Writer<'a> {
                 .ok_or(Error::Invalid("发光缓冲容量溢出"))?;
         }
         let grow = self.delta.capacity != self.current.capacity;
+        let proposal_changed = grow
+            || self.delta.count != self.current.active.len()
+            || !self.delta.active.is_empty()
+            || !self.delta.additions.is_empty()
+            || self
+                .delta
+                .records
+                .values()
+                .any(|edit| edit.mask & (VERTICES | REGION | POWER) != 0);
+        if proposal_changed {
+            self.delta.proposal = Some(self.build_proposal()?);
+        }
         let tables = if grow {
             Some(self.full_tables()?)
         } else {
@@ -446,8 +504,34 @@ impl<'a> Writer<'a> {
                 patches.regions.push((id as usize, record.region));
             }
             let mut rows = HashMap::new();
-            if self.delta.count != self.current.active.len() {
-                mapped(&mut rows, 0, [self.delta.count as u32, 0, 0, 0])?;
+            if let Some(proposal) = &self.delta.proposal {
+                mapped(
+                    &mut rows,
+                    0,
+                    [
+                        self.delta.count as u32,
+                        tree_base(self.delta.capacity) as u32,
+                        0,
+                        0,
+                    ],
+                )?;
+                if proposal.anchor != self.current.proposal.anchor {
+                    mapped(
+                        &mut rows,
+                        1,
+                        [
+                            proposal.anchor[0],
+                            proposal.anchor[1],
+                            proposal.anchor[2],
+                            0,
+                        ],
+                    )?;
+                }
+                for (index, &row) in proposal.words.as_chunks::<4>().0.iter().enumerate() {
+                    if self.current.proposal.words.as_chunks::<4>().0.get(index) != Some(&row) {
+                        mapped(&mut rows, tree_base(self.delta.capacity) + index, row)?;
+                    }
+                }
             }
             for &rank in self.delta.active.keys() {
                 let index = rank / 4;
@@ -460,7 +544,7 @@ impl<'a> Writer<'a> {
                         .unwrap_or(0)
                 });
                 if row != old {
-                    mapped(&mut rows, index + 1, row)?;
+                    mapped(&mut rows, index + 2, row)?;
                 }
             }
             if !self.delta.added_active.is_empty() {
@@ -474,7 +558,7 @@ impl<'a> Writer<'a> {
                             .unwrap_or(0)
                     });
                     if row != old {
-                        mapped(&mut rows, index + 1, row)?;
+                        mapped(&mut rows, index + 2, row)?;
                     }
                 }
             }
@@ -517,12 +601,25 @@ impl<'a> Writer<'a> {
             vertices[index * 3..index * 3 + 3].copy_from_slice(&record.vertices);
             regions[index] = record.region;
         }
-        let mut selection = reserved(1 + capacity.div_ceil(4))?;
-        selection.push([self.delta.count as u32, 0, 0, 0]);
+        let proposal = self
+            .delta
+            .proposal
+            .as_ref()
+            .unwrap_or(&self.current.proposal);
+        let mut selection = reserved(selection_rows(capacity)?)?;
+        selection.push([self.delta.count as u32, tree_base(capacity) as u32, 0, 0]);
+        selection.push([
+            proposal.anchor[0],
+            proposal.anchor[1],
+            proposal.anchor[2],
+            0,
+        ]);
         selection.extend(
             (0..capacity.div_ceil(4))
                 .map(|row| std::array::from_fn(|column| self.active(row * 4 + column))),
         );
+        selection.extend_from_slice(proposal.words.as_chunks::<4>().0);
+        selection.resize(selection_rows(capacity)?, [0; 4]);
         let buckets = capacity
             .checked_mul(2)
             .ok_or(Error::Invalid("发光反查容量溢出"))?;
@@ -553,6 +650,42 @@ impl<'a> Writer<'a> {
             vertices,
             regions,
             inverse,
+        })
+    }
+
+    /// 几何/活动顺序改变时才重建位置提案；准备失败或未提交不会修改旧树。
+    /// 发光功率来自资源亮度估计×面积×发射侧数，不读取或复制纹理发光实值。
+    fn build_proposal(&self) -> Result<Proposal, Error> {
+        let record_at = |rank: usize| {
+            if rank >= self.delta.added_start {
+                self.delta.additions[rank - self.delta.added_start].1
+            } else {
+                self.record(self.active(rank))
+            }
+        };
+        let anchor = if self.delta.count == 0 {
+            [0; 3]
+        } else {
+            record_at(0).region[..3].try_into().expect("三维region")
+        };
+        let mut quads = reserved(self.delta.count)?;
+        for rank in 0..self.delta.count {
+            let record = record_at(rank);
+            let local = light_sampling::unpack_vertices(record.vertices);
+            let translation = std::array::from_fn::<_, 3, _>(|axis| {
+                (i64::from(record.region[axis] as i32) - i64::from(anchor[axis] as i32)) as f32
+                    * 64.0
+            });
+            quads.push(light_bvh::Quad {
+                vertices: local
+                    .map(|point| std::array::from_fn(|axis| point[axis] + translation[axis])),
+                power: record.power,
+            });
+        }
+        let tree = light_bvh::Tree::build(&quads)?;
+        Ok(Proposal {
+            anchor,
+            words: tree.into_words(),
         })
     }
 }
@@ -651,6 +784,7 @@ mod tests {
                 [0., 0., 1., 0.],
             ],
             region: [0, 0, 0, 3],
+            power: 1.,
         }
     }
 
@@ -722,10 +856,18 @@ mod tests {
         );
         assert_eq!(tables.regions[..registry.regions.len()], registry.regions);
         assert_eq!(tables.inverse, registry.inverse);
+        assert_eq!(&tables.selection[1][..3], &registry.proposal.anchor);
+        let tree_base = tables.selection[0][1] as usize;
+        assert_eq!(
+            bytemuck::cast_slice::<_, u32>(
+                &tables.selection[tree_base..tree_base + registry.proposal.words.len() / 4]
+            ),
+            registry.proposal.words
+        );
         let mut identities = HashSet::new();
         for (rank, &id) in registry.active.iter().enumerate() {
             assert!(identities.insert(id));
-            assert_eq!(tables.selection[1 + rank / 4][rank % 4], id);
+            assert_eq!(tables.selection[2 + rank / 4][rank % 4], id);
             assert_eq!(registry.regions[id as usize][3] >> 2, rank as u32);
             assert_eq!(registry.regions[id as usize][3] & 3, 3);
             assert_eq!(
@@ -746,13 +888,51 @@ mod tests {
         assert!(patches.meta.is_empty());
         assert!(patches.vertices.is_empty());
         assert_eq!(patches.regions.len(), 1);
-        assert!(patches.alias.len() <= 3);
+        let tree_base = tables.selection[0][1] as usize;
+        assert!(
+            patches
+                .alias
+                .iter()
+                .filter(|(row, _)| *row < tree_base)
+                .count()
+                <= 3
+        );
         apply(&mut tables, &patches);
         registry.reserve(&delta, None).unwrap();
         registry.commit(delta, None);
         assert_eq!(registry.active[17], old_last);
         assert_eq!(registry.record(old_last).meta[3], 999);
         assert_eq!(lookup(&registry.inverse, 18), None);
+        validate(&registry, &tables);
+    }
+
+    #[test]
+    fn proposal_keeps_region_local_detail_far_from_the_world_origin() {
+        let build = |anchor: i32| {
+            let registry = Registry::default();
+            let mut writer = Writer::new(&registry);
+            for slot in 0..2 {
+                let mut value = record(slot);
+                value.region[0] = (anchor + slot as i32) as u32;
+                writer.add(value).unwrap();
+            }
+            writer.finish().unwrap().0.proposal.unwrap()
+        };
+        let near = build(0);
+        let far = build(2_000_000_000);
+        assert_eq!(near.words, far.words);
+        assert_eq!(far.anchor[0] as i32, 2_000_000_000);
+    }
+
+    #[test]
+    fn discarded_geometry_preparation_keeps_the_published_proposal() {
+        let (registry, tables) = initial(4);
+        let mut writer = Writer::new(&registry);
+        writer.remove(0).unwrap();
+        let (delta, _, patches) = writer.finish().unwrap();
+        assert!(delta.proposal.is_some());
+        assert!(!patches.alias.is_empty());
+        drop(delta);
         validate(&registry, &tables);
     }
 
@@ -946,7 +1126,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let rank = forward.index as usize;
-            let id = tables.selection[1 + rank / 4][rank % 4];
+            let id = tables.selection[2 + rank / 4][rank % 4];
             let key = tables.meta[id as usize][3] + 1;
             let reverse_id = lookup(&tables.inverse, key).unwrap();
             let reverse_rank = tables.regions[reverse_id as usize][3] >> 2;
@@ -958,7 +1138,7 @@ mod tests {
                     .to_bits()
             );
         }
-        assert_ne!(tables.selection[1][2], 2);
+        assert_ne!(tables.selection[2][2], 2);
         validate(&registry, &tables);
     }
 }

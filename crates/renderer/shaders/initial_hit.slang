@@ -61,7 +61,7 @@ public struct InitialHitTrace : restir_pt::IInitialTrace<RestirScene, HitObject>
                                            restir_pt::Surface surface, float3 u, float3 direction,
                                            float3 secondDirection, bool continuation)
     {
-        uint program = (materials[material_id(surface.hit.data.x - 1u)].control.x >> 2u) +
+        uint program = (materials[material_id(surface.identity.x)].control.x >> 2u) +
                        (continuation ? 0u : asuint(parameters[0].restir.z));
         found.SetShaderTableIndex(program + 1u);
         if (continuation)

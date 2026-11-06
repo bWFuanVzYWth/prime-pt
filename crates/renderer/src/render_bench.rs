@@ -16,7 +16,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
         .split(',')
         .map(str::parse)
         .collect::<Result<_, _>>()?;
-    if modes.len() < 2 || modes.iter().any(|&v| v > 7) {
+    if modes.len() < 2 || modes.iter().any(|&v| v > 8) {
         return Err("至少两个有效实验分派".into());
     }
     let rounds = modes.len() * 2;
@@ -214,6 +214,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                         .test_set_timestamps(stage_queries);
                 }
                 gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+                gpu.test_restart_sample_sequence(0)?;
                 let mut timings = Vec::new();
                 let mut stage_timings = Vec::new();
                 for frame in 0..warmup + samples {

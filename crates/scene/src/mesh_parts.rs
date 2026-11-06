@@ -55,6 +55,7 @@ impl FragmentMask {
 }
 pub(crate) struct Fragment {
     pub slot: u16,
+    pub revision: u64,
     pub mesh: Mesh,
 }
 
@@ -117,17 +118,29 @@ impl MeshParts {
         if found.is_err() && !mesh.quads.is_empty() {
             self.fragments.try_reserve(1)?;
         }
-        if self.owner == 0 && len != 0 {
-            self.owner = fresh_owner()?;
-        }
+        let owner = if self.owner == 0 && len != 0 {
+            fresh_owner()?
+        } else {
+            self.owner
+        };
+        let revision = if mesh.quads.is_empty() {
+            0
+        } else {
+            fresh_owner()?
+        };
+        self.owner = owner;
         let previous = match found {
             Ok(i) if mesh.quads.is_empty() => Some(self.fragments.remove(i).mesh),
-            Ok(i) => Some(std::mem::replace(&mut self.fragments[i].mesh, mesh)),
+            Ok(i) => {
+                self.fragments[i].revision = revision;
+                Some(std::mem::replace(&mut self.fragments[i].mesh, mesh))
+            }
             Err(i) if !mesh.quads.is_empty() => {
                 self.fragments.insert(
                     i,
                     Fragment {
                         slot: slot as u16,
+                        revision,
                         mesh,
                     },
                 );

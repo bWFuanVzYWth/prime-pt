@@ -548,7 +548,7 @@ fn hardware_pt_scene_baseline() -> Result {
             "atlas":save(&root,"atlas.rgba8",&atlas)?,"atlas_extent":[16,16],
             "camera":{"origin":camera.origin,"forward":camera.forward,"right":camera.right,"up":camera.up},
             "environment":{"sun_direction":environment.sun_direction,"sea_level":environment.sea_level,"exposure_ev":environment.exposure_ev},
-            "integrator":{"samples":1,"max_vertices":12,"seed":0,"max_dielectric_events":128,"rr":false,"ser":false},
+            "integrator":{"samples":1,"max_bounces":12,"seed":0,"max_dielectric_events":128,"rr":false,"ser":false},
             "rounds":ROUNDS,"steady_frames_per_round":FRAMES,"edits_per_round":EDITS,
             "boundary":"Host::render_options: command-pool creation, draw/encode, submit, queue idle, Flight completion; readback excluded",
             "scene_update_boundary":"manager_complete: plan+PRT2 packet response+apply+prepare+set_sections+commit/retire; all empty resources included; output file writes excluded",

@@ -1,13 +1,13 @@
 /// 发光quad的应用绑定；alias/面积/PDF和连接误差使用引擎，不拥有材质或纹理。
 module mod_lights;
 import pt.scene;
-import pt.light_sampling;
-import pt.emission_alias;
+__exported import pt.light_proposal;
 import geometry.ray;
 import params;
 import mod_materials;
 
-/// 首行[count,0,0,0]，后续每行四个活动数据槽；运行期无全局alias构建。
+/// 首行[count,treeBase,0,0]，随后region anchor和紧凑活动槽，再存位置BVH。
+/// BVH按几何发布事务更新；纹理alias仍仅在资源准备阶段构建。
 [[vk::binding(30, 0)]]
 StructuredBuffer<uint4> light_alias;
 /// 每灯[split,rho0,rho1,globalQuadSlot]。
@@ -24,7 +24,7 @@ StructuredBuffer<uint4> light_inverse;
 public StructuredBuffer<int4> light_regions;
 /// 每资源世代唯一的静态纹理内alias，control.w>>1给出header word偏移。
 [[vk::binding(35, 0)]]
-StructuredBuffer<uint> emission_alias_words;
+ByteAddressBuffer emission_alias_words;
 
 /// 本帧已发布的活动灯数；策略权重不依赖单次面积proposal的接受结果。
 public uint light_count()
@@ -62,10 +62,15 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
 {
     pt::LightSample result = {};
     uint4 header = light_alias[0];
-    pt::LightAliasSample selected = pt::uniform_light_sample(header.x, sample.z);
+    if (header.x == 0u)
+        return result;
+    int3 anchor = asint(light_alias[1].xyz);
+    float3 receiver = point.position + float3(params.anchor_region.xyz - anchor) * 64.0;
+    pt::LightBvhProposal proposal = { light_alias, header.y, header.x };
+    pt::LightBvhSample selected = proposal.sample(receiver, sample.z);
     if (selected.pmf <= 0)
         return result;
-    uint index = light_alias[1u + selected.index / 4u][selected.index & 3u];
+    uint index = light_alias[2u + selected.light / 4u][selected.light & 3u];
     uint4 meta = light_meta[index];
     uint primitive = meta.w * 2u;
     uint alias_offset = materials[material_id(primitive)].control.w >> 1u;
@@ -76,9 +81,9 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
         meta = pt::dynamic_quad_area(vertices);
     if (asfloat(meta.y) <= 0 && asfloat(meta.z) <= 0)
         return result;
-    pt::QuadAreaSample area =
-        alias_offset != 0u ? pt::sample_emitter_alias(emission_alias_words, alias_offset, sample.xy)
-                           : pt::sample_quad_area(meta, sample.xy);
+    pt::LightSurfaceProposal emitter = { meta, alias_offset };
+    pt::TexturedEmitterAlias distribution = { emission_alias_words };
+    pt::QuadAreaSample area = distribution.sample(emitter, sample.xy);
     float3 translation = float3(light_regions[index].xyz - params.anchor_region.xyz) * 64.0;
     float3x4 transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);
@@ -111,23 +116,24 @@ public float3 quad_light_emission(pt::LightSample sample, float block_emission_s
     return material_emission(primitive, sample.emission.xy, (flags & 2u) != 0,
                              block_emission_scale);
 }
-public float quad_emission_pdf(pt::Hit hit, float3 previous)
+public float quad_emission_pdf(pt::Hit hit, float3 previous, int3 anchor_region)
 {
     uint index = light_index(hit.identity.x >> 1u);
     if (index == 0xffffffffu)
         return 0;
     uint4 header = light_alias[0];
-    float pmf = pt::uniform_light_pmf(header.x, uint(light_regions[index].w) >> 2u);
+    int3 anchor = asint(light_alias[1].xyz);
+    float3 receiver = previous + float3(anchor_region - anchor) * 64.0;
+    pt::LightBvhProposal proposal = { light_alias, header.y, header.x };
+    float pmf = proposal.pmf(receiver, uint(light_regions[index].w) >> 2u);
     uint4 meta = light_meta[index];
     ModMaterial material = materials[material_id(hit.identity.x)];
     uint alias_offset = material.control.w >> 1u;
-    float density;
+    float2 uv = 0;
     if (alias_offset != 0u)
     {
-        float2 uv =
-            (material_uv(hit.identity.x, asfloat(hit.identity.yz)) - material.uv_bounds.xy) /
-            (material.uv_bounds.zw - material.uv_bounds.xy);
-        density = pt::emitter_alias_density(emission_alias_words, alias_offset, uv);
+        uv = (material_uv(hit.identity.x, asfloat(hit.identity.yz)) - material.uv_bounds.xy) /
+             (material.uv_bounds.zw - material.uv_bounds.xy);
     }
     else
     {
@@ -137,8 +143,10 @@ public float quad_emission_pdf(pt::Hit hit, float3 previous)
             meta = pt::dynamic_quad_area(pt::light_quad_vertices(
                 light_vertices[start], light_vertices[start + 1u], light_vertices[start + 2u]));
         }
-        density = pt::quad_area_density(meta, hit.identity.x & 1u);
     }
+    pt::LightSurfaceProposal emitter = { meta, alias_offset };
+    pt::TexturedEmitterAlias distribution = { emission_alias_words };
+    float density = distribution.density(emitter, hit.identity.x & 1u, uv);
     return pt::quad_light_pdf(previous, hit.surface.position, hit.surface.normal, density, pmf,
                               uint(light_regions[index].w) & 3u);
 }

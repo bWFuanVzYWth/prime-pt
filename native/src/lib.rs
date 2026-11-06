@@ -1102,11 +1102,12 @@ pub unsafe extern "C" fn prime_tints(id: u64, colors: *const u32, count: u32) ->
 /// environment 指向一份活动的 16B [`FrameEnvironment`]。曝光只影响呈现。
 /// rr=0 使用原始累积，rr=1 使用已完成早期 SDK 接入的 RR；其余值拒绝。
 /// quality=0..=4 对应 DLAA/Quality/Balanced/Performance/UltraPerformance；SDK 决定输入尺寸。
-/// samples=1..=64；RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为路径顶点预算。
+/// samples=1..=64；RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为最多表面反弹次数，默认12；末顶点保留发光与NEE。
 /// [`prime_set_rendering`] 选择离线时固定最近已接受帧的场景、相机、光照和路径预算，
 /// 只接受当前曝光、尺寸和每帧采样量；没有已接受帧时先绘制并接受首帧。离线禁用 RR，
 /// 实时 ReSTIR 固定每帧一个初始候选，其余实时模式使用 samples。
-/// 离线累积在超过 2^24 个样本前重开独立轮次，避免长期 float32 求和失去单位增量。
+/// 离线累积将超过2^24个样本时显式返回错误；由用户重新进入离线模式，不自动丢弃均值。
+/// 累积失效不回退独立的绝对随机基数；完整帧在宿主完成边界接受，取消不发布新序号。
 /// 宿主已确认前次 draw 完成，并独占 graphics queue；mesh 更新会同步提交构建命令。
 /// 返回成功后宿主负责提交该 command，并在任何资源替换/销毁前等待完成。
 #[unsafe(no_mangle)]

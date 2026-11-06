@@ -21,6 +21,7 @@ public SamplerState atlas_sampler;
 
 /// GPU派生的112B七块表，物理字段与prime_scene::MaterialDefinition保持同位。
 /// control.x低2位为源OpenPBR flags，高30位由资源准备写入callable槽，不回写CPU定义。
+/// control.z高12位为GPU派生FlowKey，低20位保留原flags；身份与材质参数均不截断。
 public struct ModMaterial
 {
     public float4 base_roughness;

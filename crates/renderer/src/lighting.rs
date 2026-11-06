@@ -13,6 +13,14 @@ pub(super) use registry::{TablePatches, Tables};
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
+/// 同资源世代的只读发光提案；静态亮度忽略动态tint/动画当前帧，不重解码材质。
+#[derive(Clone, Copy)]
+pub(super) struct Emitters<'a> {
+    pub sides: &'a [u32],
+    pub areas: &'a [[u32; 4]],
+    pub weights: &'a [f32],
+}
+
 #[derive(Clone, Copy)]
 struct Stamp {
     key: [i32; 3],
@@ -153,8 +161,7 @@ impl Lighting {
         &self,
         source: RenderView<'_>,
         bases: &[u32],
-        side_masks: &[u32],
-        areas: &[[u32; 4]],
+        emitters: Emitters<'_>,
         possible: bool,
         epoch: u64,
     ) -> Result<Preparation, Error> {
@@ -199,7 +206,7 @@ impl Lighting {
             if self.regions.is_empty() {
                 // 初载没有旧灯需要删除，直接流入连续新增阶段，不暂存第二份全局record。
                 let mut ids = Vec::new();
-                each_light(*region, base, side_masks, areas, possible, |_, record| {
+                each_light(*region, base, emitters, possible, |_, record| {
                     ids.try_reserve(1).map_err(prime_scene::Error::Allocation)?;
                     ids.push(writer.add(record)?);
                     Ok(())
@@ -232,7 +239,7 @@ impl Lighting {
                     continue;
                 }
             }
-            let lights = collect(*region, base, side_masks, areas, possible)?;
+            let lights = collect(*region, base, emitters, possible)?;
             let mut ids = reserved(lights.len())?;
             let old_region = old.map(|index| &self.regions[index]);
             let mut cursor = 0;
@@ -383,40 +390,32 @@ fn local(registry: &Registry, region: &RegionLights, id: u32) -> Result<u32, Err
 fn collect(
     region: RenderRegion<'_>,
     base: u32,
-    side_masks: &[u32],
-    areas: &[[u32; 4]],
+    emitters: Emitters<'_>,
     possible: bool,
 ) -> Result<Vec<(u32, Record)>, Error> {
     let mut lights = Vec::new();
-    each_light(
-        region,
-        base,
-        side_masks,
-        areas,
-        possible,
-        |local, record| {
-            lights
-                .try_reserve(1)
-                .map_err(prime_scene::Error::Allocation)?;
-            lights.push((local, record));
-            Ok(())
-        },
-    )?;
+    each_light(region, base, emitters, possible, |local, record| {
+        lights
+            .try_reserve(1)
+            .map_err(prime_scene::Error::Allocation)?;
+        lights.push((local, record));
+        Ok(())
+    })?;
     Ok(lights)
 }
 
 fn each_light(
     region: RenderRegion<'_>,
     base: u32,
-    side_masks: &[u32],
-    areas: &[[u32; 4]],
+    emitters: Emitters<'_>,
     possible: bool,
     mut output: impl FnMut(u32, Record) -> Result<(), Error>,
 ) -> Result<(), Error> {
     if possible {
         for (local, quad) in region.mesh.quads().enumerate() {
             let material = quad.material_id().index() as usize;
-            let &sides = side_masks
+            let &sides = emitters
+                .sides
                 .get(material)
                 .ok_or(Error::Invalid("quad材质索引不属于当前资源世代"))?;
             if sides == 0 {
@@ -429,7 +428,8 @@ fn each_light(
             if !positions.iter().flatten().all(|v| v.is_finite()) {
                 return Err(Error::Invalid("发光quad位置不是有限值"));
             }
-            let mut meta = *areas
+            let mut meta = *emitters
+                .areas
                 .get(material)
                 .ok_or(Error::Invalid("quad静态面积身份不属于当前资源世代"))?;
             if meta[0] == u32::MAX && degenerate(positions) {
@@ -439,7 +439,14 @@ fn each_light(
             meta[3] = base
                 .checked_add(local)
                 .ok_or(Error::Invalid("发光属性槽溢出"))?;
+            let area = light_sampling::QuadArea::new(&positions)?;
+            let weight = *emitters
+                .weights
+                .get(material)
+                .ok_or(Error::Invalid("发光亮度不属于当前资源世代"))?;
+            let power = light_sampling::emitter_power(area.area(), weight, sides)?;
             let record = Record {
+                power,
                 meta,
                 vertices: light_sampling::pack_vertices(positions),
                 region: [
@@ -475,6 +482,11 @@ mod tests {
     use prime_scene::{FragmentMask, MaterialId, Mesh, MeshParts, PreparedParts, Quad, TintPatch};
 
     const AREA: [u32; 4] = [u32::MAX, 0, 0, 0];
+    const EMITTERS: Emitters<'static> = Emitters {
+        sides: &[3],
+        areas: &[AREA],
+        weights: &[1.],
+    };
 
     fn mesh(count: usize) -> Mesh {
         Mesh {
@@ -519,8 +531,9 @@ mod tests {
             mesh: (&mesh).into(),
         }];
         let initial = lighting
-            .prepare(view(&regions), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
+        let tree_base = initial.tables.as_ref().unwrap().selection[0][1] as usize;
         lighting.publication(initial).unwrap().commit();
         let ids = lighting.regions[0].ids.clone();
         let mut changed = Mesh {
@@ -540,16 +553,65 @@ mod tests {
             mesh: (&changed).into(),
         }];
         let prep = lighting
-            .prepare(view(&regions), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
         assert!(prep.tables.is_none());
         assert_eq!(prep.patches.vertices.len(), 3);
         assert!(prep.patches.meta.is_empty());
-        assert!(prep.patches.alias.is_empty());
+        assert!(
+            prep.patches
+                .alias
+                .iter()
+                .all(|(row, _)| *row == 0 || *row >= tree_base)
+        );
+        assert!(prep.patches.alias.iter().any(|(row, _)| *row >= tree_base));
+        assert!(
+            prep.patches
+                .vertices
+                .iter()
+                .all(|(row, _)| *row / 3 == ids[19] as usize)
+        );
         assert!(prep.patches.inverse.is_empty());
         assert!(prep.patches.regions.is_empty());
         lighting.publication(prep).unwrap().commit();
         assert_eq!(lighting.regions[0].ids, ids);
+    }
+
+    #[test]
+    fn resource_brightness_updates_the_tree_without_uploading_geometry() {
+        let mut mesh = mesh(2);
+        let quad = mesh.quads[1];
+        mesh.quads[1] =
+            Quad::with_material(quad.positions(), quad.uv(), quad.tint(), MaterialId::new(1));
+        let regions = [RenderRegion {
+            key: [0; 3],
+            geometry_revision: 1,
+            content_revision: 1,
+            mesh: (&mesh).into(),
+        }];
+        let mut lighting = Lighting::new().unwrap();
+        let emitters = |weights| Emitters {
+            sides: &[1, 1],
+            areas: &[AREA; 2],
+            weights,
+        };
+        let initial = lighting
+            .prepare(view(&regions), &[0], emitters(&[1., 8.]), true, 1)
+            .unwrap();
+        lighting.publication(initial).unwrap().commit();
+        let ids = lighting.regions[0].ids.clone();
+        assert_eq!(lighting.registry.record(ids[1]).power, 8.);
+        let changed = lighting
+            .prepare(view(&regions), &[0], emitters(&[1., 16.]), true, 2)
+            .unwrap();
+        assert!(!changed.patches.alias.is_empty());
+        assert!(changed.patches.vertices.is_empty());
+        assert!(changed.patches.meta.is_empty());
+        assert!(changed.patches.regions.is_empty());
+        lighting.publication(changed).unwrap().commit();
+        assert_eq!(lighting.regions[0].ids, ids);
+        assert_eq!(lighting.registry.record(ids[0]).power, 1.);
+        assert_eq!(lighting.registry.record(ids[1]).power, 16.);
     }
 
     #[test]
@@ -564,7 +626,7 @@ mod tests {
             mesh: parts.view(),
         }];
         let initial = lighting
-            .prepare(view(&regions), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
         lighting.publication(initial).unwrap().commit();
         let ids = lighting.regions[0].ids.as_ptr();
@@ -582,7 +644,7 @@ mod tests {
             mesh: tinted.view(&parts),
         };
         let prep = lighting
-            .prepare(view(&[region]), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&[region]), &[0], EMITTERS, true, 1)
             .unwrap();
         assert!(prep.tables.is_none());
         assert!(empty(&prep.patches));
@@ -614,7 +676,7 @@ mod tests {
         });
         let mut lighting = Lighting::new().unwrap();
         let prep = lighting
-            .prepare(view(&initial), &[0, 1], &[3], &[AREA], true, 1)
+            .prepare(view(&initial), &[0, 1], EMITTERS, true, 1)
             .unwrap();
         lighting.publication(prep).unwrap().commit();
         let changes = initial.map(|mut r| {
@@ -644,21 +706,21 @@ mod tests {
         }];
         let mut lighting = Lighting::new().unwrap();
         let failed = lighting
-            .prepare(view(&regions), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
         drop(lighting.publication(failed).unwrap());
         assert!(lighting.regions.is_empty());
         assert_eq!(lighting.version, 0);
         let first = lighting
-            .prepare(view(&regions), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
         let stale = lighting
-            .prepare(view(&regions), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
         lighting.publication(first).unwrap().commit();
         assert!(lighting.publication(stale).is_err());
         let cross = lighting
-            .prepare(view(&regions), &[0], &[3], &[AREA], true, 1)
+            .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
         let mut other = Lighting::new().unwrap();
         assert!(other.publication(cross).is_err());
@@ -678,7 +740,17 @@ mod tests {
                 mesh: (&mesh).into(),
             }];
             let prep = lighting
-                .prepare(view(&regions), &[0], &[0], &[AREA], false, 1)
+                .prepare(
+                    view(&regions),
+                    &[0],
+                    Emitters {
+                        sides: &[0],
+                        areas: &[AREA],
+                        weights: &[1.],
+                    },
+                    false,
+                    1,
+                )
                 .unwrap();
             assert!(prep.tables.is_none());
             assert!(empty(&prep.patches));
@@ -707,7 +779,17 @@ mod tests {
                 mesh: mesh.into(),
             }];
             let prep = lighting
-                .prepare(view(&regions), &[0], &[0, 3], &[AREA, AREA], true, 1)
+                .prepare(
+                    view(&regions),
+                    &[0],
+                    Emitters {
+                        sides: &[0, 3],
+                        areas: &[AREA, AREA],
+                        weights: &[1., 1.],
+                    },
+                    true,
+                    1,
+                )
                 .unwrap();
             lighting.publication(prep).unwrap().commit();
             assert_eq!(lighting.regions[0].ids.len(), count);

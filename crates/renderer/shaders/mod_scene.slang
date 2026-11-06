@@ -222,7 +222,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public float emission_pdf(pt::Hit hit, float3 previous)
     {
-        return quad_emission_pdf(hit, previous);
+        return quad_emission_pdf(hit, previous, parameters[0].anchor_region.xyz);
     }
 
     public bool occluded(geometry::Ray connection)

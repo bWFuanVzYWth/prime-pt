@@ -40,6 +40,23 @@ pub(super) const fn emission_sides(material: &MaterialDefinition) -> u32 {
     }
 }
 
+/// 资源期的静态亮度提案；保留动态tint和MERS/动画实际求值的宿主适配边界。
+/// 与Game共用线性亮度×幅度公式，source RGB由本适配器解释，不扫描运行期几何。
+pub(super) fn emission_weights(definitions: &[MaterialDefinition]) -> Result<Vec<f32>, Error> {
+    let mut weights = Vec::new();
+    weights
+        .try_reserve_exact(definitions.len())
+        .map_err(scene_cache::Error::from)?;
+    for definition in definitions {
+        let [r, g, b, amplitude] = definition.emission;
+        weights.push(simple_engine::light_sampling::emission_weight(
+            [r, g, b],
+            amplitude,
+        )?);
+    }
+    Ok(weights)
+}
+
 /// `mod_materials.slang` 的场景材质能力位。只影响分支，相同路径仍共享数值参数表。
 pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinition) -> u32 {
     let flags = material.control[2];

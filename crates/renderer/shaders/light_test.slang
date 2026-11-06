@@ -53,7 +53,7 @@ void light_probe_main(uint3 id: SV_DispatchThreadID)
     hit.identity = uint4(light_meta[index].w * 2u + area.half, asuint(area.bary), 0);
     hit.front = (flags & 2u) != 0;
     hit.distance = sample.distance;
-    float reverse = quad_emission_pdf(hit, point.position);
+    float reverse = quad_emission_pdf(hit, point.position, p.anchor_region.xyz);
     float3 emission = quad_light_emission(sample, p.block_emission_scale);
     float luminance = dot(emission, float3(0.2126, 0.7152, 0.0722));
     bool valid = isfinite(sample.pdf) && reverse > 0 && isfinite(reverse) &&

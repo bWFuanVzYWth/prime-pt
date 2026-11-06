@@ -8,13 +8,23 @@ fn upload(
     words: &[u32],
     areas: &[[u32; 4]],
 ) -> Result<(), Error> {
+    upload_auxiliary(gpu, definitions, words, areas, &[128, 128, 0, 85])
+}
+
+fn upload_auxiliary(
+    gpu: &mut Gpu,
+    definitions: &[MaterialDefinition],
+    words: &[u32],
+    areas: &[[u32; 4]],
+    auxiliary: &[u8],
+) -> Result<(), Error> {
     gpu.replace_resources(ResourceUpload {
         generation: gpu.resource_generation + 1,
         extent: [1, 1],
         albedo: &[255; 4],
         materials: definitions,
         mers: &[0, 255, 242, 0],
-        auxiliary: &[128, 128, 0, 85],
+        auxiliary,
         emission_alias_words: words,
         light_areas: areas,
     })
@@ -899,9 +909,19 @@ fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
         .map(|v| u32::from_le_bytes(*v))
         .collect();
     assert_eq!(selectors[0], 6);
-    assert_eq!(selectors[5], 5, "末灯移到rank1且保留data slot5");
-    assert_eq!(selectors[9], 1, "新灯重用data slot1但位于rank5");
+    assert_eq!(selectors[9], 5, "末灯移到rank1且保留data slot5");
+    assert_eq!(selectors[13], 1, "新灯重用data slot1但位于rank5");
     assert_light_pdfs(&host, &mut gpu, &image, "swap_and_reuse")?;
+    mesh.quads[2] = Quad::with_material(
+        quad.positions()
+            .map(|point| [point[0], point[1], point[2] + 0.25]),
+        quad.uv(),
+        quad.tint(),
+        quad.material_id(),
+    );
+    publish(&mut gpu, &mesh, 3, 4, [0.; 3])?;
+    assert_eq!(gpu.lighting_gpu.roots(), lighting.roots());
+    assert_light_pdfs(&host, &mut gpu, &image, "one_emitter_moved")?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -1077,6 +1097,128 @@ fn hardware_pt_grass_overlay_selects_tinted_grass_and_untinted_dirt()
         u16::from(grass[1]) > u16::from(grass[0]) + 16,
         "覆盖层使用绿色tint {grass:?}"
     );
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实EXT SER/Vulkan RT；HG保留法线贴图在几何背面产生的连续光照支持"]
+fn hardware_pt_hit_group_preserves_authored_normal_light_support()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_ser()?;
+    let uv = [[0., 0.], [0., 1.], [1., 1.], [1., 0.]];
+    let mesh = Mesh {
+        quads: vec![
+            // Ng=-Z朝向相机；UV切线为+X，AUX把Ns倾斜至约(.8,0,-.6)。
+            Quad::with_material(
+                [[-4., -4., 4.], [-4., 4., 4.], [4., 4., 4.], [4., -4., 4.]],
+                uv,
+                [1.; 3],
+                MaterialId::new(0),
+            ),
+            // 灯位于Ng背侧，中心到接收面方向约(.95,0,.32)，但处于Ns前侧。
+            Quad::with_material(
+                [
+                    [3., -0.5, 4.7],
+                    [3., -0.5, 5.3],
+                    [3., 0.5, 5.3],
+                    [3., 0.5, 4.7],
+                ],
+                uv,
+                [1.; 3],
+                MaterialId::new(1),
+            ),
+        ],
+    };
+    let mut reference = Vec::<[f32; 4]>::new();
+    for (dispatch, authored) in [(0, true), (8, true), (8, false)] {
+        let mut gpu = host.gpu()?;
+        gpu.experiment_dispatch = dispatch;
+        let output = image(&mut gpu)?;
+        let mut receiver = MaterialDefinition {
+            base_roughness: [0.8, 0.8, 0.8, 1.],
+            ..MaterialDefinition::default()
+        };
+        receiver.control[2] |= MaterialDefinition::AUXILIARY;
+        if authored {
+            receiver.control[3] |= MaterialDefinition::AUTHORED_NORMAL;
+        }
+        let mut lamp = MaterialDefinition {
+            emission: [1., 1., 1., 20.],
+            ..MaterialDefinition::default()
+        };
+        lamp.control[1] = 3;
+        // 所有模式只在这个完整资源世代边界准备程序；绘制阶段不编译shader。
+        upload_auxiliary(
+            &mut gpu,
+            &[receiver, lamp],
+            &[],
+            &[[u32::MAX, 0, 0, 0]; 2],
+            &[230, 128, 0, 85],
+        )?;
+        publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+        gpu.set_ser(true)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., true, false)?)?;
+        gpu.test_restart_sample_sequence(0)?;
+        host.render_options(
+            &mut gpu,
+            &output,
+            &camera(),
+            Environment {
+                sun_direction: [0.; 3],
+                ..Default::default()
+            },
+            Options::new(false, streamline::Quality::Dlaa, 16, 1)?,
+        )?;
+        let hdr = gpu.view.as_ref().unwrap().output;
+        let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;
+        hdr.copy_prefix_to(&mut gpu.context, &readback, hdr.len())?;
+        let mut bytes = vec![0; hdr.len() as usize];
+        readback.read(&mut gpu.context, 0, &mut bytes)?;
+        let pixels: Vec<[f32; 4]> = bytes
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|pixel| {
+                std::array::from_fn(|i| {
+                    f32::from_le_bytes(pixel[4 * i..4 * i + 4].try_into().unwrap())
+                })
+            })
+            .collect();
+        assert!(pixels.iter().flatten().all(|value| value.is_finite()));
+        let center_mean = (12..20)
+            .flat_map(|y| (12..20).map(move |x| y * 32 + x))
+            .map(|pixel| f64::from(pixels[pixel][0]))
+            .sum::<f64>()
+            / 64.;
+        if authored {
+            assert!(
+                center_mean > 0.01,
+                "mode={dispatch}, tilted normal must receive backside light: {center_mean}"
+            );
+            if dispatch == 0 {
+                reference = pixels;
+            } else {
+                for (pixel, (actual, expected)) in pixels.iter().zip(&reference).enumerate() {
+                    for channel in 0..4 {
+                        assert!(
+                            (actual[channel] - expected[channel]).abs()
+                                <= 5e-5 * expected[channel].abs().max(1.),
+                            "mode={dispatch}, pixel={pixel}, channel={channel}: {} != {}",
+                            actual[channel],
+                            expected[channel]
+                        );
+                    }
+                }
+            }
+        } else {
+            assert!(
+                center_mean <= 1e-8,
+                "flat normal must reject the same backside light: {center_mean}"
+            );
+        }
+        drop(gpu);
+    }
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

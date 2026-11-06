@@ -9,6 +9,7 @@ thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 simple_engine = { workspace = true, features = [
     "light_sampling",
+    "light_bvh",
     "camera",
     "scene_cache",
     "pt_gpu",

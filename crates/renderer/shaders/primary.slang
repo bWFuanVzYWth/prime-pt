@@ -112,9 +112,8 @@ pt::TransportCall load_landing(uint pixel, uint2 coordinate, uint flags)
     data.path.medium = parameters[0].initial_medium;
     data.pixel = coordinate;
     uint count = sample_counts[pixel];
-    data.sample = parameters[0].reconstruction.w > 0 || (parameters[0].output_size.z & 1u) != 0
-                      ? parameters[0].rr_sample + count
-                      : count;
+    data.sample = parameters[0].rr_sample +
+                  (count >= parameters[0].image.z ? count - parameters[0].image.z : 0u);
     return data;
 }
 
@@ -128,7 +127,7 @@ void prefix_main()
     data.pixel = coordinate;
     bool diagnostic = (params.output_size.z & 1u) != 0;
     uint count = sample_counts[pixel];
-    data.sample = params.reconstruction.w > 0 || diagnostic ? params.rr_sample + count : count;
+    data.sample = params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u);
     if (!diagnostic && accumulation[pixel].w < 0)
     {
         data.path.status =
@@ -276,7 +275,7 @@ void render_fused()
     data.pixel = coordinate;
     uint count = sample_counts[pixel];
     bool diagnostic = (params.output_size.z & 1u) != 0;
-    data.sample = params.reconstruction.w > 0 || diagnostic ? params.rr_sample + count : count;
+    data.sample = params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u);
     if (!diagnostic && accumulation[pixel].w < 0)
     {
         output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);

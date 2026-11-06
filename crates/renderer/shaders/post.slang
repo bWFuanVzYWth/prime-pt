@@ -40,9 +40,9 @@ void post_main(uint3 id: SV_DispatchThreadID)
     float3 radiance = prefix.xyz + tail.xyz;
     if (tail.w >= 0 && prefix.w < pt::FAR && params.lighting.w > 0)
     {
-        pt::PathSampler sampler =
-            pt::path_sampler(id.xy, count + (diagnostic ? params.rr_sample : 0u), params.options.z,
-                             params.options.x);
+        pt::PathSampler sampler = pt::path_sampler(
+            id.xy, params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u),
+            params.options.z, params.options.x);
         float2 offset = params.reconstruction.w > 0 || (params.output_size.z & 2u) != 0
                             ? 0.5 + params.reconstruction.xy
                             : sampler.film();

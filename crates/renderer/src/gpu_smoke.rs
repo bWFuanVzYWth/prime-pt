@@ -396,7 +396,7 @@ impl Host {
             }
         };
         gpu.settings.samples = 64;
-        gpu.settings.max_vertices = 6;
+        gpu.settings.max_bounces = 6;
         gpu.display_timeline.set_enabled(false);
         Ok(gpu)
     }
@@ -454,6 +454,7 @@ impl Host {
             }
             if result.is_err() {
                 gpu.display_timeline.cancel();
+                gpu.cancel_recordings(std::mem::take(&mut records))?;
             }
             gpu.complete_previous()?;
             self.device.destroy_command_pool(pool, None);
@@ -482,12 +483,7 @@ impl Host {
             output,
             camera,
             environment,
-            Options::new(
-                true,
-                streamline::Quality::Dlaa,
-                1,
-                gpu.settings.max_vertices,
-            )?,
+            Options::new(true, streamline::Quality::Dlaa, 1, gpu.settings.max_bounces)?,
         )
     }
 
@@ -1151,7 +1147,7 @@ fn hardware_pt_sky_direction() -> Result<(), Box<dyn std::error::Error>> {
 fn hardware_pt_aerial_distance() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
     let mut gpu = host.gpu()?;
-    gpu.settings.max_vertices = 1;
+    gpu.settings.max_bounces = 1;
     let image = image(&mut gpu)?;
     let mut narrow = camera();
     narrow.right[0] = 0.0001;
@@ -1850,9 +1846,9 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         let sum = f32::from_le_bytes(accumulation[offset..offset + 4].try_into()?);
         assert!((mean - sum / 3.0).abs() <= mean.abs().max(1.0) * 0.001);
     }
-    let sample = gpu.rr_sample;
+    let sample = gpu.absolute_sample;
     host.render_options(&mut gpu, &image, &camera, environment, performance)?;
-    assert_eq!(gpu.rr_sample, sample + 3);
+    assert_eq!(gpu.absolute_sample, sample + 3);
     let next_noisy = gpu.view.as_ref().unwrap().rr.images[0].download(&mut gpu.context)?;
     assert_ne!(noisy, next_noisy, "静止相机的逐帧随机样本应独立");
     let presented = image.download(&mut gpu.context)?;
