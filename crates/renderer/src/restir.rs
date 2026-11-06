@@ -72,6 +72,8 @@ impl Restir {
         lut: Buffer,
         hit: materials::HitFeatures,
         callables: &[super::RayShader<'_>],
+        counts: [usize; 9],
+        initial_use_hits: bool,
         initial_override: Option<super::RayShader<'_>>,
         initial_hits: &[super::RayShader<'_>],
         reordered: bool,
@@ -125,7 +127,36 @@ impl Restir {
             include_bytes!(concat!(env!("OUT_DIR"), "/restir-spatial-work.spv")),
             c"restir_spatial_work",
         );
-        let count = callables.len() / 4;
+        let [
+            initial_count,
+            replay_count,
+            evaluate_count,
+            metadata_count,
+            connection_count,
+            emitter_count,
+            pdf_count,
+            guide_count,
+            _,
+        ] = counts;
+        if counts.iter().try_fold(0usize, |n, &v| n.checked_add(v)) != Some(callables.len()) {
+            return Err(Error::Invalid("ReSTIR操作SBT分段与实际程序不匹配"));
+        }
+        let replay_start = initial_count;
+        let evaluate_start = replay_start + replay_count;
+        let metadata_start = evaluate_start + evaluate_count;
+        let connection_start = metadata_start + metadata_count;
+        let guide_start = connection_start + connection_count + emitter_count + pdf_count;
+        let direct_start = guide_start + guide_count;
+        let initial_callables: Vec<_> = if !initial_use_hits {
+            callables[..initial_count]
+                .iter()
+                .chain(&callables[direct_start..])
+                .chain(&callables[guide_start..direct_start])
+                .copied()
+                .collect()
+        } else {
+            callables[guide_start..direct_start].to_vec()
+        };
         // 命中只携带稳定身份；着色法线在真正加载表面时恢复一次。
         let trace = super::programs(
             &[],
@@ -162,13 +193,9 @@ impl Restir {
             closest_hit: trace.closest_hit,
             initial_hits,
             any_hit: trace.any_hit,
-            initial_callables: if initial_hits.is_empty() {
-                &callables[..2 * count]
-            } else {
-                &[]
-            },
-            replay_callables: &callables[2 * count..3 * count],
-            evaluate_callables: &callables[3 * count..],
+            initial_callables: &initial_callables,
+            replay_callables: &callables[replay_start..evaluate_start],
+            evaluate_callables: &callables[evaluate_start..guide_start],
         };
         Ok(Self {
             renderer: Renderer::new_native(

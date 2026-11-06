@@ -159,7 +159,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
     {
         data.path.throughput *= pt::segment_transmittance(data.path.medium.yzw, data.hit.distance);
         // GPU派生表的高30位为资源期按真实Flow去重后的callable槽；不是源OpenPBR flags。
-        uint program = materials[material_id(data.hit.identity.x)].control.x >> 2u;
+        uint program = material_at(material_id(data.hit.identity.x)).control.x >> 2u;
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
@@ -222,7 +222,8 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public float emission_pdf(pt::Hit hit, float3 previous)
     {
-        return quad_emission_pdf(hit, previous, parameters[0].anchor_region.xyz);
+        return quad_emission_pdf<OPENPBR_VARIANT != 0xffffffffu, (OPENPBR_VARIANT & 1024u) != 0>(
+            hit, previous, parameters[0].anchor_region.xyz);
     }
 
     public bool occluded(geometry::Ray connection)

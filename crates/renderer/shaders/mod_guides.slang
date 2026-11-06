@@ -5,6 +5,10 @@ import params;
 import pt.denoise;
 import pt.integrator;
 import pt.reconstruction;
+import pt.key_guides;
+import pt.hit_transport;
+import restir_pt.types;
+import restir_geometry;
 import geometry.camera;
 
 [[vk::binding(19, 0)]]
@@ -28,13 +32,129 @@ RWTexture2D<float> guide_distance;
 [[vk::binding(25, 0)]]
 [[vk::image_format("rg16f")]]
 RWTexture2D<float2> guide_specular_motion;
-public struct Guides : pt::IPrefixGuides
+
+pt::KeyGuideVertex known_guide_vertex(restir_pt::HitInfo identity, float3 incoming, float4 incident)
+{
+    uint primitive = restir_primitive(identity);
+    uint program = guide_program(primitive, true, true);
+    pt::KeyGuideCall call = {};
+    call.value.point.position = asfloat(identity.data.xyz);
+    call.value.distance = asfloat(identity.data.w);
+    call.value.canonicalDirection = incoming;
+    call.value.medium = incident;
+#ifdef PRIMEPT_SER
+    ReorderThread(program, 32u);
+#endif
+    CallShader(program, call);
+    return call.value;
+}
+
+/// 无SER能力的ReSTIR仍按known-surface键处理辅助材料，不引入HitObject能力。
+public struct RestirGuideTrace : pt::IKeyGuideTrace
+{
+    public bool intersect_guide(float3 origin, float3 direction, float4 incident,
+                                out pt::KeyGuideVertex value)
+    {
+        value = {};
+        pt::Hit hit;
+        if (!ModScene().intersect(origin, direction, hit))
+            return false;
+        restir_pt::HitInfo identity = restir_stable_hit(hit.identity.x, asfloat(hit.identity.yz));
+        value = known_guide_vertex(identity, direction, incident);
+        value.distance = hit.distance;
+        return true;
+    }
+};
+
+public struct GuideTrace : pt::IKeyGuideTrace
+{
+    public bool restir;
+
+    public bool intersect_guide(float3 origin, float3 direction, float4 incident,
+                                out pt::KeyGuideVertex value)
+    {
+        value = {};
+        RayDesc ray = { origin, 0, direction, pt::FAR };
+        uint unused = 0;
+        HitObject found = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+        if (!found.IsHit())
+            return false;
+        uint primitive = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
+        uint program = guide_program(primitive, false, restir);
+        found.SetShaderTableIndex(program + 1u);
+        pt::KeyGuideCall call = {};
+        call.value.medium = incident;
+#ifdef PRIMEPT_SER
+        ReorderThread(program, 32u);
+#endif
+        HitObject::Invoke(found, call);
+        value = call.value;
+        return true;
+    }
+};
+
+public struct Guides : pt::IPrefixGuides, pt::IHitGuides
 {
     public uint2 coordinate;
     public float2 film;
     public pt::DenoiseCamera current;
     public pt::DenoiseCamera previous;
 
+    void write_key<Trace : pt::IKeyGuideTrace>(Trace provider, pt::KeyGuideVertex first,
+                                               pt::TransportCall data)
+    {
+        Params p = parameters[0];
+        pt::KeyGuideEndpoint endpoint =
+            pt::trace_key_guide(provider, first, data.path.origin, data.path.direction,
+                                data.path.medium, p.options.y, false);
+        pt::GuideProjection projection = pt::project_guide(
+            endpoint.endpoint, current, previous, film, p.image.xy, p.reconstruction.z > 0);
+        pt::DenoiseGuides albedos = endpoint.albedos;
+        guide_depth[coordinate] = projection.depth;
+        guide_motion[coordinate] = projection.motion;
+        guide_normal[coordinate] = float4(projection.normal, albedos.normal_roughness.w);
+        guide_diffuse[coordinate] = float4(albedos.diffuse_albedo, 0);
+        guide_specular[coordinate] = float4(albedos.specular_albedo, 0);
+
+        pt::KeyGuideEndpoint reflection =
+            pt::trace_key_guide(provider, first, data.path.origin, data.path.direction,
+                                data.path.medium, p.options.y, true);
+        pt::GuideProjection reflected = pt::project_guide(reflection.endpoint, current, previous,
+                                                          film, p.image.xy, p.reconstruction.z > 0);
+        guide_distance[coordinate] =
+            (reflection.endpoint.flags & pt::GUIDE_SKY) != 0 ? 0 : reflection.endpoint.distance;
+        guide_specular_motion[coordinate] =
+            (reflected.flags & pt::GUIDE_INVALID) != 0 ? projection.motion : reflected.motion;
+    }
+
+    public void surface_hit(HitObject found, pt::TransportCall data)
+    {
+        uint primitive = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
+        uint program = guide_program(primitive, false, false);
+        found.SetShaderTableIndex(program + 1u);
+        pt::KeyGuideCall call = {};
+        call.value.medium = data.path.medium;
+#ifdef PRIMEPT_SER
+        ReorderThread(program, 32u);
+#endif
+        HitObject::Invoke(found, call);
+        GuideTrace provider = { false };
+        write_key(provider, call.value, data);
+    }
+
+    public void surface_known(restir_pt::HitInfo identity, pt::TransportCall data)
+    {
+        pt::KeyGuideVertex first =
+            known_guide_vertex(identity, data.path.direction, data.path.medium);
+#ifdef PRIMEPT_SER
+        GuideTrace provider = { true };
+        write_key(provider, first, data);
+#else
+        write_key(RestirGuideTrace(), first, data);
+#endif
+    }
+
+    // mode0参考与未启用EXT的兼容PT保留旧导引；HG/PT和ReSTIR不经此通用翻译路径。
     public void surface(pt::TransportCall data)
     {
         ModScene provider;

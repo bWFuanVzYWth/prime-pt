@@ -277,13 +277,38 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|r| r.test_program_roots(&gpu.context))
                     .transpose()?;
                 let mut parameter_bytes = vec![0; gpu.view.as_ref().unwrap().params.len() as usize];
+                let material_programs = gpu.generation.as_ref().map(|generation| {
+                    let roles = ["initial", "replay", "evaluate", "metadata", "connection", "emitter", "pdf", "guide_known", "initial_direct"];
+                    let counts: Vec<_> = generation.restir_programs.iter()
+                        .map(|set| set.artifacts().len()).collect();
+                    serde_json::json!({
+                        "pt_unique_modules": generation.programs.artifacts().len(),
+                        "selected_emitter_capabilities":generation.emitter_capabilities,
+                        "roles": roles.iter().zip(&generation.restir_programs).map(|(role, set)|
+                            serde_json::json!({"role":role,"unique_modules":set.artifacts().len(),
+                                "spirv_bytes":set.artifacts().iter().map(|a|a.bytes().len()).sum::<usize>()}))
+                            .collect::<Vec<_>>(),
+                        "guide_hit_unique_modules":counts[7],
+                        "pt_native_sbt_hit_groups":1+if modes[index]==8 {generation.programs.artifacts().len()}
+                            else if modes[index]>=2 {generation.programs.artifacts().len()+counts[7]}
+                            else if modes[index]>0 {counts[7]} else {0},
+                        "pt_guided_sbt_hit_groups":1+if modes[index]>=2 {generation.programs.artifacts().len()+counts[7]}
+                            else if modes[index]>0 {counts[7]} else {0},
+                        "pt_sbt_callables":if modes[index]<2 {generation.programs.artifacts().len()} else {0},
+                        "pt_prepared_variants":1+usize::from(generation.reordered.is_some())+usize::from(generation.guided_regular.is_some())+usize::from(generation.guided_reordered.is_some()),
+                        "rr_program_addition":{"pipeline_prepare_ns":generation.guided_program_cost[0],"tracked_gpu_allocation_bytes":generation.guided_program_cost[1],"retained_cpu_bytes":generation.guided_program_cost[2],"raygen_spirv_bytes":generation.guided_program_cost[3],"driver_private_memory":"not exposed"},
+                        "initial_sbt_callables":counts[7]+if (2..=7).contains(&modes[index]) {0} else {counts[0]+counts[8]},
+                        "shift_sbt_callables":counts[1..7].iter().sum::<usize>(),
+                        "operation_table_bytes":36*generation.programs.plan().keys().len()+32,
+                    })
+                });
                 gpu.view.as_ref().unwrap().params.read(
                     &mut gpu.context,
                     0,
                     &mut parameter_bytes,
                 )?;
                 let row = serde_json::json!({"renderer":format!("{renderer:?}"),"cv":cv,"round":round,"position":step,
-                    "driver_stack_bytes":stacks,"immutable_programs":program_roots,"frame_parameters":parameter_bytes.as_chunks::<4>().0.iter().map(|w|u32::from_le_bytes(*w)).collect::<Vec<_>>(),
+                    "driver_stack_bytes":stacks,"immutable_programs":program_roots,"material_programs":material_programs,"frame_parameters":parameter_bytes.as_chunks::<4>().0.iter().map(|w|u32::from_le_bytes(*w)).collect::<Vec<_>>(),
                     "variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
                 std::fs::write(
                     directory.join(format!("{renderer:?}-cv{cv}-r{round}-v{index}.json")),

@@ -1,9 +1,7 @@
 /// point ReSTIR PT：融合初采、双向时间shift、paired三邻居空间shift和最终合并。
 module restir;
 // Hit Group仅用于初采新命中；其他raygen不实例化或保存硬件命中上下文。
-#ifdef PRIMEPT_INITIAL_HIT
 import initial_hit;
-#endif
 import restir_scene;
 import restir_call;
 import mod_scene;
@@ -105,7 +103,7 @@ void restir_initial()
     uint2 pixel = DispatchRaysIndex().xy;
     Params p = parameters[0];
     uint linear = pixel.y * p.image.x + pixel.x;
-    RestirScene scene;
+    RestirScene scene = {};
     HitInfo hit;
     float distance;
 #ifdef PRIMEPT_INITIAL_HIT
@@ -114,17 +112,14 @@ void restir_initial()
     tracer.trace(scene, traced, scene.initialOrigin(pixel), scene.initialDirection(pixel), hit,
                  distance);
 #else
-    scene.trace(scene.initialOrigin(pixel), scene.initialDirection(pixel), false, hit, distance);
+    ModInitialTrace tracer;
+    uint traced = 0;
+    tracer.trace(scene, traced, scene.initialOrigin(pixel), scene.initialDirection(pixel), hit,
+                 distance);
 #endif
     primary_current[offset_for(pixel)] = hit.data;
-    if ((p.output_size.z & 8u) != 0)
-    {
-        float3 proxy =
-            hit.isValid()
-                ? max(material_texel(restir_primitive(hit), asfloat(hit.data.zw)).xyz, 0.04)
-                : float3(0.04);
-        store_color(cv_proxy, linear, proxy);
-    }
+    if ((p.output_size.z & 8u) != 0 && !hit.isValid())
+        store_color(cv_proxy, linear, float3(0.04));
     TinyUniformSampleGenerator generator =
         rng_for_pixel(pixel, p.temporal_reserved.x ^ p.options.x);
     ShiftSettings settings = {};
@@ -133,8 +128,9 @@ void restir_initial()
         scene, tracer, traced, pixel, hit, generator.state, p.options.y, settings, true, true,
         true);
 #else
-    InitialResult initial = sampleInitialPath<RestirScene, 2>(
-        scene, pixel, hit, generator.state, p.options.y, settings, true, true, true);
+    InitialResult initial = sampleInitialPathTraced<RestirScene, uint, ModInitialTrace, 2>(
+        scene, tracer, traced, pixel, hit, generator.state, p.options.y, settings, true, true,
+        true);
 #endif
     store_reservoir(reservoirs_a, offset_for(pixel), initial.reservoir);
     if ((p.output_size.z & 8u) != 0)
@@ -143,7 +139,7 @@ void restir_initial()
     if (p.restir.w > 0)
         restir_output[linear] = float4(initial.reservoir.integrand * initial.reservoir.weight, 0);
     restir_residual[linear] = float4(initial.residual, distance);
-    if (p.reconstruction.w > 0)
+    if (p.reconstruction.w == 2)
     {
         pt::TransportCall data = {};
         data.path.origin = scene.initialOrigin(pixel);
@@ -157,8 +153,7 @@ void restir_initial()
         Guides guides = { pixel, film, current, previous };
         if (hit.isValid())
         {
-            data.hit = restir_hit(current_surface(scene, pixel));
-            guides.surface(data);
+            guides.surface_known(hit, data);
         }
         else
             guides.environment(data);
@@ -199,7 +194,7 @@ void restir_temporal_direction()
         neighbor_masks[offset] = uint2(uint(valid), donor.x | (donor.y << 12));
     if (!valid)
         return;
-    RestirScene scene;
+    RestirScene scene = {};
     bool previous = direction == 0;
     uint2 targetPixel = previous ? donor : pixel;
     uint sourceIndex = previous ? offset : offset_for(donor);
@@ -317,7 +312,7 @@ void restir_spatial_direction()
     if ((neighbor_masks[offset].x & (1u << slot)) == 0)
         return;
     uint2 donor = uint2(paired_neighbor(paired_lut, transform_for_frame(), slot, pixel));
-    RestirScene scene;
+    RestirScene scene = {};
     PrecomputedShiftData shift = shifted(scene, current_surface(scene, pixel), reservoirs_a,
                                          offset_for(donor), pixel, false);
     store_precomputed(shifts, paired_address(offset, slot), shift);

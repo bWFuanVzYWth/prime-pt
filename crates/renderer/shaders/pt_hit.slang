@@ -14,7 +14,16 @@ import geometry.camera;
 import mod_scene;
 import mod_guides;
 #ifndef OPENPBR_FLOW
-#define OPENPBR_FLOW 131
+#error OPENPBR_FLOW must come from a material key or an explicit raygen placeholder
+#endif
+#ifndef OPENPBR_VARIANT
+#error OPENPBR_VARIANT must come from a material key or an explicit raygen placeholder
+#endif
+#ifndef PRIMEPT_LIGHT_MASK
+#define PRIMEPT_LIGHT_MASK 3
+#endif
+#ifndef PRIMEPT_RECONSTRUCTION
+#define PRIMEPT_RECONSTRUCTION 1
 #endif
 [[vk::binding(7, 0)]]
 RWStructuredBuffer<float4> output_image;
@@ -24,60 +33,20 @@ RWStructuredBuffer<float4> accumulation;
 RWStructuredBuffer<uint> sample_counts;
 [[vk::binding(15, 0)]]
 RWStructuredBuffer<float4> prefix_image;
-pt::Hit object_hit(HitObject object, float3 direction)
-{
-    BuiltInTriangleIntersectionAttributes attributes =
-        object.GetAttributes<BuiltInTriangleIntersectionAttributes>();
-    float3 vertices[3] = object.GetTriangleVertexPositions();
-    // EXT返回object-space顶点，与position-fetch closest-hit采用相同误差界。
-    pt::Hit hit = {};
-    hit.surface = geometry::triangle_point(
-        vertices[0], vertices[1], vertices[2], attributes.barycentrics,
-        transpose(object.GetObjectToWorld()), transpose(object.GetWorldToObject()));
-    uint primitive = region_primitive(object.GetInstanceID(), object.GetPrimitiveIndex());
-    uint normal = mapped_shading_normal(
-        primitive, attributes.barycentrics, vertices[1] - vertices[0], vertices[2] - vertices[0],
-        (float3x3)transpose(object.GetObjectToWorld()), hit.surface.normal);
-    hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
-    hit.distance = object.GetRayDesc().TMax;
-    hit.front = dot(direction, hit.surface.normal) < 0;
-    return hit;
-}
-
 public struct HitScene : pt::IHitScene
 {
-    public pt::Hit load_hit(HitObject o, float3 d)
+    public bool guides_enabled()
     {
-        return object_hit(o, d);
+        return PRIMEPT_RECONSTRUCTION != 0 && parameters[0].reconstruction.w == 2;
     }
-    public uint program(pt::Hit h)
+    public uint program(HitObject object, float4 incident)
     {
-        return materials[material_id(h.identity.x)].control.x >> 2u;
+        uint primitive = region_primitive(object.GetInstanceID(), object.GetPrimitiveIndex());
+        return material_at(material_id(primitive)).control.x >> 2u;
     }
     public uint reorder_bits()
     {
         return 32u;
-    }
-    public pt::MaterialContext material_context(pt::Hit h)
-    {
-        return { h.surface.normal, h.identity, uint(h.front) };
-    }
-    public bool continuous(pt::Hit h)
-    {
-        return (h.capability &
-                (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
-                 openpbr::FLOW_CONTINUOUS_REFLECTION | openpbr::FLOW_CONTINUOUS_TRANSMISSION)) != 0;
-    }
-    public bool may_evaluate_both_sides(pt::Hit h)
-    {
-        // 作者法线可跨越几何半球；精确支持域由材质叶子的着色法线判断。
-        return (materials[material_id(h.identity.x)].control.w & 1u) != 0 ||
-               (h.capability & (openpbr::FLOW_SOLID_TRANSMISSION | openpbr::FLOW_THIN_TRANSMISSION |
-                                openpbr::FLOW_SUBSURFACE)) != 0;
-    }
-    public bool solid(pt::Hit h)
-    {
-        return (h.capability & openpbr::FLOW_SOLID_TRANSMISSION) != 0;
     }
 
     public pt::SurfaceMaterial resolve(pt::Hit hit, uint cap, float4 incident)
@@ -120,19 +89,25 @@ public struct HitScene : pt::IHitScene
     {
         return scene;
     }
-    public void resolve_hit(inout pt::Hit hit, float4 incident)
-    {
-        hit.capability = materials[material_id(hit.identity.x)].control.z >> 20u;
-    }
 };
 [shader("closesthit")]
 void shade_hit(inout pt::MaterialCall call, BuiltInTriangleIntersectionAttributes attributes)
 {
+    float3 a = HitTriangleVertexPosition(0), b = HitTriangleVertexPosition(1),
+           c = HitTriangleVertexPosition(2);
     pt::Hit hit = {};
-    hit.surface.normal = call.context.normal;
-    hit.identity = call.context.attributes;
-    hit.front = (call.context.state & 1u) != 0;
-    pt::shade_material<OPENPBR_FLOW, ModScene>(ModScene(), call, hit, -WorldRayDirection());
+    hit.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
+                                           WorldToObject3x4());
+    uint primitive = region_primitive(InstanceID(), PrimitiveIndex());
+    uint normal = 0;
+    if ((OPENPBR_VARIANT & 8u) != 0)
+        normal = mapped_shading_normal_known(primitive, attributes.barycentrics, b - a, c - a,
+                                             (float3x3)ObjectToWorld3x4(), hit.surface.normal);
+    hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
+    hit.distance = RayTCurrent();
+    hit.front = dot(WorldRayDirection(), hit.surface.normal) < 0;
+    pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(
+        ModScene(), call, hit, WorldRayDirection(), settings(parameters[0]));
 }
 [shader("raygeneration")]
 void prefix_empty()
@@ -168,17 +143,20 @@ void render_fused()
     data.path.throughput = 1;
     data.path.eta_scale = 1;
     data.path.medium = params.initial_medium;
+#if PRIMEPT_RECONSTRUCTION
     pt::DenoiseCamera current = geometry::camera_from_scaled(params.origin.xyz, params.forward.xyz,
                                                              params.right.xyz, params.up.xyz);
     pt::DenoiseCamera previous = { params.previous_position, params.previous_forward,
                                    params.previous_right, params.previous_up };
     Guides guides = { coordinate, film, current, previous };
     float distance;
-    if (params.reconstruction.w > 0)
-        distance = pt::trace_hit_path(HitScene(), guides, data, sampler, settings(params));
+    if (params.reconstruction.w == 2)
+        distance = pt::trace_hit_path(HitScene(), guides, data);
     else
-        distance =
-            pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data, sampler, settings(params));
+        distance = pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
+#else
+    float distance = pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
+#endif
     prefix_image[pixel] = float4(0, 0, 0, distance);
     output_image[pixel] =
         float4(data.path.radiance, data.path.status == pt::PATH_INVALID            ? -1

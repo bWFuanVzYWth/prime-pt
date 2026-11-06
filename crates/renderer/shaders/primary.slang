@@ -312,7 +312,7 @@ void render_fused()
             continue;
         }
         data.path.throughput *= pt::segment_transmittance(data.path.medium.yzw, data.hit.distance);
-        uint program = materials[material_id(data.hit.identity.x)].control.x >> 2u;
+        uint program = material_at(material_id(data.hit.identity.x)).control.x >> 2u;
         found.SetShaderTableIndex(program + 1u);
 #ifdef PRIMEPT_SER
         ReorderThread(found, 0u, 0u);

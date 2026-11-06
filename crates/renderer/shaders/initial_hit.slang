@@ -1,4 +1,4 @@
-/// 仅初采拥有实际HitObject；历史表面继续使用restir_scene的callable入口。
+/// 初采只加载几何，完整材质由一次shade产生；可选HitObject只属于当前新命中。
 module initial_hit;
 import restir_scene;
 import restir_call;
@@ -9,6 +9,29 @@ import mod_scene;
 import params;
 import pt.scene;
 import geometry.ray;
+
+public struct ModInitialTrace : restir_pt::IInitialTrace<RestirScene, uint>
+{
+    [mutating]
+    public bool trace(inout RestirScene provider, inout uint state, float3 origin, float3 direction,
+                      out restir_pt::HitInfo hit, out float distance)
+    {
+        return provider.trace(origin, direction, false, hit, distance);
+    }
+    public restir_pt::Surface load(inout RestirScene provider, inout uint state,
+                                   restir_pt::HitInfo hit, float3 view, bool fromOrigin)
+    {
+        return fromOrigin ? provider.loadGeometrySurfaceFromOrigin(hit, view)
+                          : provider.loadGeometrySurface(hit, view);
+    }
+    [mutating]
+    public restir_pt::InitialVertex shade(inout RestirScene provider, inout uint state,
+                                          restir_pt::Surface surface,
+                                          restir_pt::InitialRequest request)
+    {
+        return provider.shadeInitialVertex(surface, request);
+    }
+};
 
 public struct InitialHitTrace : restir_pt::IInitialTrace<RestirScene, HitObject>
 {
@@ -46,53 +69,25 @@ public struct InitialHitTrace : restir_pt::IInitialTrace<RestirScene, HitObject>
                                 asuint(attributes.barycentrics), 0);
         float3 delta = fromOrigin ? view - source.surface.position : view;
         restir_pt::Surface result =
-            provider.surface_from_hit(hit, source, fromOrigin ? normalize(delta) : view);
+            provider.geometry_surface_from_hit(hit, source, fromOrigin ? normalize(delta) : view);
         if (fromOrigin)
             result.distance = length(delta);
         return result;
 #else
-        return fromOrigin ? provider.loadSurfaceFromOrigin(hit, view, false)
-                          : provider.loadSurface(hit, view, false);
+        return fromOrigin ? provider.loadGeometrySurfaceFromOrigin(hit, view)
+                          : provider.loadGeometrySurface(hit, view);
 #endif
     }
 
     [mutating]
-    public restir_pt::InitialShading shade(inout RestirScene provider, inout HitObject found,
-                                           restir_pt::Surface surface, float3 u, float3 direction,
-                                           float3 secondDirection, bool continuation)
+    public restir_pt::InitialVertex shade(inout RestirScene provider, inout HitObject found,
+                                          restir_pt::Surface surface,
+                                          restir_pt::InitialRequest request)
     {
-        uint program = (materials[material_id(surface.identity.x)].control.x >> 2u) +
-                       (continuation ? 0u : asuint(parameters[0].restir.z));
+        bool continuation = (request.flags & restir_pt::INITIAL_SAMPLE) != 0;
+        uint program = material_program(surface.identity.x,
+                                        continuation ? MATERIAL_INITIAL : MATERIAL_INITIAL_DIRECT);
         found.SetShaderTableIndex(program + 1u);
-        if (continuation)
-        {
-            RestirInitialCall call = {};
-#if !defined(PRIMEPT_HIT_GEOMETRY) && !defined(PRIMEPT_HIT_GEOMETRY_LEAF)
-            call.hit = material_hit(surface);
-            call.wo = surface.wo;
-#endif
-            call.incident = surface.incident;
-            call.u = u;
-            call.direction = direction;
-            call.second_direction = secondDirection;
-#ifdef PRIMEPT_SER
-#ifdef PRIMEPT_HIT_HINT
-            ReorderThread(program, PRIMEPT_SER_BITS);
-#else
-            ReorderThread(found, 0u, 0u);
-#endif
-#endif
-            HitObject::Invoke(found, call);
-            return call.result();
-        }
-        RestirDirectCall call = {};
-#if !defined(PRIMEPT_HIT_GEOMETRY) && !defined(PRIMEPT_HIT_GEOMETRY_LEAF)
-        call.hit = material_hit(surface);
-        call.wo = surface.wo;
-#endif
-        call.direction = direction;
-        call.incident_ior = surface.incident.x;
-        call.second_direction = secondDirection;
 #ifdef PRIMEPT_SER
 #ifdef PRIMEPT_HIT_HINT
         ReorderThread(program, PRIMEPT_SER_BITS);
@@ -100,10 +95,14 @@ public struct InitialHitTrace : restir_pt::IInitialTrace<RestirScene, HitObject>
         ReorderThread(found, 0u, 0u);
 #endif
 #endif
-        HitObject::Invoke(found, call);
-        return { {},
-                 { asfloat(call.hit.identity.yzw), asfloat(call.hit.identity.x) },
-                 call.hit.normal,
-                 { call.wo, call.direction.x } };
+        if (continuation)
+        {
+            RestirInitialCall call = RestirInitialCall::input(surface, request);
+            HitObject::Invoke(found, call);
+            return call.result();
+        }
+        RestirInitialDirectCall direct = RestirInitialDirectCall::input(surface, request);
+        HitObject::Invoke(found, direct);
+        return direct.result();
     }
 };

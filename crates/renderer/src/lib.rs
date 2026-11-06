@@ -4,7 +4,8 @@
 //! 整区都无需覆盖判断时使用 opaque 几何；混合 region 的主射线
 //! 通过 any-hit 判断覆盖，阴影 RayQuery 候选使用同一接受规则。当前渲染路径不创建 OMM。
 //! RR 的反射和折射运动使用静态场景的代理，适用范围随 [Gpu] 的视图与历史契约维护。
-//! 普通PT采用材质Hit Group与raygen阴影RayQuery；100B交接只携带当前材质求值所需数据。
+//! 完整普通PT在材质Hit Group内完成着色和阴影RayQuery；交接为88B路径数值，主射线只调度。
+//! 此路径要求启用EXT invocation reorder；未启用设备保留的callable兼容路径限制见[Gpu]。
 //! ReSTIR按方向并行处理双向时间shift与三组paired邻居；已知表面仍用Flow/操作特化callable，
 //! 不统一不同来源的材质解码。初采对太阳和局部灯各采一次，继续使用pairwise MIS。
 //! 时间状态按累积、RR、路径和ReSTCV颜色分别显式失效；相机、局部编辑、照明与路径预算变化
@@ -13,6 +14,7 @@
 //! [`Layout::memory`](simple_engine::restir_pt::Layout::memory)计算，不含应用的几何目录与guide。
 //! 应用另保存每像素12B的当帧CV反射率代理，避免把材质读取带入合并阶段。
 //! 材质世代准备全部已知程序和SBT；模式或尺寸变化只分配工作集、重绑descriptor，不懒编译shader。
+//! 完整普通PT同时预备原生与RR程序；原生不链接Guide，RR使用按材质键专用的Guide。
 //! 固定fresh概率只选择当前输出，不反馈路径历史；历史M上限只应用于temporal MIS。
 //! 两种积分器默认最多12次表面反弹，末顶点保留发光和NEE；到达上限后不再散射。
 //! 原生诊断保留所选积分器、内部复用及每帧SPP，关闭RR与跨帧RGB累积。

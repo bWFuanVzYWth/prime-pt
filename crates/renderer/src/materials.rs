@@ -40,6 +40,32 @@ pub(super) const fn emission_sides(material: &MaterialDefinition) -> u32 {
     }
 }
 
+/// 已发布候选灯的能力上界，与资源发布时的Flow/side过滤相同。
+/// 输入等长由prepare_material_generation建立；不把接收材质的MERS误当作发光纹理。
+pub(super) const fn emitter_capabilities(
+    definitions: &[MaterialDefinition],
+    flows: &[openpbr::FlowKey],
+) -> u32 {
+    let mut capabilities = 0;
+    let mut index = 0;
+    while index < definitions.len() {
+        let definition = &definitions[index];
+        if flows[index].emits() && emission_sides(definition) != 0 {
+            if definition.control[3] >> 1 != 0 {
+                capabilities |= 1;
+            }
+            if definition.control[2] & MaterialDefinition::CUTOUT != 0 {
+                capabilities |= 2;
+            }
+            if definition.control[2] & MaterialDefinition::TEXTURED_EMISSION != 0 {
+                capabilities |= 4;
+            }
+        }
+        index += 1;
+    }
+    capabilities
+}
+
 /// 资源期的静态亮度提案；保留动态tint和MERS/动画实际求值的宿主适配边界。
 /// 与Game共用线性亮度×幅度公式，source RGB由本适配器解释，不扫描运行期几何。
 pub(super) fn emission_weights(definitions: &[MaterialDefinition]) -> Result<Vec<f32>, Error> {
@@ -78,6 +104,11 @@ pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinitio
     };
     maps | normal
         | emission
+        | if flow.emits() && material.control[3] >> 1 != 0 {
+            1 << 10
+        } else {
+            0
+        }
         | ((material.control[0] & 3) << 6)
         | ((flags & (MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS)) << 1)
 }
@@ -86,7 +117,105 @@ pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinitio
 pub(super) const fn scattering_key(
     (flow, variant): (openpbr::FlowKey, u32),
 ) -> (openpbr::FlowKey, u32) {
-    (flow.without_emission(), variant & !(4 | 16 | 32))
+    (
+        flow.without_emission(),
+        variant & !(4 | 16 | 32 | (1 << 10)),
+    )
+}
+
+/// 初采消费完整散射与发光；命中灯逆向提案由独立alias能力决定。
+pub(super) const fn initial_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
+    key
+}
+
+/// 初采不延续时仅连续方向与发光有消费者；纯delta降为发光专用或零程序。
+pub(super) const fn initial_direct_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
+    if key.0.continuous() {
+        initial_key(key)
+    } else {
+        emitter_key(key)
+    }
+}
+
+const fn operation_flow(bits: u32) -> openpbr::FlowKey {
+    match openpbr::FlowKey::from_bits(bits) {
+        Ok(flow) => flow,
+        Err(_) => panic!("内部操作能力组合无效"),
+    }
+}
+
+/// 表面元数据不消费散射颜色、发光或命中光源的逆向提案密度。
+pub(super) const fn metadata_key(
+    (flow, variant): (openpbr::FlowKey, u32),
+) -> (openpbr::FlowKey, u32) {
+    let variant = variant & !(4 | 16 | 32 | (1 << 10));
+    let variant = if variant & 3 == 0 {
+        variant & !((1 << 8) | (1 << 9))
+    } else {
+        variant
+    };
+    let classification = if flow.bits()
+        & (openpbr::FlowKey::DELTA_REFLECTION | openpbr::FlowKey::DELTA_TRANSMISSION)
+        == 0
+        || flow.bits()
+            & (openpbr::FlowKey::SOLID_TRANSMISSION
+                | openpbr::FlowKey::THIN_TRANSMISSION
+                | openpbr::FlowKey::CONDUCTOR_REFLECTION)
+            == 0
+    {
+        operation_flow(0)
+    } else {
+        flow.without_emission()
+    };
+    (classification, variant)
+}
+
+/// 无连续lobe时纯求值恒为零，不按无消费者的贴图/法线能力复制入口。
+pub(super) const fn evaluate_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
+    if key.0.continuous() {
+        scattering_key(key)
+    } else {
+        (operation_flow(0), 0)
+    }
+}
+
+/// 连接Beer仅solid需要几何穿界；离散表面的连续BSDF求值本身恒为零。
+pub(super) const fn connection_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
+    if key.0.continuous() {
+        scattering_key(key)
+    } else if key.0.bits() & openpbr::FlowKey::SOLID_TRANSMISSION != 0 {
+        (
+            operation_flow(
+                openpbr::FlowKey::SOLID_TRANSMISSION | openpbr::FlowKey::DELTA_TRANSMISSION,
+            ),
+            64,
+        )
+    } else {
+        (operation_flow(0), 0)
+    }
+}
+
+/// 已命中发光端只读发光侧、发光贴图和alias；overlay仅影响旧纹理发光的UV。
+pub(super) const fn emitter_key(
+    (flow, variant): (openpbr::FlowKey, u32),
+) -> (openpbr::FlowKey, u32) {
+    if !flow.emits() {
+        return (operation_flow(0), 0);
+    }
+    let overlay = if variant & 4 != 0 {
+        variant & (1 << 8)
+    } else {
+        0
+    };
+    (
+        operation_flow(openpbr::FlowKey::EMISSION),
+        variant & (4 | 16 | 32 | (1 << 10)) | overlay,
+    )
+}
+
+/// 逆向提案只消费命中灯alias形态；不消费材料RGB、MERS、IOR或法线。
+pub(super) const fn pdf_key((_flow, variant): (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
+    (operation_flow(0), variant & (1 << 10))
 }
 
 pub(super) fn defaults() -> Vec<MaterialDefinition> {
@@ -283,5 +412,104 @@ mod tests {
         let (key, variant) = scattering_key((flow, 1 | 2 | 4 | 8 | 16 | 32));
         assert!(!key.emits());
         assert_eq!(variant, 1 | 2 | 8);
+    }
+
+    #[test]
+    fn alias_presence_only_separates_operations_that_read_the_emitter_proposal() {
+        let flow = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 0.)
+            .unwrap()
+            .flow(true);
+        let mut source = MaterialDefinition {
+            emission: [1.; 4],
+            ..Default::default()
+        };
+        let plain = (flow, variant(flow, &source));
+        source.control[3] = 2;
+        let aliased = (flow, variant(flow, &source));
+        assert_ne!(initial_key(plain), initial_key(aliased));
+        assert_ne!(emitter_key(plain), emitter_key(aliased));
+        assert_ne!(pdf_key(plain), pdf_key(aliased));
+        assert_eq!(scattering_key(plain), scattering_key(aliased));
+        assert_eq!(metadata_key(plain), metadata_key(aliased));
+    }
+
+    #[test]
+    fn delta_evaluation_is_shared_but_solid_connection_keeps_medium_crossing() {
+        let glass = simple_engine::openpbr::Material::dielectric(0., None)
+            .unwrap()
+            .flow(false);
+        let metal = simple_engine::openpbr::Material::opaque([0.5; 3], 0., 1.5, 1., 0.)
+            .unwrap()
+            .flow(false);
+        assert_eq!(
+            evaluate_key((glass, 64 | 1 | 2 | 8)),
+            evaluate_key((metal, 1))
+        );
+        assert_ne!(
+            connection_key((glass, 64 | 1 | 2 | 8)),
+            connection_key((metal, 1))
+        );
+    }
+
+    #[test]
+    fn metadata_does_not_split_on_scattering_lobes_or_emission() {
+        let diffuse = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 0.)
+            .unwrap()
+            .flow(false);
+        let sss = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 1.)
+            .unwrap()
+            .flow(true);
+        assert_eq!(
+            metadata_key((diffuse, 1 | 2 | 8)),
+            metadata_key((sss, 1 | 2 | 8 | 4 | 16 | 32 | 1024))
+        );
+    }
+
+    #[test]
+    fn terminal_initial_shares_delta_surfaces_but_keeps_continuous_proposals() {
+        let glass = simple_engine::openpbr::Material::dielectric(0., None)
+            .unwrap()
+            .flow(false);
+        let metal = simple_engine::openpbr::Material::opaque([0.5; 3], 0., 1.5, 1., 0.)
+            .unwrap()
+            .flow(false);
+        assert_eq!(
+            initial_direct_key((glass, 64 | 1 | 2 | 8)),
+            initial_direct_key((metal, 1))
+        );
+        let diffuse = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 0.)
+            .unwrap()
+            .flow(false);
+        assert_eq!(
+            initial_direct_key((diffuse, 1 | 2 | 8)),
+            (diffuse, 1 | 2 | 8)
+        );
+    }
+
+    #[test]
+    fn selected_emitter_bounds_follow_the_published_light_domain() {
+        let plain = MaterialDefinition {
+            emission: [1.; 4],
+            control: [0, 1, 0, 0],
+            ..Default::default()
+        };
+        let mut mapped = plain;
+        mapped.control[2] = MaterialDefinition::MERS
+            | MaterialDefinition::TEXTURED_EMISSION
+            | MaterialDefinition::CUTOUT;
+        mapped.control[3] = 2;
+        let definitions = [plain, mapped];
+        let colors = colors(&[255; 4]).unwrap();
+        for (emission, expected) in [(0, 0), (255, 7)] {
+            let flows = flows(
+                colors,
+                &definitions,
+                map_ranges(&[0, emission, 255, 0], &[]).unwrap(),
+            )
+            .unwrap();
+            assert!(flows[0].emits());
+            assert_eq!(flows[1].emits(), emission != 0);
+            assert_eq!(emitter_capabilities(&definitions, &flows), expected);
+        }
     }
 }

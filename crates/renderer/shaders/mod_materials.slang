@@ -8,6 +8,11 @@ import bsdf.openpbr.flow;
 #define PRIMEPT_COVERAGE_MASK 40u
 #endif
 public static const uint COVERAGE_MASK = PRIMEPT_COVERAGE_MASK;
+#ifndef PRIMEPT_EMITTER_CAPABILITIES
+#define PRIMEPT_EMITTER_CAPABILITIES 7u
+#endif
+// 资源期已发布灯域：alias、cutout、MERS纹理发光；参考入口保守保留全部能力。
+public static const uint EMITTER_CAPABILITIES = PRIMEPT_EMITTER_CAPABILITIES;
 static const uint MATERIAL_OVERLAY_FLAGS = (1u << 7u) | (1u << 8u);
 static const uint VARIANT_OVERLAY = 1u << 8u;
 static const uint VARIANT_OVERLAY_MERS = 1u << 9u;
@@ -22,6 +27,7 @@ public SamplerState atlas_sampler;
 /// GPU派生的112B七块表，物理字段与prime_scene::MaterialDefinition保持同位。
 /// control.x低2位为源OpenPBR flags，高30位由资源准备写入callable槽，不回写CPU定义。
 /// control.z高12位为GPU派生FlowKey，低20位保留原flags；身份与材质参数均不截断。
+/// control.y低2位为发光侧，高30位指向同buffer尾部的资源期操作槽记录（word地址）。
 public struct ModMaterial
 {
     public float4 base_roughness;
@@ -33,11 +39,61 @@ public struct ModMaterial
     public float4 overlay_bounds;
 };
 [[vk::binding(27, 0)]]
-public StructuredBuffer<ModMaterial> materials;
+ByteAddressBuffer material_words;
 [[vk::binding(28, 0)]]
 Texture2D<float4> mers_atlas;
 [[vk::binding(29, 0)]]
 Texture2D<float4> aux_atlas;
+
+/// 前112B/材质保持源布局；逐块load供最终消费者裁剪，尾部操作表不进入材料值。
+public ModMaterial material_at(uint index)
+{
+    uint start = index * 112u;
+    return { asfloat(material_words.Load4(start)),       asfloat(material_words.Load4(start + 16u)),
+             asfloat(material_words.Load4(start + 32u)), asfloat(material_words.Load4(start + 48u)),
+             material_words.Load4(start + 64u),          asfloat(material_words.Load4(start + 80u)),
+             asfloat(material_words.Load4(start + 96u)) };
+}
+
+public static const uint MATERIAL_INITIAL = 0u;
+public static const uint MATERIAL_REPLAY = 1u;
+public static const uint MATERIAL_EVALUATE = 2u;
+public static const uint MATERIAL_METADATA = 3u;
+public static const uint MATERIAL_CONNECTION = 4u;
+public static const uint MATERIAL_EMITTER = 5u;
+public static const uint MATERIAL_PDF = 6u;
+public static const uint MATERIAL_GUIDE = 7u;
+public static const uint MATERIAL_INITIAL_DIRECT = 8u;
+
+public uint material_program(uint primitive, uint operation)
+{
+    uint pointer = material_words.Load(material_id(primitive) * 112u + 68u) >> 2u;
+    return material_words.Load((pointer + operation) * 4u);
+}
+
+/// metadata只在known-surface shift表中调度；初采由完整专用leaf一次求值。
+public uint metadata_program(uint primitive)
+{
+    uint2 control = material_words.Load2(material_id(primitive) * 112u + 64u);
+    uint pointer = control.y >> 2u;
+    uint local = material_words.Load((pointer + MATERIAL_METADATA) * 4u);
+    uint header = pointer - (control.x >> 2u) * 9u - 8u;
+    return local + material_words.Load((header + 1u) * 4u);
+}
+
+public uint guide_program(uint primitive, bool known, bool restir)
+{
+    uint2 control = material_words.Load2(material_id(primitive) * 112u + 64u);
+    uint pointer = control.y >> 2u;
+    uint local = material_words.Load((pointer + MATERIAL_GUIDE) * 4u);
+    uint header = pointer - (control.x >> 2u) * 9u - 8u;
+#ifdef PRIMEPT_INITIAL_HIT
+    uint index = known ? 4u : (restir ? 5u : 2u);
+#else
+    uint index = known ? 3u : (restir ? 5u : 2u);
+#endif
+    return local + material_words.Load((header + index) * 4u);
+}
 
 public uint material_id(uint primitive)
 {
@@ -82,7 +138,7 @@ public float4 material_texel(uint primitive, float2 barycentrics)
 /// CUTOUT来自实际源layer；opaque/透射界面不将alpha误解释为二值孔洞。
 public bool material_accepts(uint primitive, float2 bary, bool front)
 {
-    uint flags = materials[material_id(primitive)].control.z & COVERAGE_MASK;
+    uint flags = material_at(material_id(primitive)).control.z & COVERAGE_MASK;
     if ((flags & 32u) != 0 && !front)
         return false;
     return (flags & 8u) == 0 ||
@@ -94,17 +150,22 @@ bool emits_on_side(ModMaterial material, bool front)
     return (material.control.y & side) != 0 && material.emission.w > 0 &&
            ((material.control.z & 32u) == 0 || front);
 }
-public float3 material_emission(uint primitive, float2 bary, bool front, float block_emission_scale)
+/// AcceptedSample只用于已通过light_regions.sideMask与正PDF检查的forward样本。
+/// reference/未知命中保留完整源规则，不套用仅覆盖已发布候选灯的上界。
+public float3 material_emission<let AcceptedSample : bool = false>(uint primitive, float2 bary,
+                                                                   bool front,
+                                                                   float block_emission_scale)
 {
-    ModMaterial material = materials[material_id(primitive)];
-    if (!emits_on_side(material, front))
+    ModMaterial material = material_at(material_id(primitive));
+    if (!AcceptedSample && !emits_on_side(material, front))
         return 0;
     float2 uv = material_uv(primitive, bary);
     float4 texel = sample_tinted_texel(primitive, bary, uv);
-    if ((material.control.z & 8u) != 0 && texel.a < 0.5)
+    if ((!AcceptedSample || (EMITTER_CAPABILITIES & 2u) != 0) && (material.control.z & 8u) != 0 &&
+        texel.a < 0.5)
         return 0;
     float3 result = material.emission.xyz * material.emission.w * texel.xyz;
-    if ((material.control.z & 4u) != 0)
+    if ((!AcceptedSample || (EMITTER_CAPABILITIES & 4u) != 0) && (material.control.z & 4u) != 0)
         result *= mers_atlas.SampleLevel(atlas_sampler, uv, 0).y;
     return result * block_emission_scale;
 }
@@ -128,12 +189,9 @@ public float3 decode_shading_normal(uint packed)
     return normalize(normal);
 }
 /// 只有显式法线贴图需要变换三角形边；几何法线和offset原样保留。
-public uint mapped_shading_normal(uint primitive, float2 bary, float3 local_e1, float3 local_e2,
-                                  float3x3 object_to_world, float3 normal)
+public uint mapped_shading_normal_known(uint primitive, float2 bary, float3 local_e1,
+                                        float3 local_e2, float3x3 object_to_world, float3 normal)
 {
-    ModMaterial material = materials[material_id(primitive)];
-    if ((material.control.w & 1u) == 0)
-        return 0;
     uint base = (primitive >> 1) * 3u;
     float4 uv01 = asfloat(quads[base]), uv23 = asfloat(quads[base + 1u]);
     bool second = (primitive & 1u) != 0;
@@ -159,11 +217,20 @@ public uint mapped_shading_normal(uint primitive, float2 bary, float3 local_e1, 
     return encode_shading_normal(
         normalize(tangent * local.x + bitangent * local.y + normal * local.z));
 }
+/// 未知命中的独立导引路径；照明叶子按资源期能力直接调用known版本。
+public uint mapped_shading_normal(uint primitive, float2 bary, float3 local_e1, float3 local_e2,
+                                  float3x3 object_to_world, float3 normal)
+{
+    if ((material_at(material_id(primitive)).control.w & 1u) == 0)
+        return 0;
+    return mapped_shading_normal_known(primitive, bary, local_e1, local_e2, object_to_world,
+                                       normal);
+}
 // 能力位与 materials::variant 同步。通用 guide 根据当前命中读取相同信息。
 uint material_variant(ModMaterial material)
 {
     uint flags = material.control.z;
-    uint sides = (flags & 32u) != 0 ? material.control.y & 1u : material.control.y;
+    uint sides = material.control.y & ((flags & 32u) != 0 ? 1u : 3u);
     uint emission = material.emission.w > 0 ? (sides << 4u) | (flags & 4u) : 0;
     return (flags & 3u) | ((material.control.w & 1u) << 3u) | emission |
            ((material.control.x & 3u) << 6u) | ((flags & MATERIAL_OVERLAY_FLAGS) << 1u);
@@ -174,7 +241,7 @@ public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant
                                             float block_emission_scale)
 {
     uint primitive = hit.identity.x;
-    ModMaterial material = materials[material_id(primitive)];
+    ModMaterial material = material_at(material_id(primitive));
     uint mask = variant == ~0u ? material_variant(material) : variant;
     pt::SurfaceMaterial result = {};
     result.pbr.base_roughness.w = material.base_roughness.w;

@@ -20,7 +20,7 @@ public struct Params
     public atmosphere::Params atmosphere;
     /// Rec.2020 辐亮度倍率与 Aerial 最远距离 km。
     public float4 atmosphere_settings;
-    /// xy=全帧主射线偏移，z=历史有效，w=RR 开启。
+    /// xy=全帧主射线偏移，z=历史有效，w=0原生、2 RR。
     public float4 reconstruction;
     /// 本批绝对随机样本基数；与静态累积count独立，失效不回退。
     public uint rr_sample;

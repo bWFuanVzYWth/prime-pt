@@ -73,7 +73,8 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
     uint index = light_alias[2u + selected.light / 4u][selected.light & 3u];
     uint4 meta = light_meta[index];
     uint primitive = meta.w * 2u;
-    uint alias_offset = materials[material_id(primitive)].control.w >> 1u;
+    uint alias_offset =
+        (EMITTER_CAPABILITIES & 1u) != 0 ? material_at(material_id(primitive)).control.w >> 1u : 0u;
     uint start = index * 3u;
     pt::LightQuadVertices vertices = pt::light_quad_vertices(
         light_vertices[start], light_vertices[start + 1u], light_vertices[start + 2u]);
@@ -109,14 +110,16 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
     result.emission_reference = index;
     return result;
 }
+/// 只接受当前已发布灯提案返回且pdf>0的样本；源sideMask已完成发光侧准入。
 public float3 quad_light_emission(pt::LightSample sample, float block_emission_scale)
 {
     uint flags = asuint(sample.emission.z);
     uint primitive = light_meta[sample.emission_reference].w * 2u + (flags & 1u);
-    return material_emission(primitive, sample.emission.xy, (flags & 2u) != 0,
-                             block_emission_scale);
+    return material_emission<true>(primitive, sample.emission.xy, (flags & 2u) != 0,
+                                   block_emission_scale);
 }
-public float quad_emission_pdf(pt::Hit hit, float3 previous, int3 anchor_region)
+public float quad_emission_pdf<let Known : bool = false, let Aliased : bool = false>(
+    pt::Hit hit, float3 previous, int3 anchor_region)
 {
     uint index = light_index(hit.identity.x >> 1u);
     if (index == 0xffffffffu)
@@ -127,10 +130,11 @@ public float quad_emission_pdf(pt::Hit hit, float3 previous, int3 anchor_region)
     pt::LightBvhProposal proposal = { light_alias, header.y, header.x };
     float pmf = proposal.pmf(receiver, uint(light_regions[index].w) >> 2u);
     uint4 meta = light_meta[index];
-    ModMaterial material = materials[material_id(hit.identity.x)];
-    uint alias_offset = material.control.w >> 1u;
+    ModMaterial material = material_at(material_id(hit.identity.x));
+    uint alias_offset =
+        (EMITTER_CAPABILITIES & 1u) != 0 && (!Known || Aliased) ? material.control.w >> 1u : 0u;
     float2 uv = 0;
-    if (alias_offset != 0u)
+    if ((EMITTER_CAPABILITIES & 1u) != 0 && (Known ? Aliased : alias_offset != 0u))
     {
         uv = (material_uv(hit.identity.x, asfloat(hit.identity.yz)) - material.uv_bounds.xy) /
              (material.uv_bounds.zw - material.uv_bounds.xy);

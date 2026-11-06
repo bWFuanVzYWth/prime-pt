@@ -95,6 +95,316 @@ fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn 
 }
 
 #[test]
+#[ignore = "独立进程：实际SDK+EXT验证生产RR选择keyed Guide，原生程序不保留Guide SBT"]
+fn hardware_pt_rr_keyed_program_preserves_opaque_and_glass_guides()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(true, true)?;
+    let mut gpu = host.gpu()?;
+    let extent = [512, 512];
+    let output = Image::new(&mut gpu.context, [512, 512, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    let mut glass = MaterialDefinition::default();
+    glass.control[0] = 1;
+    glass.base_roughness[3] = 0.;
+    glass.extinction = [1.5, 0., 0., 0.];
+    let definitions = [MaterialDefinition::default(), glass];
+    let mut reference = Vec::new();
+    for mode in [0, 8] {
+        gpu.experiment_dispatch = mode;
+        upload(&mut gpu, &definitions, &[], &[[u32::MAX, 0, 0, 0]; 2])?;
+        assert_eq!(gpu.generation.as_ref().unwrap().dispatch, mode);
+        let generation = gpu.generation.as_ref().unwrap();
+        assert_eq!(generation.guided_regular.is_some(), mode == 8);
+        assert_eq!(generation.guided_reordered.is_some(), mode == 8);
+        for with_glass in [false, true] {
+            let mut mesh = Mesh::default();
+            add_quad(&mut mesh, 3., [0.5; 2], [0.8, 0.5, 0.2], 10.);
+            if with_glass {
+                mesh.quads.push(Quad::with_material(
+                    [
+                        [-10., -10., 1.],
+                        [-10., 10., 1.],
+                        [10., 10., 1.],
+                        [10., -10., 1.],
+                    ],
+                    [[0.5; 2]; 4],
+                    [1.; 3],
+                    MaterialId::new(1),
+                ));
+            }
+            let revision = u64::from(with_glass) + 1;
+            publish(&mut gpu, &mesh, revision, revision, [0.; 3])?;
+            gpu.invalidate_history(GlobalReset::SceneDomainReplaced)?;
+            let mut camera = camera();
+            for frame in 0..2 {
+                camera.origin[0] = frame as f32 * 0.125;
+                host.render_rr(&mut gpu, &output, &camera, Environment::default())?;
+                assert!(
+                    gpu.rr_unavailable.is_none() && gpu.rr_previous.is_some(),
+                    "SDK必须实际完成求值，不能以原生回退算通过"
+                );
+            }
+            let view = gpu.view.as_ref().unwrap();
+            assert!(view.rr_enabled);
+            let mut parameters = vec![0; view.params.len() as usize];
+            view.params.read(&mut gpu.context, 0, &mut parameters)?;
+            let reconstruction_w = (16
+                + 4
+                + 4
+                + gpu.display_drt.to_array().len()
+                + 4
+                + gpu.atmosphere.parameters().words().len()
+                + 4
+                + 3)
+                * 4;
+            assert_eq!(
+                f32::from_le_bytes(parameters[reconstruction_w..reconstruction_w + 4].try_into()?),
+                2.
+            );
+            let center = (extent[1] / 2 * extent[0] + extent[0] / 2) as usize;
+            let depth = view.rr.images[1].download(&mut gpu.context)?;
+            let depth = f32::from_le_bytes(depth[center * 4..center * 4 + 4].try_into()?);
+            let normal = half_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
+            let diffuse = half_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
+            let specular = half_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
+            let motion = half_pixel(&view.rr.images[2].download(&mut gpu.context)?, extent, 2);
+            assert!(depth.is_finite() && depth > 1.);
+            assert!((normal[2] + 1.).abs() < 0.001);
+            assert!(diffuse[..3].iter().all(|&v| v > 0. && v < 1.));
+            assert!(specular[..3].iter().all(|&v| v > 0. && v < 1.));
+            assert!(motion[0] > 1. && motion[1].abs() < 0.01);
+            if !with_glass {
+                assert!((depth - 3.).abs() < 1e-4);
+                assert!((motion[0] - 512. / 2. * 0.125 / 3.).abs() < 0.02);
+            }
+            let guides = std::iter::once(depth)
+                .chain(normal)
+                .chain(diffuse)
+                .chain(specular)
+                .chain(motion)
+                .collect::<Vec<_>>();
+            if mode == 0 {
+                reference.push(guides);
+            } else {
+                for (actual, expected) in guides.iter().zip(&reference[usize::from(with_glass)]) {
+                    assert!(
+                        (actual - expected).abs() <= 0.01,
+                        "glass={with_glass}，keyed={actual}，reference={expected}"
+                    );
+                }
+            }
+        }
+    }
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实Vulkan RT：紧凑SBT的元数据/发光/逆PDF/法线操作须路由到本材质专用叶子"]
+fn hardware_pt_material_operation_sbt_routes_all_material_keys()
+-> Result<(), Box<dyn std::error::Error>> {
+    use simple_engine::light_sampling::emitter::{Coverage, EmissionProposal, EmitterAlias};
+    use simple_engine::vulkan::native::RayTracingPipeline;
+    let host = Host::new_ser()?;
+    let mut gpu = host.gpu()?;
+    let output = image(&mut gpu)?;
+    let mut definitions = vec![MaterialDefinition::default(); 11];
+    definitions[1].surface[1] = 1.;
+    definitions[1].base_roughness[3] = 0.;
+    definitions[2].control[0] = 1;
+    definitions[2].base_roughness[3] = 0.;
+    definitions[3].control[0] = 1;
+    definitions[3].extinction = [1.33, 0.03, 0.01, 0.005];
+    definitions[3].base_roughness[3] = 0.5;
+    definitions[4].control[0] = 3;
+    definitions[4].base_roughness[3] = 0.3;
+    definitions[5].control[2] = MaterialDefinition::MERS;
+    definitions[6].control[2] = MaterialDefinition::AUXILIARY;
+    definitions[6].control[3] = MaterialDefinition::AUTHORED_NORMAL;
+    definitions[6].base_roughness[3] = 0.3;
+    for (index, sides) in [(7, 1), (8, 2), (10, 3)] {
+        definitions[index].control[1] = sides;
+        definitions[index].emission = [0.8, 0.2, 0.6, 3.];
+    }
+    definitions[7].control[2] = MaterialDefinition::TEXTURED_EMISSION;
+    definitions[9].control[2] =
+        MaterialDefinition::MERS | MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS;
+    definitions[9].overlay_bounds = [0., 0., 1., 1.];
+    definitions[10].control[2] = MaterialDefinition::MERS
+        | MaterialDefinition::AUXILIARY
+        | MaterialDefinition::TEXTURED_EMISSION;
+    definitions[10].control[3] = MaterialDefinition::AUTHORED_NORMAL | 2;
+    assert!(definitions.iter().all(|definition| definition.valid()));
+    let uv = [[0., 0.], [0., 1.], [1., 1.], [1., 0.]];
+    let mut mesh = Mesh::default();
+    for index in 0..definitions.len() {
+        let x = (index % 4) as f32 * 2. - 4.;
+        let y = (index / 4) as f32 * (8. / 3.) - 4.;
+        let mut points = [
+            [x, y, 4.],
+            [x, y + 8. / 3., 4.],
+            [x + 2., y + 8. / 3., 4.],
+            [x + 2., y, 4.],
+        ];
+        if index == 8 {
+            points.reverse();
+        }
+        mesh.quads.push(Quad::with_material(
+            points,
+            uv,
+            [0.8, 0.7, 0.6],
+            MaterialId::new(index as u32),
+        ));
+    }
+    let proposal = EmissionProposal::new([2, 1], &[0., 1.], &[255, 255])?.unwrap();
+    let alias = EmitterAlias::build(mesh.quads[10].positions(), uv, Coverage::Opaque, &proposal)?
+        .ok_or("alias样本没有建立纹理提案")?;
+    let mut words = vec![0];
+    words.extend_from_slice(alias.words());
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [2, 1],
+        albedo: &[255; 8],
+        materials: &definitions,
+        mers: &[64, 0, 153, 128, 192, 255, 204, 192],
+        auxiliary: &[200, 128, 64, 85, 200, 128, 64, 85],
+        emission_alias_words: &words,
+        light_areas: &[[u32::MAX, 0, 0, 0]; 11],
+    })?;
+    gpu.set_rendering(
+        prime_scene::RenderMode::Realtime,
+        prime_scene::RealtimeRenderer::RestirPt,
+    )?;
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    host.render_options(
+        &mut gpu,
+        &output,
+        &camera(),
+        Environment::default(),
+        Options::new(false, streamline::Quality::Dlaa, 1, 1)?,
+    )?;
+    let readback = Buffer::new(&mut gpu.context, 32 * 32 * 23 * 16, true)?;
+    let (scene, _) = gpu.renderer_bindings(
+        gpu.view.as_ref().unwrap(),
+        &gpu.atlas,
+        &gpu.scene,
+        gpu.material_gpu,
+        gpu.lighting_gpu,
+    );
+    let bindings = gpu.restir.as_ref().unwrap().test_bindings(
+        &mut gpu.context,
+        scene,
+        gpu.restir_geometry.unwrap(),
+        gpu.restir_lut,
+        Some(readback),
+    )?;
+    let generation = gpu.generation.as_ref().unwrap();
+    let guide_offset: usize = generation.restir_programs[1..7]
+        .iter()
+        .map(|set| set.artifacts().len())
+        .sum();
+    let define = format!("-DPRIMEPT_PROBE_GUIDE_OFFSET={guide_offset}");
+    let source = gpu.shader_source.with_file_name("material_probe.slang");
+    let probe = gpu.compiler.compile(&shader_build::Recipe {
+        source: source.to_str().ok_or("probe路径不是UTF-8")?,
+        entry: "material_route_probe",
+        stage: "raygeneration",
+        output: "material-route-probe.spv",
+        target: shader_build::Target::Spirv("spirv_1_4"),
+        args: &["-fp-mode", "precise", &define],
+    })?;
+    let callables: Vec<_> = generation
+        .restir_programs
+        .iter()
+        .enumerate()
+        .skip(1)
+        .take(7)
+        .flat_map(|(role, set)| {
+            set.artifacts().iter().map(move |artifact| RayShader {
+                spirv: artifact.bytes(),
+                entry: match role {
+                    1 => c"restir_replay_flow",
+                    2 => c"restir_evaluate_flow",
+                    3 => c"restir_metadata_flow",
+                    4 => c"restir_connection_flow",
+                    5 => c"restir_emitter_flow",
+                    6 => c"restir_pdf_flow",
+                    _ => c"guide_known",
+                },
+            })
+        })
+        .collect();
+    let trace = super::super::programs(
+        &[],
+        false,
+        materials::HitFeatures {
+            coverage: 0,
+            authored_normals: false,
+        },
+    );
+    let pipeline = RayTracingPipeline::new(
+        &mut gpu.context,
+        bindings,
+        [
+            RayShader {
+                spirv: probe.bytes(),
+                entry: c"material_route_probe",
+            },
+            trace.miss,
+            trace.closest_hit,
+        ],
+        trace.any_hit,
+        &callables,
+    )?;
+    let mut commands = Commands::new(&gpu.context)?;
+    commands.trace(pipeline, [32, 32])?;
+    commands.barrier();
+    commands
+        .finish(&mut gpu.context)?
+        .submit_and_wait(&mut gpu.context)?;
+    let mut bytes = vec![0; readback.len() as usize];
+    readback.read(&mut gpu.context, 0, &mut bytes)?;
+    let values: Vec<f32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|word| f32::from_le_bytes(*word))
+        .collect();
+    let mut seen = vec![0usize; definitions.len()];
+    for (pixel, rows) in values.as_chunks::<{ 23 * 4 }>().0.iter().enumerate() {
+        if rows[88] == 0. {
+            continue;
+        }
+        let material = rows[89] as usize;
+        assert!(
+            material < seen.len(),
+            "pixel={pixel}, invalid material={material}"
+        );
+        seen[material] += 1;
+        for pair in 0..11 {
+            for channel in 0..4 {
+                let actual = rows[pair * 8 + channel];
+                let expected = rows[pair * 8 + 4 + channel];
+                assert!(
+                    actual.is_finite()
+                        && expected.is_finite()
+                        && (actual - expected).abs() <= 2e-4 * expected.abs().max(1.),
+                    "material={material}, pixel={pixel}, role_pair={pair}, channel={channel}: {actual} != {expected}"
+                );
+            }
+        }
+    }
+    assert!(
+        seen.iter().all(|&count| count > 0),
+        "所有材质键都须实际命中: {seen:?}"
+    );
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan RT；超过八种材质能力仍可执行ReSTIR的独立操作叶子"]
 fn hardware_pt_restir_many_material_variants() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
