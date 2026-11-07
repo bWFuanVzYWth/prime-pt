@@ -415,7 +415,13 @@ pub unsafe extern "C" fn prime_report_device_loss(id: u64) -> i32 {
     guarded(-1, || {
         with_engine(id, |engine| {
             // SAFETY: 导出接口要求宿主确认设备已经丢失。
-            unsafe { engine.gpu.report_device_loss()? };
+            let driver = unsafe { engine.gpu.report_device_loss() };
+            let cpu = engine
+                .profile
+                .report_device_loss(std::io::stderr().lock())
+                .map_err(prime_renderer::Error::DiagnosticOutput);
+            driver?;
+            cpu?;
             Ok(())
         })
     })

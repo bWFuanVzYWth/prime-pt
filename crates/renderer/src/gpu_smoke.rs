@@ -20,6 +20,8 @@ mod cv_tests;
 mod features_tests;
 #[path = "history_tests.rs"]
 mod history_tests;
+#[path = "region_update_tests.rs"]
+mod region_update_tests;
 #[path = "render_bench.rs"]
 mod render_bench;
 #[path = "rendering_tests.rs"]

@@ -531,7 +531,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
     let extent = if std::env::var_os("PRIME_PT_EXPERIMENT_SMALL").is_some() {
         [32, 32]
     } else {
-        [960, 540]
+        [3840, 2160]
     };
     let output = Image::new(
         &mut gpu.context,
@@ -627,6 +627,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         );
         eprintln!("完成case {renderer:?} CV={cv}");
     }
+    let ser = gpu.invocation_reorder;
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     let file = std::fs::OpenOptions::new()
@@ -636,7 +637,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
     serde_json::to_writer_pretty(
         file,
         &serde_json::json!({
-            "extent":[960,540], "quads":4096, "samples":1, "bounces":12, "ser":true, "rr":false,
+            "extent":extent, "quads":4096, "samples":1, "bounces":bounces, "ser":ser, "rr":false,
             "warmup_ms":2000,
             "scope":"CPU draw录制含回收；GPU timestamp包围完整draw；不含Java、场景更新与窗口呈现",
             "cases":cases

@@ -16,7 +16,7 @@ const DETAIL_BYTES: usize = 128;
 pub(crate) const HEADER: usize = DETAILS_OFFSET + 3 * DETAIL_BYTES;
 pub(crate) const BAR: usize = 120;
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SceneInfo {
     pub dirty_regions: u64,
     pub instances: u64,
@@ -43,6 +43,18 @@ pub(crate) struct Profile {
 }
 
 impl Profile {
+    /// 只在设备丢失后输出已有CPU统计；不访问设备，不把CPU发布当作GPU完成。
+    pub(crate) fn report_device_loss(
+        &self,
+        mut output: impl std::io::Write,
+    ) -> std::io::Result<()> {
+        writeln!(
+            output,
+            "[prime_pt] gpu_fault cpu_only profile_frame={} last_scene_update={:?} pending_scene_update={:?} pressure={:?} work={:?}",
+            self.sequence, self.last_update, self.update, self.pressure, self.work,
+        )
+    }
+
     pub(crate) fn set_work(&mut self, work: prime_world::WorkStats, mesh_budget: usize) {
         self.work = work;
         self.mesh_budget = mesh_budget;

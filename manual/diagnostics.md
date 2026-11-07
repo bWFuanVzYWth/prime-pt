@@ -63,8 +63,11 @@ Set-Location 'C:\repositories\simple_engine\app\prime_pt'
 | `checkpoint=Some(...)` | `scope` 是帧样本序号，`label` 是边界，`pipeline` 和 `extent` 对应具体派发。 |
 | `checkpoint=None` | 驱动标记不在保留的最近 512 条记录中，不能解释为没有执行。 |
 | `recorded_only` | 只代表 CPU 录制过，不能当作 GPU 进度。 |
+| `cpu_only` | 最近场景发布、更新帧号、内存预算压力及捕获／编译工作量。CPU 可能已准备下一帧，不能据此断定某次更新导致了 GPU 故障。 |
 
 驱动检查点用于缩小范围，不证明对应命令就是崩溃原因，也不恢复设备。
+如果先出现地形镂空、纹理消失或区块缺失，先按 F2 保存异常画面，并记下是否静止、是否自行恢复；
+随后保留原设置继续观察。截图和故障目录一起保存。仅凭剩余轮廓，无法区分错误透明度、缺失几何和历史重建异常。
 如果需要进一步定位，可以改用逐阶段等待：它只在 RR 实际启用时对 RR 之前的自有操作独立提交并等待，
 日志中的 `state=complete` 才表示对应操作已确认完成。RR 和呈现仍按原顺序交给宿主。
 这种模式会改变时序，可能使竞态暂时消失，不能用于性能比较。
@@ -135,4 +138,4 @@ $env:PRIME_PT_RENDER_BENCH_OUTPUT = Join-Path (Get-Location).Path "temp/render-$
 cargo test --locked --release -p prime_renderer --lib hardware_pt_render_profile -- --ignored --nocapture --test-threads=1
 ```
 
-JSON 保存普通PT、ReSTIR关闭CV及开启CV三组的每帧CPU录制时间和GPU时间戳跨度。输入是960×540、4096个四边形、每帧一个样本和12顶点预算；各组至少预热两秒，不包含RR、Java捕获、场景更新和窗口呈现，不能换算为Minecraft帧率。编译后首次运行还会建立驱动缓存，应保留记录并单独重跑校准。
+JSON 保存普通PT、ReSTIR关闭CV及开启CV三组的每帧CPU录制时间和GPU时间戳跨度。默认输入是3840×2160、4096个四边形、每帧一个样本和12顶点预算；分辨率、路径预算及SER状态按本次实际设置写入JSON。各组至少预热两秒，不包含RR、Java捕获、场景更新和窗口呈现，不能换算为Minecraft帧率。编译后首次运行还会建立驱动缓存，应保留记录并单独重跑校准。
