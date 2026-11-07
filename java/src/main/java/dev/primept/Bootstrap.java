@@ -5,13 +5,14 @@ import com.mojang.renderpearl.backend.vulkan.VulkanPhysicalDevice;
 import com.mojang.renderpearl.backend.vulkan.init.FeatureSet;
 import com.mojang.renderpearl.backend.vulkan.init.VulkanFeature;
 import com.mojang.renderpearl.backend.vulkan.init.VulkanPNextStruct;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.*;
 
-/** 在宿主 vkCreateDevice 前强制启用 RT/position fetch；SER 单独协商。 */
+/** 在宿主 vkCreateDevice 前完整协商 RT；缺少必要能力时保留原版设备，SER 单独协商。 */
 public final class Bootstrap {
     private static final List<String> EXTENSIONS = List.of(
             "VK_KHR_acceleration_structure", "VK_KHR_ray_tracing_pipeline", "VK_KHR_ray_query",
@@ -28,6 +29,16 @@ public final class Bootstrap {
     private static final VulkanFeature SUBGROUP = new VulkanFeature(
             new VulkanPNextStruct(VkPhysicalDeviceSubgroupSizeControlFeatures.class),
             "subgroupSizeControl", VkPhysicalDeviceSubgroupSizeControlFeatures.SUBGROUPSIZECONTROL);
+    private static final Set<VulkanFeature> PT_FEATURES = Set.of(
+            new VulkanFeature(VulkanFeatureSets.VK12_FEATURES_STRUCT, "bufferDeviceAddress", VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS),
+            new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageExtendedFormats"),
+            new VulkanFeature(new VulkanPNextStruct(VkPhysicalDeviceAccelerationStructureFeaturesKHR.class),
+                    "accelerationStructure", VkPhysicalDeviceAccelerationStructureFeaturesKHR.ACCELERATIONSTRUCTURE),
+            new VulkanFeature(new VulkanPNextStruct(VkPhysicalDeviceRayTracingPipelineFeaturesKHR.class),
+                    "rayTracingPipeline", VkPhysicalDeviceRayTracingPipelineFeaturesKHR.RAYTRACINGPIPELINE),
+            new VulkanFeature(new VulkanPNextStruct(VkPhysicalDeviceRayQueryFeaturesKHR.class),
+                    "rayQuery", VkPhysicalDeviceRayQueryFeaturesKHR.RAYQUERY),
+            POSITION_FETCH, DEVICE_COMMANDS, SYNCHRONIZATION, SUBGROUP);
     private static final List<String> RR_EXTENSIONS = List.of("VK_NVX_binary_import", "VK_NVX_image_view_handle",
             "VK_KHR_push_descriptor", "VK_KHR_buffer_device_address", "VK_KHR_synchronization2");
     private static final VulkanFeature PRIVATE_DATA = new VulkanFeature(
@@ -43,34 +54,63 @@ public final class Bootstrap {
             new VulkanPNextStruct(VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.class),
             "rayTracingInvocationReorder", VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.RAYTRACINGINVOCATIONREORDER);
     private static long rrPhysical;
+    private static long ptPhysical;
+    private static long ptDevice;
     private static long serPhysical;
     private static long serDevice;
     private static String serStatus = "尚未协商宿主设备";
     private static int graphicsQueueIndex;
     private Bootstrap() {}
 
-    /** 实例固定请求 Vulkan 1.4；缺少 loader 支持时在创建前失败。 */
-    public static int instanceApi() {
-        if (VK.getInstanceVersionSupported() < VK14.VK_API_VERSION_1_4)
-            throw new IllegalStateException("Prime PT 需要 Vulkan 1.4 loader");
-        return VK14.VK_API_VERSION_1_4;
+    /** loader 支持时请求 Vulkan 1.4，否则保留原版版本，使原版渲染仍可启动。 */
+    public static int instanceApi(int original) {
+        return instanceApi(original, VK.getInstanceVersionSupported());
     }
 
-    /** 缺少能力时中止初始化，避免运行中静默退回非 RT 路径。 */
+    static int instanceApi(int original, int supported) {
+        return supported >= VK14.VK_API_VERSION_1_4 ? Math.max(original, VK14.VK_API_VERSION_1_4) : original;
+    }
+
+    static FeatureSet unsupported(FeatureSet original, List<String> missing) {
+        ptPhysical = ptDevice = 0;
+        serStatus = "Prime PT 所需设备能力不可用";
+        StreamlineBootstrap.unavailable("Prime PT 所需设备能力不可用");
+        SupportNotice.missing(missing);
+        return original;
+    }
+
+    /** 缺少能力时不追加 RT 扩展或特性，原因交给界面通知；仅完整支持后允许 native 接入。 */
     public static FeatureSet enable(FeatureSet original, VulkanPhysicalDevice physical) {
-        if (!physical.vkPhysicalDevice().getInstance().getCapabilities().Vulkan14
-                || physical.vkPhysicalDeviceProperties().apiVersion() < VK14.VK_API_VERSION_1_4)
-            throw new IllegalStateException("Prime PT 需要实际 Vulkan 1.4 instance 和物理设备");
+        ptPhysical = ptDevice = 0;
         rrPhysical = 0;
         serPhysical = 0;
         serDevice = 0;
         serStatus = "缺少 EXT SER 扩展或特性";
+        // 已安装的 interposer 仍负责原版设备；保留其可用的 privateData 特性。
+        if (StreamlineBootstrap.installed()
+                && physical.vkPhysicalDeviceProperties().apiVersion() >= VK13.VK_API_VERSION_1_3) {
+            try (var stack = MemoryStack.stackPush()) {
+                var privateData = VkPhysicalDevicePrivateDataFeatures.calloc(stack).sType$Default();
+                var available = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(privateData);
+                VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), available);
+                if (privateData.privateData()) {
+                    var features = new HashSet<>(original.features());
+                    features.add(PRIVATE_DATA);
+                    original = new FeatureSet(original.name(), original.extensions(), Set.copyOf(features), original.condition());
+                }
+            }
+        }
+        var missing = new ArrayList<String>();
+        if (!physical.vkPhysicalDevice().getInstance().getCapabilities().Vulkan14)
+            missing.add("Vulkan 1.4 instance/loader");
+        if (physical.vkPhysicalDeviceProperties().apiVersion() < VK14.VK_API_VERSION_1_4)
+            missing.add("Vulkan 1.4 device");
         var graphics = physical.graphicsQueueFamilyAndIndex();
-        if (graphics == null) throw new IllegalStateException("Prime PT 需要可呈现的 graphics/compute 队列");
-        graphicsQueueIndex = graphics.rightInt();
+        if (graphics == null) missing.add("graphics/compute queue");
         for (String extension : EXTENSIONS)
-            if (!physical.hasDeviceExtension(extension))
-                throw new IllegalStateException("Prime PT 缺少 " + extension);
+            if (!physical.hasDeviceExtension(extension)) missing.add(extension);
+        if (!missing.isEmpty()) return unsupported(original, missing);
+        graphicsQueueIndex = graphics.rightInt();
         var extensions = new HashSet<>(original.extensions());
         extensions.addAll(EXTENSIONS);
         var features = new HashSet<>(original.features());
@@ -86,16 +126,26 @@ public final class Bootstrap {
             var available = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default()
                     .pNext(address).pNext(commands).pNext(synchronization).pNext(acceleration).pNext(pipeline).pNext(query).pNext(position).pNext(subgroup);
             VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), available);
-            if (!address.bufferDeviceAddress() || !acceleration.accelerationStructure() || !pipeline.rayTracingPipeline() || !query.rayQuery())
-                throw new IllegalStateException("Prime PT 缺少 bufferDeviceAddress / accelerationStructure / rayTracingPipeline / rayQuery");
-            if (!commands.deviceAddressCommands() || !synchronization.synchronization2())
-                throw new IllegalStateException("Prime PT 需要 deviceAddressCommands / synchronization2");
-            if (!position.rayTracingPositionFetch())
-                throw new IllegalStateException("Prime PT 需要 rayTracingPositionFetch；不保留 shader 顶点副本回退");
-            if (!subgroup.subgroupSizeControl())
-                throw new IllegalStateException("Prime PT 的 ReSTIR 方向调度需要 subgroupSizeControl");
-            if (!available.features().shaderStorageImageExtendedFormats())
-                throw new IllegalStateException("Prime PT 降噪辅助量需要 shaderStorageImageExtendedFormats");
+            if (!address.bufferDeviceAddress()) missing.add("bufferDeviceAddress");
+            if (!acceleration.accelerationStructure()) missing.add("accelerationStructure");
+            if (!pipeline.rayTracingPipeline()) missing.add("rayTracingPipeline");
+            if (!query.rayQuery()) missing.add("rayQuery");
+            if (!commands.deviceAddressCommands()) missing.add("deviceAddressCommands");
+            if (!synchronization.synchronization2()) missing.add("synchronization2");
+            if (!position.rayTracingPositionFetch()) missing.add("rayTracingPositionFetch");
+            if (!subgroup.subgroupSizeControl()) missing.add("subgroupSizeControl");
+            if (!available.features().shaderStorageImageExtendedFormats()) missing.add("shaderStorageImageExtendedFormats");
+            var subgroupOps = VkPhysicalDeviceSubgroupProperties.calloc(stack).sType$Default();
+            var subgroupSize = VkPhysicalDeviceSubgroupSizeControlProperties.calloc(stack).sType$Default();
+            var properties = VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(subgroupOps).pNext(subgroupSize);
+            VK12.vkGetPhysicalDeviceProperties2(physical.vkPhysicalDevice(), properties);
+            int operations = VK11.VK_SUBGROUP_FEATURE_BASIC_BIT | VK11.VK_SUBGROUP_FEATURE_BALLOT_BIT | VK11.VK_SUBGROUP_FEATURE_ARITHMETIC_BIT;
+            if (subgroupSize.minSubgroupSize() > 32 || subgroupSize.maxSubgroupSize() < 32
+                    || (subgroupSize.requiredSubgroupSizeStages() & VK10.VK_SHADER_STAGE_COMPUTE_BIT) == 0
+                    || (subgroupOps.supportedStages() & VK10.VK_SHADER_STAGE_COMPUTE_BIT) == 0
+                    || (subgroupOps.supportedOperations() & operations) != operations)
+                missing.add("compute subgroup32 BASIC/BALLOT/ARITHMETIC");
+            if (!missing.isEmpty()) return unsupported(original, missing);
             boolean supported = physical.hasDeviceExtension(SER_EXTENSION);
             if (supported) {
                 var reorder = VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.calloc(stack).sType$Default();
@@ -119,7 +169,7 @@ public final class Bootstrap {
                         .pNext(address).pNext(privateData).pNext(rrSync);
                 VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), streamline);
                 if (physical.vkPhysicalDeviceProperties().apiVersion() < VK13.VK_API_VERSION_1_3 || !privateData.privateData())
-                    throw new IllegalStateException("已安装的 Streamline loader 需要 Vulkan 1.3 privateData");
+                    return unsupported(original, List.of("Streamline privateData"));
                 features.add(PRIVATE_DATA);
                 if (RR_EXTENSIONS.stream().allMatch(physical::hasDeviceExtension)
                         && address.timelineSemaphore() && address.descriptorIndexing() && rrSync.synchronization2()
@@ -134,28 +184,22 @@ public final class Bootstrap {
                 }
             }
         }
-        features.add(new VulkanFeature(VulkanFeatureSets.VK12_FEATURES_STRUCT, "bufferDeviceAddress", VkPhysicalDeviceVulkan12Features.BUFFERDEVICEADDRESS));
-        features.add(new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageExtendedFormats"));
-        features.add(new VulkanFeature(new VulkanPNextStruct(VkPhysicalDeviceAccelerationStructureFeaturesKHR.class),
-                "accelerationStructure", VkPhysicalDeviceAccelerationStructureFeaturesKHR.ACCELERATIONSTRUCTURE));
-        features.add(new VulkanFeature(new VulkanPNextStruct(VkPhysicalDeviceRayTracingPipelineFeaturesKHR.class),
-                "rayTracingPipeline", VkPhysicalDeviceRayTracingPipelineFeaturesKHR.RAYTRACINGPIPELINE));
-        features.add(new VulkanFeature(new VulkanPNextStruct(VkPhysicalDeviceRayQueryFeaturesKHR.class),
-                "rayQuery", VkPhysicalDeviceRayQueryFeaturesKHR.RAYQUERY));
-        features.add(POSITION_FETCH);
-        features.add(DEVICE_COMMANDS);
-        features.add(SYNCHRONIZATION);
-        features.add(SUBGROUP);
+        features.addAll(PT_FEATURES);
+        ptPhysical = physical.vkPhysicalDevice().address();
+        SupportNotice.supported();
         return new FeatureSet(original.name(), Set.copyOf(extensions), Set.copyOf(features), original.condition());
     }
 
     /** 只报告当前逻辑设备真正启用的能力，不能以物理支持替代。 */
     public static void created(FeatureSet enabled, VkDevice device) {
+        ptDevice = 0;
+        if (ptPhysical != device.getPhysicalDevice().address()) return;
         if (!device.getPhysicalDevice().getInstance().getCapabilities().Vulkan14
-                || !enabled.extensions().containsAll(EXTENSIONS) || !enabled.features().contains(POSITION_FETCH)
-                || !enabled.features().contains(DEVICE_COMMANDS) || !enabled.features().contains(SYNCHRONIZATION)
-                || !enabled.features().contains(SUBGROUP))
-            throw new IllegalStateException("宿主逻辑设备未启用强制 RT / position fetch 能力");
+                || !enabled.extensions().containsAll(EXTENSIONS) || !enabled.features().containsAll(PT_FEATURES)) {
+            unsupported(enabled, List.of("RT / position fetch device features"));
+            return;
+        }
+        ptDevice = device.address();
         serDevice = 0;
         if (serPhysical == device.getPhysicalDevice().address() && enabled.extensions().contains(SER_EXTENSION)
                 && enabled.features().contains(SER_FEATURE)) {
@@ -176,6 +220,9 @@ public final class Bootstrap {
 
     /** 由宿主设备协商捕获，与 graphicsQueue 的 family 一并传给 SDK。 */
     public static int graphicsQueueIndex() { return graphicsQueueIndex; }
+
+    /** 实际逻辑设备已经完整启用 Prime 必需能力，才允许资源准备和专用纹理 usage。 */
+    public static boolean rayTracingEnabled() { return ptDevice != 0; }
 
     /** 只在创建回调确认该逻辑设备已启用后返回 true。 */
     public static boolean invocationReorder(VkDevice device) { return serDevice != 0 && serDevice == device.address(); }

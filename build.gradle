@@ -285,6 +285,13 @@ tasks.register('settingsLanguageFixture', JavaExec) {
     args tasks.named('jar').flatMap { it.archiveFile }.get().asFile.absolutePath
 }
 
+tasks.register('startupSupportFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.StartupSupportFixture'
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+}
+
 tasks.register('commandHintsFixture', JavaExec) {
     dependsOn fixtureClasses
     classpath = sourceSets.fixture.runtimeClasspath
@@ -327,7 +334,18 @@ tasks.register('frameChartFixture', JavaExec) {
         args '--native=' + providers.gradleProperty('nativeFrameChart').get()
 }
 
+tasks.register('unsupportedDeviceFixture', JavaExec) {
+    dependsOn fixtureClasses
+    if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
+    classpath = sourceSets.fixture.runtimeClasspath
+    systemProperty 'primept.native', nativeLibraryPath
+    mainClass = 'dev.primept.StreamlineFixture'
+    args '--unsupported'
+    jvmArgs '--enable-native-access=ALL-UNNAMED', '-Dorg.lwjgl.vulkan.explicitInit=true'
+}
+
 tasks.named('check') {
+    dependsOn tasks.named('startupSupportFixture')
     dependsOn tasks.named('terrainSnapshotFixture')
     dependsOn tasks.named('renderTuningFixture')
     dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),

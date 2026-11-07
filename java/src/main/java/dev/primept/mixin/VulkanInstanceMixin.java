@@ -6,10 +6,10 @@ import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.ModifyArg;
 
-/** 所有宿主实例实际请求引擎的 Vulkan 1.4 基线，包括设备探测实例。 */
+/** 能力足够时请求引擎版本；不足时允许原版设备初始化并显示兼容性通知。 */
 @Mixin(VulkanInstance.class)
 abstract class VulkanInstanceMixin {
     @ModifyArg(method = "<init>", at = @At(value = "INVOKE",
             target = "Lorg/lwjgl/vulkan/VkApplicationInfo;apiVersion(I)Lorg/lwjgl/vulkan/VkApplicationInfo;"), index = 0)
-    private int primept$api(int original) { return Bootstrap.instanceApi(); }
+    private int primept$api(int original) { return Bootstrap.instanceApi(original); }
 }

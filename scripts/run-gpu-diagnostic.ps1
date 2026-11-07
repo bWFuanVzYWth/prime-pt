@@ -42,7 +42,7 @@ if (Test-Path -LiteralPath $settings) {
 [ordered]@{
     started = $started.ToString('o')
     mode = $Mode
-    launched = !$PrepareOnly
+    launchRequested = !$PrepareOnly
     native = $native
     nativeSha256 = (Get-FileHash -LiteralPath $native -Algorithm SHA256).Hash
     workingDirectory = $project

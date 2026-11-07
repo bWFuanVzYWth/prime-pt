@@ -15,6 +15,7 @@ public final class Atlas {
 
     /** 原版仍拥有 sprite 图像，本方法不保留其指针。 */
     public static void capture(TextureAtlas atlas, SpriteLoader.Preparations source) {
+        if (!Bootstrap.rayTracingEnabled()) return;
         if (!atlas.location().equals(TextureAtlas.LOCATION_BLOCKS)) return;
         int w = source.width(), h = source.height();
         byte[] rgba = new byte[Math.multiplyExact(Math.multiplyExact(w, h), 4)];

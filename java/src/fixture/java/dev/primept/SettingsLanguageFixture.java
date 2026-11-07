@@ -69,6 +69,7 @@ final class SettingsLanguageFixture {
                     requireWidgetText("Samples per frame", "DLSS quality", "Performance (2×)");
                     requireAutoExposure("Auto exposure strength");
                     requireLighting("Sun intensity", "Block emission intensity");
+                    requireStartupNotice("Prime PT unavailable", "OpenGL is active.", "GPU or driver lacks:");
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "PT 渲染");
                     requireText("restir_cv", "ReSTCV 颜色估计");
@@ -76,6 +77,7 @@ final class SettingsLanguageFixture {
                     requireWidgetText("每帧采样数", "DLSS 质量", "性能（2×）");
                     requireAutoExposure("自动曝光强度");
                     requireLighting("太阳强度", "方块发光强度");
+                    requireStartupNotice("Prime PT 不可用", "当前使用 OpenGL。", "显卡或驱动缺少：");
                 }
 
                 Files.createDirectories(lang);
@@ -119,6 +121,14 @@ final class SettingsLanguageFixture {
 
     private static void require(boolean condition, String message) {
         if (!condition) throw new AssertionError(message);
+    }
+
+    private static void requireStartupNotice(String title, String openGl, String capability) {
+        require(Component.translatable("primept.error.unavailable").getString().equals(title), "兼容性通知标题来自游戏语言栈");
+        require(new SupportNotice.Problem(true, List.of()).message().getString().startsWith(openGl), "OpenGL 通知本地化");
+        String extension = "VK_KHR_ray_tracing_position_fetch";
+        String message = new SupportNotice.Problem(false, List.of(extension)).message().getString();
+        require(message.startsWith(capability) && message.contains(extension), "扩展通知本地化且保留实际缺失项");
     }
 
     private static void requireRenderingHierarchy(String enabled, String mode, String offline, String renderer) {

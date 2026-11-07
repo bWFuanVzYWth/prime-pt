@@ -30,7 +30,7 @@ public final class Renderer {
     private static final ByteBuffer STAGES = ByteBuffer.allocateDirect(FrameChart.STAGES * 8).order(ByteOrder.LITTLE_ENDIAN);
     private static final ByteBuffer PROFILE = ByteBuffer.allocateDirect(FrameChart.CAPACITY).order(ByteOrder.LITTLE_ENDIAN);
     private static Native renderer;
-    private static boolean active = true;
+    private static boolean active;
     private static ClientLevel vanillaRestore;
     private static boolean hasFrame;
     private static boolean frozen;
@@ -46,7 +46,8 @@ public final class Renderer {
     /** ModelManager完成首次/重载发布时同步准备整代源及GPU产物；不由首次命中懒构建。 */
     public static void prepareResources(){
         RenderSystem.assertOnRenderThread();
-        ensureRenderer();await();
+        if (!ensureRenderer()) return;
+        await();
         renderer.rendering(RenderMode.REALTIME, Settings.realtimeRenderer());
         frozen=false;hasFrame=false;
         var next=SourceResources.prepareReload(Minecraft.getInstance());
@@ -55,13 +56,15 @@ public final class Renderer {
 
     /** 在外层提取边界交接原版与 Prime；完成证明后才改变 native 模式。 */
     public static void beginFrame() {
-        if (active != Settings.enabled()) {
+        SupportNotice.show();
+        boolean enabled = Settings.enabled() && renderer != null;
+        if (active != enabled) {
             if (renderer != null) {
                 await();
                 renderer.rendering(RenderMode.REALTIME, Settings.realtimeRenderer());
-                if (!Settings.enabled()) renderer.reset();
+                if (!enabled) renderer.reset();
             }
-            active = Settings.enabled();
+            active = enabled;
             frozen = false;
             hasFrame = false;
             lastCompleted = 0;
@@ -85,12 +88,17 @@ public final class Renderer {
         }
     }
 
-    private static void ensureRenderer(){
-        if(renderer!=null)return;
+    private static boolean ensureRenderer(){
+        if(renderer!=null)return true;
         var backend=((DeviceAccess)RenderSystem.getDevice()).primept$backend();
-        if(!(backend instanceof VulkanDevice device))throw new IllegalStateException("Prime PT需要Vulkan宿主");
+        if(!(backend instanceof VulkanDevice device)) {
+            SupportNotice.openGl();
+            return false;
+        }
+        if (!Bootstrap.rayTracingEnabled()) return false;
         encoder=device.createCommandEncoder();await();
         renderer=new Native(device.instance().vkInstance().address(),device.vkDevice().getPhysicalDevice().address(),device.vkDevice().address(),device.graphicsQueue().vkQueue().address(),device.graphicsQueue().queueFamilyIndex(),Bootstrap.graphicsQueueIndex(),Bootstrap.invocationReorder(device.vkDevice()),Settings.requestedSer());
+        return true;
     }
 
     private static void completeTints(Minecraft minecraft){

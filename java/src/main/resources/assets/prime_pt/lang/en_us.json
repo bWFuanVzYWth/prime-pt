@@ -1,4 +1,7 @@
 {
+  "primept.error.unavailable": "Prime PT unavailable",
+  "primept.error.opengl": "OpenGL is active. Select Vulkan and restart the game. Vanilla rendering remains available.",
+  "primept.error.capability": "GPU or driver lacks: %s\nSee the log for all missing requirements. Using vanilla rendering.",
   "primept.settings.reset": "Restore PT defaults",
   "primept.settings.render": "PT rendering",
   "primept.settings.ser": "Shader Execution Reordering",

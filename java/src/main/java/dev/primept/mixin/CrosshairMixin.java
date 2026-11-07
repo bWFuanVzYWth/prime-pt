@@ -1,6 +1,6 @@
 package dev.primept.mixin;
 
-import dev.primept.Settings;
+import dev.primept.Renderer;
 
 import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
@@ -18,7 +18,7 @@ abstract class CrosshairMixin {
             "Lnet/minecraft/client/gui/GuiGraphicsExtractor;blitSprite(Lcom/mojang/renderpearl/api/pipeline/RenderPipeline;Lnet/minecraft/resources/Identifier;IIII)V"))
     private void primept$drawCrosshair(GuiGraphicsExtractor graphics, RenderPipeline pipeline,
             Identifier sprite, int x, int y, int width, int height) {
-        if (!Settings.enabled()) {
+        if (!Renderer.active()) {
             graphics.blitSprite(pipeline, sprite, x, y, width, height);
             return;
         }

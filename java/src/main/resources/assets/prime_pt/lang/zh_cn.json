@@ -1,4 +1,7 @@
 {
+  "primept.error.unavailable": "Prime PT 不可用",
+  "primept.error.opengl": "当前使用 OpenGL。请切换到 Vulkan 并重启游戏。仍可使用原版渲染。",
+  "primept.error.capability": "显卡或驱动缺少：%s\n完整缺失项见日志。当前使用原版渲染。",
   "primept.settings.reset": "恢复 PT 默认设置",
   "primept.settings.render": "PT 渲染",
   "primept.settings.ser": "Shader Execution Reordering",
