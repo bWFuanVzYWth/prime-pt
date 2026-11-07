@@ -3789,6 +3789,9 @@ impl Gpu {
 impl Drop for Gpu {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
+            // SDK 释放失败不能靠 Drop 重试后继续拆除其图像和设备依赖。
+            self.context.retain_failed_shutdown();
+            std::mem::forget(self.rr_runtime.take());
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr().lock(),

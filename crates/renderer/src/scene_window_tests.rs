@@ -15,7 +15,8 @@ fn blases(gpu: &Gpu) -> std::collections::BTreeMap<[i32; 3], Option<vulkan::Tria
 #[ignore = "真实Vulkan RT；移动加载保留旧覆盖且重叠region复用BLAS，串行执行"]
 fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.set_atlas(16, 16, &atlas())?;
     let mut scene = prime_world::Scene::new()?;
     let camera = Camera {
@@ -134,7 +135,8 @@ fn publish_step(scene: &mut prime_world::Scene, gpu: &mut Gpu) -> Result {
 #[ignore = "真实Vulkan RT；刷新缺源保留旧BLAS，候选齐备且GPU成功后无空帧替换"]
 fn hardware_pt_region_refresh_never_drops_published_cover_for_unavailable_source() -> Result {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.set_atlas(16, 16, &atlas())?;
     let mut scene = prime_world::Scene::new()?;
     let camera = world_camera(Camera {

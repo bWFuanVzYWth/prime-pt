@@ -20,7 +20,8 @@ fn publish(gpu: &mut Gpu, mesh: &Mesh, content: u64) -> Result<(), Error> {
 fn hardware_pt_rr_restcv_streaming_motion() -> Result<(), Box<dyn std::error::Error>> {
     use prime_scene::{MaterialDefinition, MaterialId, RenderMode};
     let host = Host::new_rr_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = Image::new(&mut gpu.context, [3840, 2160, 1], ImageFormat::Rgba8Unorm)?;
     gpu.test_roots.push(output.into());
     let mut definitions = [MaterialDefinition::default(); 12];
@@ -167,7 +168,7 @@ fn hardware_pt_rr_restcv_streaming_motion() -> Result<(), Box<dyn std::error::Er
         blake3::hash(&download_buffer(&mut gpu, hdr)?),
     );
     gpu.close()?;
-    drop(gpu);
+    session.finish()?;
     // RR 的 SDK 验证消息单独保留；此用例检查真实求值、提交完成及 HDR，不将已知内部消息作为设备丢失。
     eprintln!(
         "streaming validation_errors={}",
@@ -206,7 +207,8 @@ fn download_buffer(gpu: &mut Gpu, source: Buffer) -> Result<Vec<u8>, Error> {
 fn hardware_pt_cancelled_recording_keeps_absolute_sample_sequence()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     gpu.settings.samples = 2;
     let records = gpu.record(
@@ -233,7 +235,7 @@ fn hardware_pt_cancelled_recording_keeps_absolute_sample_sequence()
     assert_eq!(gpu.absolute_sample, 0);
     host.render(&mut gpu, &output, &camera())?;
     assert_eq!(gpu.absolute_sample, 2);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -243,7 +245,8 @@ fn hardware_pt_cancelled_recording_keeps_absolute_sample_sequence()
 fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.5; 2], [0.8, 0.6, 0.4], 4.);
@@ -298,7 +301,7 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
         options,
     )?;
     assert_eq!(gpu.accumulated_samples(), 8);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -310,7 +313,8 @@ fn hardware_pt_diagnostic_batch_matches_single_sample_mean()
     let host = Host::new()?;
     let mut expected = Vec::<Vec<f64>>::new();
     for spp in [1, 4] {
-        let mut gpu = host.gpu()?;
+        let mut session = host.gpu()?;
+        let mut gpu = session.gpu();
         let output = image(&mut gpu)?;
         let mut mesh = Mesh::default();
         add_quad(&mut mesh, 2., [0.5; 2], [0.8, 0.6, 0.4], 4.);
@@ -359,7 +363,8 @@ fn hardware_pt_diagnostic_batch_matches_single_sample_mean()
 fn hardware_pt_restir_fresh_selection_preserves_path_history()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.5; 2], [0.8; 3], 4.);
@@ -393,7 +398,7 @@ fn hardware_pt_restir_fresh_selection_preserves_path_history()
     }
     assert!(histories.windows(2).all(|pair| pair[0] == pair[1]));
     assert_ne!(outputs[0], outputs[2], "输出端点实际选择不同估计");
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -402,7 +407,8 @@ fn hardware_pt_restir_fresh_selection_preserves_path_history()
 #[ignore = "真实Vulkan RT；历史cap在实际temporal MIS中限制累积质量"]
 fn hardware_pt_restir_history_cap_limits_temporal_mass() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.5; 2], [0.8; 3], 4.);
@@ -437,7 +443,7 @@ fn hardware_pt_restir_history_cap_limits_temporal_mass() -> Result<(), Box<dyn s
         masses[0] <= 8. && masses[1] > 8.,
         "三邻居合并后的质量 {masses:?}"
     );
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -446,7 +452,8 @@ fn hardware_pt_restir_history_cap_limits_temporal_mass() -> Result<(), Box<dyn s
 #[ignore = "真实Vulkan RT；ReSTIR完整阶段、历史和返回普通PT后的工作集回收"]
 fn hardware_pt_restir_switch_and_history() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.5; 2], [0.8; 3], 4.);
@@ -510,7 +517,7 @@ fn hardware_pt_restir_switch_and_history() -> Result<(), Box<dyn std::error::Err
         Options::new(false, streamline::Quality::Performance, 2, 6)?,
     )?;
     assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 2);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -519,7 +526,8 @@ fn hardware_pt_restir_switch_and_history() -> Result<(), Box<dyn std::error::Err
 #[ignore = "真实Vulkan EXT SER；相同ReSTIR帧序列在重排开关下保持HDR结果"]
 fn hardware_pt_restir_ser_preserves_radiance() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.5; 2], [0.8; 3], 4.);
@@ -561,7 +569,7 @@ fn hardware_pt_restir_ser_preserves_radiance() -> Result<(), Box<dyn std::error:
             reference = Some(bytes);
         }
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -570,7 +578,8 @@ fn hardware_pt_restir_ser_preserves_radiance() -> Result<(), Box<dyn std::error:
 #[ignore = "真实Vulkan RT；时空复用均值与独立PT的同场景辐亮度对照"]
 fn hardware_pt_restir_mean_matches_independent_paths() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.5; 2], [0.8; 3], 4.);
@@ -617,7 +626,7 @@ fn hardware_pt_restir_mean_matches_independent_paths() -> Result<(), Box<dyn std
             "复用均值超出固定采样容差：{ratio}"
         );
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -626,7 +635,8 @@ fn hardware_pt_restir_mean_matches_independent_paths() -> Result<(), Box<dyn std
 #[ignore = "真实Vulkan RT；纯属性发布更新当前颜色并保留路径历史"]
 fn hardware_pt_restir_content_change_preserves_history() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     gpu.set_rendering(
         prime_scene::RenderMode::Realtime,
@@ -662,7 +672,7 @@ fn hardware_pt_restir_content_change_preserves_history() -> Result<(), Box<dyn s
         color[1] > 2. * color[0] && color[1] > 2. * color[2],
         "新颜色没有独立发布：{color:?}"
     );
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -671,7 +681,8 @@ fn hardware_pt_restir_content_change_preserves_history() -> Result<(), Box<dyn s
 #[ignore = "真实Vulkan RT；离线继承曝光且只在调节强度变化时重测"]
 fn hardware_pt_offline_preserves_exposure() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     gpu.set_display_options(0.65, 0.05, 0.75, 0.4)?;
     let live = Options::new(false, streamline::Quality::Dlaa, 1, 6)?;
@@ -694,7 +705,7 @@ fn hardware_pt_offline_preserves_exposure() -> Result<(), Box<dyn std::error::Er
     host.render_options(&mut gpu, &output, &camera(), Environment::default(), batch)?;
     assert_eq!(changed, exposure_state(&mut gpu)?);
     assert_eq!(gpu.accumulated_samples(), 40, "显示设置不清空离线线性累积");
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -704,7 +715,8 @@ fn hardware_pt_offline_preserves_exposure() -> Result<(), Box<dyn std::error::Er
 fn hardware_pt_rr_restir_storage_preserves_path_history() -> Result<(), Box<dyn std::error::Error>>
 {
     let host = Host::new_rr()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     gpu.set_rendering(
         prime_scene::RenderMode::Realtime,
@@ -736,7 +748,7 @@ fn hardware_pt_rr_restir_storage_preserves_path_history() -> Result<(), Box<dyn 
         }
     }
     assert_eq!(gpu.history_audit.restir_storage, 1);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -745,7 +757,8 @@ fn hardware_pt_rr_restir_storage_preserves_path_history() -> Result<(), Box<dyn 
 #[ignore = "真实Vulkan RT和Streamline配置；静止相机跨Halton周期的真实shader donor不漂移，不执行SDK evaluate"]
 fn hardware_pt_rr_restir_jitter_donor_is_stationary() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_rr()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.rr_quality = streamline::Quality::Dlaa;
     gpu.settings.samples = 1;
     let output = image(&mut gpu)?;
@@ -820,7 +833,7 @@ fn hardware_pt_rr_restir_jitter_donor_is_stationary() -> Result<(), Box<dyn std:
             );
         }
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -829,7 +842,8 @@ fn hardware_pt_rr_restir_jitter_donor_is_stationary() -> Result<(), Box<dyn std:
 #[ignore = "真实Vulkan RT和Streamline；ReSTIR生成真实导引并完成RR"]
 fn hardware_pt_rr_restir_guides() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_rr()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     gpu.set_rendering(
         prime_scene::RenderMode::Realtime,
@@ -858,7 +872,7 @@ fn hardware_pt_rr_restir_guides() -> Result<(), Box<dyn std::error::Error>> {
             .all(|word| f32::from_le_bytes(*word).is_finite())
     );
     assert!(f32::from_le_bytes(values[16 * 32 + 16]) > 0.);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -882,7 +896,8 @@ fn guided_suffix_across_materials(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use prime_scene::{MaterialDefinition, MaterialId};
     let host = Host::new_rr_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     assert!(gpu.invocation_reorder);
     let output = Image::new(&mut gpu.context, [3840, 2160, 1], ImageFormat::Rgba8Unorm)?;
     gpu.test_roots.push(output.into());
@@ -1079,7 +1094,7 @@ fn guided_suffix_across_materials(
             }
         }
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

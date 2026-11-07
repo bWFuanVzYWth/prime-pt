@@ -570,7 +570,8 @@ fn hardware_pt_scene_baseline() -> Result {
         "profile":if cfg!(debug_assertions) { "debug" } else { "release" },
         "test_executable":std::env::current_exe()?.to_string_lossy()}),
     )?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.settings = pt::Settings::default();
     let mut scene = prime_world::Scene::new()?;
     let start = Instant::now();
@@ -751,7 +752,8 @@ fn hardware_pt_scene_baseline() -> Result {
 #[ignore = "真实Vulkan RT；manager刷新与anchor重定位保留未变BLAS"]
 fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.set_atlas(16, 16, &atlas())?;
     let mut scene = prime_world::Scene::new()?;
     let keys = [[4, 0, 0], EDIT_KEY];
@@ -822,7 +824,8 @@ fn hardware_pt_section_update_reuses_unmodified_blas() -> Result {
 #[ignore = "真实Vulkan RT；manager属性刷新保持BLAS且改变宿主输出"]
 fn hardware_pt_section_attributes_reuse_blas_and_change_output() -> Result {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.set_atlas(16, 16, &atlas())?;
     let mut scene = prime_world::Scene::new()?;
     let camera = Camera {

@@ -87,7 +87,8 @@ fn hardware_pt_restcv_preserves_path_sampling() -> Result {
     let mut reference = Vec::new();
     let mut changed = false;
     for comparison in [false, true] {
-        let mut gpu = host.gpu()?;
+        let mut session = host.gpu()?;
+        let mut gpu = session.gpu();
         let output = Image::new(&mut gpu.context, [31, 17, 1], ImageFormat::Rgba8Unorm)?;
         gpu.test_roots.push(output.into());
         setup(&mut gpu)?;
@@ -133,7 +134,8 @@ fn hardware_pt_restcv_preserves_path_sampling() -> Result {
 #[ignore = "真实RT；颜色只由成功帧接受，开关/取消/SER均不能隐式清除路径"]
 fn hardware_pt_restcv_color_history_is_explicit() -> Result {
     let host = Host::new_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
     let mut storage = None;
@@ -199,7 +201,7 @@ fn hardware_pt_restcv_color_history_is_explicit() -> Result {
     );
     gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
     assert!(!gpu.restir.as_ref().unwrap().color_history_valid());
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -210,7 +212,8 @@ fn hardware_pt_restcv_ser_preserves_color_estimate() -> Result {
     let host = Host::new_ser()?;
     let mut reference = Vec::new();
     for reordered in [false, true] {
-        let mut gpu = host.gpu()?;
+        let mut session = host.gpu()?;
+        let mut gpu = session.gpu();
         gpu.set_ser(reordered)?;
         let output = image(&mut gpu)?;
         setup(&mut gpu)?;
@@ -274,7 +277,8 @@ fn difference(c: &[f32; 20], n: &[f32; 20], forward: &[f32; 5], reverse: &[f32; 
 #[ignore = "生产temporal compute；独立f64公式验证双向shift、M cap和有符号颜色"]
 fn hardware_pt_restcv_temporal_matches_measure_formula() -> Result {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
     gpu.set_render_tuning(RenderTuning::new(37, 0., false, true)?)?;
@@ -340,7 +344,7 @@ fn hardware_pt_restcv_temporal_matches_measure_formula() -> Result {
     }
     assert!(negative, "合法负校正必须保留");
     assert_eq!(floats(&mut gpu, paths[0])?[0], 38.);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -349,7 +353,8 @@ fn hardware_pt_restcv_temporal_matches_measure_formula() -> Result {
 #[ignore = "生产spatial merge/post；f64公式核对paired双向缓存和有符号线性输出"]
 fn hardware_pt_restcv_spatial_matches_measure_formula() -> Result {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
     gpu.set_render_tuning(tuning(true))?;
@@ -480,7 +485,7 @@ fn hardware_pt_restcv_spatial_matches_measure_formula() -> Result {
             .any(|v| v[..3].iter().any(|v| *v < -0.1)),
         "线性post和aerial不能提前裁掉负CV校正"
     );
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

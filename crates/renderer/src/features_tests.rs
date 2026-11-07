@@ -55,7 +55,8 @@ fn publish(
 fn hardware_pt_unsupported_recipe_publishes_default_material()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.experiment_dispatch = 8;
     let default = MaterialDefinition::default();
     let mut unsupported = default;
@@ -85,7 +86,8 @@ fn hardware_pt_unsupported_recipe_publishes_default_material()
 fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn std::error::Error>>
 {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.5; 2], [0.8; 3], 4.);
@@ -119,7 +121,7 @@ fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn 
         );
     }
     gpu.clear_world()?;
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -129,7 +131,8 @@ fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn 
 fn hardware_pt_guide_source_reload_replaces_the_executed_program()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let scratch = root.join("../../target/guide-reload-tests").join(format!(
         "{}-{}",
@@ -199,7 +202,7 @@ fn hardware_pt_guide_source_reload_replaces_the_executed_program()
             .iter()
             .all(|pixel| f32::from_le_bytes(*pixel) == 123.)
     );
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -209,7 +212,8 @@ fn hardware_pt_guide_source_reload_replaces_the_executed_program()
 fn hardware_pt_rr_keyed_program_preserves_opaque_and_glass_guides()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::create(true, true)?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let extent = [512, 512];
     let output = Image::new(&mut gpu.context, [512, 512, 1], ImageFormat::Rgba8Unorm)?;
     gpu.test_roots.push(output.into());
@@ -305,7 +309,7 @@ fn hardware_pt_rr_keyed_program_preserves_opaque_and_glass_guides()
             }
         }
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -317,7 +321,8 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
     use simple_engine::light_sampling::emitter::{Coverage, EmissionProposal, EmitterAlias};
     use simple_engine::vulkan::native::RayTracingPipeline;
     let host = Host::new_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut definitions = vec![MaterialDefinition::default(); 11];
     definitions[1].surface[1] = 1.;
@@ -509,7 +514,7 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
         seen.iter().all(|&count| count > 0),
         "所有材质键都须实际命中: {seen:?}"
     );
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -518,7 +523,8 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
 #[ignore = "真实Vulkan RT；超过八种材质能力仍可执行ReSTIR的独立操作叶子"]
 fn hardware_pt_restir_many_material_variants() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let definitions: Vec<_> = (0..12)
         .map(|index| {
@@ -586,7 +592,7 @@ fn hardware_pt_restir_many_material_variants() -> Result<(), Box<dyn std::error:
             .iter()
             .all(|word| f32::from_le_bytes(*word).is_finite())
     );
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -596,7 +602,8 @@ fn hardware_pt_restir_many_material_variants() -> Result<(), Box<dyn std::error:
 fn hardware_pt_region_primitive_index_keeps_full_quad_base()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     host.render_environment(&mut gpu, &image, &camera(), Environment::default())?;
     let view = gpu.view.as_ref().unwrap();
@@ -647,7 +654,8 @@ fn hardware_pt_region_primitive_index_keeps_full_quad_base()
 fn hardware_pt_region_instance_order_is_independent_of_attribute_slot()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let materials = [[1., 0., 0., 10.], [0., 1., 0., 10.]].map(|emission| {
         let mut material = MaterialDefinition {
@@ -734,7 +742,8 @@ fn scene() -> Mesh {
 fn hardware_pt_restir_light_families_use_conditional_pdfs() -> Result<(), Box<dyn std::error::Error>>
 {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let receiver = MaterialDefinition::default();
     let mut lamp = receiver;
@@ -818,7 +827,7 @@ fn hardware_pt_restir_light_families_use_conditional_pdfs() -> Result<(), Box<dy
             assert_eq!(seen[family] > 512, enabled, "case={case}, seen={seen:?}");
         }
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -829,7 +838,8 @@ fn hardware_pt_sparse_tint_publication_keeps_geometry_and_writes_only_the_patch(
 -> Result<(), Box<dyn std::error::Error>> {
     use prime_scene::{FragmentMask, MeshParts, PreparedParts, RenderChange, TintPatch};
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     upload(
         &mut gpu,
         &[MaterialDefinition::default(); 2],
@@ -909,7 +919,8 @@ fn hardware_pt_sparse_tint_publication_keeps_geometry_and_writes_only_the_patch(
 fn hardware_pt_incremental_attributes_keep_storage_and_tlas()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let definitions = [MaterialDefinition::default(), MaterialDefinition::default()];
     upload(&mut gpu, &definitions, &[], &[[u32::MAX, 0, 0, 0]; 2])?;
     let mut mesh = scene();
@@ -972,7 +983,8 @@ fn hardware_pt_incremental_attributes_keep_storage_and_tlas()
 fn hardware_pt_attribute_growth_keeps_existing_gpu_bytes() -> Result<(), Box<dyn std::error::Error>>
 {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     upload(
         &mut gpu,
         &[MaterialDefinition::default(); 2],
@@ -1023,7 +1035,8 @@ fn hardware_pt_attribute_growth_keeps_existing_gpu_bytes() -> Result<(), Box<dyn
 fn hardware_pt_emissive_quad_lights_the_receiver_from_the_correct_side()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let receiver = MaterialDefinition::default();
     let mut lamp = receiver;
@@ -1067,7 +1080,8 @@ fn hardware_pt_emissive_quad_lights_the_receiver_from_the_correct_side()
 fn hardware_pt_block_ev_doubles_visible_and_sampled_emission()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let lamp = MaterialDefinition {
         emission: [1., 1., 1., 20.],
@@ -1131,7 +1145,8 @@ fn hardware_pt_block_ev_doubles_visible_and_sampled_emission()
 fn hardware_pt_rejected_resource_domain_preserves_the_published_generation()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     upload(
         &mut gpu,
         &[MaterialDefinition::default(); 2],
@@ -1191,7 +1206,8 @@ fn hardware_pt_static_emission_alias_and_dynamic_area_match_reverse_pdf()
 -> Result<(), Box<dyn std::error::Error>> {
     use simple_engine::light_sampling::emitter::{Coverage, EmissionProposal, EmitterAlias};
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let receiver = MaterialDefinition::default();
     let mut lamp = receiver;
@@ -1299,7 +1315,8 @@ fn assert_light_pdfs(
 fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let dark = MaterialDefinition::default();
     let lamp = MaterialDefinition {
@@ -1351,7 +1368,8 @@ fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
 fn hardware_pt_bilateral_distinct_materials_select_the_visible_front()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let mut red = MaterialDefinition {
         emission: [1., 0., 0., 10.],
@@ -1408,7 +1426,8 @@ fn hardware_pt_bilateral_distinct_materials_select_the_visible_front()
 fn hardware_pt_region_material_change_restores_cutout_coverage()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let mut red = MaterialDefinition {
         emission: [1., 0., 0., 10.],
@@ -1462,7 +1481,8 @@ fn hardware_pt_region_material_change_restores_cutout_coverage()
 fn hardware_pt_grass_overlay_selects_tinted_grass_and_untinted_dirt()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     let material = MaterialDefinition {
         uv_bounds: [0., 0., 0.5, 1.],
@@ -1552,7 +1572,8 @@ fn hardware_pt_hit_group_preserves_authored_normal_light_support()
     };
     let mut reference = Vec::<[f32; 4]>::new();
     for (dispatch, authored) in [(0, true), (8, true), (8, false)] {
-        let mut gpu = host.gpu()?;
+        let mut session = host.gpu()?;
+        let mut gpu = session.gpu();
         gpu.experiment_dispatch = dispatch;
         let output = image(&mut gpu)?;
         let mut receiver = MaterialDefinition {
@@ -1637,7 +1658,7 @@ fn hardware_pt_hit_group_preserves_authored_normal_light_support()
                 "flat normal must reject the same backside light: {center_mean}"
             );
         }
-        drop(gpu);
+        session.finish()?;
     }
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())

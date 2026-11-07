@@ -182,7 +182,8 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
             ]);
         }
     }
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.test_center_film = true;
     gpu.experiment_dispatch = modes[0];
     let started = std::time::Instant::now();
@@ -515,7 +516,8 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         .map(|v| v.parse())
         .transpose()?
         .unwrap_or(12);
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     if let Some(mode) = std::env::var_os("PRIME_PT_EXPERIMENT_DISPATCH") {
         gpu.experiment_dispatch = mode.to_str().ok_or("实验分派须为0..5")?.parse()?;
         if gpu.experiment_dispatch > 5 {
@@ -625,7 +627,7 @@ fn hardware_pt_render_profile() -> Result<(), Box<dyn std::error::Error>> {
         );
         eprintln!("完成case {renderer:?} CV={cv}");
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     let file = std::fs::OpenOptions::new()
         .write(true)

@@ -39,7 +39,8 @@ fn bytes(gpu: &mut Gpu, buffer: Buffer) -> Result<Vec<u8>, Error> {
 #[ignore = "真实Vulkan PT；输入改变显式清除静态均值，不能触及重投影消费者"]
 fn hardware_pt_static_mean_uses_explicit_input_event() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 4., [0.5; 2], [0.8; 3], 8.);
@@ -81,7 +82,7 @@ fn hardware_pt_static_mean_uses_explicit_input_event() -> Result<(), Box<dyn std
         [gpu.history_audit.rr_resets, gpu.history_audit.restir_resets],
         resets
     );
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -90,7 +91,8 @@ fn hardware_pt_static_mean_uses_explicit_input_event() -> Result<(), Box<dyn std
 #[ignore = "真实Vulkan RT；日照/相机/FOV/anchor/介质/随机与预算变化不能全局重置"]
 fn hardware_pt_restir_history_survives_frame_inputs() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mesh = setup(&mut gpu)?;
     host.render_options(
@@ -138,7 +140,7 @@ fn hardware_pt_restir_history_survives_frame_inputs() -> Result<(), Box<dyn std:
         resets
     );
     assert_eq!(gpu.history_audit.restir_storage, storage);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -147,7 +149,8 @@ fn hardware_pt_restir_history_survives_frame_inputs() -> Result<(), Box<dyn std:
 #[ignore = "真实Vulkan RT；RGB重启和封闭全局事件分别影响各自消费者，不回退绝对采样"]
 fn hardware_pt_history_explicit_reset_scope() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
     host.render_options(
@@ -200,7 +203,7 @@ fn hardware_pt_history_explicit_reset_scope() -> Result<(), Box<dyn std::error::
         )?;
         gpu.rr_previous = Some(CameraFrame::new(&camera(), gpu.anchor)?);
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -211,7 +214,8 @@ fn hardware_pt_history_consumers_invalidate_independently() -> Result<(), Box<dy
 {
     use simple_engine::pt::history::{Histories, History, Invalidation};
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
     gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., false, true)?)?;
@@ -256,7 +260,7 @@ fn hardware_pt_history_consumers_invalidate_independently() -> Result<(), Box<dy
         assert_eq!(restir.frame()?.frame_index, sequence);
         assert_eq!(restir.previous_jitter, jitter);
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -265,7 +269,8 @@ fn hardware_pt_history_consumers_invalidate_independently() -> Result<(), Box<dy
 #[ignore = "真实Vulkan RT/SER；已准备程序切换不替换路径工作集或重开历史"]
 fn hardware_pt_restir_history_survives_ser_switch() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_ser()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
     host.render_options(
@@ -294,7 +299,7 @@ fn hardware_pt_restir_history_survives_ser_switch() -> Result<(), Box<dyn std::e
     }
     assert_eq!(gpu.history_audit.restir_resets, reset_count);
     assert_eq!(gpu.history_audit.restir_storage, storage_count);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -332,7 +337,8 @@ fn probe_identity(gpu: &mut Gpu, hit: [u32; 4]) -> Result<[u32; 4], Box<dyn std:
 fn hardware_pt_restir_identity_rejects_removed_and_reused_slots()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mesh = setup(&mut gpu)?;
     let both = |revision| {
@@ -423,7 +429,7 @@ fn hardware_pt_restir_identity_rejects_removed_and_reused_slots()
     assert_eq!(probe_identity(&mut gpu, fresh)?[..3], [1; 3]);
     assert_eq!(gpu.restir.as_ref().unwrap().frame()?.frame_index, 3);
     assert_eq!(gpu.history_audit.restir_resets, reset_count);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -433,7 +439,8 @@ fn hardware_pt_restir_identity_rejects_removed_and_reused_slots()
 fn hardware_pt_restir_stable_hit_preserves_authored_normal()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mut definition = prime_scene::MaterialDefinition::default();
     definition.control[2] = prime_scene::MaterialDefinition::AUXILIARY;
@@ -496,7 +503,7 @@ fn hardware_pt_restir_stable_hit_preserves_authored_normal()
         .find(|h| h[0] != 0)
         .ok_or("ReSTIR没有命中")?;
     assert_eq!(probe_identity(&mut gpu, hit)?[3], reference);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -506,7 +513,8 @@ fn hardware_pt_restir_stable_hit_preserves_authored_normal()
 fn hardware_pt_restir_cancel_preserves_accepted_history() -> Result<(), Box<dyn std::error::Error>>
 {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
     host.render_options(
@@ -549,7 +557,7 @@ fn hardware_pt_restir_cancel_preserves_accepted_history() -> Result<(), Box<dyn 
         options()?,
     )?;
     assert_eq!(gpu.restir.as_ref().unwrap().frame()?.frame_index, 2);
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -560,7 +568,8 @@ fn hardware_pt_restir_unchanged_slab_keeps_its_history_after_region_rebuild()
 -> Result<(), Box<dyn std::error::Error>> {
     use prime_scene::{FragmentMask, MeshParts, PreparedParts};
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     let mesh = setup(&mut gpu)?;
     let mut parts = MeshParts::default();
@@ -646,7 +655,8 @@ fn hardware_pt_restir_unchanged_slab_keeps_its_history_after_region_rebuild()
 fn hardware_pt_restir_streaming_geometry_matches_directory()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
-    let mut gpu = host.gpu()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
     gpu.set_rendering(RenderMode::Realtime, RealtimeRenderer::RestirPt)?;
     let mut meshes = Vec::new();
     for count in [1, 3, 17, 65, 257] {
@@ -687,7 +697,7 @@ fn hardware_pt_restir_streaming_geometry_matches_directory()
             }
         }
     }
-    drop(gpu);
+    session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
