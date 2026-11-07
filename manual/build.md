@@ -81,3 +81,7 @@ Java 和 javac 应显示 25，Cargo 与 Gradle 应能打印版本。找不到 ja
 - `-PnativeLibrary=绝对路径` 可在 `runClient` 和 native 夹具中复用现有 DLL。其同目录应有 SDK 运行库与许可。开发 DLL 通过工作目录的祖先定位项目源码。
 
 开发的 shader 和驱动管线缓存位于 `target/shaders` 与 `target/pipeline-cache`，发行版在提取目录的 `cache/` 下建立对应缓存。设备或驱动变化后，以日志中的缓存加载结果确认实际复用情况。
+
+资源加载时会一起准备本设备可用的 PT、ReSTIR 和 RR 导引程序。Slang 按实际导入文件缓存：修改已有但未被导入的文件不会让其他入口重编；新增文件可能影响模块查找，因此会重新校验。旧格式的缓存会在第一次使用时重建，此后无需手动删除缓存。
+
+准备阶段默认最多并行运行 8 个 Slang 进程。内存紧张或希望降低 CPU 占用时，在启动客户端前的 PowerShell 设置 `$env:PRIME_PT_SHADER_JOBS = '4'`；只接受正整数。日志中的 `shader_prepare complete` 会分别列出缓存命中数、Slang 批次耗时（`shader_ms`）、驱动管线准备耗时（`pipeline_ms`）和总时间（`total_ms`）。这项设置只影响资源准备，不改变每帧的渲染算法。用 Nsight 抓帧时可直接使用[准备脚本及 GUI 参数](nsight.md)。

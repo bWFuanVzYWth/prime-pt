@@ -99,6 +99,8 @@ tasks.register('buildNative', Exec) {
 }
 tasks.named('runClient') {
     if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
+    // 从Nsight GUI启动时也使用已选择的完整Slang发行包，不依赖启动工具的终端环境。
+    if (slangCompiler.isFile()) environment 'SLANGC', slangCompiler.absolutePath
 }
 
 def vcFiles = ['msvcp140.dll', 'vcruntime140.dll', 'vcruntime140_1.dll']
