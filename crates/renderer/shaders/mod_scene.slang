@@ -177,11 +177,8 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public pt::SurfaceMaterial resolve_flow(pt::Hit hit, uint flow, float4 incident)
     {
-        // 光学介质不以atlas颜色调制；由材质键裁掉无消费者的UV/颜色/tint读取。
-        if ((flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
-                     openpbr::FLOW_CONDUCTOR_REFLECTION | openpbr::FLOW_EMISSION)) != 0)
-            hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
-        return resolve_material(hit, flow, OPENPBR_VARIANT, parameters[0].block_emission_scale);
+        return resolve_material<false, true>(hit, flow, OPENPBR_VARIANT,
+                                             parameters[0].block_emission_scale);
     }
 
     public openpbr::Energy energy()

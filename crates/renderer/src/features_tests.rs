@@ -51,6 +51,36 @@ fn publish(
 }
 
 #[test]
+#[ignore = "真实Vulkan RT；白名单回退与默认材质发布相同的GPU参数和操作槽"]
+fn hardware_pt_unsupported_recipe_publishes_default_material()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_ser()?;
+    let mut gpu = host.gpu()?;
+    gpu.experiment_dispatch = 8;
+    let default = MaterialDefinition::default();
+    let mut unsupported = default;
+    unsupported.control[0] = 3;
+    unsupported.surface[1] = 0.37;
+    unsupported.emission = [4.; 4];
+    upload(
+        &mut gpu,
+        &[default, unsupported],
+        &[],
+        &[[u32::MAX, 0, 0, 0]; 2],
+    )?;
+    let table = gpu.material_gpu.table;
+    let bytes = (2 * size_of::<MaterialDefinition>()) as u64;
+    let readback = Buffer::new(&mut gpu.context, bytes, true)?;
+    table.copy_prefix_to(&mut gpu.context, &readback, bytes)?;
+    let mut records = vec![0; bytes as usize];
+    readback.read(&mut gpu.context, 0, &mut records)?;
+    let (reference, fallback) = records.split_at(size_of::<MaterialDefinition>());
+    assert_eq!(fallback, reference);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实Vulkan RT；资源准备后进入、退出世界仍可使用所有已准备渲染器"]
 fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn std::error::Error>>
 {

@@ -97,11 +97,22 @@ public struct InitialHitTrace : restir_pt::IInitialTrace<RestirScene, HitObject>
 #endif
         if (continuation)
         {
-            RestirInitialCall call = RestirInitialCall::input(surface, request);
+#ifdef PRIMEPT_HIT_GEOMETRY_LEAF
+            RestirInitialCall call = {};
+            call.vertex = restir_pt::InitialPacket::inputHit(surface.incident, request);
+#else
+            RestirInitialCall call = RestirInitialCall::input(surface, request, surface.identity);
+#endif
             HitObject::Invoke(found, call);
             return call.result();
         }
-        RestirInitialDirectCall direct = RestirInitialDirectCall::input(surface, request);
+#ifdef PRIMEPT_HIT_GEOMETRY_LEAF
+        restir_pt::InitialHitDirectCall direct = { restir_pt::InitialPacket::inputHit(
+            surface.incident, request) };
+#else
+        RestirInitialDirectCall direct =
+            RestirInitialDirectCall::input(surface, request, surface.identity);
+#endif
         HitObject::Invoke(found, direct);
         return direct.result();
     }

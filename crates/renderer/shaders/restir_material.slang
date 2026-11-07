@@ -27,15 +27,16 @@ static const uint INITIAL_LIGHT_MASK =
 [[vk::binding(11, 0)]]
 RWByteAddressBuffer initial_cv_proxy;
 
-pt::Hit known_material_hit(RestirMaterialHit source)
+pt::Hit known_material_hit(RestirMaterialHit source, out float4 auxiliary)
 {
     pt::Hit hit = to_pt_hit(source);
-    hit.identity.w = restir_normal<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz),
-                                                    hit.surface.normal);
+    auxiliary = material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
+    hit.identity.w =
+        restir_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
     return hit;
 }
 
-pt::Hit initial_material_hit(inout restir_pt::Surface surface
+pt::Hit initial_material_hit(inout restir_pt::Surface surface, out float4 auxiliary
 #ifdef PRIMEPT_INITIAL_HIT
                              ,
                              BuiltInTriangleIntersectionAttributes attributes
@@ -49,29 +50,31 @@ pt::Hit initial_material_hit(inout restir_pt::Surface surface
     surface.point = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
                                              WorldToObject3x4());
     uint primitive = region_primitive(InstanceID(), PrimitiveIndex());
+    auxiliary = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
     uint normal = 0;
     if ((OPENPBR_VARIANT & 8u) != 0)
-        normal = mapped_shading_normal_known(primitive, attributes.barycentrics, b - a, c - a,
-                                             (float3x3)ObjectToWorld3x4(), surface.point.normal);
+        normal = map_normal_xy(primitive, auxiliary.xy, b - a, c - a, (float3x3)ObjectToWorld3x4(),
+                               surface.point.normal);
     surface.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
     surface.wo = -WorldRayDirection();
     surface.frontFacing = dot(surface.wo, surface.point.normal) >= 0;
     hit = restir_hit(surface);
 #else
-    hit = known_material_hit(material_hit(surface));
+    hit = known_material_hit(material_hit(surface), auxiliary);
 #endif
     hit.surface = surface.point;
     return hit;
 }
 
 restir_pt::InitialVertex shade_initial_surface(restir_pt::Surface surface, pt::Hit hit,
-                                               restir_pt::InitialRequest request)
+                                               float4 auxiliary, restir_pt::InitialRequest request)
 {
     ModScene provider;
     bool proxy = (request.flags & restir_pt::INITIAL_PRIMARY) != 0 &&
                  (parameters[0].output_size.z & 8u) != 0;
-    if ((OPENPBR_FLOW & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
-                         openpbr::FLOW_CONDUCTOR_REFLECTION | openpbr::FLOW_EMISSION)) != 0 ||
+    if (((OPENPBR_VARIANT & VARIANT_OVERLAY) == 0 &&
+         (reads_scattering_color(OPENPBR_FLOW, OPENPBR_VARIANT) ||
+          (OPENPBR_FLOW & openpbr::FLOW_EMISSION) != 0)) ||
         proxy)
         hit.texel = material_texel(hit.identity.x, asfloat(hit.identity.yz));
     if (proxy)
@@ -80,16 +83,15 @@ restir_pt::InitialVertex shade_initial_surface(restir_pt::Surface surface, pt::H
         restir_pt::store_color(initial_cv_proxy, pixel.y * parameters[0].image.x + pixel.x,
                                max(hit.texel.xyz, 0.04));
     }
-    pt::SurfaceMaterial material =
-        resolve_material(hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale);
+    pt::SurfaceMaterial material = resolve_material<true>(
+        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
     surface.transmitted = material.transmitted;
-    restir_pt::InitialVertex result =
-        restir_pt::shade_initial_vertex<OPENPBR_FLOW, RestirScene, INITIAL_LIGHT_MASK>(
-            RestirScene(), surface, material, provider.energy(), request);
+    float emissionPdf = 0;
     if ((OPENPBR_FLOW & openpbr::FLOW_EMISSION) != 0 &&
-        (request.flags & restir_pt::INITIAL_PRIMARY) == 0 && any(result.emission > 0))
-        result.emissionPdf = provider.emission_pdf(hit, request.previousPosition);
-    return result;
+        (request.flags & restir_pt::INITIAL_PRIMARY) == 0 && any(material.emission > 0))
+        emissionPdf = provider.emission_pdf(hit, request.previousPosition);
+    return restir_pt::shade_initial_vertex<OPENPBR_FLOW, RestirScene, INITIAL_LIGHT_MASK>(
+        RestirScene(), surface, material, provider.energy(), request, emissionPdf);
 }
 
 #ifdef PRIMEPT_INITIAL_HIT
@@ -105,14 +107,16 @@ void restir_initial_flow(inout RestirInitialCall call
 )
 {
     restir_pt::Surface surface = call.surface();
-    pt::Hit hit = initial_material_hit(surface
+    float4 auxiliary;
+    pt::Hit hit = initial_material_hit(surface, auxiliary
 #ifdef PRIMEPT_INITIAL_HIT
                                        ,
                                        attributes
 #endif
     );
     restir_pt::InitialRequest request = call.request();
-    call.store(shade_initial_surface(surface, hit, request));
+    request.flags |= restir_pt::INITIAL_SAMPLE;
+    call.store(shade_initial_surface(surface, hit, auxiliary, request));
 }
 
 #ifdef PRIMEPT_INITIAL_HIT
@@ -120,7 +124,11 @@ void restir_initial_flow(inout RestirInitialCall call
 #else
 [shader("callable")]
 #endif
+#ifdef PRIMEPT_HIT_GEOMETRY_LEAF
+void restir_initial_direct(inout restir_pt::InitialHitDirectCall call
+#else
 void restir_initial_direct(inout RestirInitialDirectCall call
+#endif
 #ifdef PRIMEPT_INITIAL_HIT
                            ,
                            BuiltInTriangleIntersectionAttributes attributes
@@ -128,7 +136,8 @@ void restir_initial_direct(inout RestirInitialDirectCall call
 )
 {
     restir_pt::Surface surface = call.surface();
-    pt::Hit hit = initial_material_hit(surface
+    float4 auxiliary;
+    pt::Hit hit = initial_material_hit(surface, auxiliary
 #ifdef PRIMEPT_INITIAL_HIT
                                        ,
                                        attributes
@@ -136,15 +145,17 @@ void restir_initial_direct(inout RestirInitialDirectCall call
     );
     restir_pt::InitialRequest request = call.request();
     request.flags &= ~restir_pt::INITIAL_SAMPLE;
-    call.store(shade_initial_surface(surface, hit, request));
+    call.store(shade_initial_surface(surface, hit, auxiliary, request));
 }
 
 [shader("callable")]
 void restir_replay_flow(inout RestirReplayCall call)
 {
-    pt::Hit hit = known_material_hit(call.hit);
+    float4 auxiliary;
+    pt::Hit hit = known_material_hit(call.hit, auxiliary);
     ModScene provider;
-    pt::SurfaceMaterial material = provider.resolve_flow(hit, OPENPBR_FLOW, call.incident);
+    pt::SurfaceMaterial material = resolve_material<true, true>(
+        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
     openpbr::Sample sampled = openpbr::sample_flow<OPENPBR_FLOW>(
         provider.energy(), material.pbr, pt::shading_normal(hit, material), call.wo, call.u,
         call.incident, material.transmitted);
@@ -163,10 +174,12 @@ void restir_replay_flow(inout RestirReplayCall call)
 [shader("callable")]
 void restir_evaluate_flow(inout RestirEvaluateCall call)
 {
-    pt::Hit hit = known_material_hit(call.hit);
+    float4 auxiliary;
+    pt::Hit hit = known_material_hit(call.hit, auxiliary);
     ModScene provider;
     float4 incident = float4(call.incident_ior, 0, 0, 0);
-    pt::SurfaceMaterial material = provider.resolve_flow(hit, OPENPBR_FLOW, incident);
+    pt::SurfaceMaterial material = resolve_material<true, true>(
+        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
     openpbr::Evaluation evaluated = openpbr::evaluate_flow<OPENPBR_FLOW>(
         provider.energy(), material.pbr, pt::shading_normal(hit, material), call.wo, call.direction,
         incident, material.transmitted);
@@ -176,9 +189,11 @@ void restir_evaluate_flow(inout RestirEvaluateCall call)
 [shader("callable")]
 void restir_connection_flow(inout RestirConnectionCall call)
 {
-    pt::Hit hit = known_material_hit(call.hit);
+    float4 auxiliary;
+    pt::Hit hit = known_material_hit(call.hit, auxiliary);
     ModScene provider;
-    pt::SurfaceMaterial material = provider.resolve_flow(hit, OPENPBR_FLOW, call.incident);
+    pt::SurfaceMaterial material = resolve_material<true, true>(
+        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
     restir_pt::Surface surface = {};
     surface.point = hit.surface;
     surface.wo = call.wo;

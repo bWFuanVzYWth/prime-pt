@@ -73,6 +73,10 @@ impl Host {
         Self::create(true, false)
     }
 
+    fn new_rr_ser() -> Result<Self, Box<dyn std::error::Error>> {
+        Self::create(true, true)
+    }
+
     fn new_ser() -> Result<Self, Box<dyn std::error::Error>> {
         Self::create(false, true)
     }
@@ -449,7 +453,8 @@ impl Host {
                 )?;
                 Ok(())
             })();
-            if self.device.queue_wait_idle(self.queue).is_err() {
+            if let Err(error) = self.device.queue_wait_idle(self.queue) {
+                eprintln!("无窗口GPU提交完成失败：{error:?}");
                 std::process::abort();
             }
             if result.is_err() {
@@ -563,7 +568,8 @@ impl Host {
                 )?;
                 Ok(())
             })();
-            if self.device.queue_wait_idle(self.queue).is_err() {
+            if let Err(error) = self.device.queue_wait_idle(self.queue) {
+                eprintln!("无窗口GPU提交完成失败：{error:?}");
                 std::process::abort();
             }
             if result.is_err() {

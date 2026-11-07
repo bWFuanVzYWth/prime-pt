@@ -14,8 +14,16 @@ public static const uint COVERAGE_MASK = PRIMEPT_COVERAGE_MASK;
 // 资源期已发布灯域：alias、cutout、MERS纹理发光；参考入口保守保留全部能力。
 public static const uint EMITTER_CAPABILITIES = PRIMEPT_EMITTER_CAPABILITIES;
 static const uint MATERIAL_OVERLAY_FLAGS = (1u << 7u) | (1u << 8u);
-static const uint VARIANT_OVERLAY = 1u << 8u;
+public static const uint VARIANT_OVERLAY = 1u << 8u;
 static const uint VARIANT_OVERLAY_MERS = 1u << 9u;
+static const uint VARIANT_BLACK_CONDUCTOR = 1u << 13u;
+
+public bool reads_scattering_color(uint flow, uint variant)
+{
+    return (variant == ~0u || (variant & VARIANT_BLACK_CONDUCTOR) == 0) &&
+           (flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
+                    openpbr::FLOW_CONDUCTOR_REFLECTION)) != 0;
+}
 
 [[vk::binding(1, 0)]]
 public StructuredBuffer<uint4> quads;
@@ -115,6 +123,25 @@ public float2 material_uv(uint primitive, float2 barycentrics)
     uv += (second ? uv23.zw : uv23.xy) * bary.z;
     return uv;
 }
+// 材质图按最近点读取。UV 在 sprite 边缘或越界时仍落在准备阶段扫描的像素矩形内。
+int3 sprite_address(float2 uv, float4 bounds)
+{
+    uint w, h;
+    atlas.GetDimensions(w, h);
+    float2 size = float2(w, h);
+    int2 lo = clamp(int2(floor(bounds.xy * size)), int2(0), int2(w - 1, h - 1));
+    int2 hi = clamp(int2(ceil(bounds.zw * size)) - 1, lo, int2(w - 1, h - 1));
+    return int3(clamp(int2(floor(uv * size)), lo, hi), 0);
+}
+
+public float4 material_aux<let Variant : uint = ~0u>(uint primitive, float2 bary)
+{
+    if ((Variant & 2u) == 0)
+        return 0;
+    ModMaterial m = material_at(material_id(primitive));
+    return aux_atlas.Load(sprite_address(material_uv(primitive, bary), m.uv_bounds));
+}
+
 float3 quad_tint(uint primitive, float2 barycentrics)
 {
     float3 bary = float3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
@@ -127,7 +154,7 @@ float3 quad_tint(uint primitive, float2 barycentrics)
 }
 float4 sample_tinted_texel(uint primitive, float2 barycentrics, float2 uv)
 {
-    float4 value = atlas.SampleLevel(atlas_sampler, uv, 0);
+    float4 value = atlas.Load(sprite_address(uv, material_at(material_id(primitive)).uv_bounds));
     return float4(value.xyz * quad_tint(primitive, barycentrics), value.w);
 }
 /// 保留旧共享tint的FP32插值顺序；覆盖alpha不乘tint。
@@ -142,7 +169,9 @@ public bool material_accepts(uint primitive, float2 bary, bool front)
     if ((flags & 32u) != 0 && !front)
         return false;
     return (flags & 8u) == 0 ||
-           atlas.SampleLevel(atlas_sampler, material_uv(primitive, bary), 0).a >= 0.5;
+           atlas.Load(sprite_address(material_uv(primitive, bary),
+                                     material_at(material_id(primitive)).uv_bounds))
+                   .a >= 0.5;
 }
 bool emits_on_side(ModMaterial material, bool front)
 {
@@ -166,7 +195,7 @@ public float3 material_emission<let AcceptedSample : bool = false>(uint primitiv
         return 0;
     float3 result = material.emission.xyz * material.emission.w * texel.xyz;
     if ((!AcceptedSample || (EMITTER_CAPABILITIES & 4u) != 0) && (material.control.z & 4u) != 0)
-        result *= mers_atlas.SampleLevel(atlas_sampler, uv, 0).y;
+        result *= mers_atlas.Load(sprite_address(uv, material.uv_bounds)).y;
     return result * block_emission_scale;
 }
 float2 normal_sign(float2 value)
@@ -189,8 +218,8 @@ public float3 decode_shading_normal(uint packed)
     return normalize(normal);
 }
 /// 只有显式法线贴图需要变换三角形边；几何法线和offset原样保留。
-public uint mapped_shading_normal_known(uint primitive, float2 bary, float3 local_e1,
-                                        float3 local_e2, float3x3 object_to_world, float3 normal)
+public uint map_normal_xy(uint primitive, float2 encoded, float3 local_e1, float3 local_e2,
+                          float3x3 object_to_world, float3 normal)
 {
     uint base = (primitive >> 1) * 3u;
     float4 uv01 = asfloat(quads[base]), uv23 = asfloat(quads[base + 1u]);
@@ -210,12 +239,16 @@ public uint mapped_shading_normal_known(uint primitive, float2 bary, float3 loca
         return encode_shading_normal(normal);
     tangent *= rsqrt(length_squared);
     bitangent = cross(normal, tangent) * (dot(cross(normal, tangent), bitangent) < 0 ? -1.0 : 1.0);
-    float2 xy =
-        (aux_atlas.SampleLevel(atlas_sampler, material_uv(primitive, bary), 0).xy * 255.0 - 128.0) /
-        127.0;
+    float2 xy = (encoded * 255.0 - 128.0) / 127.0;
     float3 local = normalize(float3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy)))));
     return encode_shading_normal(
         normalize(tangent * local.x + bitangent * local.y + normal * local.z));
+}
+public uint mapped_shading_normal_known(uint primitive, float2 bary, float3 local_e1,
+                                        float3 local_e2, float3x3 object_to_world, float3 normal)
+{
+    return map_normal_xy(primitive, material_aux(primitive, bary).xy, local_e1, local_e2,
+                         object_to_world, normal);
 }
 /// 未知命中的独立导引路径；照明叶子按资源期能力直接调用known版本。
 public uint mapped_shading_normal(uint primitive, float2 bary, float3 local_e1, float3 local_e2,
@@ -237,8 +270,9 @@ uint material_variant(ModMaterial material)
 }
 
 /// 消费已通过覆盖测试的命中；callable 的 Flow 和 variant 都在资源准备时特化。
-public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant,
-                                            float block_emission_scale)
+public pt::SurfaceMaterial resolve_material<let HasAux : bool = false,
+                                            let ReadColor : bool = false>(
+    pt::Hit hit, uint flow, uint variant, float block_emission_scale, float4 sampledAux = float4(0))
 {
     uint primitive = hit.identity.x;
     ModMaterial material = material_at(material_id(primitive));
@@ -252,33 +286,41 @@ public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant
                   ((mask & 32u) != 0 && !hit.front));
     bool textured_emission = emits && (mask & 4u) != 0;
     float2 uv = 0;
-    if ((mask & (3u | VARIANT_OVERLAY)) != 0 || textured_emission)
+    bool useColor = reads_scattering_color(flow, mask);
+    bool overlay = (mask & VARIANT_OVERLAY) != 0 &&
+                   (useColor || (mask & (1u | VARIANT_OVERLAY_MERS)) != 0 || textured_emission);
+    bool readBase = ReadColor && (mask & VARIANT_OVERLAY) == 0 && (useColor || emits);
+    if (readBase || overlay || (mask & 3u) != 0 || textured_emission)
         uv = material_uv(primitive, asfloat(hit.identity.yz));
+    float4 bounds = material.uv_bounds;
+    if (readBase)
+        hit.texel.xyz = atlas.Load(sprite_address(uv, bounds)).rgb *
+                        quad_tint(primitive, asfloat(hit.identity.yz));
     float3 base_color = hit.texel.xyz;
     bool reads_mers = (mask & 1u) != 0;
-    if ((mask & VARIANT_OVERLAY) != 0)
+    if (overlay)
     {
         float2 local =
             (uv - material.uv_bounds.xy) / (material.uv_bounds.zw - material.uv_bounds.xy);
         float2 top_uv = lerp(material.overlay_bounds.xy, material.overlay_bounds.zw, local);
-        float4 top = atlas.SampleLevel(atlas_sampler, top_uv, 0);
+        float4 top = atlas.Load(sprite_address(top_uv, material.overlay_bounds));
         if (top.a >= 0.5)
         {
             base_color = top.rgb * quad_tint(primitive, asfloat(hit.identity.yz));
             reads_mers = (mask & VARIANT_OVERLAY_MERS) != 0;
             uv = top_uv;
+            bounds = material.overlay_bounds;
         }
         else
         {
-            base_color = atlas.SampleLevel(atlas_sampler, uv, 0).rgb;
+            base_color = atlas.Load(sprite_address(uv, bounds)).rgb;
         }
     }
-    if ((flow & (openpbr::FLOW_DIFFUSE | openpbr::FLOW_SUBSURFACE |
-                 openpbr::FLOW_CONDUCTOR_REFLECTION)) != 0)
+    if (useColor)
         result.pbr.base_roughness.xyz = base_color * material.base_roughness.xyz;
     float4 mers = float4(material.surface.y, 0, material.base_roughness.w, material.surface.z);
     if (reads_mers || textured_emission)
-        mers = mers_atlas.SampleLevel(atlas_sampler, uv, 0);
+        mers = mers_atlas.Load(sprite_address(uv, bounds));
     if (reads_mers)
     {
         result.pbr.base_roughness.w = mers.z;
@@ -288,7 +330,7 @@ public pt::SurfaceMaterial resolve_material(pt::Hit hit, uint flow, uint variant
     float4 medium = material.extinction;
     if ((mask & 2u) != 0)
     {
-        float4 auxiliary = aux_atlas.SampleLevel(atlas_sampler, uv, 0);
+        float4 auxiliary = HasAux ? sampledAux : aux_atlas.Load(sprite_address(uv, bounds));
         float ior = 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) / 255.0);
         result.pbr.surface.x = ior;
         medium.x = ior;

@@ -99,15 +99,18 @@ void shade_hit(inout pt::MaterialCall call, BuiltInTriangleIntersectionAttribute
     hit.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
                                            WorldToObject3x4());
     uint primitive = region_primitive(InstanceID(), PrimitiveIndex());
+    float4 auxiliary = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
     uint normal = 0;
     if ((OPENPBR_VARIANT & 8u) != 0)
-        normal = mapped_shading_normal_known(primitive, attributes.barycentrics, b - a, c - a,
-                                             (float3x3)ObjectToWorld3x4(), hit.surface.normal);
+        normal = map_normal_xy(primitive, auxiliary.xy, b - a, c - a, (float3x3)ObjectToWorld3x4(),
+                               hit.surface.normal);
     hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
     hit.distance = RayTCurrent();
     hit.front = dot(WorldRayDirection(), hit.surface.normal) < 0;
+    pt::SurfaceMaterial material = resolve_material<true, true>(
+        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(
-        ModScene(), call, hit, WorldRayDirection(), settings(parameters[0]));
+        ModScene(), call, hit, material, WorldRayDirection(), settings(parameters[0]));
 }
 [shader("raygeneration")]
 void prefix_empty()

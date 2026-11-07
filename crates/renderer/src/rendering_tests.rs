@@ -701,3 +701,177 @@ fn hardware_pt_rr_restir_guides() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
+
+#[test]
+#[ignore = "独立进程：真实4K/Performance RR+SER+CV穿过delta首面与不同Guide材质，严格保留SDK同步检查"]
+fn hardware_pt_rr_ser_restir_guided_suffix_across_materials()
+-> Result<(), Box<dyn std::error::Error>> {
+    use prime_scene::{MaterialDefinition, MaterialId};
+    let host = Host::new_rr_ser()?;
+    let mut gpu = host.gpu()?;
+    assert!(gpu.invocation_reorder);
+    let output = Image::new(&mut gpu.context, [3840, 2160, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    let mut opaque = MaterialDefinition::default();
+    opaque.control[2] |= MaterialDefinition::AUXILIARY;
+    opaque.control[3] = MaterialDefinition::AUTHORED_NORMAL;
+    let mut glass = MaterialDefinition::default();
+    glass.control[0] = 1;
+    glass.base_roughness[3] = 0.;
+    let mut lamp = opaque;
+    lamp.emission = [2., 1., 0.5, 2.];
+    let definitions = [opaque, glass, lamp];
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [1, 1],
+        albedo: &[255; 4],
+        materials: &definitions,
+        mers: &[0, 0, 255, 0],
+        auxiliary: &[128, 128, 0, 85],
+        emission_alias_words: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]; 3],
+    })?;
+    gpu.set_rendering(
+        prime_scene::RenderMode::Realtime,
+        RealtimeRenderer::RestirPt,
+    )?;
+    gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0.4, false, true)?)?;
+    let mut mesh = Mesh::default();
+    let uv = [[0., 0.], [0., 1.], [1., 1.], [1., 0.]];
+    for (z, material) in [(1., 1), (3., 0)] {
+        mesh.quads.push(Quad::with_material(
+            [
+                [-10., -10., z],
+                [-10., 10., z],
+                [10., 10., z],
+                [10., -10., z],
+            ],
+            uv,
+            [0.8; 3],
+            MaterialId::new(material),
+        ));
+    }
+    mesh.quads.push(Quad::with_material(
+        [
+            [-10., -10., -2.],
+            [10., -10., -2.],
+            [10., 10., -2.],
+            [-10., 10., -2.],
+        ],
+        uv,
+        [0.8; 3],
+        MaterialId::new(0),
+    ));
+    mesh.quads.push(Quad::with_material(
+        [[-2., 2., -2.], [2., 2., -2.], [2., 2., 2.], [-2., 2., 2.]],
+        uv,
+        [1.; 3],
+        MaterialId::new(2),
+    ));
+    publish(&mut gpu, &mesh, 1)?;
+    let generation = gpu.generation.as_ref().unwrap();
+    let counts: Vec<_> = generation
+        .restir_programs
+        .iter()
+        .map(|set| set.artifacts().len())
+        .collect();
+    assert!(
+        generation.programs.artifacts().len() > counts[7],
+        "发光材质与接收面应共享Guide键，测试必须覆盖不同的Full/Guide段长"
+    );
+    eprintln!(
+        "RR+SER完整材质键={}，操作段={counts:?}",
+        generation.programs.artifacts().len()
+    );
+    let mut camera = camera();
+    for rr in [false, true] {
+        for (frame, ser) in [false, true, false, true].into_iter().enumerate() {
+            let accepted = (gpu.absolute_sample, gpu.rr_index, gpu.rr_previous.is_some());
+            let histories = gpu
+                .restir
+                .as_ref()
+                .map(|r| {
+                    r.frame()
+                        .map(|frame| (frame.history_valid, r.color_history_valid()))
+                })
+                .transpose()?;
+            gpu.set_ser(ser)?;
+            assert_eq!(
+                accepted,
+                (gpu.absolute_sample, gpu.rr_index, gpu.rr_previous.is_some())
+            );
+            if let Some(histories) = histories {
+                let restir = gpu.restir.as_ref().unwrap();
+                assert_eq!(
+                    histories,
+                    (restir.frame()?.history_valid, restir.color_history_valid())
+                );
+            }
+            camera.origin[0] = frame as f32 * 0.05;
+            eprintln!("RR+SER mode_rr={rr} frame={frame} begin ser={ser} histories={histories:?}");
+            host.render_options(
+                &mut gpu,
+                &output,
+                &camera,
+                Environment::default(),
+                Options::new(rr, streamline::Quality::Performance, 1, 12)?,
+            )?;
+            let view = gpu.view.as_ref().unwrap();
+            assert_eq!(view.rr_enabled, rr);
+            if !rr {
+                assert_eq!(view.extent, [3840, 2160]);
+                assert!(gpu.rr_runtime.is_none());
+                eprintln!(
+                    "RR+SER mode_rr={rr} frame={frame} complete ser={ser} absolute={} rr_index={}",
+                    gpu.absolute_sample, gpu.rr_index
+                );
+                continue;
+            }
+            assert!(
+                gpu.rr_unavailable.is_none() && gpu.rr_previous.is_some(),
+                "必须实际完成SDK求值，不能只走原生回退"
+            );
+            assert_eq!(view.extent, [1920, 1080]);
+            let extent = view.extent;
+            let offset = (extent[1] / 2 * extent[0] + extent[0] / 2) as usize * 4;
+            let depth = view.rr.images[1].download(&mut gpu.context)?;
+            let depth = f32::from_le_bytes(depth[offset..offset + 4].try_into()?);
+            let normal = half_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
+            let diffuse = half_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
+            let specular = half_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
+            let motion = half_pixel(&view.rr.images[2].download(&mut gpu.context)?, extent, 2);
+            let specular_motion =
+                half_pixel(&view.rr.images[8].download(&mut gpu.context)?, extent, 2);
+            let reflected = view.rr.images[7].download(&mut gpu.context)?;
+            let reflected = f32::from_le_bytes(reflected[offset..offset + 4].try_into()?);
+            assert!(
+                depth.is_finite() && depth > 1.5 && depth < 6.,
+                "透射Guide必须越过z=1的glass首面并恢复opaque终点：{depth}"
+            );
+            assert!(
+                (normal[3] - 0.9).abs() < 0.001,
+                "Guide终点应读取opaque粗糙度，不能停在delta首面：{normal:?}"
+            );
+            assert!(diffuse[..3].iter().all(|&v| v.is_finite() && v > 0.));
+            assert!(
+                normal
+                    .iter()
+                    .chain(&specular)
+                    .chain(&specular_motion)
+                    .all(|v| v.is_finite())
+            );
+            assert!(
+                (reflected - 3.).abs() < 0.01,
+                "反射Guide必须命中相机后z=-2的不同材质：{reflected}"
+            );
+            assert!(motion.iter().all(|v| v.is_finite()));
+            eprintln!(
+                "RR+SER mode_rr={rr} frame={frame} complete ser={ser} depth={depth} roughness={} reflection={reflected} motion={motion:?} specular={specular:?} specular_motion={specular_motion:?}",
+                normal[3]
+            );
+        }
+    }
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}

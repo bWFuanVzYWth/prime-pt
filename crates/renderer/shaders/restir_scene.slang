@@ -188,11 +188,12 @@ public struct RestirScene : restir_pt::IRestirScene
 #endif
         if (continuation)
         {
-            RestirInitialCall call = RestirInitialCall::input(surface, request);
+            RestirInitialCall call = RestirInitialCall::input(surface, request, surface.identity);
             CallShader(program, call);
             return call.result();
         }
-        RestirInitialDirectCall direct = RestirInitialDirectCall::input(surface, request);
+        RestirInitialDirectCall direct =
+            RestirInitialDirectCall::input(surface, request, surface.identity);
         CallShader(program, direct);
         return direct.result();
     }

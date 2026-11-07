@@ -729,14 +729,12 @@ pub struct Gpu {
     // 程序模板只保留初始空场景，不能钉住重载时完整 mesh／AS 的工作集。
     program_scene: Scene,
     atlas: Image,
-    atlas_colors: [openpbr::resource::ColorRanges; 2],
     material_gpu: MaterialGpu,
     material_coverage: Vec<bool>,
     light_sides: Vec<u32>,
     light_weights: Vec<f32>,
     has_emission: bool,
     light_areas: Vec<[u32; 4]>,
-    map_ranges: materials::MapRanges,
     resource_generation: u64,
     lighting: lighting::Lighting,
     lighting_gpu: LightingGpu,
@@ -1146,14 +1144,12 @@ impl Gpu {
             scene_update: None,
             program_scene,
             atlas,
-            atlas_colors: materials::colors(&[255; 4])?,
             material_gpu,
             material_coverage: definitions.iter().map(materials::tests_coverage).collect(),
             light_areas: vec![[u32::MAX, 0, 0, 0]; definitions.len()],
             light_sides: vec![0; definitions.len()],
             light_weights: materials::emission_weights(&definitions)?,
             has_emission: false,
-            map_ranges: materials::map_ranges(&[0, 0, 255, 0], &[128, 128, 255, 128])?,
             resource_generation: 0,
             lighting: lighting::Lighting::new()?,
             lighting_gpu,
@@ -1398,20 +1394,29 @@ impl Gpu {
         if width == 0 || height == 0 || expected != pixels.len() as u64 {
             return Err(Error::Invalid("atlas 尺寸与 RGBA8 字节数不匹配"));
         }
-        let colors = materials::colors(pixels)?;
         let definitions = materials::defaults();
-        let flows = materials::flows(colors, &definitions, self.map_ranges)?;
+        let prepared = materials::bindings(
+            self.resource_generation,
+            &definitions,
+            [width, height],
+            pixels,
+            &[],
+            &[],
+        )?;
         let atlas = Image::new(
             &mut self.context,
             [width, height, 1],
             ImageFormat::Rgba8Srgb,
         )?;
         atlas.upload(&mut self.context, pixels)?;
-        let (resources, generation) =
-            self.prepare_material_generation(atlas, self.material_gpu, &flows, &definitions)?;
+        let (resources, generation) = self.prepare_material_generation(
+            atlas,
+            self.material_gpu,
+            &prepared.keys,
+            &definitions,
+        )?;
         self.invalidate_history(GlobalReset::SceneDomainReplaced)?;
         self.atlas = atlas;
-        self.atlas_colors = colors;
         self.material_gpu = resources;
         self.material_coverage = definitions.iter().map(materials::tests_coverage).collect();
         self.generation = Some(generation);
@@ -1442,11 +1447,9 @@ impl Gpu {
                 .any(|n| n as u64 != bytes)
                 || source.materials.is_empty()
                 || source.materials.len() != source.light_areas.len()
-                || source.materials.iter().any(|m| !m.valid())
             {
                 return Err(Error::Invalid("完整资源图像或材质域无效"));
             }
-            validate_aliases(source.materials, source.emission_alias_words)?;
             for area in source.light_areas {
                 if area[0] != u32::MAX
                     && (area[0] > light_sampling::SELECTORS
@@ -1459,15 +1462,22 @@ impl Gpu {
             }
             let region_cache = scene_cache::Cache::new()?;
             let lighting = lighting::Lighting::new()?;
-            let definitions = source.materials;
-            let colors = materials::colors(source.albedo)?;
-            let ranges = materials::map_ranges(source.mers, source.auxiliary)?;
-            let flows = materials::flows(colors, definitions, ranges)?;
+            let prepared = materials::bindings(
+                source.generation,
+                source.materials,
+                source.extent,
+                source.albedo,
+                source.mers,
+                source.auxiliary,
+            )?;
+            let definitions = prepared.definitions.as_ref();
+            let keys = &prepared.keys;
+            validate_aliases(definitions, source.emission_alias_words)?;
             let mut light_sides = Vec::new();
             light_sides
                 .try_reserve_exact(source.materials.len())
                 .map_err(scene_cache::Error::from)?;
-            light_sides.extend(definitions.iter().zip(&flows).map(|(m, flow)| {
+            light_sides.extend(definitions.iter().zip(keys).map(|(m, (flow, _))| {
                 if flow.emits() {
                     materials::emission_sides(m)
                 } else {
@@ -1508,14 +1518,13 @@ impl Gpu {
                 )?,
             };
             let (resources, generation) =
-                self.prepare_material_generation(atlas, resources, &flows, definitions)?;
+                self.prepare_material_generation(atlas, resources, keys, definitions)?;
             let candidates: Vec<_> = generation.roots().collect();
             self.collect_with(&candidates)?;
             // 此后只移动已经准备的所有者；不得以清理失败向宿主报告“保留旧世代”。
             self.renderer = None;
             self.transition_history(history::Event::Global(GlobalReset::SceneDomainReplaced))?;
             self.atlas = atlas;
-            self.atlas_colors = colors;
             self.material_gpu = resources;
             self.material_coverage = material_coverage;
             self.light_sides = light_sides;
@@ -1528,7 +1537,6 @@ impl Gpu {
             self.lighting = lighting;
             self.lighting_gpu = self.program_lighting;
             self.light_areas = light_areas;
-            self.map_ranges = ranges;
             self.resource_generation = source.generation;
             self.generation = Some(generation);
             self.restir = None;
@@ -1548,10 +1556,10 @@ impl Gpu {
         &mut self,
         atlas: Image,
         mut resources: MaterialGpu,
-        flows: &[openpbr::FlowKey],
+        keys: &[materials::Key],
         definitions: &[MaterialDefinition],
     ) -> Result<(MaterialGpu, MaterialGeneration), Error> {
-        if flows.len() != definitions.len() {
+        if keys.len() != definitions.len() {
             return Err(Error::Invalid("材质Flow与输入定义数量不匹配"));
         }
         #[cfg(test)]
@@ -1564,9 +1572,9 @@ impl Gpu {
         };
         let hit = materials::hit_features(definitions);
         let coverage = format!("-DPRIMEPT_COVERAGE_MASK={}", hit.coverage);
-        let emitter_capabilities = materials::emitter_capabilities(definitions, flows);
+        let emitter_capabilities = materials::emitter_capabilities(definitions, keys);
         let emitters = format!("-DPRIMEPT_EMITTER_CAPABILITIES={emitter_capabilities}");
-        let lights = if flows.iter().any(|flow| flow.emits()) {
+        let lights = if keys.iter().any(|(flow, _)| flow.emits()) {
             "-DPRIMEPT_LIGHT_MASK=3"
         } else {
             "-DPRIMEPT_LIGHT_MASK=1"
@@ -1584,11 +1592,7 @@ impl Gpu {
         };
         let programs = compile_programs(
             &self.compiler,
-            flows
-                .iter()
-                .copied()
-                .zip(definitions)
-                .map(|(flow, definition)| (flow, materials::variant(flow, definition))),
+            keys.iter().copied(),
             openpbr::program::Template {
                 source: program_source
                     .to_str()
@@ -1603,6 +1607,7 @@ impl Gpu {
                 args: &[
                     "-fp-mode",
                     "precise",
+                    "-DOPENPBR_RECIPE_VARIANT=1",
                     lights,
                     &coverage,
                     &emitters,
@@ -1611,7 +1616,14 @@ impl Gpu {
                 ],
             },
         )?;
-        let hit_args = ["-fp-mode", "precise", lights, &coverage, &emitters];
+        let hit_args = [
+            "-fp-mode",
+            "precise",
+            "-DOPENPBR_RECIPE_VARIANT=1",
+            lights,
+            &coverage,
+            &emitters,
+        ];
         let material_hits = if (2..=7).contains(&dispatch) {
             Some(openpbr::program::ProgramSet::compile_hit_variants(
                 &self.compiler,
@@ -1738,6 +1750,12 @@ impl Gpu {
             .transpose()?;
         let restir_source = self.shader_source.with_file_name("restir_material.slang");
         let guide_source = self.shader_source.with_file_name("guide_material.slang");
+        let hit_initial = (2..=8).contains(&dispatch);
+        let leaf_geometry = match dispatch {
+            4 | 5 => Some("-DPRIMEPT_HIT_GEOMETRY=1"),
+            7 | 8 => Some("-DPRIMEPT_HIT_GEOMETRY_LEAF=1"),
+            _ => None,
+        };
         let mut restir_sets = Vec::with_capacity(9);
         for (entry, sampling) in [
             ("restir_initial_flow", "-DPRIMEPT_RESTIR_SAMPLE=1"),
@@ -1750,7 +1768,22 @@ impl Gpu {
             ("guide_known", "-DPRIMEPT_RESTIR_SAMPLE=0"),
             ("restir_initial_direct", "-DPRIMEPT_RESTIR_SAMPLE=0"),
         ] {
-            restir_sets.push(openpbr::program::ProgramSet::compile_variants(
+            let hit =
+                hit_initial && matches!(entry, "restir_initial_flow" | "restir_initial_direct");
+            let mut args = vec!["-fp-mode", "precise", "-DOPENPBR_RECIPE_VARIANT=1"];
+            if hit {
+                args.push("-DPRIMEPT_INITIAL_HIT=1");
+            }
+            args.extend([sampling, lights, &coverage, &emitters]);
+            let compile = if hit {
+                if let Some(geometry) = leaf_geometry {
+                    args.extend([geometry, "-capability", "spvRayTracingPositionFetchKHR"]);
+                }
+                openpbr::program::ProgramSet::compile_hit_variants
+            } else {
+                openpbr::program::ProgramSet::compile_variants
+            };
+            restir_sets.push(compile(
                 &self.compiler,
                 programs
                     .plan()
@@ -1777,11 +1810,13 @@ impl Gpu {
                     .to_str()
                     .ok_or(Error::Invalid("shader路径不是UTF-8"))?,
                     entry,
-                    output: "restir-flow.spv",
+                    output: if hit {
+                        "restir-hit.spv"
+                    } else {
+                        "restir-flow.spv"
+                    },
                     target: shader_build::Target::Spirv("spirv_1_4"),
-                    args: &[
-                        "-fp-mode", "precise", sampling, lights, &coverage, &emitters,
-                    ],
+                    args: &args,
                 },
             )?);
         }
@@ -1816,6 +1851,7 @@ impl Gpu {
                 args: &[
                     "-fp-mode",
                     "precise",
+                    "-DOPENPBR_RECIPE_VARIANT=1",
                     &coverage,
                     "-capability",
                     "spvRayTracingPositionFetchKHR",
@@ -1850,10 +1886,8 @@ impl Gpu {
         table
             .try_reserve_exact(table_words)
             .map_err(scene_cache::Error::from)?;
-        for ((definition, &slot), flow) in definitions
-            .iter()
-            .zip(programs.plan().bindings())
-            .zip(flows)
+        for ((definition, &slot), (flow, _)) in
+            definitions.iter().zip(programs.plan().bindings()).zip(keys)
         {
             if slot > u32::MAX >> 2 {
                 return Err(Error::Invalid("材质callable索引超过30bit"));
@@ -1870,7 +1904,7 @@ impl Gpu {
             programs.plan().keys().len() as u32,
             (initial_count + initial_direct_count) as u32,
             0,
-            if (2..=7).contains(&dispatch) {
+            if (2..=8).contains(&dispatch) {
                 (initial_count + initial_direct_count) as u32
             } else {
                 0
@@ -1938,7 +1972,7 @@ impl Gpu {
                 "spvRayTracingPositionFetchKHR",
             ]);
         }
-        if dispatch == 6 || dispatch == 7 {
+        if matches!(dispatch, 6..=8) {
             initial_args.extend([
                 if dispatch == 6 {
                     "-DPRIMEPT_HIT_GEOMETRY_LOAD=1"
@@ -1952,70 +1986,33 @@ impl Gpu {
         if dispatch == 5 {
             initial_args.push("-DPRIMEPT_HIT_HINT=1");
         }
-        let mut restir_hit_sets = Vec::new();
-        if (2..=7).contains(&dispatch) {
-            for (entry, sampling) in [
-                ("restir_initial_flow", "-DPRIMEPT_RESTIR_SAMPLE=1"),
-                ("restir_initial_direct", "-DPRIMEPT_RESTIR_SAMPLE=0"),
-            ] {
-                let mut leaf_args = vec![
-                    "-fp-mode",
-                    "precise",
-                    "-DPRIMEPT_INITIAL_HIT=1",
-                    sampling,
-                    lights,
-                    &coverage,
-                    &emitters,
-                ];
-                if (4..=5).contains(&dispatch) {
-                    leaf_args.extend([
-                        "-DPRIMEPT_HIT_GEOMETRY=1",
-                        "-capability",
-                        "spvRayTracingPositionFetchKHR",
-                    ]);
-                }
-                if dispatch == 7 {
-                    leaf_args.extend([
-                        "-DPRIMEPT_HIT_GEOMETRY_LEAF=1",
-                        "-capability",
-                        "spvRayTracingPositionFetchKHR",
-                    ]);
-                }
-                restir_hit_sets.push(openpbr::program::ProgramSet::compile_hit_variants(
-                    &self.compiler,
-                    programs.plan().keys().iter().copied().map(|key| {
-                        if entry == "restir_initial_direct" {
-                            materials::initial_direct_key(key)
-                        } else {
-                            materials::initial_key(key)
-                        }
-                    }),
-                    openpbr::program::Template {
-                        source: restir_source
-                            .to_str()
-                            .ok_or(Error::Invalid("shader路径不是UTF-8"))?,
-                        entry,
-                        output: "restir-hit.spv",
-                        target: shader_build::Target::Spirv("spirv_1_4"),
-                        args: &leaf_args,
-                    },
-                )?);
-            }
+        // 单一操作表提供SBT索引和实际模块。初采只为本设备的命中或callable入口编译一次。
+        let mut restir_hits = Vec::new();
+        let mut restir_callables = Vec::new();
+        let mut callable_counts = restir_counts;
+        let entries = [
+            c"restir_initial_flow",
+            c"restir_replay_flow",
+            c"restir_evaluate_flow",
+            c"restir_metadata_flow",
+            c"restir_connection_flow",
+            c"restir_emitter_flow",
+            c"restir_pdf_flow",
+            c"guide_known",
+            c"restir_initial_direct",
+        ];
+        for (index, (set, entry)) in restir_sets.iter().zip(entries).enumerate() {
+            let slots = if hit_initial && matches!(index, 0 | 8) {
+                callable_counts[index] = 0;
+                &mut restir_hits
+            } else {
+                &mut restir_callables
+            };
+            slots.extend(set.artifacts().iter().map(|a| RayShader {
+                spirv: a.bytes(),
+                entry,
+            }));
         }
-        let mut restir_hits: Vec<_> = restir_hit_sets
-            .iter()
-            .enumerate()
-            .flat_map(|(index, set)| {
-                set.artifacts().iter().map(move |artifact| RayShader {
-                    spirv: artifact.bytes(),
-                    entry: if index == 0 {
-                        c"restir_initial_flow"
-                    } else {
-                        c"restir_initial_direct"
-                    },
-                })
-            })
-            .collect();
         restir_hits.extend(guide_hits.artifacts().iter().map(|artifact| RayShader {
             spirv: artifact.bytes(),
             entry: c"guide_hit",
@@ -2026,7 +2023,7 @@ impl Gpu {
             .copied()
             .chain(["-DPRIMEPT_SER=1"])
             .collect();
-        let initial = ((2..=7).contains(&dispatch))
+        let initial = hit_initial
             .then(|| {
                 compile_stage(
                     &restir_rg,
@@ -2037,8 +2034,7 @@ impl Gpu {
                 )
             })
             .transpose()?;
-        let initial_ser = ((2..=7).contains(&dispatch)
-            && self.context.capabilities().invocation_reorder)
+        let initial_ser = (hit_initial && self.context.capabilities().invocation_reorder)
             .then(|| {
                 compile_stage(
                     &restir_rg,
@@ -2049,26 +2045,6 @@ impl Gpu {
                 )
             })
             .transpose()?;
-        let restir_callables: Vec<_> = restir_sets
-            .iter()
-            .enumerate()
-            .flat_map(|(index, set)| {
-                set.artifacts().iter().map(move |artifact| RayShader {
-                    spirv: artifact.bytes(),
-                    entry: match index {
-                        0 => c"restir_initial_flow",
-                        1 => c"restir_replay_flow",
-                        2 => c"restir_evaluate_flow",
-                        3 => c"restir_metadata_flow",
-                        4 => c"restir_connection_flow",
-                        5 => c"restir_emitter_flow",
-                        6 => c"restir_pdf_flow",
-                        7 => c"guide_known",
-                        _ => c"restir_initial_direct",
-                    },
-                })
-            })
-            .collect();
         let same_material_code = self
             .generation
             .as_ref()
@@ -2079,7 +2055,7 @@ impl Gpu {
                 .as_ref()
                 .is_some_and(|p| dispatch == p.dispatch);
         let restir_dispatch = |mode| match mode {
-            0 | 1 | 8 => 0,
+            0 | 1 => 0,
             2 | 3 => 2,
             other => other,
         };
@@ -2110,8 +2086,7 @@ impl Gpu {
                 self.restir_lut,
                 hit,
                 &restir_callables,
-                restir_counts,
-                (2..=7).contains(&dispatch),
+                callable_counts,
                 initial.as_ref().map(|a| RayShader {
                     spirv: a.bytes(),
                     entry: c"restir_initial",
@@ -2145,8 +2120,7 @@ impl Gpu {
                     self.restir_lut,
                     hit,
                     &restir_callables,
-                    restir_counts,
-                    (2..=7).contains(&dispatch),
+                    callable_counts,
                     initial_ser.as_ref().map(|a| RayShader {
                         spirv: a.bytes(),
                         entry: c"restir_initial",

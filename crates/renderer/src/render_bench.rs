@@ -124,13 +124,24 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     let mut preparation =
         vec![serde_json::json!({"dispatch":modes[0],"host_ns":started.elapsed().as_nanos()})];
-    let flows = materials::flows(gpu.atlas_colors, &definitions, gpu.map_ranges)?;
+    let prepared = materials::bindings(
+        gpu.resource_generation,
+        &definitions,
+        [1, 1],
+        &[255; 4],
+        &[0, 0, 255, 0],
+        &[128, 128, 255, 128],
+    )?;
     let mut variants = Vec::new();
     for &mode in &modes[1..] {
         let started = std::time::Instant::now();
         gpu.experiment_dispatch = mode;
-        let (_, generation) =
-            gpu.prepare_material_generation(gpu.atlas, gpu.material_gpu, &flows, &definitions)?;
+        let (_, generation) = gpu.prepare_material_generation(
+            gpu.atlas,
+            gpu.material_gpu,
+            &prepared.keys,
+            &definitions,
+        )?;
         let previous = gpu.generation.replace(generation).unwrap();
         gpu.test_roots.extend(previous.roots());
         variants.push(Some(previous));
@@ -352,7 +363,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                         "pt_sbt_callables":if modes[index]<2 {generation.programs.artifacts().len()} else {0},
                         "pt_prepared_variants":1+usize::from(generation.reordered.is_some())+usize::from(generation.guided_regular.is_some())+usize::from(generation.guided_reordered.is_some()),
                         "rr_program_addition":{"pipeline_prepare_ns":generation.guided_program_cost[0],"tracked_gpu_allocation_bytes":generation.guided_program_cost[1],"retained_cpu_bytes":generation.guided_program_cost[2],"raygen_spirv_bytes":generation.guided_program_cost[3],"driver_private_memory":"not exposed"},
-                        "initial_sbt_callables":counts[7]+if (2..=7).contains(&modes[index]) {0} else {counts[0]+counts[8]},
+                        "initial_sbt_callables":counts[7]+if generation.dispatch < 2 {counts[0]+counts[8]} else {0},
                         "shift_sbt_callables":counts[1..7].iter().sum::<usize>(),
                         "operation_table_bytes":36*generation.programs.plan().keys().len()+32,
                     })

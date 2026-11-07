@@ -73,7 +73,6 @@ impl Restir {
         hit: materials::HitFeatures,
         callables: &[super::RayShader<'_>],
         counts: [usize; 9],
-        initial_use_hits: bool,
         initial_override: Option<super::RayShader<'_>>,
         initial_hits: &[super::RayShader<'_>],
         reordered: bool,
@@ -147,16 +146,12 @@ impl Restir {
         let connection_start = metadata_start + metadata_count;
         let guide_start = connection_start + connection_count + emitter_count + pdf_count;
         let direct_start = guide_start + guide_count;
-        let initial_callables: Vec<_> = if !initial_use_hits {
-            callables[..initial_count]
-                .iter()
-                .chain(&callables[direct_start..])
-                .chain(&callables[guide_start..direct_start])
-                .copied()
-                .collect()
-        } else {
-            callables[guide_start..direct_start].to_vec()
-        };
+        let initial_callables: Vec<_> = callables[..initial_count]
+            .iter()
+            .chain(&callables[direct_start..])
+            .chain(&callables[guide_start..direct_start])
+            .copied()
+            .collect();
         // 命中只携带稳定身份；着色法线在真正加载表面时恢复一次。
         let trace = super::programs(
             &[],

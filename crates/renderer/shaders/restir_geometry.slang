@@ -36,7 +36,7 @@ public restir_pt::HitInfo restir_stable_hit(uint primitive, float2 bary)
     return { uint4(token, primitive - domain.x * 2u, asuint(bary)) };
 }
 
-public uint restir_normal<let Variant : uint>(uint primitive, float2 bary, float3 normal)
+public uint restir_normal_xy<let Variant : uint>(uint primitive, float2 encoded, float3 normal)
 {
     if ((Variant & 8u) == 0)
         return 0;
@@ -45,10 +45,16 @@ public uint restir_normal<let Variant : uint>(uint primitive, float2 bary, float
                                                              asfloat(restir_positions[start + 1u]),
                                                              asfloat(restir_positions[start + 2u]));
     bool second = (primitive & 1u) != 0;
-    return mapped_shading_normal_known(primitive, bary,
-                                       (second ? vertices.c : vertices.b) - vertices.a,
-                                       (second ? vertices.d : vertices.c) - vertices.a,
-                                       float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1), normal);
+    return map_normal_xy(primitive, encoded, (second ? vertices.c : vertices.b) - vertices.a,
+                         (second ? vertices.d : vertices.c) - vertices.a,
+                         float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1), normal);
+}
+
+public uint restir_normal<let Variant : uint>(uint primitive, float2 bary, float3 normal)
+{
+    if ((Variant & 8u) == 0)
+        return 0;
+    return restir_normal_xy<Variant>(primitive, material_aux(primitive, bary).xy, normal);
 }
 
 public geometry::TriangleEndpoint restir_endpoint(uint primitive, float2 bary)
