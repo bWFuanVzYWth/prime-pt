@@ -125,6 +125,86 @@ fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn 
 }
 
 #[test]
+#[ignore = "真实Vulkan RT；局部Guide源码重载必须替换实际程序且保留未变化的照明程序"]
+fn hardware_pt_guide_source_reload_replaces_the_executed_program()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_ser()?;
+    let mut gpu = host.gpu()?;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let scratch = root.join("../../target/guide-reload-tests").join(format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    let sources = scratch.join("sources");
+    std::fs::create_dir_all(&sources)?;
+    for entry in std::fs::read_dir(gpu.shader_source.parent().unwrap())? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::copy(entry.path(), sources.join(entry.file_name()))?;
+        }
+    }
+    let engine = root.join(env!("PRIME_ENGINE_SHADERS_RELATIVE"));
+    gpu.compiler =
+        shader_build::RuntimeCompiler::new(scratch.join("cache"), &[&sources, &engine], &[])?;
+    gpu.shader_source = sources.join("primary.slang");
+    let definitions = [MaterialDefinition::default()];
+    let areas = [[u32::MAX, 0, 0, 0]];
+    upload(&mut gpu, &definitions, &[], &areas)?;
+    let generation = gpu.generation.as_ref().unwrap();
+    let before = generation
+        .guide_regular
+        .unwrap()
+        .program_root(&gpu.context)?;
+    let restir = generation.restir.test_program_roots(&gpu.context)?;
+    let pt = generation.code[0];
+    std::fs::write(
+        sources.join("guides.slang"),
+        "module guides; [[vk::binding(19, 0)]] [[vk::image_format(\"r32f\")]] RWTexture2D<float> probe_depth; [shader(\"raygeneration\")] void guide_main() { probe_depth[DispatchRaysIndex().xy] = 123.0; }",
+    )?;
+    upload(&mut gpu, &definitions, &[], &areas)?;
+    let generation = gpu.generation.as_ref().unwrap();
+    assert_ne!(
+        before,
+        generation
+            .guide_regular
+            .unwrap()
+            .program_root(&gpu.context)?
+    );
+    assert_eq!(pt, generation.code[0]);
+    assert_eq!(restir, generation.restir.test_program_roots(&gpu.context)?);
+    let guide = generation.guide_regular.unwrap();
+    let view = View::new(&mut gpu.context, [32, 32], true)?;
+    let (trace, _) = gpu.renderer_bindings(
+        &view,
+        &gpu.atlas,
+        &gpu.scene,
+        gpu.material_gpu,
+        gpu.lighting_gpu,
+    );
+    let bindings = Bindings::new(&mut gpu.context, &trace)?;
+    let guide = guide.rebind(&mut gpu.context, bindings)?;
+    let mut commands = Commands::new(&gpu.context)?;
+    commands.trace(guide, [32, 32])?;
+    commands
+        .finish(&mut gpu.context)?
+        .submit_and_wait(&mut gpu.context)?;
+    let depth = view.rr.images[1].download(&mut gpu.context)?;
+    assert!(
+        depth
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| f32::from_le_bytes(*pixel) == 123.)
+    );
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "独立进程：实际SDK+EXT验证生产RR选择keyed Guide，原生程序不保留Guide SBT"]
 fn hardware_pt_rr_keyed_program_preserves_opaque_and_glass_guides()
 -> Result<(), Box<dyn std::error::Error>> {

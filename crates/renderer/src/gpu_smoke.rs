@@ -6,7 +6,7 @@ use ash::{
     Entry, vk,
     vk::{Handle, TaggedStructure},
 };
-use simple_engine::{openpbr, shader_build, vulkan};
+use simple_engine::{shader_build, vulkan};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -859,8 +859,10 @@ fn hardware_pt_material_reload() -> Result<(), Box<dyn std::error::Error>> {
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 1., [0.5; 2], [1.; 3], 2.);
     gpu.set_scene(&mesh)?;
+    let white_sample = gpu.absolute_sample;
     let white = host.render(&mut gpu, &image, &camera())?;
     gpu.set_atlas(1, 1, &[0, 0, 0, 255])?;
+    let black_sample = gpu.absolute_sample;
     let black = host.render(&mut gpu, &image, &camera())?;
     assert_ne!(center(&white), center(&black));
     assert!(gpu.set_atlas(2, 1, &[255; 4]).is_err());
@@ -870,13 +872,16 @@ fn hardware_pt_material_reload() -> Result<(), Box<dyn std::error::Error>> {
     let compiler = std::mem::replace(&mut gpu.compiler, unavailable);
     assert!(matches!(
         gpu.set_atlas(1, 1, &[255; 4]),
-        Err(Error::MaterialPrograms(openpbr::program::Error::Shader(_)))
+        Err(Error::Shader(shader_build::Error::Compile { .. }))
     ));
     gpu.compiler = compiler;
     gpu.restart_accumulation()?;
+    // 重启累积保留绝对随机序列；资源等价对照必须使用相同样本输入。
+    gpu.absolute_sample = black_sample;
     let retained = host.render(&mut gpu, &image, &camera())?;
     assert_eq!(black, retained);
     gpu.set_atlas(1, 1, &[255; 4])?;
+    gpu.absolute_sample = white_sample;
     let restored = host.render(&mut gpu, &image, &camera())?;
     assert_eq!(white, restored);
     drop(gpu);

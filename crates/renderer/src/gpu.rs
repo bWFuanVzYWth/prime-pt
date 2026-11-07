@@ -601,14 +601,27 @@ fn programs<'a>(
     }
 }
 
+fn program_identity<'a>(
+    artifacts: impl IntoIterator<Item = &'a shader_build::Artifact>,
+) -> blake3::Hash {
+    let mut hash = blake3::Hasher::new();
+    for artifact in artifacts {
+        hash.update(&(artifact.bytes().len() as u64).to_le_bytes());
+        hash.update(artifact.bytes());
+    }
+    hash.finalize()
+}
+
 // 每代 atlas、能力证明和已初始化程序一起发布；旧命令通过 Flight 保活旧绑定。
 struct MaterialGeneration {
     dispatch: u32,
     programs: openpbr::program::ProgramSet<(openpbr::FlowKey, u32)>,
+    #[cfg(test)]
     restir_programs: Vec<openpbr::program::ProgramSet<(openpbr::FlowKey, u32)>>,
     #[cfg(test)]
     emitter_capabilities: u32,
     hit: materials::HitFeatures,
+    code: [blake3::Hash; 3],
     regular: Renderer,
     reordered: Option<Renderer>,
     // Guide独立于PT/ReSTIR照明管线；资源期准备两种SER设置，帧间仅重绑。
@@ -1582,6 +1595,20 @@ impl Gpu {
         } else {
             0
         };
+        let prepare_started = std::time::Instant::now();
+        let workers = match std::env::var("PRIME_PT_SHADER_JOBS") {
+            Ok(value) => value
+                .parse::<std::num::NonZeroUsize>()
+                .map_err(|_| Error::Invalid("PRIME_PT_SHADER_JOBS须为正整数"))?,
+            Err(std::env::VarError::NotPresent) => std::num::NonZeroUsize::new(
+                std::thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(8),
+            )
+            .unwrap(),
+            Err(_) => return Err(Error::Invalid("PRIME_PT_SHADER_JOBS须为正整数")),
+        };
+        let mut batch = self.compiler.batch();
         let hit = materials::hit_features(definitions);
         let coverage = format!("-DPRIMEPT_COVERAGE_MASK={}", hit.coverage);
         let emitter_capabilities = materials::emitter_capabilities(definitions, keys);
@@ -1598,12 +1625,12 @@ impl Gpu {
             &self.shader_source
         };
         let compile_programs = if dispatch == 8 {
-            openpbr::program::ProgramSet::compile_hit_variants
+            openpbr::program::ProgramSet::queue_hit_variants
         } else {
-            openpbr::program::ProgramSet::compile_variants
+            openpbr::program::ProgramSet::queue_variants
         };
         let programs = compile_programs(
-            &self.compiler,
+            &mut batch,
             keys.iter().copied(),
             openpbr::program::Template {
                 source: program_source
@@ -1637,8 +1664,8 @@ impl Gpu {
             &emitters,
         ];
         let material_hits = if (2..=7).contains(&dispatch) {
-            Some(openpbr::program::ProgramSet::compile_hit_variants(
-                &self.compiler,
+            Some(openpbr::program::ProgramSet::queue_hit_variants(
+                &mut batch,
                 programs.plan().keys().iter().copied(),
                 openpbr::program::Template {
                     source: self
@@ -1654,21 +1681,13 @@ impl Gpu {
         } else {
             None
         };
-        let mut hit_shaders: Vec<_> = if dispatch == 8 {
-            programs.artifacts()
-        } else {
-            material_hits
-                .as_ref()
-                .map_or(&[][..], |set| set.artifacts())
-        }
-        .iter()
-        .map(|a| RayShader {
-            spirv: a.bytes(),
-            entry: c"shade_hit",
-        })
-        .collect();
-        let compile_stage = |source: &Path, entry, stage, output, args: &[&str]| {
-            self.compiler.compile(&shader_build::Recipe {
+        let compile_stage = |batch: &mut shader_build::RuntimeBatch<'_>,
+                             source: &Path,
+                             entry,
+                             stage,
+                             output,
+                             args: &[&str]| {
+            batch.queue(&shader_build::Recipe {
                 source: source.to_str().ok_or(shader_build::Error::Configuration(
                     "shader路径不是UTF-8".into(),
                 ))?,
@@ -1718,6 +1737,7 @@ impl Gpu {
         let fused = (dispatch != 0)
             .then(|| {
                 compile_stage(
+                    &mut batch,
                     program_source,
                     "render_fused",
                     "raygeneration",
@@ -1730,6 +1750,7 @@ impl Gpu {
         let guided = (dispatch == 8)
             .then(|| {
                 compile_stage(
+                    &mut batch,
                     &guide_rg,
                     "guide_main",
                     "raygeneration",
@@ -1741,6 +1762,7 @@ impl Gpu {
         let guided_ser = (dispatch == 8 && self.context.capabilities().invocation_reorder)
             .then(|| {
                 compile_stage(
+                    &mut batch,
                     &guide_rg,
                     "guide_main",
                     "raygeneration",
@@ -1752,6 +1774,7 @@ impl Gpu {
         let fused_ser = (dispatch != 0 && self.context.capabilities().invocation_reorder)
             .then(|| {
                 compile_stage(
+                    &mut batch,
                     program_source,
                     "render_fused",
                     "raygeneration",
@@ -1791,12 +1814,12 @@ impl Gpu {
                 if let Some(geometry) = leaf_geometry {
                     args.extend([geometry, "-capability", "spvRayTracingPositionFetchKHR"]);
                 }
-                openpbr::program::ProgramSet::compile_hit_variants
+                openpbr::program::ProgramSet::queue_hit_variants
             } else {
-                openpbr::program::ProgramSet::compile_variants
+                openpbr::program::ProgramSet::queue_variants
             };
             restir_sets.push(compile(
-                &self.compiler,
+                &mut batch,
                 programs
                     .plan()
                     .keys()
@@ -1833,7 +1856,7 @@ impl Gpu {
             )?);
         }
         // 每个操作按真实消费者独立去重；36B/PT键记录九个完整u32操作槽。
-        let restir_counts: [usize; 9] = std::array::from_fn(|i| restir_sets[i].artifacts().len());
+        let restir_counts: [usize; 9] = std::array::from_fn(|i| restir_sets[i].plan().keys().len());
         let [
             initial_count,
             replay_count,
@@ -1845,8 +1868,8 @@ impl Gpu {
             _,
             initial_direct_count,
         ] = restir_counts;
-        let guide_hits = openpbr::program::ProgramSet::compile_hit_variants(
-            &self.compiler,
+        let guide_hits = openpbr::program::ProgramSet::queue_hit_variants(
+            &mut batch,
             programs
                 .plan()
                 .keys()
@@ -1870,6 +1893,111 @@ impl Gpu {
                 ],
             },
         )?;
+        let initial_ser_bits = format!(
+            "-DPRIMEPT_SER_BITS={}",
+            (initial_count + initial_direct_count)
+                .next_power_of_two()
+                .ilog2()
+        );
+        let mut initial_args = vec![
+            "-fp-mode",
+            "precise",
+            "-capability",
+            "spvShaderInvocationReorderEXT",
+            "-DPRIMEPT_INITIAL_HIT=1",
+            &initial_ser_bits,
+            &emitters,
+        ];
+        if (4..=5).contains(&dispatch) {
+            initial_args.extend([
+                "-DPRIMEPT_HIT_GEOMETRY=1",
+                "-capability",
+                "spvRayTracingPositionFetchKHR",
+            ]);
+        }
+        if matches!(dispatch, 6..=8) {
+            initial_args.extend([
+                if dispatch == 6 {
+                    "-DPRIMEPT_HIT_GEOMETRY_LOAD=1"
+                } else {
+                    "-DPRIMEPT_HIT_GEOMETRY_LEAF=1"
+                },
+                "-capability",
+                "spvRayTracingPositionFetchKHR",
+            ]);
+        }
+        if dispatch == 5 {
+            initial_args.push("-DPRIMEPT_HIT_HINT=1");
+        }
+        if dispatch == 8 {
+            initial_args.push("-DPRIMEPT_SEPARATE_GUIDES=1");
+        }
+        let restir_rg = self.shader_source.with_file_name("restir.slang");
+        let initial_ser_args: Vec<_> = initial_args
+            .iter()
+            .copied()
+            .chain(["-DPRIMEPT_SER=1"])
+            .collect();
+        let initial = hit_initial
+            .then(|| {
+                compile_stage(
+                    &mut batch,
+                    &restir_rg,
+                    "restir_initial",
+                    "raygeneration",
+                    "initial-hit.spv",
+                    &initial_args,
+                )
+            })
+            .transpose()?;
+        let initial_ser = (hit_initial && self.context.capabilities().invocation_reorder)
+            .then(|| {
+                compile_stage(
+                    &mut batch,
+                    &restir_rg,
+                    "restir_initial",
+                    "raygeneration",
+                    "initial-hit.spv",
+                    &initial_ser_args,
+                )
+            })
+            .transpose()?;
+        eprintln!(
+            "[prime_pt] shader_prepare begin tasks={} workers={}",
+            batch.task_count(),
+            workers
+        );
+        let mut compiled = batch.compile(workers)?;
+        let compile_statistics = compiled.statistics();
+        let programs = programs.finish(&mut compiled)?;
+        let material_hits = material_hits
+            .map(|set| set.finish(&mut compiled))
+            .transpose()?;
+        let restir_sets = restir_sets
+            .into_iter()
+            .map(|set| set.finish(&mut compiled))
+            .collect::<Result<Vec<_>, _>>()?;
+        let guide_hits = guide_hits.finish(&mut compiled)?;
+        let mut take = |ticket| compiled.take(ticket);
+        let fused = fused.map(&mut take).transpose()?;
+        let fused_ser = fused_ser.map(&mut take).transpose()?;
+        let guided = guided.map(&mut take).transpose()?;
+        let guided_ser = guided_ser.map(&mut take).transpose()?;
+        let initial = initial.map(&mut take).transpose()?;
+        let initial_ser = initial_ser.map(&mut take).transpose()?;
+        let mut hit_shaders: Vec<_> = if dispatch == 8 {
+            programs.artifacts()
+        } else {
+            material_hits
+                .as_ref()
+                .map_or(&[][..], |set| set.artifacts())
+        }
+        .iter()
+        .map(|a| RayShader {
+            spirv: a.bytes(),
+            entry: c"shade_hit",
+        })
+        .collect();
         if dispatch != 8 {
             hit_shaders.extend(guide_hits.artifacts().iter().map(|artifact| RayShader {
                 spirv: artifact.bytes(),
@@ -1964,45 +2092,6 @@ impl Gpu {
             self.program_lighting,
         );
         let restir_post = Bindings::new(&mut self.context, &descriptors.1)?;
-        let initial_ser_bits = format!(
-            "-DPRIMEPT_SER_BITS={}",
-            (initial_count + initial_direct_count)
-                .next_power_of_two()
-                .ilog2()
-        );
-        let mut initial_args = vec![
-            "-fp-mode",
-            "precise",
-            "-capability",
-            "spvShaderInvocationReorderEXT",
-            "-DPRIMEPT_INITIAL_HIT=1",
-            &initial_ser_bits,
-            &emitters,
-        ];
-        if (4..=5).contains(&dispatch) {
-            initial_args.extend([
-                "-DPRIMEPT_HIT_GEOMETRY=1",
-                "-capability",
-                "spvRayTracingPositionFetchKHR",
-            ]);
-        }
-        if matches!(dispatch, 6..=8) {
-            initial_args.extend([
-                if dispatch == 6 {
-                    "-DPRIMEPT_HIT_GEOMETRY_LOAD=1"
-                } else {
-                    "-DPRIMEPT_HIT_GEOMETRY_LEAF=1"
-                },
-                "-capability",
-                "spvRayTracingPositionFetchKHR",
-            ]);
-        }
-        if dispatch == 5 {
-            initial_args.push("-DPRIMEPT_HIT_HINT=1");
-        }
-        if dispatch == 8 {
-            initial_args.push("-DPRIMEPT_SEPARATE_GUIDES=1");
-        }
         // 单一操作表提供SBT索引和实际模块。初采只为本设备的命中或callable入口编译一次。
         let mut restir_hits = Vec::new();
         let mut restir_callables = Vec::new();
@@ -2040,57 +2129,52 @@ impl Gpu {
                 entry: c"guide_hit",
             }));
         }
-        let restir_rg = self.shader_source.with_file_name("restir.slang");
-        let initial_ser_args: Vec<_> = initial_args
-            .iter()
-            .copied()
-            .chain(["-DPRIMEPT_SER=1"])
-            .collect();
-        let initial = hit_initial
-            .then(|| {
-                compile_stage(
-                    &restir_rg,
-                    "restir_initial",
-                    "raygeneration",
-                    "initial-hit.spv",
-                    &initial_args,
-                )
-            })
-            .transpose()?;
-        let initial_ser = (hit_initial && self.context.capabilities().invocation_reorder)
-            .then(|| {
-                compile_stage(
-                    &restir_rg,
-                    "restir_initial",
-                    "raygeneration",
-                    "initial-hit.spv",
-                    &initial_ser_args,
-                )
-            })
-            .transpose()?;
-        let same_material_code = self
-            .generation
-            .as_ref()
-            .is_some_and(|previous| hit == previous.hit && programs.same_code(&previous.programs));
-        let same_code = same_material_code
-            && self
-                .generation
-                .as_ref()
-                .is_some_and(|p| dispatch == p.dispatch);
+        // 比较实际链接代码；局部Guide/RG修改不能借用未变化材质叶子的身份复用旧管线。
+        let code = [
+            program_identity(
+                programs
+                    .artifacts()
+                    .iter()
+                    .chain(material_hits.iter().flat_map(|set| set.artifacts()))
+                    .chain(fused.iter())
+                    .chain(fused_ser.iter())
+                    .chain(guide_hits.artifacts().iter().filter(|_| dispatch != 8)),
+            ),
+            program_identity(
+                guide_hits
+                    .artifacts()
+                    .iter()
+                    .chain(guided.iter())
+                    .chain(guided_ser.iter()),
+            ),
+            program_identity(
+                restir_sets
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| dispatch != 8 || *index != 7)
+                    .flat_map(|(_, set)| set.artifacts())
+                    .chain(initial.iter())
+                    .chain(initial_ser.iter())
+                    .chain(guide_hits.artifacts().iter().filter(|_| dispatch != 8)),
+            ),
+        ];
+        let same_code = self.generation.as_ref().is_some_and(|previous| {
+            hit == previous.hit && dispatch == previous.dispatch && code[0] == previous.code[0]
+        });
+        let same_guide_code = self.generation.as_ref().is_some_and(|previous| {
+            hit == previous.hit && dispatch == previous.dispatch && code[1] == previous.code[1]
+        });
         let restir_dispatch = |mode| match mode {
             0 | 1 => 0,
             2 | 3 => 2,
             other => other,
         };
-        let same_restir_code = same_material_code
-            && self.generation.as_ref().is_some_and(|previous| {
-                restir_dispatch(dispatch) == restir_dispatch(previous.dispatch)
-                    && previous.restir_programs.len() == restir_sets.len()
-                    && restir_sets
-                        .iter()
-                        .zip(&previous.restir_programs)
-                        .all(|(current, previous)| current.same_code(previous))
-            });
+        let same_restir_code = self.generation.as_ref().is_some_and(|previous| {
+            hit == previous.hit
+                && restir_dispatch(dispatch) == restir_dispatch(previous.dispatch)
+                && code[2] == previous.code[2]
+        });
+        let pipelines_started = std::time::Instant::now();
         let restir = if same_restir_code {
             self.generation.as_ref().unwrap().restir.resize(
                 &mut self.context,
@@ -2233,7 +2317,7 @@ impl Gpu {
                              code: Option<&shader_build::Artifact>,
                              old: Option<RayTracingPipeline>| {
             code.map(|code| {
-                if same_code && let Some(old) = old {
+                if same_guide_code && let Some(old) = old {
                     old.rebind(context, trace)
                 } else {
                     RayTracingPipeline::with_hit_groups(
@@ -2277,15 +2361,30 @@ impl Gpu {
                 .map(|a| a.bytes().len() as u64)
                 .sum(),
         ];
+        eprintln!(
+            "[prime_pt] shader_prepare complete tasks={} cache_hits={} compiled={} workers={} shader_ms={} pipeline_ms={} total_ms={} reuse_pt={} reuse_guides={} reuse_restir={}",
+            compile_statistics.tasks,
+            compile_statistics.cache_hits,
+            compile_statistics.tasks - compile_statistics.cache_hits,
+            compile_statistics.workers,
+            compile_statistics.elapsed.as_millis(),
+            pipelines_started.elapsed().as_millis(),
+            prepare_started.elapsed().as_millis(),
+            same_code,
+            same_guide_code,
+            same_restir_code
+        );
         Ok((
             resources,
             MaterialGeneration {
                 dispatch,
                 programs,
+                #[cfg(test)]
                 restir_programs: restir_sets,
                 #[cfg(test)]
                 emitter_capabilities,
                 hit,
+                code,
                 regular,
                 reordered,
                 guide_regular,
