@@ -151,7 +151,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'slang'
     }
     from('crates/renderer/shaders') {
-        include 'primary.slang', 'pt_hit.slang', 'restir.slang', 'guide_material.slang', 'initial_hit.slang',
+        include 'primary.slang', 'pt_hit.slang', 'restir.slang', 'guides.slang', 'guide_material.slang', 'initial_hit.slang',
                 'params.slang', 'mod_*.slang', 'restir_*.slang'
         exclude 'restir_probe.slang'
         into 'shaders/prime'
@@ -165,7 +165,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         def directory = runtimeDirectory.get().asFile
         def required = nativeFiles + vcFiles + (slangFiles + vcFiles).collect { 'slang/' + it } +
                 ['slang/LICENSE', 'shaders/prime/primary.slang', 'shaders/prime/pt_hit.slang',
-                 'shaders/prime/guide_material.slang', 'shaders/prime/initial_hit.slang',
+                 'shaders/prime/guides.slang', 'shaders/prime/guide_material.slang', 'shaders/prime/initial_hit.slang',
                  'shaders/prime/restir.slang',
                  'shaders/prime/restir_geometry.slang', 'shaders/prime/restir_material.slang',
                  'shaders/engine/pt/scene.slang', 'shaders/engine/pt/hit_transport.slang',

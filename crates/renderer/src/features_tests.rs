@@ -144,8 +144,8 @@ fn hardware_pt_rr_keyed_program_preserves_opaque_and_glass_guides()
         upload(&mut gpu, &definitions, &[], &[[u32::MAX, 0, 0, 0]; 2])?;
         assert_eq!(gpu.generation.as_ref().unwrap().dispatch, mode);
         let generation = gpu.generation.as_ref().unwrap();
-        assert_eq!(generation.guided_regular.is_some(), mode == 8);
-        assert_eq!(generation.guided_reordered.is_some(), mode == 8);
+        assert_eq!(generation.guide_regular.is_some(), mode == 8);
+        assert_eq!(generation.guide_reordered.is_some(), mode == 8);
         for with_glass in [false, true] {
             let mut mesh = Mesh::default();
             add_quad(&mut mesh, 3., [0.5; 2], [0.8, 0.5, 0.2], 10.);

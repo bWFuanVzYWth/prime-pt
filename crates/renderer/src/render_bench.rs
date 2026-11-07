@@ -23,13 +23,14 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
     }
     let quality_mean = std::env::var_os("PRIME_PT_DISPATCH_QUALITY_MEAN").is_some();
     let rounds = if quality_mean { 1 } else { modes.len() * 2 };
-    let extent = [960, 540];
-    let warmup = 60;
-    let samples = 120;
+    let extent = [3840, 2160];
+    let warmup = if quality_mean { 60 } else { 20 };
+    let samples = if quality_mean { 120 } else { 30 };
+    let rr = std::env::var_os("PRIME_PT_DISPATCH_RR").is_some();
     let spp: u32 = std::env::var("PRIME_PT_DISPATCH_SPP")
         .unwrap_or_else(|_| "1".into())
         .parse()?;
-    let options = Options::new(false, streamline::Quality::Dlaa, spp, 12)?;
+    let options = Options::new(rr, streamline::Quality::Dlaa, spp, 12)?;
     let cases: &[(RealtimeRenderer, bool)] =
         match std::env::var("PRIME_PT_DISPATCH_CASE").as_deref() {
             Ok("pt") => &[(RealtimeRenderer::PathTrace, false)],
@@ -44,7 +45,27 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
             ],
             _ => return Err("PRIME_PT_DISPATCH_CASE须省略或为pt/restir".into()),
         };
-    let host = Host::new_ser()?;
+    let conductor = std::env::var("PRIME_PT_DISPATCH_SCENE").as_deref() == Ok("conductor");
+    let scale = (0.5f32).tan();
+    let fixed_camera = if conductor {
+        Camera {
+            origin: [32., 32., 48., 0.],
+            forward: [0., 0., -1., 0.],
+            right: [scale * 3840. / 2160., 0., 0., 0.],
+            up: [0., scale, 0., 0.],
+        }
+    } else {
+        camera()
+    };
+    let environment = if conductor {
+        Environment {
+            sea_level: 0.,
+            ..Environment::default()
+        }
+    } else {
+        Environment::default()
+    };
+    let host = Host::create(rr, true)?;
     let mut definitions = vec![MaterialDefinition::default(); 6];
     for material in &mut definitions {
         material.control = [0, 3, 0, 0];
@@ -109,7 +130,60 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
             MaterialId::new(id),
         ));
     }
+    if conductor {
+        // 与Game的64×64×1 Gold板相同边界、相机、0.24粗糙度和线性颜色；保留各宿主真实材质访问。
+        let gold = MaterialDefinition {
+            base_roughness: [0.72, 0.47, 0.065, 0.24],
+            surface: [1.5, 1., 0., 0.],
+            ..Default::default()
+        };
+        definitions.fill(gold);
+        mesh.quads.clear();
+        let mut add = |v| {
+            mesh.quads.push(Quad::with_material(
+                v,
+                [[0.5; 2]; 4],
+                [1.; 3],
+                MaterialId::new(0),
+            ))
+        };
+        for y in 0..64 {
+            for x in 0..64 {
+                let (x, y) = (x as f32, y as f32);
+                add([
+                    [x, y, 2.],
+                    [x + 1., y, 2.],
+                    [x + 1., y + 1., 2.],
+                    [x, y + 1., 2.],
+                ]);
+                add([
+                    [x, y, 1.],
+                    [x, y + 1., 1.],
+                    [x + 1., y + 1., 1.],
+                    [x + 1., y, 1.],
+                ]);
+            }
+        }
+        for v in 0..64 {
+            let v = v as f32;
+            add([[0., v, 1.], [0., v, 2.], [0., v + 1., 2.], [0., v + 1., 1.]]);
+            add([
+                [64., v, 1.],
+                [64., v + 1., 1.],
+                [64., v + 1., 2.],
+                [64., v, 2.],
+            ]);
+            add([[v, 0., 1.], [v + 1., 0., 1.], [v + 1., 0., 2.], [v, 0., 2.]]);
+            add([
+                [v, 64., 1.],
+                [v, 64., 2.],
+                [v + 1., 64., 2.],
+                [v + 1., 64., 1.],
+            ]);
+        }
+    }
     let mut gpu = host.gpu()?;
+    gpu.test_center_film = true;
     gpu.experiment_dispatch = modes[0];
     let started = std::time::Instant::now();
     gpu.replace_resources(ResourceUpload {
@@ -189,6 +263,17 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let gpu = &mut gpu;
+    if !quality_mean {
+        let queries =
+            vulkan::native::TimestampQueries::new(&mut gpu.context, 4 * if rr { 1 } else { spp })?;
+        gpu.test_roots.push(queries.into());
+        gpu.test_pt_timestamps = Some(queries);
+        if rr {
+            let queries = vulkan::native::TimestampQueries::new(&mut gpu.context, 2)?;
+            gpu.test_roots.push(queries.into());
+            gpu.test_guide_timestamps = Some(queries);
+        }
+    }
     let mut records = Vec::new();
     for &(renderer, cv) in cases {
         for round in 0..rounds {
@@ -203,6 +288,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                     variants[active] = gpu.generation.replace(variants[index].take().unwrap());
                     active = index;
                     gpu.renderer = None;
+                    gpu.guide_pipeline = None;
                     gpu.restir_dirty = true;
                 }
                 gpu.set_rendering(RenderMode::Realtime, renderer)?;
@@ -218,14 +304,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                 })?;
                 gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., false, cv)?)?;
                 for _ in 0..20 {
-                    host.render_profiled(
-                        gpu,
-                        &output,
-                        &camera(),
-                        Environment::default(),
-                        options,
-                        None,
-                    )?;
+                    host.render_profiled(gpu, &output, &fixed_camera, environment, options, None)?;
                 }
                 if renderer == RealtimeRenderer::RestirPt {
                     gpu.restir
@@ -250,6 +329,8 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     None
                 };
+                let mut pt_timings = Vec::new();
+                let mut guide_timings = Vec::new();
                 for frame in 0..warmup + samples {
                     if renderer == RealtimeRenderer::PathTrace {
                         gpu.transition_history(history::Event::Accumulation(
@@ -259,8 +340,8 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                     let timing = host.render_profiled(
                         gpu,
                         &output,
-                        &camera(),
-                        Environment::default(),
+                        &fixed_camera,
+                        environment,
                         options,
                         pair,
                     )?;
@@ -281,6 +362,23 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         } else {
                             timings.push(timing);
+                        }
+                        if renderer == RealtimeRenderer::PathTrace
+                            && let Some(queries) = gpu.test_pt_timestamps
+                        {
+                            let ticks = queries.read(&gpu.context)?.ok_or("PT时间戳未完成")?;
+                            pt_timings.push([
+                                queries.elapsed_ns(&gpu.context, ticks[0], ticks[1])?,
+                                queries.elapsed_ns(&gpu.context, ticks[2], ticks[3])?,
+                            ]);
+                        }
+                        if let Some(queries) = gpu.test_guide_timestamps {
+                            let ticks = queries.read(&gpu.context)?.ok_or("Guide时间戳未完成")?;
+                            guide_timings.push(queries.elapsed_ns(
+                                &gpu.context,
+                                ticks[0],
+                                ticks[1],
+                            )?);
                         }
                         if renderer == RealtimeRenderer::RestirPt
                             && let Some(queries) = stage_queries
@@ -358,12 +456,12 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                         "pt_native_sbt_hit_groups":1+if modes[index]==8 {generation.programs.artifacts().len()}
                             else if modes[index]>=2 {generation.programs.artifacts().len()+counts[7]}
                             else if modes[index]>0 {counts[7]} else {0},
-                        "pt_guided_sbt_hit_groups":1+if modes[index]>=2 {generation.programs.artifacts().len()+counts[7]}
+                        "pt_guided_sbt_hit_groups":1+if modes[index]==8 {counts[7]} else if modes[index]>=2 {generation.programs.artifacts().len()+counts[7]}
                             else if modes[index]>0 {counts[7]} else {0},
                         "pt_sbt_callables":if modes[index]<2 {generation.programs.artifacts().len()} else {0},
-                        "pt_prepared_variants":1+usize::from(generation.reordered.is_some())+usize::from(generation.guided_regular.is_some())+usize::from(generation.guided_reordered.is_some()),
-                        "rr_program_addition":{"pipeline_prepare_ns":generation.guided_program_cost[0],"tracked_gpu_allocation_bytes":generation.guided_program_cost[1],"retained_cpu_bytes":generation.guided_program_cost[2],"raygen_spirv_bytes":generation.guided_program_cost[3],"driver_private_memory":"not exposed"},
-                        "initial_sbt_callables":counts[7]+if generation.dispatch < 2 {counts[0]+counts[8]} else {0},
+                        "pt_prepared_variants":1+usize::from(generation.reordered.is_some())+usize::from(generation.guide_regular.is_some())+usize::from(generation.guide_reordered.is_some()),
+                        "rr_program_addition":{"pipeline_prepare_ns":generation.guide_program_cost[0],"tracked_gpu_allocation_bytes":generation.guide_program_cost[1],"retained_cpu_bytes":generation.guide_program_cost[2],"raygen_spirv_bytes":generation.guide_program_cost[3],"driver_private_memory":"not exposed"},
+                        "initial_sbt_callables":if generation.dispatch==8 {0} else {counts[7]+if generation.dispatch < 2 {counts[0]+counts[8]} else {0}},
                         "shift_sbt_callables":counts[1..7].iter().sum::<usize>(),
                         "operation_table_bytes":36*generation.programs.plan().keys().len()+32,
                     })
@@ -375,7 +473,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
                 let row = serde_json::json!({"renderer":format!("{renderer:?}"),"cv":cv,"round":round,"position":step,
                     "driver_stack_bytes":stacks,"immutable_programs":program_roots,"material_programs":material_programs,"frame_parameters":parameter_bytes.as_chunks::<4>().0.iter().map(|w|u32::from_le_bytes(*w)).collect::<Vec<_>>(),
-                    "variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"quality_only":quality_mean,"mean_frames":if quality_mean {samples} else {0},"mean_image":mean_image,"mean_blake3":mean_blake3,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
+                    "variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"pt_trace_post_ns":pt_timings,"guide_ns":guide_timings,"quality_only":quality_mean,"mean_frames":if quality_mean {samples} else {0},"mean_image":mean_image,"mean_blake3":mean_blake3,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
                 std::fs::write(
                     directory.join(format!("{renderer:?}-cv{cv}-r{round}-v{index}.json")),
                     serde_json::to_vec_pretty(&row)?,
@@ -395,7 +493,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::write(
         directory.join("results.json"),
         serde_json::to_vec_pretty(&serde_json::json!({"modes":modes,"rounds":rounds,
-        "extent":extent,"warmup":warmup,"samples":samples,"spp":spp,"bounces":12,"ser":true,"rr":false,
+        "scene":if conductor {"conductor"} else {"materials"},"quads":mesh.quads.len(),"extent":extent,"warmup":warmup,"samples":samples,"spp":spp,"bounces":12,"ser":true,"rr":rr,"jitter":[0,0],"pixel_center":true,
         "preparation":preparation,"quality_only":quality_mean,"scope":if quality_mean {"独立质量运行；逐帧readback，以f64导出120帧线性HDR均值，不可用于性能计时"} else {"CPU draw录制含回收；GPU完整draw；准备/场景更新/读回/窗口不计入稳态"},
         "stage_order":simple_engine::restir_pt::Stage::sequence(true).map(|stage|format!("{stage:?}")).collect::<Vec<_>>(),
         "stage_markers":stage_queries.is_some(),

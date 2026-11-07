@@ -80,7 +80,11 @@ public struct GuideTrace : pt::IKeyGuideTrace
         if (!found.IsHit())
             return false;
         uint primitive = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
+#ifdef PRIMEPT_SEPARATE_GUIDES
+        uint program = guide_slot(primitive);
+#else
         uint program = guide_program(primitive, false, restir);
+#endif
         found.SetShaderTableIndex(program + 1u);
         pt::KeyGuideCall call = {};
         call.value.medium = incident;
@@ -100,13 +104,13 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
     public pt::DenoiseCamera current;
     public pt::DenoiseCamera previous;
 
-    void write_key<Trace : pt::IKeyGuideTrace>(Trace provider, pt::KeyGuideVertex first,
-                                               pt::TransportCall data)
+    public void write_key<Trace : pt::IKeyGuideTrace>(Trace provider, pt::KeyGuideVertex first,
+                                                      float3 origin, float3 direction,
+                                                      float4 incident)
     {
         Params p = parameters[0];
         pt::KeyGuideEndpoint endpoint =
-            pt::trace_key_guide(provider, first, data.path.origin, data.path.direction,
-                                data.path.medium, p.options.y, false);
+            pt::trace_key_guide(provider, first, origin, direction, incident, p.options.y, false);
         pt::GuideProjection projection = pt::project_guide(
             endpoint.endpoint, current, previous, film, p.image.xy, p.reconstruction.z > 0);
         pt::DenoiseGuides albedos = endpoint.albedos;
@@ -117,8 +121,7 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
         guide_specular[coordinate] = float4(albedos.specular_albedo, 0);
 
         pt::KeyGuideEndpoint reflection =
-            pt::trace_key_guide(provider, first, data.path.origin, data.path.direction,
-                                data.path.medium, p.options.y, true);
+            pt::trace_key_guide(provider, first, origin, direction, incident, p.options.y, true);
         pt::GuideProjection reflected = pt::project_guide(reflection.endpoint, current, previous,
                                                           film, p.image.xy, p.reconstruction.z > 0);
         guide_distance[coordinate] =
@@ -139,18 +142,20 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
 #endif
         HitObject::Invoke(found, call);
         GuideTrace provider = { false };
-        write_key(provider, call.value, data);
+        write_key(provider, call.value, data.path.origin, data.path.direction, data.path.medium);
     }
 
     public void surface_known(restir_pt::HitInfo identity, pt::TransportCall data)
     {
         pt::KeyGuideVertex first =
             known_guide_vertex(identity, data.path.direction, data.path.medium);
-#ifdef PRIMEPT_SER
+// 原生初采的兼容变体只用known-surface Guide；完整HG的Guide由独立管线调度。
+#if defined(PRIMEPT_SER) && !defined(PRIMEPT_INITIAL_HIT)
         GuideTrace provider = { true };
-        write_key(provider, first, data);
+        write_key(provider, first, data.path.origin, data.path.direction, data.path.medium);
 #else
-        write_key(RestirGuideTrace(), first, data);
+        write_key(RestirGuideTrace(), first, data.path.origin, data.path.direction,
+                  data.path.medium);
 #endif
     }
 
@@ -180,11 +185,15 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
 
     public void environment(pt::TransportCall data)
     {
+        sky(data.path.direction);
+    }
+
+    public void sky(float3 direction)
+    {
         guide_depth[coordinate] = pt::DENOISE_SKY_DEPTH;
         float2 pixels = 0;
         if (parameters[0].reconstruction.z > 0 &&
-            (!pt::denoise_motion(previous, film, data.path.direction, true, parameters[0].image.xy,
-                                 pixels) ||
+            (!pt::denoise_motion(previous, film, direction, true, parameters[0].image.xy, pixels) ||
              any(abs(pixels) > 65504)))
             pixels = 0;
         guide_motion[coordinate] = pixels;

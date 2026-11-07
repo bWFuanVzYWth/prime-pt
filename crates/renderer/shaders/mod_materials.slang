@@ -89,6 +89,13 @@ public uint metadata_program(uint primitive)
     return local + material_words.Load((header + 1u) * 4u);
 }
 
+/// 独立Guide SBT只有本操作的紧凑槽，不读取其他积分器的段偏移。
+public uint guide_slot(uint primitive)
+{
+    uint pointer = material_words.Load(material_id(primitive) * 112u + 68u) >> 2u;
+    return material_words.Load((pointer + MATERIAL_GUIDE) * 4u);
+}
+
 public uint guide_program(uint primitive, bool known, bool restir)
 {
     uint2 control = material_words.Load2(material_id(primitive) * 112u + 64u);

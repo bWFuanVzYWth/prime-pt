@@ -139,6 +139,7 @@ void restir_initial()
     if (p.restir.w > 0)
         restir_output[linear] = float4(initial.reservoir.integrand * initial.reservoir.weight, 0);
     restir_residual[linear] = float4(initial.residual, distance);
+#ifndef PRIMEPT_SEPARATE_GUIDES
     if (p.reconstruction.w == 2)
     {
         pt::TransportCall data = {};
@@ -158,6 +159,7 @@ void restir_initial()
         else
             guides.environment(data);
     }
+#endif
 }
 
 // 准入只恢复几何，不重复翻译材质；两个方向分别加载自己的目标表面。

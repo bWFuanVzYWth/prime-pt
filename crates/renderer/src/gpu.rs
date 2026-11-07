@@ -8,14 +8,15 @@
 //!
 //! 首次加载和资源重载先准备材质范围、静态发光 alias、Slang callable 及普通／SER 管线与 SBT，
 //! 成功后一次发布资源世代，失败保留上一代。切换已支持的 SER 变体只选择现有程序。
-//! 完整HG的原生与RR程序也分别在此准备；原生不链接Guide Hit Group，RR保留专用导引。
+//! 完整HG照明与RR导引独立准备；启用RR不改变照明调用图，导引每帧只执行一次。
 //! region 增量更新复用已准备的材质资源，旧 GPU 资源在最后一次实际使用完成后退役。
 //! 局部几何变动按 region 重建 BLAS，纯 tint 走属性更新，anchor 变化更新 TLAS 平移。
 //!
 //! 普通PT的完整Hit Group/专用导引要求设备已启用`VK_EXT_ray_tracing_invocation_reorder`；
 //! 是否实际执行SER由设置选择。未启用该能力时保留Flow callable兼容路径，其作者法线预解码
 //! 与旧导引仍是通用实现，不属于完整Hit Group路径的逐阶段材质裁剪保证。ReSTIR已知表面
-//! 使用独立的专用callable，不要求EXT能力。
+//! 使用独立的专用callable，不要求EXT能力；完整HG设备的导引单独重追相机射线，
+//! Guide与初采不共享HitObject调用图和payload存活区间。
 
 use crate::scene::{Camera, Environment, Mesh};
 use prime_scene::MaterialDefinition;
@@ -47,7 +48,8 @@ use simple_engine::vulkan::{
     interop::RayShader,
     native::{
         Binding, Bindings, Buffer, Capabilities, Commands, ComputePipeline, Context,
-        ExternalBinding, ExternalKind, Flight, Image, ImageFormat, RawDevice, Recorded, Sampler,
+        ExternalBinding, ExternalKind, Flight, Image, ImageFormat, RawDevice, RayTracingPipeline,
+        Recorded, Sampler,
     },
 };
 
@@ -609,26 +611,18 @@ struct MaterialGeneration {
     hit: materials::HitFeatures,
     regular: Renderer,
     reordered: Option<Renderer>,
-    // mode8原生与RR分别驻留无Guide、keyed Guide程序；逐帧只选择并重绑。
-    guided_regular: Option<Renderer>,
-    guided_reordered: Option<Renderer>,
+    // Guide独立于PT/ReSTIR照明管线；资源期准备两种SER设置，帧间仅重绑。
+    guide_regular: Option<RayTracingPipeline>,
+    guide_reordered: Option<RayTracingPipeline>,
     #[cfg(test)]
-    guided_program_cost: [u64; 4],
+    guide_program_cost: [u64; 4],
     restir: restir::Restir,
     restir_reordered: Option<restir::Restir>,
 }
 
 impl MaterialGeneration {
-    fn pt_program(&self, reordered: bool, guides: bool) -> &Renderer {
-        if guides && self.dispatch == 8 {
-            if reordered {
-                self.guided_reordered
-                    .as_ref()
-                    .expect("资源期已准备SER RR程序")
-            } else {
-                self.guided_regular.as_ref().expect("资源期已准备RR程序")
-            }
-        } else if reordered {
+    fn pt_program(&self, reordered: bool) -> &Renderer {
+        if reordered {
             self.reordered.as_ref().expect("资源期已准备SER程序")
         } else {
             &self.regular
@@ -639,8 +633,8 @@ impl MaterialGeneration {
         self.regular
             .roots()
             .chain(self.reordered.iter().flat_map(Renderer::roots))
-            .chain(self.guided_regular.iter().flat_map(Renderer::roots))
-            .chain(self.guided_reordered.iter().flat_map(Renderer::roots))
+            .chain(self.guide_regular.map(vulkan::native::Resource::from))
+            .chain(self.guide_reordered.map(vulkan::native::Resource::from))
             .chain(self.restir.roots())
             .chain(self.restir_reordered.iter().flat_map(restir::Restir::roots))
     }
@@ -755,6 +749,7 @@ pub struct Gpu {
     shader_source: PathBuf,
     generation: Option<MaterialGeneration>,
     renderer: Option<Renderer>,
+    guide_pipeline: Option<RayTracingPipeline>,
     renderer_kind: prime_scene::RealtimeRenderer,
     restir: Option<restir::Restir>,
     restir_geometry: Option<Buffer>,
@@ -767,6 +762,12 @@ pub struct Gpu {
     // 测试宿主持有的native输出；生产输出由宿主管理，不进入资源表。
     #[cfg(test)]
     test_roots: Vec<vulkan::native::Resource>,
+    #[cfg(test)]
+    test_pt_timestamps: Option<vulkan::native::TimestampQueries>,
+    #[cfg(test)]
+    test_guide_timestamps: Option<vulkan::native::TimestampQueries>,
+    #[cfg(test)]
+    test_center_film: bool,
     settings: pt::Settings,
     invocation_reorder: bool,
     display_origin: std::time::Instant,
@@ -825,6 +826,7 @@ impl Gpu {
         if self.renderer_kind != renderer {
             self.renderer_kind = renderer;
             self.renderer = None;
+            self.guide_pipeline = None;
             self.restir = None;
             self.restir_dirty = true;
             if renderer == prime_scene::RealtimeRenderer::PathTrace {
@@ -1170,6 +1172,7 @@ impl Gpu {
             shader_source,
             generation: None,
             renderer: None,
+            guide_pipeline: None,
             renderer_kind: prime_scene::RealtimeRenderer::PathTrace,
             restir: None,
             restir_geometry: None,
@@ -1181,6 +1184,12 @@ impl Gpu {
             flights: Vec::new(),
             #[cfg(test)]
             test_roots: Vec::new(),
+            #[cfg(test)]
+            test_pt_timestamps: None,
+            #[cfg(test)]
+            test_guide_timestamps: None,
+            #[cfg(test)]
+            test_center_film: false,
             settings: pt::Settings::default().validate()?,
             invocation_reorder: invocation_reorder && ser_requested,
             display_origin: std::time::Instant::now(),
@@ -1278,7 +1287,7 @@ impl Gpu {
         })
     }
 
-    /// 完成旧提交后切换阶段程序；仅 transport shader 不同，保留数据和 PT/RR 历史。
+    /// 完成旧提交后选择已准备的照明与导引程序；保留数据和 PT/RR 历史。
     /// 不支持时保持普通程序；仅选择资源边界已准备的变体，不创建pipeline或SBT。
     pub fn set_ser(&mut self, requested: bool) -> Result<(), Error> {
         if (requested && self.context.capabilities().invocation_reorder) == self.invocation_reorder
@@ -1308,6 +1317,7 @@ impl Gpu {
         }
         self.invocation_reorder = enabled;
         self.renderer = None;
+        self.guide_pipeline = None;
         self.restir_dirty = true;
         Ok(())
     }
@@ -1317,6 +1327,7 @@ impl Gpu {
     fn invalidate(&mut self) -> Result<(), Error> {
         self.complete_previous()?;
         self.renderer = None;
+        self.guide_pipeline = None;
         self.restir_dirty = true;
         self.transition_history(history::Event::Accumulation(
             history::AccumulationEvent::SceneChanged,
@@ -1523,6 +1534,7 @@ impl Gpu {
             self.collect_with(&candidates)?;
             // 此后只移动已经准备的所有者；不得以清理失败向宿主报告“保留旧世代”。
             self.renderer = None;
+            self.guide_pipeline = None;
             self.transition_history(history::Event::Global(GlobalReset::SceneDomainReplaced))?;
             self.atlas = atlas;
             self.material_gpu = resources;
@@ -1655,7 +1667,6 @@ impl Gpu {
             entry: c"shade_hit",
         })
         .collect();
-        let transport_hit_count = hit_shaders.len();
         let compile_stage = |source: &Path, entry, stage, output, args: &[&str]| {
             self.compiler.compile(&shader_build::Recipe {
                 source: source.to_str().ok_or(shader_build::Error::Configuration(
@@ -1692,7 +1703,7 @@ impl Gpu {
         let guided_args: Vec<_> = args
             .iter()
             .copied()
-            .chain(["-DPRIMEPT_RECONSTRUCTION=1"])
+            .chain(["-DPRIMEPT_SEPARATE_GUIDES=1"])
             .collect();
         let ser_args: Vec<_> = native_args
             .iter()
@@ -1715,13 +1726,14 @@ impl Gpu {
                 )
             })
             .transpose()?;
+        let guide_rg = self.shader_source.with_file_name("guides.slang");
         let guided = (dispatch == 8)
             .then(|| {
                 compile_stage(
-                    program_source,
-                    "render_fused",
+                    &guide_rg,
+                    "guide_main",
                     "raygeneration",
-                    "render-fused-guided.spv",
+                    "guides.spv",
                     &guided_args,
                 )
             })
@@ -1729,10 +1741,10 @@ impl Gpu {
         let guided_ser = (dispatch == 8 && self.context.capabilities().invocation_reorder)
             .then(|| {
                 compile_stage(
-                    program_source,
-                    "render_fused",
+                    &guide_rg,
+                    "guide_main",
                     "raygeneration",
-                    "render-fused-guided.spv",
+                    "guides.spv",
                     &guided_ser_args,
                 )
             })
@@ -1858,10 +1870,12 @@ impl Gpu {
                 ],
             },
         )?;
-        hit_shaders.extend(guide_hits.artifacts().iter().map(|artifact| RayShader {
-            spirv: artifact.bytes(),
-            entry: c"guide_hit",
-        }));
+        if dispatch != 8 {
+            hit_shaders.extend(guide_hits.artifacts().iter().map(|artifact| RayShader {
+                spirv: artifact.bytes(),
+                entry: c"guide_hit",
+            }));
+        }
         let table_start = definitions
             .len()
             .checked_mul(28)
@@ -1986,6 +2000,9 @@ impl Gpu {
         if dispatch == 5 {
             initial_args.push("-DPRIMEPT_HIT_HINT=1");
         }
+        if dispatch == 8 {
+            initial_args.push("-DPRIMEPT_SEPARATE_GUIDES=1");
+        }
         // 单一操作表提供SBT索引和实际模块。初采只为本设备的命中或callable入口编译一次。
         let mut restir_hits = Vec::new();
         let mut restir_callables = Vec::new();
@@ -2002,6 +2019,10 @@ impl Gpu {
             c"restir_initial_direct",
         ];
         for (index, (set, entry)) in restir_sets.iter().zip(entries).enumerate() {
+            if dispatch == 8 && index == 7 {
+                callable_counts[index] = 0;
+                continue;
+            }
             let slots = if hit_initial && matches!(index, 0 | 8) {
                 callable_counts[index] = 0;
                 &mut restir_hits
@@ -2013,10 +2034,12 @@ impl Gpu {
                 entry,
             }));
         }
-        restir_hits.extend(guide_hits.artifacts().iter().map(|artifact| RayShader {
-            spirv: artifact.bytes(),
-            entry: c"guide_hit",
-        }));
+        if dispatch != 8 {
+            restir_hits.extend(guide_hits.artifacts().iter().map(|artifact| RayShader {
+                spirv: artifact.bytes(),
+                entry: c"guide_hit",
+            }));
+        }
         let restir_rg = self.shader_source.with_file_name("restir.slang");
         let initial_ser_args: Vec<_> = initial_args
             .iter()
@@ -2141,15 +2164,11 @@ impl Gpu {
                 entry: c"shade_opaque",
             })
             .collect();
-        let configured = |reordered, guides| {
+        let configured = |reordered| {
             let mut result = self::programs(&callables, reordered, hit);
             if dispatch != 0 {
                 result.prefix = None;
-                let code = if guides && reordered {
-                    guided_ser.as_ref()
-                } else if guides {
-                    guided.as_ref()
-                } else if reordered {
+                let code = if reordered {
                     fused_ser.as_ref()
                 } else {
                     fused.as_ref()
@@ -2159,11 +2178,7 @@ impl Gpu {
                     spirv: code.bytes(),
                     entry: c"render_fused",
                 };
-                result.material_hits = if dispatch == 8 && !guides {
-                    &hit_shaders[..transport_hit_count]
-                } else {
-                    &hit_shaders
-                };
+                result.material_hits = &hit_shaders;
                 if dispatch >= 2 {
                     result.callables = &[];
                 }
@@ -2178,13 +2193,7 @@ impl Gpu {
                 [1, 1],
             )?
         } else {
-            Renderer::new(
-                &mut self.context,
-                configured(false, false),
-                trace,
-                post,
-                [1, 1],
-            )?
+            Renderer::new(&mut self.context, configured(false), trace, post, [1, 1])?
         };
         let reordered = if self.context.capabilities().invocation_reorder {
             Some(
@@ -2194,13 +2203,7 @@ impl Gpu {
                 {
                     previous.rebind(&mut self.context, trace, post, [1, 1])?
                 } else {
-                    Renderer::new(
-                        &mut self.context,
-                        configured(true, false),
-                        trace,
-                        post,
-                        [1, 1],
-                    )?
+                    Renderer::new(&mut self.context, configured(true), trace, post, [1, 1])?
                 },
             )
         } else {
@@ -2212,46 +2215,55 @@ impl Gpu {
             self.context.allocated_bytes(),
             self.context.retained_cpu_bytes(),
         );
-        let guided_regular = if dispatch == 8 {
-            Some(if same_code {
-                self.generation
-                    .as_ref()
-                    .and_then(|g| g.guided_regular.as_ref())
-                    .expect("完整HG代同时准备原生与RR程序")
-                    .rebind(&mut self.context, trace, post, [1, 1])?
-            } else {
-                Renderer::new(
-                    &mut self.context,
-                    configured(false, true),
-                    trace,
-                    post,
-                    [1, 1],
-                )?
+        let guide_trace = self::programs(
+            &[],
+            false,
+            materials::HitFeatures {
+                authored_normals: false,
+                ..hit
+            },
+        );
+        let guide_groups: Vec<_> = std::iter::once(guide_trace.closest_hit)
+            .chain(guide_hits.artifacts().iter().map(|a| RayShader {
+                spirv: a.bytes(),
+                entry: c"guide_hit",
+            }))
+            .collect();
+        let prepare_guide = |context: &mut Context,
+                             code: Option<&shader_build::Artifact>,
+                             old: Option<RayTracingPipeline>| {
+            code.map(|code| {
+                if same_code && let Some(old) = old {
+                    old.rebind(context, trace)
+                } else {
+                    RayTracingPipeline::with_hit_groups(
+                        context,
+                        trace,
+                        RayShader {
+                            spirv: code.bytes(),
+                            entry: c"guide_main",
+                        },
+                        guide_trace.miss,
+                        &guide_groups,
+                        guide_trace.any_hit,
+                        &[],
+                    )
+                }
             })
-        } else {
-            None
+            .transpose()
         };
-        let guided_reordered = if dispatch == 8 && self.context.capabilities().invocation_reorder {
-            Some(if same_code {
-                self.generation
-                    .as_ref()
-                    .and_then(|g| g.guided_reordered.as_ref())
-                    .expect("完整HG代同时准备SER原生与RR程序")
-                    .rebind(&mut self.context, trace, post, [1, 1])?
-            } else {
-                Renderer::new(
-                    &mut self.context,
-                    configured(true, true),
-                    trace,
-                    post,
-                    [1, 1],
-                )?
-            })
-        } else {
-            None
-        };
+        let guide_regular = prepare_guide(
+            &mut self.context,
+            guided.as_ref(),
+            self.generation.as_ref().and_then(|g| g.guide_regular),
+        )?;
+        let guide_reordered = prepare_guide(
+            &mut self.context,
+            guided_ser.as_ref(),
+            self.generation.as_ref().and_then(|g| g.guide_reordered),
+        )?;
         #[cfg(test)]
-        let guided_program_cost = [
+        let guide_program_cost = [
             guided_start.0.elapsed().as_nanos() as u64,
             self.context
                 .allocated_bytes()
@@ -2276,10 +2288,10 @@ impl Gpu {
                 hit,
                 regular,
                 reordered,
-                guided_regular,
-                guided_reordered,
+                guide_regular,
+                guide_reordered,
                 #[cfg(test)]
-                guided_program_cost,
+                guide_program_cost,
                 restir,
                 restir_reordered,
             },
@@ -2826,6 +2838,7 @@ impl Gpu {
         self.attribute_revisions = versions;
         if bindings_changed {
             self.renderer = None;
+            self.guide_pipeline = None;
         }
         self.transition_history(history::Event::Accumulation(
             history::AccumulationEvent::SceneChanged,
@@ -2884,6 +2897,7 @@ impl Gpu {
         if let Some(renderer) = &self.renderer {
             roots.extend(renderer.roots());
         }
+        roots.extend(self.guide_pipeline.map(vulkan::native::Resource::from));
         roots
             .extend([self.restir_lut, self.restir_placeholder].map(vulkan::native::Resource::from));
         roots.extend(self.restir_geometry.map(vulkan::native::Resource::from));
@@ -2962,10 +2976,30 @@ impl Gpu {
         ))
     }
 
+    fn create_guide_pipeline(&mut self) -> Result<RayTracingPipeline, Error> {
+        let view = self.view.as_ref().expect("已创建view");
+        let (trace, _) = self.renderer_bindings(
+            view,
+            &self.atlas,
+            &self.scene,
+            self.material_gpu,
+            self.lighting_gpu,
+        );
+        let bindings = Bindings::new(&mut self.context, &trace)?;
+        let generation = self.generation.as_ref().expect("完整资源世代");
+        let program = if self.invocation_reorder {
+            generation.guide_reordered
+        } else {
+            generation.guide_regular
+        };
+        Ok(program
+            .expect("资源期已准备Guide程序")
+            .rebind(&mut self.context, bindings)?)
+    }
+
     fn create_renderer(&mut self) -> Result<Renderer, Error> {
         let view = self.view.as_ref().expect("已创建view");
         let extent = view.extent;
-        let guides = view.rr_enabled;
         let descriptors = self.renderer_bindings(
             view,
             &self.atlas,
@@ -2975,7 +3009,7 @@ impl Gpu {
         );
         let (trace, post) = self.allocate_bindings(descriptors)?;
         let generation = self.generation.as_ref().unwrap();
-        let program = generation.pt_program(self.invocation_reorder, guides);
+        let program = generation.pt_program(self.invocation_reorder);
         Ok(program.rebind(&mut self.context, trace, post, extent)?)
     }
 
@@ -3088,6 +3122,7 @@ impl Gpu {
                 self.transition_history(history::Event::ViewStorage(storage_event))?;
                 self.view = Some(next);
                 self.renderer = None;
+                self.guide_pipeline = None;
                 self.restir_dirty = true;
             }
             let using_restir = self.renderer_kind == prime_scene::RealtimeRenderer::RestirPt;
@@ -3095,6 +3130,12 @@ impl Gpu {
                 self.prepare_restir_view()?;
             } else if self.renderer.is_none() {
                 self.renderer = Some(self.create_renderer()?);
+            }
+            if rr_enabled
+                && self.generation.as_ref().unwrap().dispatch == 8
+                && self.guide_pipeline.is_none()
+            {
+                self.guide_pipeline = Some(self.create_guide_pipeline()?);
             }
             let restir_frame = if using_restir {
                 Some(self.restir.as_ref().unwrap().frame()?)
@@ -3172,13 +3213,26 @@ impl Gpu {
                 view.output_extent[0],
                 rr_enabled,
             )?;
+            #[cfg(test)]
+            let jitter = if self.test_center_film {
+                [0.; 2]
+            } else {
+                jitter
+            };
+            let film_mode = if rr_enabled { 2.0 } else { 0.0 };
+            #[cfg(test)]
+            let film_mode = if self.test_center_film && !rr_enabled {
+                1.0
+            } else {
+                film_mode
+            };
             view.jitter = jitter;
             words.extend(
                 [
                     jitter[0],
                     jitter[1],
                     if self.rr_previous.is_some() { 1.0 } else { 0.0 },
-                    if rr_enabled { 2.0 } else { 0.0 },
+                    film_mode,
                 ]
                 .map(f32::to_bits),
             );
@@ -3236,17 +3290,37 @@ impl Gpu {
                 clear.barrier();
                 result.push(clear.finish(&mut self.context)?);
             }
+            if rr_enabled && let Some(pipeline) = self.guide_pipeline {
+                let mut commands = Commands::new(&self.context)?;
+                #[cfg(test)]
+                if let Some(queries) = self.test_guide_timestamps {
+                    commands.reset_timestamps(queries)?;
+                    commands.barrier();
+                    commands.write_timestamp(queries, 0)?;
+                }
+                commands.trace(pipeline, view.extent)?;
+                commands.barrier();
+                #[cfg(test)]
+                if let Some(queries) = self.test_guide_timestamps {
+                    commands.write_timestamp(queries, 1)?;
+                }
+                result.push(commands.finish(&mut self.context)?);
+            }
             if using_restir {
                 let restir = self.restir.as_mut().unwrap();
                 result.push(restir.record(&mut self.context, current, jitter, cv_enabled)?);
                 result.push(restir.post(&mut self.context)?);
             } else {
-                result.push(
-                    self.renderer
-                        .as_ref()
-                        .unwrap()
-                        .record(&mut self.context, batch.samples())?,
-                );
+                let renderer = self.renderer.as_ref().unwrap();
+                #[cfg(not(test))]
+                let recorded = renderer.record(&mut self.context, batch.samples())?;
+                #[cfg(test)]
+                let recorded = if let Some(queries) = self.test_pt_timestamps {
+                    renderer.record_with_timestamps(&mut self.context, batch.samples(), queries)?
+                } else {
+                    renderer.record(&mut self.context, batch.samples())?
+                };
+                result.push(recorded);
             }
             if rr_enabled {
                 let mut pack = Commands::new(&self.context)?;
