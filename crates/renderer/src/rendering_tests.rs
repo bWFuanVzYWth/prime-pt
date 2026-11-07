@@ -372,6 +372,7 @@ fn hardware_pt_restir_fresh_selection_preserves_path_history()
     let mut outputs = Vec::new();
     for probability in [0., 0.4, 1.] {
         gpu.clear_world()?;
+        gpu.test_restart_sample_sequence(0)?;
         gpu.set_rendering(
             prime_scene::RenderMode::Realtime,
             RealtimeRenderer::RestirPt,
@@ -534,6 +535,7 @@ fn hardware_pt_restir_ser_preserves_radiance() -> Result<(), Box<dyn std::error:
     let mut reference: Option<Vec<u8>> = None;
     for enabled in [false, true] {
         gpu.clear_world()?;
+        gpu.test_restart_sample_sequence(0)?;
         gpu.set_ser(enabled)?;
         gpu.set_rendering(
             prime_scene::RenderMode::Realtime,

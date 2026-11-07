@@ -701,3 +701,85 @@ fn hardware_pt_restir_streaming_geometry_matches_directory()
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
+
+#[test]
+#[ignore = "真实Vulkan：属性重编译复用BLAS后，其他region重建不能使当前面的身份失效"]
+fn hardware_pt_restir_reused_blas_identity_matches_after_another_region_rebuild()
+-> Result<(), Box<dyn std::error::Error>> {
+    use prime_scene::MeshParts;
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    gpu.set_rendering(RenderMode::Realtime, RealtimeRenderer::RestirPt)?;
+    let mut a = MeshParts::default();
+    let mut b = MeshParts::default();
+    let mut mesh = Mesh::default();
+    add_quad(&mut mesh, 4., [0.5; 2], [0.8; 3], 8.);
+    a.insert(
+        0,
+        Mesh {
+            quads: mesh.quads.clone(),
+        },
+    )?;
+    b.insert(
+        0,
+        Mesh {
+            quads: mesh.quads.clone(),
+        },
+    )?;
+    for phase in 0..3 {
+        if phase == 1 {
+            // 自然更新重新编译，但位置/primitive顺序相同；几何版本和BLAS继续复用。
+            mesh.quads[0].set_tint([0.4; 3]);
+            a.insert(
+                0,
+                Mesh {
+                    quads: mesh.quads.clone(),
+                },
+            )?;
+        } else if phase == 2 {
+            add_quad(&mut mesh, 5., [0.5; 2], [0.8; 3], 8.);
+            b.insert(
+                0,
+                Mesh {
+                    quads: mesh.quads.clone(),
+                },
+            )?;
+        }
+        gpu.set_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor: [0.; 3],
+            regions: &[
+                RenderRegion {
+                    key: [0; 3],
+                    geometry_revision: 1,
+                    content_revision: if phase == 0 { 1 } else { 2 },
+                    mesh: a.view(),
+                },
+                RenderRegion {
+                    key: [1, 0, 0],
+                    geometry_revision: if phase < 2 { 1 } else { 2 },
+                    content_revision: if phase < 2 { 1 } else { 2 },
+                    mesh: b.view(),
+                },
+            ],
+        })?;
+        let geometry = gpu.restir_geometry.unwrap();
+        let contents = bytes(gpu, geometry)?;
+        for record in gpu.geometry_identities.records() {
+            let [start, count, _] = record.source.location;
+            for quad in start..start + count {
+                let offset = 16 + quad as usize * 64 + 60;
+                let token = u32::from_le_bytes(contents[offset..offset + 4].try_into()?);
+                assert_eq!(
+                    token, record.token,
+                    "phase={phase} key={:?} quad={quad}",
+                    record.source.key
+                );
+            }
+        }
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}

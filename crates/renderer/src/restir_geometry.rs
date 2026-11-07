@@ -1,6 +1,8 @@
 //! ReSTIR稳定slab目录与交点恢复数据；源键/源版本由场景所有者提供。
 //! 单一buffer为16B头、每quad64B原位置/region/token、容量尾部的活动身份目录。
 //! 未改slab沿用token；当前primitive范围可搬移，历史通过目录恢复新范围。
+//! BLAS复用只证明位置和primitive顺序相同，不证明源slab版本未变；目录换token时
+//! 必须在同一事务改写复用quad的token，不能让当前硬件命中变成失效历史交点。
 use super::{Error, Gpu, RegionGpu};
 use simple_engine::{scene_cache, vulkan::native::Buffer};
 use std::ops::Range;
@@ -14,16 +16,25 @@ pub(super) struct GeometryUpdate {
     pub directory_offset: usize,
     data: Vec<[u32; 16]>,
     ranges: Vec<(usize, Range<usize>)>,
-    retired: Vec<(usize, u32)>,
+    tokens: Vec<(usize, u32)>,
 }
 impl GeometryUpdate {
+    fn set_tokens(&mut self, range: Range<u32>, token: u32) -> Result<(), Error> {
+        self.tokens
+            .try_reserve(range.len())
+            .map_err(scene_cache::Error::from)?;
+        self.tokens
+            .extend(range.map(|slot| (16 + slot as usize * 64 + 60, token)));
+        Ok(())
+    }
+
     pub fn writes(&self) -> Vec<(usize, &[u8])> {
         let mut writes: Vec<_> = self
             .ranges
             .iter()
             .map(|(offset, range)| (*offset, bytemuck::cast_slice(&self.data[range.clone()])))
             .chain(
-                self.retired
+                self.tokens
                     .iter()
                     .map(|(offset, value)| (*offset, bytemuck::bytes_of(value))),
             )
@@ -41,7 +52,7 @@ impl GeometryUpdate {
     }
     pub fn written_bytes(&self) -> u64 {
         self.data.len() as u64 * 64
-            + self.retired.len() as u64 * 4
+            + self.tokens.len() as u64 * 4
             + self.header.map_or(0, |_| 16)
             + self
                 .identity
@@ -64,7 +75,7 @@ impl Gpu {
             directory_offset: 0,
             data: Vec::new(),
             ranges: Vec::new(),
-            retired: Vec::new(),
+            tokens: Vec::new(),
         };
         if self.renderer_kind != prime_scene::RealtimeRenderer::RestirPt {
             prepared.buffer = None;
@@ -152,12 +163,21 @@ impl Gpu {
             .try_reserve_exact(count)
             .map_err(scene_cache::Error::from)?;
         let mut domain = 0;
+        let old_domains = self.geometry_identities.records();
+        let mut old_domain = 0;
         for (region, entry) in source.regions.iter().zip(entries) {
             let dirty = first || matches!(entry, scene_cache::Prepared::Built(_));
             let start = prepared.data.len();
             for (_, mesh) in region.mesh.fragments() {
-                let token = identity.records()[domain].token;
+                let record = &identity.records()[domain];
+                let token = record.token;
                 domain += 1;
+                while old_domains
+                    .get(old_domain)
+                    .is_some_and(|old| old.source.key < record.source.key)
+                {
+                    old_domain += 1;
+                }
                 if dirty {
                     for quad in &mesh.quads {
                         let mut row = [0; 16];
@@ -168,6 +188,14 @@ impl Gpu {
                         row[15] = token;
                         prepared.data.push(row);
                     }
+                } else if old_domains
+                    .get(old_domain)
+                    .filter(|old| old.source.key == record.source.key)
+                    .is_none_or(|old| old.token != token)
+                {
+                    // 只更新4B身份；已复用的60B位置/region数据和BLAS不重传、不重建。
+                    let [base, count, _] = record.source.location;
+                    prepared.set_tokens(base..base + count, token)?;
                 }
             }
             if dirty {
@@ -188,11 +216,7 @@ impl Gpu {
                 {
                     continue;
                 }
-                prepared.retired.extend(
-                    old.range
-                        .clone()
-                        .map(|slot| (16 + slot as usize * 64 + 60, 0)),
-                );
+                prepared.set_tokens(old.range.clone(), 0)?;
             }
         }
         prepared.buffer = Some(buffer);

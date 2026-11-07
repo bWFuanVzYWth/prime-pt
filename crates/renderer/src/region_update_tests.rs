@@ -4,7 +4,6 @@ use prime_scene::{
     FragmentMask, MaterialDefinition, MaterialId, MeshParts, PreparedParts, RealtimeRenderer,
     RenderChange, RenderMode, RenderRegion, RenderView, TintPatch,
 };
-use std::io::Write as _;
 
 fn face(slot: usize, z: f32, material: u32, extra: bool) -> Mesh {
     let x = if slot & 1 == 0 { -4. } else { 0. };
@@ -38,6 +37,8 @@ fn publish(
     mesh: prime_scene::MeshView<'_>,
     geometry: u64,
     content: u64,
+    secondary: &Mesh,
+    secondary_revision: u64,
 ) -> Result<(), Error> {
     let region = RenderRegion {
         key: [0; 3],
@@ -45,15 +46,24 @@ fn publish(
         content_revision: content,
         mesh,
     };
+    let secondary = RenderRegion {
+        key: [1, 0, 0],
+        geometry_revision: secondary_revision,
+        content_revision: secondary_revision,
+        mesh: secondary.into(),
+    };
     if !gpu.try_attribute_changes(
         gpu.resource_generation,
         [0.; 3],
-        &[RenderChange::Upsert(region)],
+        &[
+            RenderChange::Upsert(region),
+            RenderChange::Upsert(secondary),
+        ],
     )? {
         gpu.set_regions(RenderView {
             generation: gpu.resource_generation,
             anchor: [0.; 3],
-            regions: &[region],
+            regions: &[region, secondary],
         })?;
     }
     Ok(())
@@ -89,7 +99,21 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
     })?;
     gpu.set_rendering(RenderMode::Realtime, RealtimeRenderer::RestirPt)?;
     gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0.4, false, true)?)?;
-    let options = Options::new(true, streamline::Quality::Dlaa, 1, 6)?;
+    let quality = match std::env::var("PRIME_PT_PARTIAL_QUALITY").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("dlaa") => streamline::Quality::Dlaa,
+        Ok("performance") => streamline::Quality::Performance,
+        _ => return Err("PRIME_PT_PARTIAL_QUALITY只接受dlaa或performance".into()),
+    };
+    let input_extent = if quality == streamline::Quality::Dlaa {
+        extent
+    } else {
+        [1920, 1080]
+    };
+    let options = Options::new(true, quality, 1, 6)?;
+    writeln!(
+        std::io::stderr().lock(),
+        "stationary partial output={extent:?} input={input_extent:?} quality={quality:?}"
+    )?;
     let mut parts = MeshParts::default();
     for slot in 0..4 {
         parts.insert(slot, face(slot, 4., 0, false))?;
@@ -97,10 +121,11 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
     let mut background = Mesh::default();
     add_quad(&mut background, 8., [0.25; 2], [1.; 3], 32.);
     parts.insert(255, background)?;
+    let secondary = face(0, 4., 0, false);
     let mut geometry = 1;
-    publish(gpu, parts.view(), geometry, 1)?;
+    publish(gpu, parts.view(), geometry, 1, &secondary, 1)?;
     let layout = simple_engine::restir_pt::Layout::with_color_estimates(
-        extent,
+        input_extent,
         simple_engine::restir_pt::Fusion::DIRECTIONS,
     )?;
     let primary_readback = Buffer::new(&mut gpu.context, u64::from(layout.elements()) * 16, true)?;
@@ -136,8 +161,27 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
                     vec![]
                 },
             )?;
-            publish(gpu, candidate.view(&parts), geometry, frame as u64 + 1)?;
+            publish(
+                gpu,
+                candidate.view(&parts),
+                geometry,
+                frame as u64 + 1,
+                &secondary,
+                1 + frame as u64 / 4,
+            )?;
             parts = candidate.finish(&mut parts);
+        }
+        // 先检查生产上传的数据，阻止已知无效身份继续进入路径重放。
+        let positions = gpu.restir_geometry.unwrap();
+        let mut data = vec![0; positions.len() as usize];
+        positions.read(&mut gpu.context, 0, &mut data)?;
+        for record in gpu.geometry_identities.records() {
+            let [start, count, _] = record.source.location;
+            for quad in start..start + count {
+                let offset = 16 + quad as usize * 64 + 60;
+                let token = u32::from_le_bytes(data[offset..offset + 4].try_into()?);
+                assert_eq!(token, record.token, "frame={frame} 当前面身份与目录不一致");
+            }
         }
         host.render_options(gpu, &output, &camera(), Environment::default(), options)?;
         assert!(gpu.rr_unavailable.is_none() && gpu.rr_previous.is_some());
@@ -159,8 +203,8 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
         primary.copy_prefix_to(&mut gpu.context, &primary_readback, primary_readback.len())?;
         for (slot, &transparent) in cutout.iter().enumerate() {
             let pixel = [
-                extent[0] * if slot & 1 == 0 { 1 } else { 3 } / 4,
-                extent[1] * if slot & 2 == 0 { 3 } else { 1 } / 4,
+                input_extent[0] * if slot & 1 == 0 { 1 } else { 3 } / 4,
+                input_extent[1] * if slot & 2 == 0 { 3 } else { 1 } / 4,
             ];
             let mut bytes = [0; 16];
             primary_readback.read(
