@@ -15,6 +15,157 @@ fn publish(gpu: &mut Gpu, mesh: &Mesh, content: u64) -> Result<(), Error> {
     })
 }
 
+#[test]
+#[ignore = "独立进程：4K Performance RR+SER+ReSTCV，移动相机和连续区块增删后仍能完成有限HDR"]
+fn hardware_pt_rr_restcv_streaming_motion() -> Result<(), Box<dyn std::error::Error>> {
+    use prime_scene::{MaterialDefinition, MaterialId, RenderMode};
+    let host = Host::new_rr_ser()?;
+    let mut gpu = host.gpu()?;
+    let output = Image::new(&mut gpu.context, [3840, 2160, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    let mut definitions = [MaterialDefinition::default(); 12];
+    for material in &mut definitions {
+        material.control = [0, 3, 0, 0];
+    }
+    definitions[1].surface[1] = 1.;
+    definitions[1].base_roughness[3] = 0.15;
+    definitions[2].control[0] = 1;
+    definitions[2].base_roughness[3] = 0.;
+    definitions[3].control[0] = 1;
+    definitions[3].extinction = [1.33, 0.03, 0.01, 0.005];
+    definitions[3].base_roughness[3] = 0.15;
+    definitions[4].surface[2] = 0.5;
+    definitions[5].emission = [2., 1., 0.5, 1.];
+    definitions[6].control[2] = MaterialDefinition::CUTOUT;
+    definitions[7].control[2] = MaterialDefinition::AUXILIARY;
+    definitions[7].control[3] = MaterialDefinition::AUTHORED_NORMAL;
+    definitions[8] = definitions[7];
+    definitions[8].surface[2] = 0.6;
+    definitions[9] = definitions[3];
+    definitions[9].control[2] = MaterialDefinition::TRANSLUCENT;
+    definitions[10].surface[1] = 0.4;
+    definitions[10].base_roughness[3] = 0.2;
+    definitions[11].control = [3, 3, MaterialDefinition::TRANSLUCENT, 0];
+    definitions[11].base_roughness[3] = 0.;
+    let mut albedo = Vec::new();
+    let mut auxiliary = Vec::new();
+    for y in 0..8 {
+        for x in 0..8 {
+            albedo.extend([200, 180, 150, if (x + y) % 2 == 0 { 255 } else { 0 }]);
+            auxiliary.extend([100 + x * 8, 100 + y * 8, 0, 85]);
+        }
+    }
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [8, 8],
+        albedo: &albedo,
+        materials: &definitions,
+        mers: &[0; 256],
+        auxiliary: &auxiliary,
+        emission_alias_words: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]; 12],
+    })?;
+    gpu.set_rendering(RenderMode::Realtime, RealtimeRenderer::RestirPt)?;
+    gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0.4, false, true)?)?;
+    let mut meshes = Vec::new();
+    for variant in 0..3 {
+        let mut mesh = Mesh::default();
+        for y in 0..16 {
+            for x in 0..32 {
+                if variant == 1 && (x + y) % 7 == 0 {
+                    continue;
+                }
+                let z = 20. + (x % 3) as f32 + variant as f32;
+                let a = x as f32 * 2.;
+                let b = y as f32 * 2.;
+                mesh.quads.push(Quad::with_material(
+                    [
+                        [a, b, z],
+                        [a, b + 2., z],
+                        [a + 2., b + 2., z],
+                        [a + 2., b, z],
+                    ],
+                    [[0., 0.], [0., 1.], [1., 1.], [1., 0.]],
+                    [0.8, 0.7, 0.6],
+                    MaterialId::new(((x + y + variant) % 12) as u32),
+                ));
+            }
+        }
+        for points in [
+            [[0., 0., 0.], [0., 0., 64.], [64., 0., 64.], [64., 0., 0.]],
+            [
+                [0., 0., 40.],
+                [0., 32., 40.],
+                [64., 32., 40.],
+                [64., 0., 40.],
+            ],
+        ] {
+            mesh.quads.push(Quad::with_material(
+                points,
+                [[0.5; 2]; 4],
+                [0.8; 3],
+                MaterialId::new(0),
+            ));
+        }
+        meshes.push(mesh);
+    }
+    let options = Options::new(true, streamline::Quality::Performance, 1, 12)?;
+    let frames =
+        std::env::var("PRIME_PT_STREAMING_FRAMES").map_or(Ok(240), |value| value.parse::<u64>())?;
+    for frame in 0..frames {
+        let t = frame as f32 * 0.07;
+        let x = 128. + 150. * t.sin();
+        let center = (x / 64.).floor() as i32;
+        let regions: Vec<_> = (center - 2..=center + 2)
+            .map(|id| {
+                let revision = frame / 9 + 1;
+                RenderRegion {
+                    key: [id, 0, 0],
+                    geometry_revision: revision,
+                    content_revision: revision,
+                    mesh: (&meshes[revision as usize % 3]).into(),
+                }
+            })
+            .collect();
+        gpu.set_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor: [f64::from(center) * 64., 0., 0.],
+            regions: &regions,
+        })?;
+        let mut camera = camera();
+        camera.origin = [
+            x - center as f32 * 64.,
+            8. + 3. * (t * 0.7).sin(),
+            5. + 3. * t.cos(),
+            0.,
+        ];
+        camera.right[0] = 16. / 9.;
+        if frame % 16 == 0 {
+            eprintln!("streaming frame={frame} center={center} begin");
+        }
+        host.render_options(&mut gpu, &output, &camera, Environment::default(), options)?;
+        assert!(gpu.rr_unavailable.is_none() && gpu.rr_previous.is_some());
+        if frame % 16 == 0 {
+            eprintln!(
+                "streaming frame={frame} complete hdr={:?}",
+                hdr_mean(&mut gpu)?
+            );
+        }
+    }
+    let hdr = gpu.view.as_ref().unwrap().output;
+    eprintln!(
+        "streaming final_hdr_blake3={}",
+        blake3::hash(&download_buffer(&mut gpu, hdr)?),
+    );
+    drop(gpu);
+    // RR 的 SDK 验证消息单独保留；此用例检查真实求值、提交完成及 HDR，不将已知内部消息作为设备丢失。
+    eprintln!(
+        "streaming validation_errors={}",
+        host.errors.load(Ordering::Relaxed)
+    );
+    Ok(())
+}
+
 fn hdr_mean(gpu: &mut Gpu) -> Result<[f64; 3], Error> {
     let output = gpu.view.as_ref().unwrap().output;
     let readback = Buffer::new(&mut gpu.context, output.len(), true)?;

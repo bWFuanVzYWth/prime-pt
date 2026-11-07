@@ -28,6 +28,43 @@ cargo test --locked -p prime_renderer --lib hardware_pt_restir_ -- --ignored --n
 
 遇到 RR 回退时先检查设备实际启用的能力、SDK 初始化与每帧求值日志，再查看引擎 [Streamline 手册](../../../manual/streamline.md) 的同步验证说明。关闭同步验证所得结果按普通验证记录。
 
+## 运行一段时间后出现 DEVICE_LOST
+
+`DEVICE_LOST` 表示 GPU 设备无法继续工作；“等待提交完成失败”本身无法指出哪次计算出错。
+下面的阶段诊断只在 RR 实际启用时逐次等待 RR 之前的光追和计算工作，记录最后成功完成的操作。
+RR 与呈现仍交给宿主按原顺序提交。它会改变时序，可能使竞态暂时不出现，不能用于性能比较。
+
+先关闭已有开发客户端。在 **PowerShell 7** 中复制执行；这里使用已配置好的源码开发环境：
+
+```powershell
+Set-Location 'C:\repositories\simple_engine\app\prime_pt'
+.\scripts\prepare-nsight.ps1 -Offline
+.\scripts\run-gpu-diagnostic.ps1 -Offline
+```
+
+第二个脚本会启动游戏。进入原来发生问题的世界，保持相同的 RR、SER、ReSTCV 和分辨率设置，
+按原来的方式游玩或移动。不要开启 `/pt diagnostic on`，它是另一项关闭 RR 的图像诊断功能。
+已有本次源码构建出的 `target/release/prime_pt.dll` 时可以省略准备命令。
+缺少离线依赖时去掉 `-Offline`；只想检查启动输入而不打开游戏时加 `-PrepareOnly`。
+
+终端会显示引擎根目录下的新目录 `temp/prime-gpu-日期时间-stages`。
+`native.log` 同时保存 Java 与原生库的输出；原生检查点不保证出现在 Minecraft 的 `latest.log` 中。
+成功进入渲染后应能在 `native.log` 找到 `gpu_frame` 和 `gpu_checkpoint`。
+退出或崩溃后保留整个目录，其中还包含 DLL、源码差异、设置、启动参数和本次崩溃报告。
+
+| 最后日志 | 含义 |
+| --- | --- |
+| 某操作有 `state=begin`，没有对应 `state=complete` | 该次独立提交未确认完成；用同一 `sample/record/op` 定位。 |
+| `state=rr_present_encoded` | 只完成了 RR 和呈现的 CPU 录制，尚未证明 GPU 执行成功。 |
+| `state=host_complete` | 宿主已确认整帧提交完成。 |
+
+阶段诊断不再崩溃时，使用下面的命令保留原调度再复现。诊断开关只对脚本启动的进程生效，
+结束后恢复终端原值，不修改游戏设置。
+
+```powershell
+.\scripts\run-gpu-diagnostic.ps1 -Offline -Mode normal
+```
+
 ## 在游戏中读取诊断
 
 使用 **F3+2** 打开 Prime 分项图。左侧显示 Prime 的帧耗时，右侧保留 Minecraft 的 TPS 图。先检查最大的分项、预算压力和近期场景更新，再结合移动、编辑或资源重载的时间点读日志。分项显示主线程实际经过的时间，单位是毫秒。耗时越长，画面更新通常越慢。场景更新摘要可能来自与所选历史帧不同的更新。字段归属见[诊断模块文档](../target/doc/prime_pt/diagnostics/index.html)。

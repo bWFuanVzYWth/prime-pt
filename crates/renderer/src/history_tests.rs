@@ -640,3 +640,54 @@ fn hardware_pt_restir_unchanged_slab_keeps_its_history_after_region_rebuild()
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
+
+#[test]
+#[ignore = "真实Vulkan：连续区块增删、扩容和槽复用后，每个活动面的稳定身份必须与目录一致"]
+fn hardware_pt_restir_streaming_geometry_matches_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut gpu = host.gpu()?;
+    gpu.set_rendering(RenderMode::Realtime, RealtimeRenderer::RestirPt)?;
+    let mut meshes = Vec::new();
+    for count in [1, 3, 17, 65, 257] {
+        let mut mesh = Mesh::default();
+        for index in 0..count {
+            add_quad(&mut mesh, 4. + index as f32 * 0.01, [0.5; 2], [0.8; 3], 8.);
+        }
+        meshes.push(mesh);
+    }
+    for step in 0..96usize {
+        let first = (step / 8) as i32;
+        let count = 1 + step % 13;
+        let regions: Vec<_> = (0..count)
+            .map(|index| {
+                let id = first + index as i32;
+                let variant = (id as usize + step / 3) % meshes.len();
+                RenderRegion {
+                    key: [id, 0, 0],
+                    geometry_revision: (step / 3 + 1) as u64,
+                    content_revision: (step / 3 + 1) as u64,
+                    mesh: (&meshes[variant]).into(),
+                }
+            })
+            .collect();
+        gpu.set_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor: [f64::from(first) * 64., 0., 0.],
+            regions: &regions,
+        })?;
+        let geometry = gpu.restir_geometry.unwrap();
+        let contents = bytes(&mut gpu, geometry)?;
+        for record in gpu.geometry_identities.records() {
+            let [start, count, _] = record.source.location;
+            for quad in start..start + count {
+                let offset = 16 + quad as usize * 64 + 60;
+                let actual = u32::from_le_bytes(contents[offset..offset + 4].try_into().unwrap());
+                assert_eq!(actual, record.token, "step={step} quad={quad}");
+            }
+        }
+    }
+    drop(gpu);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}

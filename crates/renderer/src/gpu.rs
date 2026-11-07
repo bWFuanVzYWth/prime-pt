@@ -711,6 +711,8 @@ impl Options {
 
 /// 独占场景、管线、工作缓冲和SDK；所有入口及销毁前宿主须完成旧命令并独占队列。
 pub struct Gpu {
+    // 显式诊断开关；只拆分 RR 之前不依赖宿主 command 的自有工作。
+    diagnostic_sync: bool,
     #[cfg(test)]
     experiment_dispatch: u32,
     history_audit: history::Audit,
@@ -1127,6 +1129,8 @@ impl Gpu {
             simple_engine::shader_library::restir_paired_neighbors(),
         )?;
         let gpu = Self {
+            diagnostic_sync: std::env::var_os("PRIME_PT_DIAGNOSTIC_SYNC")
+                .is_some_and(|value| value == "1"),
             #[cfg(test)]
             experiment_dispatch: if context.capabilities().invocation_reorder {
                 8
@@ -1396,6 +1400,9 @@ impl Gpu {
             restir.completed()?;
         }
         if let Some((next, _)) = self.pending_absolute.take() {
+            if self.diagnostic_sync {
+                eprintln!("[prime_pt] gpu_checkpoint sample_next={next} state=host_complete");
+            }
             self.absolute_sample = next;
         }
         Ok(())
@@ -3531,6 +3538,32 @@ impl Gpu {
         Ok(())
     }
 
+    // 只用于 RR 前的自有记录；RR 和呈现继续按顺序编码进宿主 command。
+    fn submit_diagnostic_recordings(&mut self, recordings: Vec<Recorded>) -> Result<(), Error> {
+        let mut pending = recordings.into_iter().enumerate();
+        let sample = self.absolute_sample;
+        while let Some((record, recorded)) = pending.next() {
+            let result = recorded.submit_diagnostic_and_wait(
+                &mut self.context,
+                |op, kind, extent, complete| {
+                    let state = if complete { "complete" } else { "begin" };
+                    eprintln!(
+                        "[prime_pt] gpu_checkpoint sample={sample} record={record} op={op} kind={kind} extent={extent:?} state={state}"
+                    );
+                },
+            );
+            if let Err(error) = result {
+                eprintln!(
+                    "[prime_pt] gpu_checkpoint sample={sample} record={record} failed: {error}"
+                );
+                self.cancel_recordings(pending.map(|(_, record)| record).collect())?;
+                return Err(error.into());
+            }
+            self.recording_encoded();
+        }
+        Ok(())
+    }
+
     /// 句柄、GENERAL 布局和前次完成保证由 `prime_draw` 的外部契约维护。
     #[allow(
         clippy::too_many_arguments,
@@ -3607,9 +3640,29 @@ impl Gpu {
             } else {
                 self.rr_index
             };
-            // SAFETY: 宿主独占正在 render pass 外录制的 command；会话持有 Flight 至完成。
-            unsafe {
-                self.encode_recordings(std::mem::take(&mut recordings), command)?;
+            if self.diagnostic_sync {
+                eprintln!(
+                    "[prime_pt] gpu_frame sample={} rr_index={} renderer={:?} cv={} rr={rr} quality={:?} ser={} output={extent:?} input={:?} regions={} anchor={:?} camera={:?} records={}",
+                    self.absolute_sample,
+                    self.rr_index,
+                    self.renderer_kind,
+                    self.tuning.restir_cv(),
+                    self.rr_quality,
+                    self.invocation_reorder,
+                    self.view.as_ref().unwrap().extent,
+                    self.region_cache.entries().len(),
+                    self.anchor,
+                    camera.origin,
+                    recordings.len(),
+                );
+            }
+            if self.diagnostic_sync && rr {
+                self.submit_diagnostic_recordings(std::mem::take(&mut recordings))?;
+            } else {
+                // SAFETY: 宿主独占正在 render pass 外录制的 command；会话持有 Flight 至完成。
+                unsafe {
+                    self.encode_recordings(std::mem::take(&mut recordings), command)?;
+                }
             }
             if rr {
                 let current = CameraFrame::new(camera, self.anchor)?;
@@ -3624,6 +3677,12 @@ impl Gpu {
                     view.rr.resources(&self.context)?,
                 )?;
                 rr_touched = true;
+                if self.diagnostic_sync {
+                    eprintln!(
+                        "[prime_pt] gpu_checkpoint sample={} state=rr_record_begin",
+                        self.absolute_sample
+                    );
+                }
                 let evaluated = match unsafe { self.rr_runtime.as_mut().unwrap().evaluate(&frame) }
                 {
                     Ok(()) => true,
@@ -3680,6 +3739,12 @@ impl Gpu {
                 // SAFETY: 同本帧前序命令，宿主持有并独占 command 至完成。
                 unsafe {
                     self.encode_recordings(std::mem::take(&mut recordings), command)?;
+                }
+                if self.diagnostic_sync {
+                    eprintln!(
+                        "[prime_pt] gpu_checkpoint sample={} state=rr_present_encoded evaluated={evaluated}",
+                        self.absolute_sample
+                    );
                 }
                 if evaluated {
                     self.rr_previous = Some(current);
