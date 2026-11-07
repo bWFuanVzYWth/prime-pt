@@ -36,6 +36,7 @@ struct Host {
     errors: ManuallyDrop<Box<AtomicUsize>>,
     streamline: Option<StreamlineBootstrap>,
     invocation_reorder: bool,
+    diagnostic_checkpoints: bool,
     retained: Cell<bool>,
 }
 
@@ -246,6 +247,8 @@ impl Host {
                 errors: ManuallyDrop::new(errors),
                 streamline,
                 invocation_reorder,
+                diagnostic_checkpoints: std::env::var_os("PRIME_PT_DIAGNOSTIC_CHECKPOINTS")
+                    .is_some_and(|value| value == "1"),
                 retained: Cell::new(false),
             };
             let mut required = vec![
@@ -267,6 +270,9 @@ impl Host {
             }
             if invocation_reorder {
                 required.push(ash::ext::ray_tracing_invocation_reorder::NAME);
+            }
+            if host.diagnostic_checkpoints {
+                required.push(ash::nv::device_diagnostic_checkpoints::NAME);
             }
             for physical in host.instance.enumerate_physical_devices()? {
                 if host
@@ -486,6 +492,10 @@ impl Host {
                 )?
             }
         };
+        if self.diagnostic_checkpoints {
+            // SAFETY: Host::create 在该测试逻辑设备显式启用同一 NV 扩展。
+            unsafe { gpu.enable_diagnostic_checkpoints()? };
+        }
         gpu.settings.samples = 64;
         gpu.settings.max_bounces = 6;
         gpu.display_timeline.set_enabled(false);

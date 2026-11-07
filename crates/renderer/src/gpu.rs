@@ -56,6 +56,9 @@ use simple_engine::vulkan::{
 /// 渲染输入、资源、程序或SDK失败；保留实际底层来源。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// GPU 故障进度无法写入宿主标准错误；保留原始 IO 失败。
+    #[error("写入 GPU 故障诊断失败")]
+    DiagnosticOutput(#[source] std::io::Error),
     /// 资源槽或发布事务失败。
     #[error(transparent)]
     SceneCache(#[from] scene_cache::Error),
@@ -959,6 +962,59 @@ impl Gpu {
     /// 空洞、场景内其他缓冲和实际可用显存另计。
     pub const fn attribute_slot_limit(&self) -> u32 {
         self.attribute_slot_limit
+    }
+
+    /// 启用保持原提交顺序的 NV 异步进度诊断；不插入逐阶段等待。
+    /// # Safety
+    /// 宿主已在借出的逻辑设备启用 `VK_NV_device_diagnostic_checkpoints`。
+    pub unsafe fn enable_diagnostic_checkpoints(&mut self) -> Result<(), Error> {
+        use std::io::Write as _;
+        // SAFETY: 能力由宿主逻辑设备创建边界确认。
+        unsafe { self.context.enable_diagnostic_checkpoints()? };
+        writeln!(
+            std::io::stderr().lock(),
+            "[prime_pt] gpu_checkpoints enabled: asynchronous, no extra submits/waits"
+        )
+        .map_err(Error::DiagnosticOutput)?;
+        Ok(())
+    }
+
+    /// 输出驱动检查点与近期 CPU 录制信息；不恢复设备或确认在途工作完成。
+    /// # Safety
+    /// 宿主已收到同设备的 `VK_ERROR_DEVICE_LOST`，保活设备和 queue，并独占 queue。
+    pub unsafe fn report_device_loss(&self) -> Result<(), Error> {
+        use std::io::Write as _;
+        // SAFETY: 只从宿主明确的设备丢失异常边界调用，普通超时不调用。
+        let report = unsafe { self.context.checkpoints_after_device_loss()? };
+        let mut output = std::io::stderr().lock();
+        let Some(report) = report else {
+            writeln!(
+                output,
+                "[prime_pt] gpu_fault: asynchronous checkpoints were not enabled"
+            )
+            .map_err(Error::DiagnosticOutput)?;
+            return Ok(());
+        };
+        writeln!(
+            output,
+            "[prime_pt] gpu_fault: driver_stages={} retained_markers={}",
+            report.progress.len(),
+            report.recorded.len()
+        )
+        .map_err(Error::DiagnosticOutput)?;
+        for progress in report.progress {
+            writeln!(
+                output,
+                "[prime_pt] gpu_fault stage={:#x} marker={} checkpoint={:?}",
+                progress.stage, progress.marker, progress.checkpoint
+            )
+            .map_err(Error::DiagnosticOutput)?;
+        }
+        for record in report.recorded.iter().rev().take(16).rev() {
+            writeln!(output, "[prime_pt] gpu_fault recorded_only={record:?}")
+                .map_err(Error::DiagnosticOutput)?;
+        }
+        Ok(())
     }
 
     /// # Safety
@@ -3585,6 +3641,8 @@ impl Gpu {
         if [command, image, view].contains(&0) {
             return Err(Error::Invalid("宿主 draw 句柄为空"));
         }
+        self.context
+            .set_diagnostic_scope(u64::from(self.absolute_sample));
         // SAFETY: prime_draw 借出本设备的 GENERAL storage view，并保活至本次命令完成。
         let target =
             unsafe { ExternalBinding::new(&self.context, view, ExternalKind::StorageImage)? };
@@ -3677,6 +3735,8 @@ impl Gpu {
                     view.rr.resources(&self.context)?,
                 )?;
                 rr_touched = true;
+                // SAFETY: 宿主独占本设备有效的录制中 command；无检查点模式时不录入命令。
+                unsafe { self.context.diagnostic_checkpoint(command, "rr/begin")? };
                 if self.diagnostic_sync {
                     eprintln!(
                         "[prime_pt] gpu_checkpoint sample={} state=rr_record_begin",
@@ -3692,6 +3752,8 @@ impl Gpu {
                         false
                     }
                 };
+                // SAFETY: 与 RR 前相同的宿主录制边界。
+                unsafe { self.context.diagnostic_checkpoint(command, "rr/end")? };
                 let bindings = Bindings::new(
                     &mut self.context,
                     &[

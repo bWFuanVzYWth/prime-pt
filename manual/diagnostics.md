@@ -31,35 +31,49 @@ cargo test --locked -p prime_renderer --lib hardware_pt_restir_ -- --ignored --n
 ## 运行一段时间后出现 DEVICE_LOST
 
 `DEVICE_LOST` 表示 GPU 设备无法继续工作；“等待提交完成失败”本身无法指出哪次计算出错。
-下面的阶段诊断只在 RR 实际启用时逐次等待 RR 之前的光追和计算工作，记录最后成功完成的操作。
-RR 与呈现仍交给宿主按原顺序提交。它会改变时序，可能使竞态暂时不出现，不能用于性能比较。
+优先使用下面的异步检查点模式。它保留原提交顺序，在光追、计算派发和 RR 前后插入驱动进度标记，
+不会逐阶段等待 GPU。出现设备丢失后，日志记录驱动最后经过的标记及近期录制信息。
+需要设备支持 `VK_NV_device_diagnostic_checkpoints`；扩展不可用时会明确记录，不能把缺少检查点当作 GPU 没有执行。
 
 先关闭已有开发客户端。在 **PowerShell 7** 中复制执行；这里使用已配置好的源码开发环境：
 
 ```powershell
 Set-Location 'C:\repositories\simple_engine\app\prime_pt'
+.\scripts\setup-streamline.ps1 -VerifyOnly
 .\scripts\prepare-nsight.ps1 -Offline
-.\scripts\run-gpu-diagnostic.ps1 -Offline
+.\scripts\run-gpu-diagnostic.ps1 -Offline -Mode checkpoints
 ```
 
-第二个脚本会启动游戏。进入原来发生问题的世界，保持相同的 RR、SER、ReSTCV 和分辨率设置，
+最后一个脚本会启动游戏，前两个只检查工具和构建。进入原来发生问题的世界，保持相同的 RR、SER、ReSTCV 和分辨率设置，
 按原来的方式游玩或移动。不要开启 `/pt diagnostic on`，它是另一项关闭 RR 的图像诊断功能。
-已有本次源码构建出的 `target/release/prime_pt.dll` 时可以省略准备命令。
+已有本次源码构建出的 `target/release/prime_pt.dll` 时只需最后一条启动命令。
 缺少离线依赖时去掉 `-Offline`；只想检查启动输入而不打开游戏时加 `-PrepareOnly`。
 
-终端会显示引擎根目录下的新目录 `temp/prime-gpu-日期时间-stages`。
+终端会显示引擎根目录下的新目录 `temp/prime-gpu-日期时间-checkpoints`。
 `native.log` 同时保存 Java 与原生库的输出；原生检查点不保证出现在 Minecraft 的 `latest.log` 中。
-成功进入渲染后应能在 `native.log` 找到 `gpu_frame` 和 `gpu_checkpoint`。
-退出或崩溃后保留整个目录，其中还包含 DLL、源码差异、设置、启动参数和本次崩溃报告。
+成功进入渲染后应能找到 `gpu_checkpoints enabled`，设备丢失后搜索 `gpu_fault`。
+退出或崩溃后保留整个目录，其中还包含实际启动的 DLL／SDK 副本、源码差异、设置、启动参数和本次崩溃报告。
+不需要先用 Nsight 抓帧；普通运行即可。此诊断模式仍可能带来额外开销，不用于性能验收。
 
 | 最后日志 | 含义 |
 | --- | --- |
-| 某操作有 `state=begin`，没有对应 `state=complete` | 该次独立提交未确认完成；用同一 `sample/record/op` 定位。 |
-| `state=rr_present_encoded` | 只完成了 RR 和呈现的 CPU 录制，尚未证明 GPU 执行成功。 |
-| `state=host_complete` | 宿主已确认整帧提交完成。 |
+| `gpu_fault stage=0x1` | 驱动在 TOP_OF_PIPE 阶段最后经过的标记；不能据此认为操作已完成。 |
+| `gpu_fault stage=0x2000` | 驱动在 BOTTOM_OF_PIPE 阶段最后经过的标记；用于缩小未完成区间。 |
+| 其他 `stage` | Vulkan 阶段原始位；保留原值交给分析，不猜测成某个 shader。 |
+| `checkpoint=Some(...)` | `scope` 是帧样本序号，`label` 是边界，`pipeline` 和 `extent` 对应具体派发。 |
+| `checkpoint=None` | 驱动标记不在保留的最近 512 条记录中，不能解释为没有执行。 |
+| `recorded_only` | 只代表 CPU 录制过，不能当作 GPU 进度。 |
 
-阶段诊断不再崩溃时，使用下面的命令保留原调度再复现。诊断开关只对脚本启动的进程生效，
-结束后恢复终端原值，不修改游戏设置。
+驱动检查点用于缩小范围，不证明对应命令就是崩溃原因，也不恢复设备。
+如果需要进一步定位，可以改用逐阶段等待：它只在 RR 实际启用时对 RR 之前的自有操作独立提交并等待，
+日志中的 `state=complete` 才表示对应操作已确认完成。RR 和呈现仍按原顺序交给宿主。
+这种模式会改变时序，可能使竞态暂时消失，不能用于性能比较。
+
+```powershell
+.\scripts\run-gpu-diagnostic.ps1 -Offline -Mode stages
+```
+
+完全关闭两种诊断时使用下面的命令。所有诊断环境变量只对脚本启动的进程生效，结束后恢复终端原值，不修改游戏设置。
 
 ```powershell
 .\scripts\run-gpu-diagnostic.ps1 -Offline -Mode normal

@@ -327,13 +327,14 @@ pub unsafe extern "C" fn prime_create(
     unsafe { prime_create_options(instance, physical, device, queue, family, queue_index, 0) }
 }
 
-/// 带设备能力声明的会话创建；flags bit0 声明 EXT SER，bit1 关闭初始 SER，其余位拒绝。
+/// 带设备能力声明的会话创建；flags bit0 声明 EXT SER，bit1 关闭初始 SER，bit2 启用 NV 异步检查点，其余位拒绝。
 /// bit1 只允许与 bit0 同时设置；失败返回 0。
 ///
 /// # Safety
 /// 与 [`prime_create`] 相同；bit0 为 1 时设备还须真正启用
 /// `VK_EXT_ray_tracing_invocation_reorder` 与 `rayTracingInvocationReorder`。
 /// 初始选择由 bit1 决定，之后可用 [`prime_set_ser`] 切换；不以物理支持替代逻辑设备启用。
+/// bit2 为 1 时必须在该逻辑设备启用 `VK_NV_device_diagnostic_checkpoints`。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prime_create_options(
     instance: u64,
@@ -345,7 +346,7 @@ pub unsafe extern "C" fn prime_create_options(
     flags: u32,
 ) -> u64 {
     guarded(0, || {
-        if flags & !3 != 0 || flags == 2 {
+        if flags & !7 != 0 || flags & 3 == 2 {
             return Err(Error::Input("未知设备能力 flags"));
         }
         if [instance, physical, device, queue].contains(&0) {
@@ -353,7 +354,7 @@ pub unsafe extern "C" fn prime_create_options(
         }
         let scene = scene::Scene::new()?;
         // SAFETY: 调用者提供同一活动设备并独占 queue，见导出接口契约。
-        let gpu = unsafe {
+        let mut gpu = unsafe {
             gpu::Gpu::attach_options(
                 instance,
                 physical,
@@ -366,6 +367,10 @@ pub unsafe extern "C" fn prime_create_options(
                 runtime::root(),
             )?
         };
+        if flags & 4 != 0 {
+            // SAFETY: bit2 是宿主逻辑设备创建边界对已启用扩展的声明。
+            unsafe { gpu.enable_diagnostic_checkpoints()? };
+        }
         // 属性槽按二次幂增长，额外留四分之一给空洞及过渡范围。
         let attribute_limited_resident_bytes =
             (u64::from(gpu.attribute_slot_limit()) * 3 / 4) * size_of::<Quad>() as u64;
@@ -397,6 +402,22 @@ pub unsafe extern "C" fn prime_create_options(
                 },
             );
         Ok(id)
+    })
+}
+
+/// 输出 GPU 故障异步进度；成功返回 0，诊断自身失败返回 -1 并保留来源。
+/// 不等待、不提交、不销毁资源，也不吞掉宿主的原始设备丢失错误。
+/// # Safety
+/// 宿主已收到本会话设备的 `VK_ERROR_DEVICE_LOST`，保持设备与 queue 有效并独占访问；
+/// 普通超时或其他异常不满足该前提。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn prime_report_device_loss(id: u64) -> i32 {
+    guarded(-1, || {
+        with_engine(id, |engine| {
+            // SAFETY: 导出接口要求宿主确认设备已经丢失。
+            unsafe { engine.gpu.report_device_loss()? };
+            Ok(())
+        })
     })
 }
 

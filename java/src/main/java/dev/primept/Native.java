@@ -15,6 +15,7 @@ final class Native implements AutoCloseable {
     private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, invalidateTints, invalidateBatch, failCapture, batch, sources, cameraMedium, tintBegin, tintRequests, tints, biomeWorld, biomeRequests, biomeSamples, atlas, draw, setSer, error;
     private final long handle;
     private final MethodHandle setUpdateBudget;
+    private final MethodHandle reportDeviceLoss;
     private UpdateBudget updateBudget;
     private final MethodHandle setSolarOrbit;
     private SolarSettings solar;
@@ -38,6 +39,10 @@ final class Native implements AutoCloseable {
     }
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex, boolean ser, boolean requested) {
+        this(instance, physical, device, queue, family, queueIndex, ser, requested, false);
+    }
+
+    Native(long instance, long physical, long device, long queue, int family, int queueIndex, boolean ser, boolean requested, boolean checkpoints) {
         SymbolLookup symbols;
         try {
             symbols = NativeRuntime.open(NativeRuntime.locate(), arena);
@@ -45,12 +50,13 @@ final class Native implements AutoCloseable {
             arena.close();
             throw failure;
         }
-        var create = ser
+        var create = ser || checkpoints
                 ? bind(symbols, "prime_create_options", FunctionDescriptor.of(JAVA_LONG,
                         JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT))
                 : bind(symbols, "prime_create", FunctionDescriptor.of(JAVA_LONG,
                         JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT));
         destroy = bind(symbols, "prime_destroy", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
+        reportDeviceLoss = bind(symbols, "prime_report_device_loss", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         reset = bind(symbols, "prime_reset", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         plan = bind(symbols, "prime_plan", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS,
                 JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT));
@@ -82,8 +88,9 @@ final class Native implements AutoCloseable {
                 JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
         error = bind(symbols, "prime_error", FunctionDescriptor.of(ADDRESS));
         try {
-            handle = ser
-                    ? (long) create.invokeExact(instance, physical, device, queue, family, queueIndex, requested ? 1 : 3)
+            handle = ser || checkpoints
+                    ? (long) create.invokeExact(instance, physical, device, queue, family, queueIndex,
+                            (ser ? (requested ? 1 : 3) : 0) | (checkpoints ? 4 : 0))
                     : (long) create.invokeExact(instance, physical, device, queue, family, queueIndex);
             if (handle == 0) throw failure();
             serRequested = requested;
@@ -92,6 +99,11 @@ final class Native implements AutoCloseable {
 
     private static MethodHandle bind(SymbolLookup symbols, String name, FunctionDescriptor type) {
         return Linker.nativeLinker().downcallHandle(symbols.find(name).orElseThrow(), type);
+    }
+
+    /** 调用者已捕获当前宿主设备的 GpuDeviceLossException；普通超时禁止调用。 */
+    void reportDeviceLoss() {
+        try { check((int) reportDeviceLoss.invokeExact(handle)); } catch (Throwable e) { throw unchecked(e); }
     }
 
     void rendering(RenderMode mode, RealtimeRenderer renderer) {

@@ -50,6 +50,7 @@ public final class Bootstrap {
             new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageExtendedFormats"),
             new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat"));
     private static final String SER_EXTENSION = "VK_EXT_ray_tracing_invocation_reorder";
+    private static final String CHECKPOINT_EXTENSION = "VK_NV_device_diagnostic_checkpoints";
     private static final VulkanFeature SER_FEATURE = new VulkanFeature(
             new VulkanPNextStruct(VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.class),
             "rayTracingInvocationReorder", VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.RAYTRACINGINVOCATIONREORDER);
@@ -58,6 +59,7 @@ public final class Bootstrap {
     private static long ptDevice;
     private static long serPhysical;
     private static long serDevice;
+    private static long checkpointDevice;
     private static String serStatus = "尚未协商宿主设备";
     private static int graphicsQueueIndex;
     private Bootstrap() {}
@@ -85,6 +87,7 @@ public final class Bootstrap {
         rrPhysical = 0;
         serPhysical = 0;
         serDevice = 0;
+        checkpointDevice = 0;
         serStatus = "缺少 EXT SER 扩展或特性";
         // 已安装的 interposer 仍负责原版设备；保留其可用的 privateData 特性。
         if (StreamlineBootstrap.installed()
@@ -113,6 +116,11 @@ public final class Bootstrap {
         graphicsQueueIndex = graphics.rightInt();
         var extensions = new HashSet<>(original.extensions());
         extensions.addAll(EXTENSIONS);
+        if ("1".equals(System.getenv("PRIME_PT_DIAGNOSTIC_CHECKPOINTS"))) {
+            if (physical.hasDeviceExtension(CHECKPOINT_EXTENSION)) extensions.add(CHECKPOINT_EXTENSION);
+            else System.getLogger("prime_pt").log(System.Logger.Level.WARNING,
+                    "异步 GPU 检查点不可用：缺少 " + CHECKPOINT_EXTENSION);
+        }
         var features = new HashSet<>(original.features());
         try (var stack = MemoryStack.stackPush()) {
             var address = VkPhysicalDeviceVulkan12Features.calloc(stack).sType$Default();
@@ -193,6 +201,7 @@ public final class Bootstrap {
     /** 只报告当前逻辑设备真正启用的能力，不能以物理支持替代。 */
     public static void created(FeatureSet enabled, VkDevice device) {
         ptDevice = 0;
+        checkpointDevice = 0;
         if (ptPhysical != device.getPhysicalDevice().address()) return;
         if (!device.getPhysicalDevice().getInstance().getCapabilities().Vulkan14
                 || !enabled.extensions().containsAll(EXTENSIONS) || !enabled.features().containsAll(PT_FEATURES)) {
@@ -200,6 +209,12 @@ public final class Bootstrap {
             return;
         }
         ptDevice = device.address();
+        if ("1".equals(System.getenv("PRIME_PT_DIAGNOSTIC_CHECKPOINTS"))
+                && enabled.extensions().contains(CHECKPOINT_EXTENSION)
+                && device.getCapabilities().VK_NV_device_diagnostic_checkpoints) {
+            checkpointDevice = device.address();
+            System.getLogger("prime_pt").log(System.Logger.Level.INFO, "NV 异步 GPU 检查点已启用；保留原提交顺序");
+        }
         serDevice = 0;
         if (serPhysical == device.getPhysicalDevice().address() && enabled.extensions().contains(SER_EXTENSION)
                 && enabled.features().contains(SER_FEATURE)) {
@@ -226,6 +241,9 @@ public final class Bootstrap {
 
     /** 只在创建回调确认该逻辑设备已启用后返回 true。 */
     public static boolean invocationReorder(VkDevice device) { return serDevice != 0 && serDevice == device.address(); }
+
+    /** 仅显式诊断请求且逻辑设备实际启用 NV 检查点时返回 true。 */
+    public static boolean diagnosticCheckpoints(VkDevice device) { return checkpointDevice != 0 && checkpointDevice == device.address(); }
 
     /** 设置界面和命令显示的实际设备协商状态。 */
     public static String serStatus() { return serStatus; }

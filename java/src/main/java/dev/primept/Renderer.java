@@ -3,6 +3,7 @@ package dev.primept;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.renderpearl.api.GpuFormat;
+import com.mojang.renderpearl.api.device.GpuDeviceLossException;
 import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
 import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 import com.mojang.renderpearl.backend.vulkan.VulkanGpuTexture;
@@ -35,6 +36,7 @@ public final class Renderer {
     private static boolean hasFrame;
     private static boolean frozen;
     private static VulkanCommandEncoder encoder;
+    private static boolean faultReported;
     private static long generation = -1;
     private static volatile boolean resetRequested;
     private static long lastCompleted;
@@ -97,7 +99,8 @@ public final class Renderer {
         }
         if (!Bootstrap.rayTracingEnabled()) return false;
         encoder=device.createCommandEncoder();await();
-        renderer=new Native(device.instance().vkInstance().address(),device.vkDevice().getPhysicalDevice().address(),device.vkDevice().address(),device.graphicsQueue().vkQueue().address(),device.graphicsQueue().queueFamilyIndex(),Bootstrap.graphicsQueueIndex(),Bootstrap.invocationReorder(device.vkDevice()),Settings.requestedSer());
+        renderer=new Native(device.instance().vkInstance().address(),device.vkDevice().getPhysicalDevice().address(),device.vkDevice().address(),device.graphicsQueue().vkQueue().address(),device.graphicsQueue().queueFamilyIndex(),Bootstrap.graphicsQueueIndex(),Bootstrap.invocationReorder(device.vkDevice()),Settings.requestedSer(),Bootstrap.diagnosticCheckpoints(device.vkDevice()));
+        faultReported = false;
         return true;
     }
 
@@ -123,6 +126,11 @@ public final class Renderer {
 
     /** 替代原版世界绘制；相机、手持物和 UI 继续使用宿主路径。 */
     public static void render(CameraRenderState camera, RenderTarget target) {
+        try { renderFrame(camera, target); }
+        catch (GpuDeviceLossException failure) { reportDeviceLoss(failure); throw failure; }
+    }
+
+    private static void renderFrame(CameraRenderState camera, RenderTarget target) {
         var minecraft = Minecraft.getInstance();
         if (minecraft.level == null || target.width <= 0 || target.height <= 0) {
             lastCompleted = 0; FrameChart.clear(); return;
@@ -237,7 +245,17 @@ public final class Renderer {
         try (var fence = encoder.createFence()) {
             encoder.submit();
             if (!fence.awaitCompletion(5_000_000_000L)) throw fenceTimeout();
+        } catch (GpuDeviceLossException failure) {
+            reportDeviceLoss(failure);
+            throw failure;
         }
+    }
+
+    private static void reportDeviceLoss(GpuDeviceLossException failure) {
+        if (faultReported || renderer == null) return;
+        faultReported = true;
+        try { renderer.reportDeviceLoss(); }
+        catch (RuntimeException | Error diagnosticFailure) { failure.addSuppressed(diagnosticFailure); }
     }
 
     private static IllegalStateException fenceTimeout() {
