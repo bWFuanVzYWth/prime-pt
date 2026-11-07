@@ -427,12 +427,16 @@ pub unsafe extern "C" fn prime_set_ser(id: u64, enabled: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prime_destroy(id: u64) -> i32 {
     guarded(-1, || {
-        let engine = ENGINES
+        let mut engines = ENGINES
             .get_or_init(Mutex::default)
             .lock()
-            .map_err(|_| Error::Input("native 会话锁已损坏"))?
-            .remove(&id)
-            .ok_or(Error::Input("无效 native 句柄"))?;
+            .map_err(|_| Error::Input("native 会话锁已损坏"))?;
+        engines
+            .get_mut(&id)
+            .ok_or(Error::Input("无效 native 句柄"))?
+            .gpu
+            .close()?;
+        let engine = engines.remove(&id).expect("已确认并关闭同一独占会话");
         drop(engine);
         Ok(0)
     })

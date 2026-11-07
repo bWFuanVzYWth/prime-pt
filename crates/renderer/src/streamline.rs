@@ -18,6 +18,10 @@ pub fn bootstrap() -> Result<(), Error> {
 pub(crate) struct Runtime(vulkan::streamline::Runtime);
 
 impl Runtime {
+    pub(crate) fn close(&mut self) -> Result<(), Error> {
+        self.0.close()
+    }
+
     /// # Safety
     /// 遵守 vulkan::streamline::Runtime::new 的设备和完成契约。
     pub(crate) unsafe fn new(init: Init) -> Result<Self, Error> {

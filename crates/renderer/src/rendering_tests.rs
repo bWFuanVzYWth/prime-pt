@@ -16,7 +16,7 @@ fn publish(gpu: &mut Gpu, mesh: &Mesh, content: u64) -> Result<(), Error> {
 }
 
 #[test]
-#[ignore = "独立进程：4K Performance RR+SER+ReSTCV，移动相机和连续区块增删后仍能完成有限HDR"]
+#[ignore = "独立进程：原生4K DLAA+SER+ReSTCV，移动相机和连续区块增删后仍能完成有限HDR"]
 fn hardware_pt_rr_restcv_streaming_motion() -> Result<(), Box<dyn std::error::Error>> {
     use prime_scene::{MaterialDefinition, MaterialId, RenderMode};
     let host = Host::new_rr_ser()?;
@@ -109,9 +109,18 @@ fn hardware_pt_rr_restcv_streaming_motion() -> Result<(), Box<dyn std::error::Er
         }
         meshes.push(mesh);
     }
-    let options = Options::new(true, streamline::Quality::Performance, 1, 12)?;
+    let quality = match std::env::var("PRIME_PT_STREAMING_QUALITY").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("dlaa") => streamline::Quality::Dlaa,
+        Ok("performance") => streamline::Quality::Performance,
+        _ => return Err("PRIME_PT_STREAMING_QUALITY 只接受 dlaa 或 performance".into()),
+    };
+    let options = Options::new(true, quality, 1, 12)?;
     let frames =
         std::env::var("PRIME_PT_STREAMING_FRAMES").map_or(Ok(240), |value| value.parse::<u64>())?;
+    if frames == 0 {
+        return Err("移动回归至少需要一帧".into());
+    }
+    eprintln!("移动回归：output=3840x2160 quality={quality:?} frames={frames}");
     for frame in 0..frames {
         let t = frame as f32 * 0.07;
         let x = 128. + 150. * t.sin();
@@ -157,6 +166,7 @@ fn hardware_pt_rr_restcv_streaming_motion() -> Result<(), Box<dyn std::error::Er
         "streaming final_hdr_blake3={}",
         blake3::hash(&download_buffer(&mut gpu, hdr)?),
     );
+    gpu.close()?;
     drop(gpu);
     // RR 的 SDK 验证消息单独保留；此用例检查真实求值、提交完成及 HDR，不将已知内部消息作为设备丢失。
     eprintln!(

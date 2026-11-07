@@ -3771,11 +3771,29 @@ impl Gpu {
     }
 }
 
+impl Gpu {
+    /// 宿主确认此前 GPU 命令完成后，显式完成记录并释放 RR；失败保留底层错误与 SDK 所有者。
+    /// 在移除会话前调用；重复关闭不重复释放 SDK，场景资源仍由本对象持有至析构。
+    /// # Errors
+    /// 尚有未编码命令、完成记录失败或 SDK 释放失败时返回来源，宿主不得按成功关闭继续销毁设备。
+    pub fn close(&mut self) -> Result<(), Error> {
+        self.complete_previous()?;
+        if let Some(runtime) = &mut self.rr_runtime {
+            runtime.close()?;
+        }
+        self.rr_runtime = None;
+        Ok(())
+    }
+}
+
 impl Drop for Gpu {
     fn drop(&mut self) {
-        self.rr_runtime = None;
-        if self.complete_previous().is_err() {
-            std::process::abort();
+        if let Err(error) = self.close() {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "[prime_pt] renderer 退役失败：{error}"
+            );
         }
     }
 }
