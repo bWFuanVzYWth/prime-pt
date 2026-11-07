@@ -152,18 +152,22 @@ impl MeshParts {
         self.version = version;
         Ok(previous)
     }
-    /// 移出片段；缺失不改变版本，版本耗尽时panic。
-    pub fn take(&mut self, slot: usize) -> Option<Mesh> {
-        let slot = u16::try_from(slot).ok()?;
-        let i = self
-            .fragments
-            .binary_search_by_key(&slot, |v| v.slot)
-            .ok()?;
-        let version = self.version.checked_add(1).expect("分片版本耗尽");
+    /// 移出片段；缺失返回 `Ok(None)`，版本耗尽返回错误且不改变目录或版本。
+    pub fn take(&mut self, slot: usize) -> Result<Option<Mesh>, Error> {
+        let Ok(slot) = u16::try_from(slot) else {
+            return Ok(None);
+        };
+        let Ok(i) = self.fragments.binary_search_by_key(&slot, |v| v.slot) else {
+            return Ok(None);
+        };
+        let version = self
+            .version
+            .checked_add(1)
+            .ok_or(Error::Input("分片版本耗尽"))?;
         let mesh = self.fragments.remove(i).mesh;
         self.len -= mesh.quads.len();
         self.version = version;
-        Some(mesh)
+        Ok(Some(mesh))
     }
     /// O(1)借用当前目录，使用所有者缓存的quad量。
     pub fn view(&self) -> MeshView<'_> {

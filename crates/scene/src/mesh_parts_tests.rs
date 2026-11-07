@@ -14,6 +14,18 @@ fn mesh(color: [f32; 3]) -> Mesh {
 }
 
 #[test]
+fn exhausted_version_preserves_the_removed_fragment() -> Result<(), Error> {
+    let mut parts = MeshParts::default();
+    parts.insert(3, mesh([1.; 3]))?;
+    parts.version = u64::MAX;
+    let allocation = parts.get(3).unwrap().quads.as_ptr();
+    assert!(parts.take(3).is_err());
+    assert_eq!(parts.get(3).unwrap().quads.as_ptr(), allocation);
+    assert_eq!(parts.len(), 1);
+    Ok(())
+}
+
+#[test]
 fn publication_moves_unchanged_vectors_and_retains_only_old_dirty_payload() -> Result<(), Error> {
     let mut old = MeshParts::default();
     old.insert(3, mesh([1.; 3]))?;
