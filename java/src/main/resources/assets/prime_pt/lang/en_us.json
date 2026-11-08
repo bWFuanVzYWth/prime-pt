@@ -15,8 +15,8 @@
   "primept.settings.quality.balanced": "Balanced",
   "primept.settings.quality.performance": "Performance (2×)",
   "primept.settings.quality.ultra_performance": "Ultra Performance",
-  "primept.settings.samples": "Samples per frame",
-  "primept.settings.samples.tooltip": "Plain PT and offline mode trace 1–64 paths per pixel per frame. Realtime ReSTIR uses one initial candidate per frame. RR averages this frame before reconstruction.\nCommand: /pt spp 1..64",
+  "primept.settings.samples": "Primary sampling",
+  "primept.settings.samples.tooltip": "Realtime PT only: balance interface reflection and entry into the material, or sample both. Pure metals use two specular paths. Later bounces are unchanged. Offline PT retains material probabilities and command-controlled batch sizes.",
   "primept.settings.bounces": "Path vertex budget",
   "primept.settings.bounces.tooltip": "Allow 1–64 vertices per path, including the primary hit. The last vertex still evaluates direct lighting and emission.\nCommand: /pt bounces 1..64",
   "primept.settings.display": "PT display",
@@ -62,5 +62,7 @@
   "primept.settings.restir_cv.tooltip": "Reduce ReSTIR color noise with temporal and spatial control variates. Enabled by default. Toggling starts fresh color history and preserves path history.\nCommand: /pt cv on|off",
   "primept.settings.restir_fresh.tooltip": "Choose the fresh estimate independently at this fixed probability to reduce output correlation. 0% shows reuse, 100% shows fresh. Reuse stages still run.\nCommand: /pt fresh 0..100",
   "primept.settings.diagnostic": "Native raw diagnostic",
-  "primept.settings.diagnostic.tooltip": "Native resolution, no RR or frame accumulation. Plain PT averages the configured SPP within each frame; ReSTIR keeps one initial candidate and internal reuse. Display exposure and quality preferences remain active.\nCommand: /pt diagnostic on|off"
+  "primept.settings.diagnostic.tooltip": "Native resolution, no RR or frame accumulation. Plain PT averages the configured SPP within each frame; ReSTIR keeps one initial candidate and internal reuse. Display exposure and quality preferences remain active.\nCommand: /pt diagnostic on|off",
+  "primept.settings.samples.random": "1 spp random",
+  "primept.settings.samples.separated": "2 spp separated"
 }

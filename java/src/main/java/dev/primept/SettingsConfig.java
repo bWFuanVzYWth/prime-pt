@@ -71,7 +71,7 @@ final class SettingsConfig {
     boolean rr() { return values.rr; }
     boolean ser() { return values.ser; }
     Quality quality() { return values.quality; }
-    int samples() { return values.samples; }
+    int samples() { return values.selection.mode() == RenderMode.OFFLINE ? values.samples : Math.min(2, values.samples); }
     int bounces() { return values.bounces; }
     UpdateBudget updateBudget() { return values.updateBudget; }
     SolarSettings solar() { return values.solar; }
@@ -99,6 +99,7 @@ final class SettingsConfig {
     }
 
     void setSamples(int samples) throws IOException {
+        if (values.selection.mode() != RenderMode.OFFLINE) range(samples, 1, 2, "实时采样策略");
         store(new Values(values.ev, values.rr, values.quality, samples, values.bounces, values.ser,
                 values.updateBudget, values.solar, values.display, values.lighting, values.selection, values.tuning));
     }
@@ -259,7 +260,7 @@ final class SettingsConfig {
                 }
                 case "spp" -> {
                     if (parts.length == 3) setSamples(parseInteger(parts[2], "SPP"));
-                    return "PT SPP：" + samples() + "（范围 [1, 64]）";
+                    return "PT SPP：" + samples() + (values.selection.mode() == RenderMode.OFFLINE ? "（离线批大小 [1, 64]）" : "（1 随机 / 2 首表面分离）");
                 }
                 case "bounces" -> {
                     if (parts.length == 3) setBounces(parseInteger(parts[2], "路径顶点数"));
@@ -341,6 +342,6 @@ final class SettingsConfig {
 
     private static String usage() {
         return "用法：/pt enabled [on|off]；/pt mode [realtime|offline]；/pt renderer [path_trace|restir_pt]；/pt ser [on|off]；/pt rr [on|off]；/pt quality [dlaa|quality|balanced|performance|ultra_performance]；"
-                + "/pt ev [EV]；/pt spp [1..64]；/pt bounces [1..64]；/pt mcap [1..100]；/pt fresh [0..100]；/pt cv [on|off]；/pt diagnostic [on|off]；/pt reset";
+                + "/pt ev [EV]；/pt spp [1|2，离线1..64]；/pt bounces [1..64]；/pt mcap [1..100]；/pt fresh [0..100]；/pt cv [on|off]；/pt diagnostic [on|off]；/pt reset";
     }
 }

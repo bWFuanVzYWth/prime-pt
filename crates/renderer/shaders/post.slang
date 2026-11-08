@@ -55,7 +55,10 @@ void post_main(uint3 id: SV_DispatchThreadID)
         if ((params.output_size.z & 8u) == 0)
             radiance = max(radiance, 0);
     }
-    pt::accumulate_sample(sum, count, radiance, tail.w);
+    uint paths = (params.output_size.z & 32u) != 0 ? params.image.w : 1u;
+    // 本次均值代表1或2条输运路径，累积计数仍按实际路径计。
+    for (uint lane = 0; lane < paths; lane++)
+        pt::accumulate_sample(sum, count, radiance, tail.w);
     accumulation[pixel] = sum;
     sample_counts[pixel] = count;
     if (sum.w < 0 || count == params.image.z + params.image.w)

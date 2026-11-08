@@ -15,8 +15,8 @@
   "primept.settings.quality.balanced": "均衡",
   "primept.settings.quality.performance": "性能（2×）",
   "primept.settings.quality.ultra_performance": "超级性能",
-  "primept.settings.samples": "每帧采样数",
-  "primept.settings.samples.tooltip": "普通 PT 和离线模式每像素每帧追踪 1–64 条路径；实时 ReSTIR 固定每帧一个初始候选。RR 先平均本帧样本，再重建画面。\n命令：/pt spp 1..64",
+  "primept.settings.samples": "首表面采样",
+  "primept.settings.samples.tooltip": "仅普通实时 PT：界面反射与进入内部固定概率选择，或各取一条路径。纯金属取两条高光。后续反弹不变；离线使用原材质概率，可用命令设置批大小。",
   "primept.settings.bounces": "路径顶点预算",
   "primept.settings.bounces.tooltip": "每条路径最多 1–64 个顶点，包括主命中；最后一个顶点仍计算直接光与自发光。\n命令：/pt bounces 1..64",
   "primept.settings.display": "PT 显示",
@@ -62,5 +62,7 @@
   "primept.settings.restir_cv.tooltip": "使用时空控制变量降低ReSTIR颜色噪声，默认开启。切换只冷启动颜色历史，保留路径历史。\n命令：/pt cv on|off",
   "primept.settings.restir_fresh.tooltip": "按固定概率独立选择本帧初采结果，减少输出相关性。0%全部复用，100%全部初采；复用阶段仍照常执行。\n命令：/pt fresh 0..100",
   "primept.settings.diagnostic": "原生无累积诊断",
-  "primept.settings.diagnostic.tooltip": "使用原生分辨率，关闭RR和跨帧图像累积。普通PT按所设SPP平均本帧样本，ReSTIR保留内部复用及单个初始候选；显示曝光与画质偏好保持。\n命令：/pt diagnostic on|off"
+  "primept.settings.diagnostic.tooltip": "使用原生分辨率，关闭RR和跨帧图像累积。普通PT按所设SPP平均本帧样本，ReSTIR保留内部复用及单个初始候选；显示曝光与画质偏好保持。\n命令：/pt diagnostic on|off",
+  "primept.settings.samples.random": "1 spp 随机",
+  "primept.settings.samples.separated": "2 spp 分离"
 }

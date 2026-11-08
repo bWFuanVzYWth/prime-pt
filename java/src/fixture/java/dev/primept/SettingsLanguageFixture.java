@@ -66,7 +66,7 @@ final class SettingsLanguageFixture {
                     requireText("render", "PT rendering");
                     requireText("restir_cv", "ReSTCV color estimate");
                     requireRenderingHierarchy("Prime PT", "Rendering mode", "Offline snapshot", "Realtime renderer");
-                    requireWidgetText("Samples per frame", "DLSS quality", "Performance (2×)");
+                    requireWidgetText("Primary sampling", "2 spp separated", "DLSS quality", "Performance (2×)");
                     requireAutoExposure("Auto exposure strength");
                     requireLighting("Sun intensity", "Block emission intensity");
                     requireStartupNotice("Prime PT unavailable", "OpenGL is active.", "GPU or driver lacks:");
@@ -74,7 +74,7 @@ final class SettingsLanguageFixture {
                     requireText("render", "PT 渲染");
                     requireText("restir_cv", "ReSTCV 颜色估计");
                     requireRenderingHierarchy("Prime PT 开关", "渲染模式", "离线快照", "实时渲染器");
-                    requireWidgetText("每帧采样数", "DLSS 质量", "性能（2×）");
+                    requireWidgetText("首表面采样", "2 spp 分离", "DLSS 质量", "性能（2×）");
                     requireAutoExposure("自动曝光强度");
                     requireLighting("太阳强度", "方块发光强度");
                     requireStartupNotice("Prime PT 不可用", "当前使用 OpenGL。", "显卡或驱动缺少：");
@@ -86,7 +86,7 @@ final class SettingsLanguageFixture {
                 try (var resources = new MultiPackResourceManager(PackType.CLIENT_RESOURCES, List.of(vanilla, pack, userPack))) {
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "资源包覆盖");
-                    requireText("samples", "每帧采样数");
+                    requireText("samples", "首表面采样");
                 }
             }
         } finally {
@@ -106,11 +106,13 @@ final class SettingsLanguageFixture {
         require(actual.equals(expected), key + " 的翻译为 " + actual + "，预期 " + expected);
     }
 
-    private static void requireWidgetText(String samples, String quality, String performance) {
-        var slider = new VideoOptions.Slider("samples", 1, 64, 1, () -> 32, value -> {},
-                error -> { throw new AssertionError(error); }, VideoOptions.ValueFormat.INTEGER);
-        var expectedSlider = Options.genericValueLabel(Component.literal(samples), Component.literal("32"));
-        require(slider.getMessage().getString().equals(expectedSlider.getString()), "滑块显示一次本地化标题和数值");
+    private static void requireWidgetText(String samples, String separated, String quality, String performance) {
+        var sampling = VideoOptions.cycle(CycleButton.builder(
+                        (PrimarySampling value) -> Component.translatable("primept.settings.samples." + value.key), PrimarySampling.SEPARATED)
+                .withValues(PrimarySampling.values()), Component.translatable("primept.settings.samples"),
+                () -> PrimarySampling.SEPARATED, value -> {}, error -> { throw new AssertionError(error); });
+        var expectedSampling = CommonComponents.optionNameValue(Component.literal(samples), Component.literal(separated));
+        require(sampling.getMessage().getString().equals(expectedSampling.getString()), "采样策略显示一次本地化标题和选项");
         var cycle = VideoOptions.cycle(CycleButton.builder(
                         (String key) -> Component.translatable("primept.settings.quality." + key), "performance")
                 .withValues("performance", "quality"), Component.translatable("primept.settings.quality"),

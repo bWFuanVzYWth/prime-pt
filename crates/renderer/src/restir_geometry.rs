@@ -1,4 +1,4 @@
-//! ReSTIR稳定slab目录与交点恢复数据；源键/源版本由场景所有者提供。
+//! 普通PT首面与ReSTIR共用的交点恢复数据；稳定slab源键/源版本由场景所有者提供。
 //! 单一buffer为16B头、每quad64B原位置/region/token、容量尾部的活动身份目录。
 //! 未改slab沿用token；当前primitive范围可搬移，历史通过目录恢复新范围。
 //! BLAS复用只证明位置和primitive顺序相同，不证明源slab版本未变；目录换token时
@@ -77,7 +77,7 @@ impl Gpu {
             ranges: Vec::new(),
             tokens: Vec::new(),
         };
-        if self.renderer_kind != prime_scene::RealtimeRenderer::RestirPt {
+        if !self.needs_known_geometry() {
             prepared.buffer = None;
             prepared.capacity = 0;
             return Ok(prepared);

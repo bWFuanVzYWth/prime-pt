@@ -1549,6 +1549,17 @@ fn hardware_pt_grass_overlay_selects_tinted_grass_and_untinted_dirt()
 #[ignore = "真实EXT SER/Vulkan RT；HG保留法线贴图在几何背面产生的连续光照支持"]
 fn hardware_pt_hit_group_preserves_authored_normal_light_support()
 -> Result<(), Box<dyn std::error::Error>> {
+    authored_normal_light_support(false)
+}
+
+#[test]
+#[ignore = "真实EXT/Vulkan RT；缓存首命中重建与直接命中保留相同法线贴图光照支持"]
+fn hardware_pt_primary_cache_preserves_authored_normal_light_support()
+-> Result<(), Box<dyn std::error::Error>> {
+    authored_normal_light_support(true)
+}
+
+fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_ser()?;
     let uv = [[0., 0.], [0., 1.], [1., 1.], [1., 0.]];
     let mesh = Mesh {
@@ -1584,6 +1595,10 @@ fn hardware_pt_hit_group_preserves_authored_normal_light_support()
             base_roughness: [0.8, 0.8, 0.8, 1.],
             ..MaterialDefinition::default()
         };
+        if staged {
+            // 消除首面提案概率差异，只比较缓存重建和直接命中的物理输入。
+            receiver.surface[0] = 1.;
+        }
         receiver.control[2] |= MaterialDefinition::AUXILIARY;
         if authored {
             receiver.control[3] |= MaterialDefinition::AUTHORED_NORMAL;
@@ -1599,11 +1614,11 @@ fn hardware_pt_hit_group_preserves_authored_normal_light_support()
             &[receiver, lamp],
             &[],
             &[[u32::MAX, 0, 0, 0]; 2],
-            &[230, 128, 0, 85],
+            &[230, 128, 0, if staged { 0 } else { 85 }],
         )?;
         publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
         gpu.set_ser(true)?;
-        gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., true, false)?)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., !staged, false)?)?;
         gpu.test_restart_sample_sequence(0)?;
         host.render_options(
             &mut gpu,
@@ -1613,7 +1628,12 @@ fn hardware_pt_hit_group_preserves_authored_normal_light_support()
                 sun_direction: [0.; 3],
                 ..Default::default()
             },
-            Options::new(false, streamline::Quality::Dlaa, 16, 1)?,
+            Options::new(
+                false,
+                streamline::Quality::Dlaa,
+                if staged { 1 } else { 16 },
+                1,
+            )?,
         )?;
         let hdr = gpu.view.as_ref().unwrap().output;
         let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;
@@ -1644,17 +1664,21 @@ fn hardware_pt_hit_group_preserves_authored_normal_light_support()
             if dispatch == 0 {
                 reference = pixels;
             } else {
-                for (pixel, (actual, expected)) in pixels.iter().zip(&reference).enumerate() {
-                    for channel in 0..4 {
-                        assert!(
+                let error = pixels
+                    .iter()
+                    .zip(&reference)
+                    .flat_map(|(actual, expected)| {
+                        (0..4).map(move |channel| {
                             (actual[channel] - expected[channel]).abs()
-                                <= 5e-5 * expected[channel].abs().max(1.),
-                            "mode={dispatch}, pixel={pixel}, channel={channel}: {} != {}",
-                            actual[channel],
-                            expected[channel]
-                        );
-                    }
-                }
+                                / expected[channel].abs().max(1.)
+                        })
+                    })
+                    .fold(0f32, f32::max);
+                println!("normal support staged={staged} maximum scaled error={error}");
+                assert!(
+                    error <= 5e-5,
+                    "mode={dispatch}, maximum scaled error={error}"
+                );
             }
         } else {
             assert!(

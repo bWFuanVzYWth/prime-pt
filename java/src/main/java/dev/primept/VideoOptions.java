@@ -62,6 +62,7 @@ public final class VideoOptions {
     private CycleButton<Boolean> rr;
     private CycleButton<Boolean> ser;
     private CycleButton<Quality> quality;
+    private CycleButton<PrimarySampling> primarySampling;
     private CycleButton<UpdateBudget> updateBudget;
 
     private VideoOptions(OptionsList list, Screen screen, Runnable rebuild) {
@@ -155,8 +156,16 @@ public final class VideoOptions {
                         text("quality"), Settings::quality, Settings::setQuality, this::failed);
                 list.addBig(quality);
             }
-            case SAMPLES -> addSlider("samples", Settings.MIN_SAMPLES, Settings.MAX_SAMPLES, 1,
-                    Settings::samples, value -> Settings.setSamples((int)value), ValueFormat.INTEGER);
+            case SAMPLES -> {
+                primarySampling = cycle(CycleButton.builder(
+                                (PrimarySampling value) -> text("samples." + value.key),
+                                PrimarySampling.fromSamples(Settings.samples()))
+                        .withValues(List.of(PrimarySampling.values()))
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("samples.tooltip"))),
+                        text("samples"), () -> PrimarySampling.fromSamples(Settings.samples()),
+                        value -> Settings.setSamples(value.samples), this::failed);
+                list.addBig(primarySampling);
+            }
             case BOUNCES -> addSlider("bounces", Settings.MIN_BOUNCES, Settings.MAX_BOUNCES, 1,
                     Settings::bounces, value -> Settings.setBounces((int)value), ValueFormat.INTEGER);
             case UPDATE_BUDGET -> {
@@ -253,6 +262,9 @@ public final class VideoOptions {
         rr.active = realtime && !Settings.diagnostic();
         quality.active = realtime && !Settings.diagnostic() && Settings.requestedRr();
         updateBudget.active = realtime;
+        primarySampling.active = realtime && Settings.realtimeRenderer() == RealtimeRenderer.PATH_TRACE;
+        var strategy = PrimarySampling.fromSamples(Settings.samples());
+        if (primarySampling.getValue() != strategy) primarySampling.setValue(strategy);
         for (var slider : sliders) {
             boolean display = switch (slider.key) {
                 case "exposure", "auto_exposure", "drt_saturation", "drt_hue", "drt_compression_start" -> true;

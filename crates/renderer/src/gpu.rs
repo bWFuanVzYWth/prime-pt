@@ -15,8 +15,8 @@
 //! 普通PT的完整Hit Group/专用导引要求设备已启用`VK_EXT_ray_tracing_invocation_reorder`；
 //! 是否实际执行SER由设置选择。未启用该能力时保留Flow callable兼容路径，其作者法线预解码
 //! 与旧导引仍是通用实现，不属于完整Hit Group路径的逐阶段材质裁剪保证。ReSTIR已知表面
-//! 使用独立的专用callable，不要求EXT能力；完整HG设备的导引单独重追相机射线，
-//! Guide与初采不共享HitObject调用图和payload存活区间。
+//! 使用独立的专用callable，不要求EXT能力。实时普通PT先缓存首视线，再独立运行delta导引
+//! 和随机输运；Guide与输运从同一首面重启，不共用后缀。离线仍追踪完整路径且不生成导引。
 
 use crate::scene::{Camera, Environment, Mesh};
 use prime_scene::MaterialDefinition;
@@ -560,6 +560,7 @@ fn programs<'a>(
     hit: materials::HitFeatures,
 ) -> Programs<'a> {
     Programs {
+        primary: None,
         prefix: Some(shader(
             include_bytes!(concat!(env!("OUT_DIR"), "/prefix.spv")),
             c"prefix_main",
@@ -850,13 +851,19 @@ impl Gpu {
             self.guide_pipeline = None;
             self.restir = None;
             self.restir_dirty = true;
-            if renderer == prime_scene::RealtimeRenderer::PathTrace {
+            if !self.needs_known_geometry() {
                 self.restir_geometry = None;
             }
         }
         self.offline = offline;
         self.offline_metered = inherited_exposure;
         self.collect_resources()
+    }
+
+    // 已知首面与历史重连共享目录；旧兼容输运不保留这个工作集。
+    const fn needs_known_geometry(&self) -> bool {
+        matches!(self.renderer_kind, prime_scene::RealtimeRenderer::RestirPt)
+            || matches!(&self.generation, Some(generation) if generation.dispatch == 8)
     }
 
     /// 当前独立累积域已接受的样本数；尚无视图时为零，RR 和 ReSTIR 每帧重开累积域。
@@ -1733,6 +1740,25 @@ impl Gpu {
             &coverage,
             &emitters,
         ];
+        let primary_source = self.shader_source.with_file_name("primary_material.slang");
+        let primary_materials = (dispatch == 8)
+            .then(|| {
+                openpbr::program::ProgramSet::queue_variants(
+                    &mut batch,
+                    keys.iter().copied(),
+                    openpbr::program::Template {
+                        source: primary_source
+                            .to_str()
+                            .ok_or(Error::Invalid("shader路径不是UTF-8"))?,
+                        entry: "shade_primary",
+                        output: "primary-material.spv",
+                        target: shader_build::Target::Spirv("spirv_1_4"),
+                        args: &hit_args,
+                    },
+                )
+                .map_err(Error::from)
+            })
+            .transpose()?;
         let material_hits = if (2..=7).contains(&dispatch) {
             Some(openpbr::program::ProgramSet::queue_hit_variants(
                 &mut batch,
@@ -1812,6 +1838,18 @@ impl Gpu {
                     "render_fused",
                     "raygeneration",
                     "render-fused.spv",
+                    &native_args,
+                )
+            })
+            .transpose()?;
+        let primary = (dispatch == 8)
+            .then(|| {
+                compile_stage(
+                    &mut batch,
+                    program_source,
+                    "primary_main",
+                    "raygeneration",
+                    "primary.spv",
                     &native_args,
                 )
             })
@@ -1963,6 +2001,29 @@ impl Gpu {
                 ],
             },
         )?;
+        let primary_guides = (dispatch == 8)
+            .then(|| {
+                openpbr::program::ProgramSet::queue_variants(
+                    &mut batch,
+                    programs
+                        .plan()
+                        .keys()
+                        .iter()
+                        .copied()
+                        .map(materials::scattering_key),
+                    openpbr::program::Template {
+                        source: guide_source
+                            .to_str()
+                            .ok_or(Error::Invalid("shader路径不是UTF-8"))?,
+                        entry: "guide_primary",
+                        output: "primary-guide.spv",
+                        target: shader_build::Target::Spirv("spirv_1_4"),
+                        args: &hit_args,
+                    },
+                )
+                .map_err(Error::from)
+            })
+            .transpose()?;
         let initial_ser_bits = format!(
             "-DPRIMEPT_SER_BITS={}",
             (initial_count + initial_direct_count)
@@ -2048,7 +2109,14 @@ impl Gpu {
             .map(|set| set.finish(&mut compiled))
             .collect::<Result<Vec<_>, _>>()?;
         let guide_hits = guide_hits.finish(&mut compiled)?;
+        let primary_materials = primary_materials
+            .map(|set| set.finish(&mut compiled))
+            .transpose()?;
+        let primary_guides = primary_guides
+            .map(|set| set.finish(&mut compiled))
+            .transpose()?;
         let mut take = |ticket| compiled.take(ticket);
+        let primary = primary.map(&mut take).transpose()?;
         let fused = fused.map(&mut take).transpose()?;
         let fused_ser = fused_ser.map(&mut take).transpose()?;
         let guided = guided.map(&mut take).transpose()?;
@@ -2206,6 +2274,8 @@ impl Gpu {
                     .artifacts()
                     .iter()
                     .chain(material_hits.iter().flat_map(|set| set.artifacts()))
+                    .chain(primary_materials.iter().flat_map(|set| set.artifacts()))
+                    .chain(primary.iter())
                     .chain(fused.iter())
                     .chain(fused_ser.iter())
                     .chain(guide_hits.artifacts().iter().filter(|_| dispatch != 8)),
@@ -2214,6 +2284,7 @@ impl Gpu {
                 guide_hits
                     .artifacts()
                     .iter()
+                    .chain(primary_guides.iter().flat_map(|set| set.artifacts()))
                     .chain(guided.iter())
                     .chain(guided_ser.iter()),
             ),
@@ -2318,6 +2389,22 @@ impl Gpu {
                 entry: c"shade_opaque",
             })
             .collect();
+        let primary_callables: Vec<_> = primary_materials
+            .iter()
+            .flat_map(|set| set.artifacts())
+            .map(|a| RayShader {
+                spirv: a.bytes(),
+                entry: c"shade_primary",
+            })
+            .collect();
+        let guide_callables: Vec<_> = primary_guides
+            .iter()
+            .flat_map(|set| set.artifacts())
+            .map(|a| RayShader {
+                spirv: a.bytes(),
+                entry: c"guide_primary",
+            })
+            .collect();
         let configured = |reordered| {
             let mut result = self::programs(&callables, reordered, hit);
             if dispatch != 0 {
@@ -2336,6 +2423,13 @@ impl Gpu {
                 if dispatch >= 2 {
                     result.callables = &[];
                 }
+            }
+            if dispatch == 8 {
+                result.primary = primary.as_ref().map(|a| RayShader {
+                    spirv: a.bytes(),
+                    entry: c"primary_main",
+                });
+                result.callables = &primary_callables;
             }
             result
         };
@@ -2400,7 +2494,7 @@ impl Gpu {
                         guide_trace.miss,
                         &guide_groups,
                         guide_trace.any_hit,
-                        &[],
+                        &guide_callables,
                     )
                 }
             })
@@ -2487,9 +2581,7 @@ impl Gpu {
 
     /// 材质域更新后，即使管理器没有几何patch，也须重新准备发光分布。
     pub const fn scene_resources_dirty(&self) -> bool {
-        self.lighting_dirty
-            || (matches!(self.renderer_kind, prime_scene::RealtimeRenderer::RestirPt)
-                && self.restir_geometry.is_none())
+        self.lighting_dirty || (self.needs_known_geometry() && self.restir_geometry.is_none())
     }
 
     #[cfg(test)]
@@ -2504,7 +2596,14 @@ impl Gpu {
     #[cfg(test)]
     fn set_scene_inner(&mut self, mesh: &Mesh) -> Result<(), Error> {
         let scene = Self::build_scene(&mut self.context, mesh)?;
+        let mut geometry = vec![0u32; 4];
+        for quad in &mesh.quads {
+            geometry.extend(quad.positions().into_iter().flatten().map(f32::to_bits));
+            geometry.extend([0, 0, 0, 0]);
+        }
+        let positions = Buffer::upload(&mut self.context, bytemuck::cast_slice(&geometry))?;
         self.invalidate()?;
+        self.restir_geometry = Some(positions);
         self.scene = scene;
         self.region_cache = scene_cache::Cache::new()?;
         self.attribute_revisions.clear();
@@ -3137,8 +3236,11 @@ impl Gpu {
 
     fn allocate_bindings(
         &mut self,
-        (trace, post): (Vec<Binding>, Vec<Binding>),
+        (mut trace, post): (Vec<Binding>, Vec<Binding>),
     ) -> Result<(Bindings, Bindings), Error> {
+        trace.push(Binding::StorageBuffer(
+            self.restir_geometry.unwrap_or(self.restir_placeholder),
+        ));
         Ok((
             Bindings::new(&mut self.context, &trace)?,
             Bindings::new(&mut self.context, &post)?,
@@ -3147,13 +3249,16 @@ impl Gpu {
 
     fn create_guide_pipeline(&mut self) -> Result<RayTracingPipeline, Error> {
         let view = self.view.as_ref().expect("已创建view");
-        let (trace, _) = self.renderer_bindings(
+        let (mut trace, _) = self.renderer_bindings(
             view,
             &self.atlas,
             &self.scene,
             self.material_gpu,
             self.lighting_gpu,
         );
+        trace.push(Binding::StorageBuffer(
+            self.restir_geometry.unwrap_or(self.restir_placeholder),
+        ));
         let bindings = Bindings::new(&mut self.context, &trace)?;
         let generation = self.generation.as_ref().expect("完整资源世代");
         let program = if self.invocation_reorder {
@@ -3295,6 +3400,13 @@ impl Gpu {
                 self.restir_dirty = true;
             }
             let using_restir = self.renderer_kind == prime_scene::RealtimeRenderer::RestirPt;
+            let realtime_pt = !self.offline
+                && !using_restir
+                && !diagnostic
+                && self.generation.as_ref().unwrap().dispatch == 8;
+            if realtime_pt && !matches!(self.settings.samples, 1 | 2) {
+                return Err(Error::Invalid("实时PT只接受1 spp随机或2 spp分离"));
+            }
             if using_restir {
                 self.prepare_restir_view()?;
             } else if self.renderer.is_none() {
@@ -3431,7 +3543,8 @@ impl Gpu {
                             .is_some_and(|g| g.hit.authored_normals),
                     ) << 2)
                     | (u32::from(cv_enabled) << 3)
-                    | (u32::from(cv_history) << 4),
+                    | (u32::from(cv_history) << 4)
+                    | (u32::from(realtime_pt) << 5),
                 self.tuning.history_cap(),
             ]);
             words.extend(self.anchor.map(|v| ((v / 64.) as i32) as u32));
@@ -3476,7 +3589,10 @@ impl Gpu {
                 clear.barrier();
                 result.push(clear.finish(&mut self.context)?);
             }
-            if rr_enabled && let Some(pipeline) = self.guide_pipeline {
+            if rr_enabled
+                && !realtime_pt
+                && let Some(pipeline) = self.guide_pipeline
+            {
                 let mut commands = Commands::new(&self.context)?;
                 #[cfg(test)]
                 if let Some(queries) = self.test_guide_timestamps {
@@ -3499,9 +3615,25 @@ impl Gpu {
             } else {
                 let renderer = self.renderer.as_ref().unwrap();
                 #[cfg(not(test))]
-                let recorded = renderer.record(&mut self.context, batch.samples())?;
+                let recorded = if realtime_pt {
+                    renderer.record_realtime(
+                        &mut self.context,
+                        self.guide_pipeline.filter(|_| rr_enabled),
+                        None,
+                        None,
+                    )?
+                } else {
+                    renderer.record(&mut self.context, batch.samples())?
+                };
                 #[cfg(test)]
-                let recorded = if let Some(queries) = self.test_pt_timestamps {
+                let recorded = if realtime_pt {
+                    renderer.record_realtime(
+                        &mut self.context,
+                        self.guide_pipeline.filter(|_| rr_enabled),
+                        self.test_pt_timestamps,
+                        self.test_guide_timestamps,
+                    )?
+                } else if let Some(queries) = self.test_pt_timestamps {
                     renderer.record_with_timestamps(&mut self.context, batch.samples(), queries)?
                 } else {
                     renderer.record(&mut self.context, batch.samples())?

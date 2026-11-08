@@ -50,7 +50,7 @@ public final class CommandHints {
         }
         root.then(CommandHints.<S>command("spp").then(RequiredArgumentBuilder.<S, Integer>argument("样本数",
                         IntegerArgumentType.integer(SettingsConfig.MIN_SAMPLES, SettingsConfig.MAX_SAMPLES))
-                .suggests((context, builder) -> suggest(builder, Integer.toString(samples.getAsInt()), "1", "2", "4", "8", "16", "32", "64"))
+                .suggests((context, builder) -> suggest(builder, Integer.toString(samples.getAsInt()), "1", "2"))
                 .executes(context -> 0)));
         root.then(CommandHints.<S>command("bounces").then(RequiredArgumentBuilder.<S, Integer>argument("顶点数",
                         IntegerArgumentType.integer(SettingsConfig.MIN_BOUNCES, SettingsConfig.MAX_BOUNCES))

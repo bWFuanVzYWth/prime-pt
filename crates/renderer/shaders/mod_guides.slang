@@ -106,11 +106,11 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
 
     public void write_key<Trace : pt::IKeyGuideTrace>(Trace provider, pt::KeyGuideVertex first,
                                                       float3 origin, float3 direction,
-                                                      float4 incident)
+                                                      float4 incident, bool deltaOnly = false)
     {
         Params p = parameters[0];
-        pt::KeyGuideEndpoint endpoint =
-            pt::trace_key_guide(provider, first, origin, direction, incident, p.options.y, false);
+        pt::KeyGuideEndpoint endpoint = pt::trace_key_guide(
+            provider, first, origin, direction, incident, p.options.y, false, deltaOnly);
         pt::GuideProjection projection = pt::project_guide(
             endpoint.endpoint, current, previous, film, p.image.xy, p.reconstruction.z > 0);
         pt::DenoiseGuides albedos = endpoint.albedos;
@@ -120,8 +120,8 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
         guide_diffuse[coordinate] = float4(albedos.diffuse_albedo, 0);
         guide_specular[coordinate] = float4(albedos.specular_albedo, 0);
 
-        pt::KeyGuideEndpoint reflection =
-            pt::trace_key_guide(provider, first, origin, direction, incident, p.options.y, true);
+        pt::KeyGuideEndpoint reflection = pt::trace_key_guide(
+            provider, first, origin, direction, incident, p.options.y, true, deltaOnly);
         pt::GuideProjection reflected = pt::project_guide(reflection.endpoint, current, previous,
                                                           film, p.image.xy, p.reconstruction.z > 0);
         guide_distance[coordinate] =

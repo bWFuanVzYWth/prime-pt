@@ -7,6 +7,7 @@ import mod_decode;
 import restir_geometry;
 import restir_pt.types;
 import geometry.ray;
+import primary_cache;
 
 #ifndef OPENPBR_FLOW
 #error OPENPBR_FLOW must come from resource preparation
@@ -57,4 +58,22 @@ void guide_known(inout pt::KeyGuideCall call)
     hit.front = dot(incoming, hit.surface.normal) < 0;
     hit.distance = length(hit.surface.position - parameters[0].origin.xyz);
     call.value = guide_value(hit, incoming, call.value.medium, auxiliary);
+}
+
+// 首命中来自第一阶段，不再追相机射线；delta后缀仍独立重追。
+[shader("callable")]
+void guide_primary(inout pt::KeyGuideCall call)
+{
+    uint pixel = primary_pixel();
+    pt::Hit hit = {};
+    hit.identity = primary_identity[pixel];
+    hit.surface =
+        geometry::surface_point(restir_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
+    float4 ray = primary_ray[pixel];
+    float4 auxiliary = material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
+    hit.identity.w =
+        restir_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
+    hit.front = dot(ray.xyz, hit.surface.normal) < 0;
+    hit.distance = ray.w;
+    call.value = guide_value(hit, ray.xyz, call.value.medium, auxiliary);
 }

@@ -370,7 +370,7 @@ fn check_replayed_integrand(roundtrip: bool, material_case: &str) -> Result {
             "frame={frame} peak={peak} mean={mean:?} cumulative_mismatch={mismatch} rejected={rejected}"
         );
     }
-    gpu.set_rendering(RenderMode::Realtime, RealtimeRenderer::PathTrace)?;
+    gpu.set_rendering(RenderMode::Offline, RealtimeRenderer::PathTrace)?;
     let reference_options = Options::new(false, streamline::Quality::Dlaa, 64, 12)?;
     let mut pt_sum = [0.; 3];
     for _ in 0..8 {
@@ -455,8 +455,12 @@ fn hardware_pt_mapped_glass_preserves_transmission() -> Result {
                 MaterialId::new(material),
             ));
         }
-        for renderer in [RealtimeRenderer::PathTrace, RealtimeRenderer::RestirPt] {
-            gpu.set_rendering(RenderMode::Realtime, renderer)?;
+        for (mode, renderer, spp) in [
+            (RenderMode::Realtime, RealtimeRenderer::PathTrace, 2),
+            (RenderMode::Realtime, RealtimeRenderer::RestirPt, 1),
+            (RenderMode::Offline, RealtimeRenderer::PathTrace, 64),
+        ] {
+            gpu.set_rendering(mode, renderer)?;
             gpu.set_regions(RenderView {
                 generation: gpu.resource_generation,
                 anchor: [0.; 3],
@@ -475,10 +479,12 @@ fn hardware_pt_mapped_glass_preserves_transmission() -> Result {
                     sun_direction: [0.; 3],
                     ..Default::default()
                 },
-                Options::new(false, streamline::Quality::Dlaa, 64, 12)?,
+                Options::new(false, streamline::Quality::Dlaa, spp, 12)?,
             )?;
             let mean = read_output_mean(&mut gpu, &readback, &mut bytes)?;
-            eprintln!("glass topology={topology} renderer={renderer:?} mean={mean:?}");
+            eprintln!(
+                "glass topology={topology} mode={mode:?} renderer={renderer:?} mean={mean:?}"
+            );
             assert!(
                 mean.iter().all(|&v| v > 0.7 && v < 1.1),
                 "玻璃没有透出已知辐射率的灯面"
