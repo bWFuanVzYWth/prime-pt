@@ -183,15 +183,13 @@ fn hardware_pt_history_explicit_reset_scope() -> Result<(), Box<dyn std::error::
     ] {
         let sequence = gpu.restir.as_ref().unwrap().frame()?.frame_index;
         let absolute = gpu.absolute_sample;
-        let jitter = gpu.restir.as_ref().unwrap().previous_jitter;
         gpu.invalidate_history(reason)?;
         assert_eq!(gpu.accumulated_samples(), 0);
         assert!(gpu.rr_previous.is_none());
         let restir = gpu.restir.as_ref().unwrap();
         assert!(!restir.frame()?.history_valid);
         assert_eq!(restir.frame()?.frame_index, sequence);
-        assert_eq!(restir.previous_jitter, jitter);
-        assert!(restir.previous_camera.is_none());
+        assert!(restir.previous_primary.is_none());
         assert_eq!((gpu.rr_index, gpu.absolute_sample), (17, absolute));
         assert_eq!(bytes(&mut gpu, exposure)?, accepted_exposure);
         host.render_options(
@@ -234,7 +232,7 @@ fn hardware_pt_history_consumers_invalidate_independently() -> Result<(), Box<dy
         )?;
         gpu.rr_previous = Some(CameraFrame::new(&camera(), gpu.anchor)?);
         let sequence = gpu.restir.as_ref().unwrap().frame()?.frame_index;
-        let jitter = gpu.restir.as_ref().unwrap().previous_jitter;
+        let primary = gpu.restir.as_ref().unwrap().previous_primary.unwrap();
         let samples = gpu.accumulated_samples();
         assert!(gpu.restir.as_ref().unwrap().frame()?.history_valid);
         assert!(gpu.restir.as_ref().unwrap().color_history_valid());
@@ -258,7 +256,14 @@ fn hardware_pt_history_consumers_invalidate_independently() -> Result<(), Box<dy
             }
         );
         assert_eq!(restir.frame()?.frame_index, sequence);
-        assert_eq!(restir.previous_jitter, jitter);
+        if selected == History::Paths {
+            assert!(restir.previous_primary.is_none());
+        } else {
+            let preserved = restir.previous_primary.unwrap();
+            assert_eq!(preserved.jitter, primary.jitter);
+            assert_eq!(preserved.direction, primary.direction);
+            assert_eq!(preserved.medium, primary.medium);
+        }
     }
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
@@ -517,6 +522,7 @@ fn hardware_pt_restir_cancel_preserves_accepted_history() -> Result<(), Box<dyn 
     let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
     setup(&mut gpu)?;
+    gpu.set_initial_medium([1.333, 0.2916, 0.04444, 0.010182])?;
     host.render_options(
         &mut gpu,
         &output,
@@ -525,8 +531,11 @@ fn hardware_pt_restir_cancel_preserves_accepted_history() -> Result<(), Box<dyn 
         options()?,
     )?;
     let state = gpu.restir.as_ref().unwrap().frame()?;
+    let accepted = gpu.restir.as_ref().unwrap().previous_primary.unwrap();
     let mut moved = camera();
     moved.origin[0] = 0.25;
+    moved.right[0] *= 1.1;
+    gpu.set_initial_medium([1., 0., 0., 0.])?;
     let records = gpu.record_frame(
         [32, 32],
         &moved,
@@ -548,7 +557,14 @@ fn hardware_pt_restir_cancel_preserves_accepted_history() -> Result<(), Box<dyn 
         history::AccumulationEvent::RecordingCancelled,
     ))?;
     assert_eq!(gpu.restir.as_ref().unwrap().frame()?, state);
-    assert!(gpu.restir.as_ref().unwrap().previous_camera.is_some());
+    let preserved = gpu.restir.as_ref().unwrap().previous_primary.unwrap();
+    assert_eq!(preserved.medium, accepted.medium);
+    assert_eq!(preserved.direction, accepted.direction);
+    assert_eq!(preserved.jitter, accepted.jitter);
+    assert_eq!(
+        preserved.camera.camera_words(gpu.anchor)?,
+        accepted.camera.camera_words(gpu.anchor)?
+    );
     host.render_options(
         &mut gpu,
         &output,
@@ -557,6 +573,15 @@ fn hardware_pt_restir_cancel_preserves_accepted_history() -> Result<(), Box<dyn 
         options()?,
     )?;
     assert_eq!(gpu.restir.as_ref().unwrap().frame()?.frame_index, 2);
+    assert_eq!(
+        gpu.restir
+            .as_ref()
+            .unwrap()
+            .previous_primary
+            .unwrap()
+            .medium,
+        [1., 0., 0., 0.]
+    );
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())

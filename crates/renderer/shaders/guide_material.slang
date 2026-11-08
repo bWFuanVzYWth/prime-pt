@@ -3,6 +3,7 @@ module guide_material;
 import pt.key_guides;
 import pt.scene;
 import mod_scene;
+import mod_decode;
 import restir_geometry;
 import restir_pt.types;
 import geometry.ray;
@@ -14,8 +15,8 @@ import geometry.ray;
 pt::KeyGuideVertex guide_value(pt::Hit hit, float3 incoming, float4 incident, float4 auxiliary)
 {
     ModScene provider;
-    pt::SurfaceMaterial material = resolve_material<true, true>(
-        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
+    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
+        hit, parameters[0].block_emission_scale, { auxiliary });
     return pt::make_key_guide<OPENPBR_FLOW>(hit, material, provider.energy(),
                                             provider.guide_pose(hit), incoming, incident);
 }

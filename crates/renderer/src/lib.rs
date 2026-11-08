@@ -23,5 +23,6 @@
 mod gpu;
 mod reconstruction;
 pub mod streamline;
+pub use gpu::capture;
 pub use gpu::{Error, GlobalReset, Gpu, Options, ResourceUpload, SceneUpdateTiming};
 use prime_scene as scene;

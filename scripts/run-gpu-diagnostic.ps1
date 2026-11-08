@@ -23,7 +23,7 @@ $started = Get-Date
 $output = Join-Path $engine "temp/prime-gpu-$($started.ToString('yyyyMMdd-HHmmss-fff'))-$Mode"
 New-Item -ItemType Directory -Path $output | Out-Null
 $frozenNative = Join-Path $output 'prime_pt.dll'
-$arguments = @('--no-daemon', '--console=plain', 'runClient', '-PnativeProfile=release', "-PnativeLibrary=$frozenNative")
+$arguments = @('--no-daemon', '--console=plain', 'runClient', '-PnativeProfile=release', '-PwindowDiagnostic=true', "-PnativeLibrary=$frozenNative")
 if ($Offline) { $arguments += '--offline' }
 $sync = if ($Mode -eq 'stages') { '1' } else { '0' }
 $checkpoints = if ($Mode -eq 'checkpoints') { '1' } else { '0' }

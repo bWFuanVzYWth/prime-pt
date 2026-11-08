@@ -205,7 +205,7 @@ void restir_temporal_direction()
     {
         HitInfo hit;
         hit.data = primary_history[offset_for(donor)];
-        target = scene.loadSurfaceFromOrigin(hit, parameters[0].previous_position.xyz, true);
+        target = scene.loadPreviousPrimary(hit, donor);
     }
     else
         target = current_surface(scene, pixel);

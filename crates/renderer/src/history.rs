@@ -205,9 +205,7 @@ impl Gpu {
                     "restir",
                     reason.name(),
                     "storage_cold",
-                    self.restir
-                        .as_ref()
-                        .is_some_and(|r| r.previous_camera.is_some()),
+                    self.restir.as_ref().is_some_and(|r| r.has_history()),
                 );
                 self.history_audit.restir_storage =
                     self.history_audit.restir_storage.saturating_add(1);

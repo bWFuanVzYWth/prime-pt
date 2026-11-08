@@ -49,10 +49,14 @@ loom {
     runs {
         client {
             client()
-            runDir = 'run'
+            runDir = providers.gradleProperty('diagnosticRunDir').getOrElse('run')
             vmArgs '--enable-native-access=ALL-UNNAMED'
             vmArgs "-Dprimept.native=${nativeLibraryPath}"
             vmArgs "-Dprimept.rr=${providers.gradleProperty('rr').getOrElse('true')}"
+            vmArgs "-Dprimept.windowDiagnostic=${providers.gradleProperty('windowDiagnostic').getOrElse('false')}"
+            if (providers.gradleProperty('diagnosticWorld').isPresent()) {
+                programArgs '--quickPlaySingleplayer', providers.gradleProperty('diagnosticWorld').get(), '--width', '3840', '--height', '2160'
+            }
             if (providers.gradleProperty('ser').isPresent())
                 vmArgs "-Dprimept.ser=${providers.gradleProperty('ser').get()}"
             programArgs '--graphicsBackend', 'VULKAN'
@@ -98,6 +102,7 @@ tasks.register('buildNative', Exec) {
     commandLine args
 }
 tasks.named('runClient') {
+    if (providers.gradleProperty('diagnosticRunDir').isPresent()) environment 'PRIME_PT_SOURCE_ROOT', rootDir.absolutePath
     if (!nativeLibraryOverride.isPresent()) dependsOn tasks.named('buildNative')
     // 从Nsight GUI启动时也使用已选择的完整Slang发行包，不依赖启动工具的终端环境。
     if (slangCompiler.isFile()) environment 'SLANGC', slangCompiler.absolutePath
@@ -155,7 +160,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
     from('crates/renderer/shaders') {
         include 'primary.slang', 'pt_hit.slang', 'restir.slang', 'guides.slang', 'guide_material.slang', 'initial_hit.slang',
                 'params.slang', 'mod_*.slang', 'restir_*.slang'
-        exclude 'restir_probe.slang'
+        exclude 'restir_probe.slang', 'restir_replay_probe.slang'
         into 'shaders/prime'
     }
     from('../../shaders') {

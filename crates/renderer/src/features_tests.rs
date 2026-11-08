@@ -60,8 +60,7 @@ fn hardware_pt_unsupported_recipe_publishes_default_material()
     gpu.experiment_dispatch = 8;
     let default = MaterialDefinition::default();
     let mut unsupported = default;
-    unsupported.control[0] = 3;
-    unsupported.surface[1] = 0.37;
+    unsupported.control[0] = 2;
     unsupported.emission = [4.; 4];
     upload(
         &mut gpu,
@@ -324,15 +323,17 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
     let mut session = host.gpu()?;
     let mut gpu = session.gpu();
     let output = image(&mut gpu)?;
-    let mut definitions = vec![MaterialDefinition::default(); 11];
+    let mut definitions = vec![MaterialDefinition::default(); 12];
     definitions[1].surface[1] = 1.;
     definitions[1].base_roughness[3] = 0.;
     definitions[2].control[0] = 1;
+    definitions[2].control[2] = MaterialDefinition::MERS;
     definitions[2].base_roughness[3] = 0.;
     definitions[3].control[0] = 1;
     definitions[3].extinction = [1.33, 0.03, 0.01, 0.005];
     definitions[3].base_roughness[3] = 0.5;
     definitions[4].control[0] = 3;
+    definitions[4].control[2] = MaterialDefinition::MERS;
     definitions[4].base_roughness[3] = 0.3;
     definitions[5].control[2] = MaterialDefinition::MERS;
     definitions[6].control[2] = MaterialDefinition::AUXILIARY;
@@ -346,6 +347,9 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
     definitions[9].control[2] =
         MaterialDefinition::MERS | MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS;
     definitions[9].overlay_bounds = [0., 0., 1., 1.];
+    definitions[11] = definitions[9];
+    definitions[11].control[2] &= !MaterialDefinition::MERS;
+    definitions[11].base_roughness[3] = 0.;
     definitions[10].control[2] = MaterialDefinition::MERS
         | MaterialDefinition::AUXILIARY
         | MaterialDefinition::TEXTURED_EMISSION;
@@ -385,7 +389,7 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
         mers: &[64, 0, 153, 128, 192, 255, 204, 192],
         auxiliary: &[200, 128, 64, 85, 200, 128, 64, 85],
         emission_alias_words: &words,
-        light_areas: &[[u32::MAX, 0, 0, 0]; 11],
+        light_areas: &[[u32::MAX, 0, 0, 0]; 12],
     })?;
     gpu.set_rendering(
         prime_scene::RenderMode::Realtime,
@@ -399,7 +403,7 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
         Environment::default(),
         Options::new(false, streamline::Quality::Dlaa, 1, 1)?,
     )?;
-    let readback = Buffer::new(&mut gpu.context, 32 * 32 * 23 * 16, true)?;
+    let readback = Buffer::new(&mut gpu.context, 32 * 32 * 31 * 16, true)?;
     let (scene, _) = gpu.renderer_bindings(
         gpu.view.as_ref().unwrap(),
         &gpu.atlas,
@@ -487,17 +491,17 @@ fn hardware_pt_material_operation_sbt_routes_all_material_keys()
         .map(|word| f32::from_le_bytes(*word))
         .collect();
     let mut seen = vec![0usize; definitions.len()];
-    for (pixel, rows) in values.as_chunks::<{ 23 * 4 }>().0.iter().enumerate() {
-        if rows[88] == 0. {
+    for (pixel, rows) in values.as_chunks::<{ 31 * 4 }>().0.iter().enumerate() {
+        if rows[120] == 0. {
             continue;
         }
-        let material = rows[89] as usize;
+        let material = rows[121] as usize;
         assert!(
             material < seen.len(),
             "pixel={pixel}, invalid material={material}"
         );
         seen[material] += 1;
-        for pair in 0..11 {
+        for pair in 0..15 {
             for channel in 0..4 {
                 let actual = rows[pair * 8 + channel];
                 let expected = rows[pair * 8 + 4 + channel];

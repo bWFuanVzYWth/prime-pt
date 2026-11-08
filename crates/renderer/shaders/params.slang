@@ -40,6 +40,11 @@ public struct Params
     public float4 initial_medium;
     /// xy为ReSTIR前帧jitter，z为callable数量的uint位模式，w为fresh输出概率。
     public float4 restir;
+    /// 已提交前帧的相机介质与原始缩放射线基；不可从命中材质或重建点反推。
+    public float4 previous_medium;
+    public float4 previous_ray_forward;
+    public float4 previous_ray_right;
+    public float4 previous_ray_up;
 };
 
 public pt::Settings settings(Params params)

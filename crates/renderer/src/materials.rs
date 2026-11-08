@@ -5,6 +5,9 @@ use simple_engine::{openpbr, scene_cache};
 
 // mod_materials.slang 的散射颜色输入位；金属 Fresnel 仍需执行。
 const BLACK_CONDUCTOR: u32 = 1 << 13;
+const OVERLAY_COVERED: u32 = 1 << 14;
+const OVERLAY_EMPTY: u32 = 1 << 15;
+const OVERLAY_SHAPE: u32 = OVERLAY_COVERED | OVERLAY_EMPTY;
 
 /// 只有这些覆盖规则会拒绝硬件三角候选；透明度和光学透射彼此独立。
 pub(super) const fn tests_coverage(definition: &MaterialDefinition) -> bool {
@@ -157,8 +160,8 @@ pub(super) const fn metadata_key(
 ) -> (openpbr::FlowKey, u32) {
     let variant =
         variant & !(4 | 16 | 32 | (1 << 10) | openpbr::Recipe::WEIGHT_BITS | BLACK_CONDUCTOR);
-    let variant = if variant & 3 == 0 {
-        variant & !((1 << 8) | (1 << 9))
+    let variant = if variant & (1 | (1 << 9)) == 0 {
+        variant & !((1 << 8) | (1 << 9) | OVERLAY_SHAPE)
     } else {
         variant
     };
@@ -211,7 +214,7 @@ pub(super) const fn emitter_key(
         return (operation_flow(0), 0);
     }
     let overlay = if variant & 4 != 0 {
-        variant & (1 << 8)
+        variant & ((1 << 8) | OVERLAY_SHAPE)
     } else {
         0
     };
@@ -413,10 +416,12 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
     } else {
         None
     };
+    // 覆盖层只替换散射/MERS；作者法线和命中发光仍消费源底图。
+    let source = atlas.tile(m.uv_bounds, flags & M::CUTOUT != 0);
     let base = if top.is_some_and(|t| t.fully_covered) {
         None
     } else {
-        atlas.tile(m.uv_bounds, flags & M::CUTOUT != 0)
+        source
     };
     let scalar = || -> Result<_, &'static str> {
         Ok((
@@ -456,7 +461,7 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
     }
     if flags & M::AUXILIARY != 0
         && m.control[3] & M::AUTHORED_NORMAL != 0
-        && let Some(t) = base
+        && let Some(t) = source
     {
         rough = rough
             .with_normal_distribution(t.ndf)
@@ -469,14 +474,16 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
     let black = channels(&m.base_roughness) & color_channels == 0;
     let recipe = match (m.control[0], metal, sss) {
         (0, m, s) => Recipe::opaque(m, if black { Base::Black } else { Base::Colored(s) }),
-        (1, Weight::Zero, Weight::Zero) => Recipe::Solid,
-        (3, Weight::Zero, Weight::Zero) => Recipe::Thin,
-        _ => return Err("白名单没有此透射拓扑与金属／SSS组合"),
+        // OpenPBR 的介电拓扑不消费 opaque metal/SSS 权重；共享 MERS 的这些通道
+        // 不能新增闭包或触发默认材质回退，粗糙度和发光仍按其实际消费者保留。
+        (1, _, _) => Recipe::Solid,
+        (3, _, _) => Recipe::Thin,
+        _ => return Err("白名单没有此表面拓扑"),
     };
     let tint = channels(&m.emission);
     let emits = emission_sides(m) != 0
         && m.emission[3] > 0.
-        && base.is_some_and(|t| {
+        && source.is_some_and(|t| {
             let channels = if flags & M::TEXTURED_EMISSION != 0 {
                 t.emitting_channels
             } else {
@@ -493,7 +500,19 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
     } else {
         0
     };
-    Ok((flow, variant(flow, m) | recipe.weight_bits() | color))
+    let shape = if !overlay {
+        0
+    } else if top.is_none() {
+        OVERLAY_EMPTY
+    } else if top.is_some_and(|t| t.fully_covered) {
+        OVERLAY_COVERED
+    } else {
+        0
+    };
+    Ok((
+        flow,
+        variant(flow, m) | recipe.weight_bits() | color | shape,
+    ))
 }
 
 #[cfg(test)]
@@ -504,6 +523,33 @@ mod tests {
         bindings(1, &[m], [1, 1], &[255; 4], &mers, &aux)
             .unwrap()
             .keys[0]
+    }
+
+    #[test]
+    fn dielectric_maps_do_not_create_opaque_lobes() {
+        for topology in [1, 3] {
+            let mut material = MaterialDefinition::default();
+            material.control[0] = topology;
+            material.control[2] = MaterialDefinition::MERS;
+            material.base_roughness[3] = 0.;
+            let definitions = [material];
+            let bound = bindings(
+                1,
+                &definitions,
+                [1, 1],
+                &[255; 4],
+                &[89, 0, 64, 127],
+                &[0; 4],
+            )
+            .unwrap();
+            assert_eq!(bound.definitions.as_ref(), &definitions);
+            let bits = bound.keys[0].0.bits();
+            assert_ne!(bits & openpbr::FlowKey::CONTINUOUS_TRANSMISSION, 0);
+            assert_eq!(
+                bits & (openpbr::FlowKey::CONDUCTOR_REFLECTION | openpbr::FlowKey::SUBSURFACE),
+                0
+            );
+        }
     }
 
     #[test]
@@ -520,6 +566,37 @@ mod tests {
             key(m, [0; 4], [128, 128, 128, 85]).0.bits() & openpbr::FlowKey::CONTINUOUS_REFLECTION,
             0
         );
+    }
+
+    #[test]
+    fn overlay_coverage_keeps_only_reachable_scattering() {
+        let mut material = MaterialDefinition::default();
+        material.control[2] = MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS;
+        material.overlay_bounds = [0.5, 0., 1., 1.];
+        material.uv_bounds = [0., 0., 0.5, 1.];
+        assert!(material.valid());
+        let defs = [material];
+        let maps = [0, 0, 255, 0, 255, 0, 128, 0];
+        let covered = bindings(1, &defs, [2, 1], &[255; 8], &maps, &[0; 8]).unwrap();
+        let empty = bindings(
+            1,
+            &defs,
+            [2, 1],
+            &[255, 255, 255, 255, 255, 255, 255, 0],
+            &maps,
+            &[0; 8],
+        )
+        .unwrap();
+        assert_ne!(
+            covered.keys[0].0.bits() & openpbr::FlowKey::CONDUCTOR_REFLECTION,
+            0
+        );
+        assert_eq!(covered.keys[0].0.bits() & openpbr::FlowKey::DIFFUSE, 0);
+        assert_eq!(
+            empty.keys[0].0.bits() & openpbr::FlowKey::CONDUCTOR_REFLECTION,
+            0
+        );
+        assert_ne!(empty.keys[0].0.bits() & openpbr::FlowKey::DIFFUSE, 0);
     }
 
     #[test]
@@ -548,8 +625,7 @@ mod tests {
     #[test]
     fn unsupported_material_publishes_a_nonemitting_default_at_the_same_index() {
         let mut m = MaterialDefinition::default();
-        m.control[0] = 3;
-        m.surface[1] = 0.4;
+        m.control[0] = 2;
         m.emission = [1.; 4];
         let defs = [MaterialDefinition::default(), m];
         let values = bindings(1, &defs, [1, 1], &[255; 4], &[0; 4], &[0; 4]).unwrap();

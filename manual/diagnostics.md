@@ -4,6 +4,58 @@
 
 需要检查实际游戏的光追、ReSTIR或RR成本时，按 [Nsight抓帧手册](nsight.md) 从工具启动客户端，先抓普通PT与ReSTIR的原生无累积对照，再展开热点。
 
+## 捕获可复现的世界画面
+
+场景快照保存已准备的真实网格、材质贴图、发光采样表、相机和照明，供不启动游戏的 GPU 回放使用。
+它是同版本开发诊断数据，不是 Minecraft 存档，也不包含服务端模拟。
+
+先关闭开发客户端。在已配置源码开发环境的 **PowerShell 7** 中，从 Prime PT 目录执行：
+
+```powershell
+Set-Location 'C:\repositories\simple_engine\app\prime_pt'
+.\scripts\capture-scene.ps1 -WorldPath '.\run\saves\GNLXC_main_v1.0.1' -OutputDirectory 'C:\repositories\simple_engine\temp\world-capture-01'
+```
+
+输出目录必须是新目录。脚本复制地图和设置，只运行副本；窗口使用 4K，RR 档位设为 DLAA。
+进入保存视角后不要移动，默认经过 600 个有效渲染帧写入一次。可用 `-Frames 1200` 增加等待，
+也可用 `-PrepareOnly` 只复制输入和生成 `launch.json`，不启动游戏。
+出现 `scene_capture complete`，且输出目录的 `capture\complete` 存在，表示快照写入完成。
+检查原生输出，而不是仅检查 `latest.log`；资源、编译或磁盘错误不会生成完成标记。
+确认地图已加载到需要的范围，再退出这个副本。
+
+无窗口回放的输入固定为该快照。继续在同一 PowerShell 中执行：
+
+```powershell
+$env:PRIME_PT_REPLAY = 'C:\repositories\simple_engine\temp\world-capture-01\capture'
+$env:PRIME_PT_REPLAY_FRAMES = '128'
+cargo test -p prime_renderer --release --lib hardware_world_capture_replay -- --ignored --nocapture --test-threads=1
+```
+
+默认按 4K 回放普通 PT、只输出 ReSTIR 初采、ReSTIR 和 ReSTCV，关闭 RR 和跨帧 RGB 累积，
+保留各自内部路径复用。结果写入 `capture\replay`，包括每帧 HDR 最大值、极值像素位置、均值和高亮像素计数。
+`*-peak.rgba32fle` 和 `*-last.rgba32fle` 是小端 RGBA32F 原始数据，尺寸见同名 JSON；不是可直接打开的图片。
+需要重复运行时，将 `$env:PRIME_PT_REPLAY_OUTPUT` 设成另一个新子目录名。此过程包含大量读回和磁盘写入，不用于性能比较。
+SER 默认沿用快照开关；用 `$env:PRIME_PT_REPLAY_SER = '0'` 或 `'1'` 做独立对照。
+水下和玻璃后的稀有焦散可能长时间不收敛；短序列均值接近不能证明积分器正确。
+检查冻结场景的时间重放时，可设置 `$env:PRIME_PT_REPLAY_PROBE = 'previous'`：
+回放会从 4K 储层每隔 8 像素抽取路径，使用已提交的前帧相机输入再次求值，
+比较同一路径的积分值与单位 Jacobian。结果写入 `*-identity.json`，原始记录为 `*-identity.bin`。
+该检查覆盖抽到的路径及前帧输入契约，不证明所有路径的采样分布或统计收敛。
+
+## F11 和窗口卡死
+
+上述捕获脚本及 `run-gpu-diagnostic.ps1` 同时记录窗口边界。
+搜索 `window_transition`，保留 `setMode`、`SDL_SetWindowFullscreen`、`SDL_SyncWindow` 和 `swapchain` 的 `BEGIN`／`END`。
+缺少 `END` 能缩小阻塞范围，但不能仅凭它判定驱动或 SDK 有错。
+卡住时先保留线程栈，再关闭进程。在另一个 PowerShell 中运行以下命令，将 `12345` 替换为该客户端的进程 ID：
+
+```powershell
+Get-Process java,javaw -ErrorAction SilentlyContinue | Select-Object Id,MainWindowTitle
+& "$env:JAVA_HOME\bin\jcmd.exe" 12345 Thread.print > 'C:\repositories\simple_engine\temp\f11-threads.txt'
+```
+
+同时记录独占／无边框模式、退出前后的分辨率及 RR 档位。不要把仍在运行的 Gradle 后台进程误认成客户端。
+
 ## 开发检查
 
 ```powershell

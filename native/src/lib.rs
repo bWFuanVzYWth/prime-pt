@@ -27,6 +27,7 @@
 #![recursion_limit = "256"]
 
 use simple_engine::{atmosphere, frame_loop};
+mod capture;
 mod changes;
 mod diagnostics;
 mod frame_environment;
@@ -87,6 +88,7 @@ pub(crate) enum Error {
 }
 
 struct Engine {
+    capture: Option<capture::Capture>,
     scene: scene::Scene,
     attribute_limited_resident_bytes: u64,
     gpu: gpu::Gpu,
@@ -352,6 +354,7 @@ pub unsafe extern "C" fn prime_create_options(
         if [instance, physical, device, queue].contains(&0) {
             return Err(Error::Input("Vulkan 句柄不能为空"));
         }
+        let capture = capture::Capture::from_env()?;
         let scene = scene::Scene::new()?;
         // SAFETY: 调用者提供同一活动设备并独占 queue，见导出接口契约。
         let mut gpu = unsafe {
@@ -385,6 +388,7 @@ pub unsafe extern "C" fn prime_create_options(
             .insert(
                 id,
                 Engine {
+                    capture,
                     scene,
                     attribute_limited_resident_bytes,
                     gpu,
@@ -856,7 +860,7 @@ pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i3
             let world = engine.scene.stage_source_generation(generation)?;
             {
                 let materials = prepared.material_resources(*extent, albedo)?;
-                engine.gpu.replace_resources(gpu::ResourceUpload {
+                let source = gpu::ResourceUpload {
                     generation,
                     extent: *extent,
                     albedo,
@@ -865,7 +869,12 @@ pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i3
                     auxiliary: &materials.auxiliary,
                     emission_alias_words: &materials.emission_alias_words,
                     light_areas: &materials.quad_areas,
-                })?;
+                };
+                if let Some(capture) = &engine.capture {
+                    gpu::capture::write_resources(&capture.directory, &source)
+                        .map_err(gpu::Error::DiagnosticOutput)?;
+                }
+                engine.gpu.replace_resources(source)?;
             }
             prepared.commit();
             world.commit();
@@ -1266,6 +1275,30 @@ pub unsafe extern "C" fn prime_draw(
                 return Err(Error::Input(
                     "离线样本达到精确累积上限；请显式重新进入离线模式",
                 ));
+            }
+            if engine.capture.as_mut().is_some_and(capture::Capture::frame) {
+                let capture = engine.capture.take().expect("捕获计数到达零");
+                let regions: Vec<_> = engine.scene.render_regions().collect();
+                engine
+                    .gpu
+                    .capture_frame(
+                        &capture.directory,
+                        prime_scene::RenderView {
+                            generation: engine.scene.generation(),
+                            regions: &regions,
+                            anchor: engine.scene.anchor(),
+                        },
+                        &camera,
+                        environment,
+                        [width, height],
+                        options,
+                    )
+                    .map_err(gpu::Error::DiagnosticOutput)?;
+                eprintln!(
+                    "[prime_pt] scene_capture complete path={} regions={}",
+                    capture.directory.display(),
+                    regions.len()
+                );
             }
             engine.gpu.draw(
                 command,

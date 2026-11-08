@@ -9,7 +9,8 @@ const HALVES: [[usize; 3]; 2] = [[0, 1, 2], [0, 2, 3]];
 /// 两种覆盖各存线性颜色亮度及其与 MERS G 的乘积，供查询实际 UV 下的功率比。
 pub(crate) struct PowerMoments {
     extent: [u32; 2],
-    prefix: Vec<[f64; 4]>,
+    texels: Vec<[f64; 4]>,
+    total: [f64; 4],
 }
 
 impl PowerMoments {
@@ -23,71 +24,57 @@ impl PowerMoments {
         } else {
             [1, 1]
         };
-        let stride = extent[0] as usize + 1;
-        let count = stride * (extent[1] as usize + 1);
-        let mut prefix = Vec::new();
-        prefix.try_reserve_exact(count)?;
-        prefix.resize(count, [0.; 4]);
-        if extent != source {
-            for y in 0..source[1] {
-                for x in 0..source[0] {
-                    for (sum, value) in prefix[3].iter_mut().zip(texel([x, y])) {
-                        *sum += value;
-                    }
+        let mut texels = Vec::new();
+        texels.try_reserve_exact((extent[0] * extent[1]) as usize)?;
+        let mut total = [0.; 4];
+        for y in 0..source[1] {
+            for x in 0..source[0] {
+                let value = texel([x, y]);
+                for (sum, value) in total.iter_mut().zip(value) {
+                    *sum += value;
                 }
-            }
-        } else {
-            for y in 0..extent[1] {
-                let mut row = [0.; 4];
-                for x in 0..extent[0] {
-                    let above = y as usize * stride + x as usize + 1;
-                    for (sum, value) in row.iter_mut().zip(texel([x, y])) {
-                        *sum += value;
-                    }
-                    prefix[above + stride] = std::array::from_fn(|i| prefix[above][i] + row[i]);
+                if extent == source {
+                    texels.push(value);
                 }
             }
         }
-        Ok(Self { extent, prefix })
-    }
-
-    fn cumulative(&self, uv: [f64; 2], lane: usize) -> [f64; 2] {
-        let [w, h] = self.extent.map(|v| v as usize);
-        let p = [uv[0] * w as f64, uv[1] * h as f64];
-        let [x, y] = p.map(|v| v.floor() as usize);
-        let [fx, fy] = [p[0] - x as f64, p[1] - y as f64];
-        let at = |dx: usize, dy: usize, i: usize| {
-            self.prefix[(y + dy).min(h) * (w + 1) + (x + dx).min(w)][lane + i]
-        };
-        std::array::from_fn(|i| {
-            let a = at(0, 0, i) * (1. - fx) + at(1, 0, i) * fx;
-            let b = at(0, 1, i) * (1. - fx) + at(1, 1, i) * fx;
-            a * (1. - fy) + b * fy
+        if extent != source {
+            texels.push(total);
+        }
+        Ok(Self {
+            extent,
+            texels,
+            total,
         })
     }
 
     fn rectangle(&self, lo: [f64; 2], hi: [f64; 2], lane: usize) -> [f64; 2] {
-        let a = self.cumulative(lo, lane);
-        let b = self.cumulative([hi[0], lo[1]], lane);
-        let c = self.cumulative([lo[0], hi[1]], lane);
-        let d = self.cumulative(hi, lane);
-        std::array::from_fn(|i| d[i] - b[i] - c[i] + a[i])
+        let lo = std::array::from_fn::<_, 2, _>(|i| lo[i] * f64::from(self.extent[i]));
+        let hi = std::array::from_fn::<_, 2, _>(|i| hi[i] * f64::from(self.extent[i]));
+        let mut integral = [0.; 2];
+        // 仅资源期执行，最多64² texel。只加非负局部项，严格保留空遮罩的零；
+        // 四个大前缀相减会在暗区制造极小正功率，除法随后把它放大为极亮光源。
+        for y in lo[1].floor() as u32..(hi[1].ceil() as u32).min(self.extent[1]) {
+            let dy = hi[1].min(f64::from(y + 1)) - lo[1].max(f64::from(y));
+            for x in lo[0].floor() as u32..(hi[0].ceil() as u32).min(self.extent[0]) {
+                let dx = hi[0].min(f64::from(x + 1)) - lo[0].max(f64::from(x));
+                for (sum, value) in integral.iter_mut().zip(self.texel([x, y], lane)) {
+                    *sum += value * dx * dy;
+                }
+            }
+        }
+        integral
     }
 
     fn texel(&self, [x, y]: [u32; 2], lane: usize) -> [f64; 2] {
-        let stride = self.extent[0] as usize + 1;
-        let at = y as usize * stride + x as usize;
-        std::array::from_fn(|i| {
-            let i = lane + i;
-            self.prefix[at + stride + 1][i] - self.prefix[at + stride][i] - self.prefix[at + 1][i]
-                + self.prefix[at][i]
-        })
+        let at = (y * self.extent[0] + x) as usize;
+        [self.texels[at][lane], self.texels[at][lane + 1]]
     }
 
     /// 以实际两片世界面积校准局部 UV。过程几何和越界 UV 取整图参考。
     pub(crate) fn ratio(&self, quad: Option<([[f32; 2]; 4], [f64; 2])>, cutout: bool) -> f64 {
         let lane = usize::from(cutout) * 2;
-        let whole = self.prefix[self.prefix.len() - 1];
+        let whole = self.total;
         let whole = [whole[lane], whole[lane + 1]];
         let [color, textured] = match quad {
             Some((uv, areas))
@@ -189,5 +176,49 @@ mod tests {
     fn triangular_crop_weights_texels_by_covered_world_area() {
         let uv = [[0., 0.], [1., 0.], [1., 1.], [1., 1.]];
         assert_eq!(two_texels().ratio(Some((uv, [1., 0.])), false), 16. / 3.);
+    }
+
+    #[test]
+    fn dark_crop_cannot_create_emission_power_from_cancellation() {
+        let moments = PowerMoments::new([16, 16], |[x, y]| {
+            let mask = if x < 2 { 0.03 * f64::from(y + 1) } else { 0. };
+            [1., mask, 1., mask]
+        })
+        .unwrap();
+        // 实际地图异常面的 UV 范围：所有覆盖 texel 的发光遮罩严格为零。
+        let uv = [
+            [0.375, 0.375],
+            [0.375, 0.125],
+            [0.125, 0.125],
+            [0.125, 0.375],
+        ];
+        for cutout in [false, true] {
+            assert_eq!(moments.ratio(Some((uv, [0.5, 0.5])), cutout), 0.);
+        }
+    }
+
+    #[test]
+    fn nonzero_dim_crop_is_preserved_without_an_epsilon_cutoff() {
+        let moments = PowerMoments::new([4, 1], |[x, _]| {
+            [1., if x == 1 { 1e-24 } else { 1. }, 0., 0.]
+        })
+        .unwrap();
+        let uv = [[0.25, 0.], [0.5, 0.], [0.5, 1.], [0.25, 1.]];
+        let ratio = moments.ratio(Some((uv, [0.5, 0.5])), false);
+        assert!((ratio / 1e24 - 1.).abs() < 1e-15);
+    }
+
+    #[test]
+    fn dark_triangle_and_constant_uv_keep_zero_power() {
+        let moments = PowerMoments::new([16, 16], |[x, y]| {
+            [1., if x < 2 { 0.03 * f64::from(y + 1) } else { 0. }, 0., 0.]
+        })
+        .unwrap();
+        for uv in [
+            [[0.125, 0.125], [0.375, 0.125], [0.25, 0.375], [0.25, 0.375]],
+            [[0.25, 0.25]; 4],
+        ] {
+            assert_eq!(moments.ratio(Some((uv, [0.5, 0.])), false), 0.);
+        }
     }
 }

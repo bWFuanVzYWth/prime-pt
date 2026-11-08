@@ -1,6 +1,10 @@
 /// Minecraft 捕获网格到引擎 PT 契约；源模型、atlas 和 tint 的策略只在此求值。
 module mod_scene;
 
+#ifndef PRIMEPT_COVERAGE_MASK
+#define PRIMEPT_COVERAGE_MASK 40
+#endif
+
 import pt.scene;
 import pt.integrator;
 import pt.transport;
@@ -8,8 +12,10 @@ import pt.roulette;
 import mod_call;
 __exported import mod_materials;
 import mod_lights;
+import mod_decode;
 import pt.reconstruction;
 import geometry.ray;
+import geometry.cone;
 import bsdf.openpbr.api;
 import bsdf.openpbr.specialized;
 import bsdf.openpbr.flow;
@@ -45,14 +51,15 @@ public uint region_primitive(uint instance, uint local_primitive)
     return instance_quad_bases[instance] * 2u + local_primitive;
 }
 
-float sun_cos()
+public bool sun_contains(float3 direction)
 {
-    return cos(parameters[0].atmosphere.sun.z);
+    return geometry::cone_contains(parameters[0].lighting.xyz, parameters[0].atmosphere.sun.z,
+                                   direction);
 }
 
-float sun_pdf()
+public float sun_pdf()
 {
-    return 1.0 / (2.0 * atmosphere::PI * (1.0 - sun_cos()));
+    return geometry::uniform_cone_pdf(parameters[0].atmosphere.sun.z);
 }
 
 float altitude(float world_y)
@@ -155,11 +162,17 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         return false;
     }
 
+    public pt::DeltaInterface delta_interface(pt::Hit hit, float4 incident)
+    {
+        // prefix恒为false，所有材质进入已绑定键的CH/callable。
+        return {};
+    }
+
     public void shade(inout pt::TransportCall data)
     {
         data.path.throughput *= pt::segment_transmittance(data.path.medium.yzw, data.hit.distance);
         // GPU派生表的高30位为资源期按真实Flow去重后的callable槽；不是源OpenPBR flags。
-        uint program = material_at(material_id(data.hit.identity.x)).control.x >> 2u;
+        uint program = material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2u;
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
@@ -177,8 +190,12 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public pt::SurfaceMaterial resolve_flow(pt::Hit hit, uint flow, float4 incident)
     {
+#if defined(OPENPBR_FLOW) && OPENPBR_VARIANT != 0xffffffffu
+        return decode_surface<AtlasColor, FetchAux>(hit, parameters[0].block_emission_scale, {});
+#else
         return resolve_material<false, true>(hit, flow, OPENPBR_VARIANT,
                                              parameters[0].block_emission_scale);
+#endif
     }
 
     public openpbr::Energy energy()
@@ -191,14 +208,8 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         pt::LightSample result = (pt::LightSample)0;
         if (parameters[0].lighting.w <= 0)
             return result;
-        float3 normal = parameters[0].lighting.xyz;
-        float z = lerp(1.0, sun_cos(), sample.x);
-        float radius = sqrt(max(0.0, 1.0 - z * z));
-        float phi = 2.0 * atmosphere::PI * sample.y;
-        float3 tangent =
-            normalize(cross(abs(normal.z) < 0.999 ? float3(0, 0, 1) : float3(0, 1, 0), normal));
-        result.direction =
-            normal * z + radius * (cos(phi) * tangent + sin(phi) * cross(normal, tangent));
+        result.direction = geometry::sample_uniform_cone(parameters[0].lighting.xyz,
+                                                         parameters[0].atmosphere.sun.z, sample);
         result.pdf = sun_pdf();
         result.distance = pt::FAR;
         result.visibility = { geometry::offset_origin(point, result.direction), 0, result.direction,
@@ -219,21 +230,22 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public float emission_pdf(pt::Hit hit, float3 previous)
     {
-        return quad_emission_pdf<OPENPBR_VARIANT != 0xffffffffu, (OPENPBR_VARIANT & 1024u) != 0>(
-            hit, previous, parameters[0].anchor_region.xyz);
+        return quad_emission_pdf<SelectedEmitterArea>(hit, previous,
+                                                      parameters[0].anchor_region.xyz);
     }
 
     public bool occluded(geometry::Ray connection)
     {
         RayDesc ray = { connection.origin, connection.t_min, connection.direction,
                         connection.t_max };
-        if (COVERAGE_MASK == 0)
+#if PRIMEPT_COVERAGE_MASK == 0
         {
             RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE> opaque;
             opaque.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
             opaque.Proceed();
             return opaque.CommittedStatus() != COMMITTED_NOTHING;
         }
+#else
         RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
         query.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
         while (query.Proceed())
@@ -246,6 +258,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
                 query.CommitNonOpaqueTriangleHit();
         }
         return query.CommittedStatus() != COMMITTED_NOTHING;
+#endif
     }
 
     public pt::Environment environment(float3 direction, float3 previous, uint depth)
@@ -256,7 +269,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
             return result;
         float3 rgb = atmosphere::sky_radiance(p.atmosphere, sky_mapping, sky_texture, direction);
         result.sky = max(color::rec2020_to_bt709(rgb * p.atmosphere_settings.xyz), 0);
-        if (dot(direction, p.lighting.xyz) >= sun_cos())
+        if (sun_contains(direction))
         {
             result.sun =
                 solar_radiance(direction, depth == 0 ? p.atmosphere.view.w : altitude(previous.y));

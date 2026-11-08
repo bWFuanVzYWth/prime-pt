@@ -47,11 +47,11 @@ public struct ModMaterial
     public float4 overlay_bounds;
 };
 [[vk::binding(27, 0)]]
-ByteAddressBuffer material_words;
+public ByteAddressBuffer material_words;
 [[vk::binding(28, 0)]]
-Texture2D<float4> mers_atlas;
+public Texture2D<float4> mers_atlas;
 [[vk::binding(29, 0)]]
-Texture2D<float4> aux_atlas;
+public Texture2D<float4> aux_atlas;
 
 /// 前112B/材质保持源布局；逐块load供最终消费者裁剪，尾部操作表不进入材料值。
 public ModMaterial material_at(uint index)
@@ -131,7 +131,7 @@ public float2 material_uv(uint primitive, float2 barycentrics)
     return uv;
 }
 // 材质图按最近点读取。UV 在 sprite 边缘或越界时仍落在准备阶段扫描的像素矩形内。
-int3 sprite_address(float2 uv, float4 bounds)
+public int3 sprite_address(float2 uv, float4 bounds)
 {
     uint w, h;
     atlas.GetDimensions(w, h);
@@ -145,11 +145,11 @@ public float4 material_aux<let Variant : uint = ~0u>(uint primitive, float2 bary
 {
     if ((Variant & 2u) == 0)
         return 0;
-    ModMaterial m = material_at(material_id(primitive));
-    return aux_atlas.Load(sprite_address(material_uv(primitive, bary), m.uv_bounds));
+    float4 bounds = asfloat(material_words.Load4(material_id(primitive) * 112u + 80u));
+    return aux_atlas.Load(sprite_address(material_uv(primitive, bary), bounds));
 }
 
-float3 quad_tint(uint primitive, float2 barycentrics)
+public float3 quad_tint(uint primitive, float2 barycentrics)
 {
     float3 bary = float3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
     float3 shared_tint = asfloat(quads[(primitive >> 1) * 3u + 2u].xyz);
@@ -161,7 +161,8 @@ float3 quad_tint(uint primitive, float2 barycentrics)
 }
 float4 sample_tinted_texel(uint primitive, float2 barycentrics, float2 uv)
 {
-    float4 value = atlas.Load(sprite_address(uv, material_at(material_id(primitive)).uv_bounds));
+    float4 value = atlas.Load(
+        sprite_address(uv, asfloat(material_words.Load4(material_id(primitive) * 112u + 80u))));
     return float4(value.xyz * quad_tint(primitive, barycentrics), value.w);
 }
 /// 保留旧共享tint的FP32插值顺序；覆盖alpha不乘tint。
@@ -170,15 +171,113 @@ public float4 material_texel(uint primitive, float2 barycentrics)
     return sample_tinted_texel(primitive, barycentrics, material_uv(primitive, barycentrics));
 }
 /// CUTOUT来自实际源layer；opaque/透射界面不将alpha误解释为二值孔洞。
+interface ICoverage
+{
+    static bool accepts(uint primitive, float2 bary, bool front);
+};
+struct AllFaces : ICoverage
+{
+    static bool accepts(uint primitive, float2 bary, bool front)
+    {
+        return true;
+    }
+};
+struct FrontFaces : ICoverage
+{
+    static bool accepts(uint primitive, float2 bary, bool front)
+    {
+        return front || (material_words.Load(material_id(primitive) * 112u + 72u) & 32u) == 0;
+    }
+};
+struct AlphaFaces<F : ICoverage> : ICoverage
+{
+    static bool accepts(uint primitive, float2 bary, bool front)
+    {
+        if (!F.accepts(primitive, bary, front))
+            return false;
+        uint start = material_id(primitive) * 112u;
+        if ((material_words.Load(start + 72u) & 8u) == 0)
+            return true;
+        return atlas
+                   .Load(sprite_address(material_uv(primitive, bary),
+                                        asfloat(material_words.Load4(start + 80u))))
+                   .a >= 0.5;
+    }
+};
+#if PRIMEPT_COVERAGE_MASK == 0
+typedef AllFaces PublishedCoverage;
+#elif PRIMEPT_COVERAGE_MASK == 8
+typedef AlphaFaces<AllFaces> PublishedCoverage;
+#elif PRIMEPT_COVERAGE_MASK == 32
+typedef FrontFaces PublishedCoverage;
+#elif PRIMEPT_COVERAGE_MASK == 40
+typedef AlphaFaces<FrontFaces> PublishedCoverage;
+#else
+#error invalid coverage recipe
+#endif
 public bool material_accepts(uint primitive, float2 bary, bool front)
 {
-    uint flags = material_at(material_id(primitive)).control.z & COVERAGE_MASK;
-    if ((flags & 32u) != 0 && !front)
-        return false;
-    return (flags & 8u) == 0 ||
-           atlas.Load(sprite_address(material_uv(primitive, bary),
-                                     material_at(material_id(primitive)).uv_bounds))
-                   .a >= 0.5;
+    return PublishedCoverage.accepts(primitive, bary, front);
+}
+
+interface IEmissionWeight
+{
+    static float read(uint start, int3 address);
+};
+struct UniformEmission : IEmissionWeight
+{
+    static float read(uint start, int3 address)
+    {
+        return 1;
+    }
+};
+struct MappedEmission : IEmissionWeight
+{
+    static float read(uint start, int3 address)
+    {
+        return (material_words.Load(start + 72u) & 4u) != 0 ? mers_atlas.Load(address).y : 1;
+    }
+};
+interface IEmitterCoverage
+{
+    static bool accepts(uint start, float alpha);
+};
+struct OpaqueEmitter : IEmitterCoverage
+{
+    static bool accepts(uint start, float alpha)
+    {
+        return true;
+    }
+};
+struct CutoutEmitter : IEmitterCoverage
+{
+    static bool accepts(uint start, float alpha)
+    {
+        return (material_words.Load(start + 72u) & 8u) == 0 || alpha >= 0.5;
+    }
+};
+#if PRIMEPT_EMITTER_CAPABILITIES & 4
+typedef MappedEmission EmissionWeight;
+#else
+typedef UniformEmission EmissionWeight;
+#endif
+#if PRIMEPT_EMITTER_CAPABILITIES & 2
+typedef CutoutEmitter EmitterCoverage;
+#else
+typedef OpaqueEmitter EmitterCoverage;
+#endif
+/// 已经通过灯面side/PDF检查；只读发光消费者所需的四行字段与纹素。
+public float3 sampled_material_emission(uint primitive, float2 bary, float scale)
+{
+    uint start = material_id(primitive) * 112u;
+    int3 address =
+        sprite_address(material_uv(primitive, bary), asfloat(material_words.Load4(start + 80u)));
+    float4 texel = atlas.Load(address);
+    if (!EmitterCoverage.accepts(start, texel.a))
+        return 0;
+    float4 emission = asfloat(material_words.Load4(start + 48u));
+    return emission.xyz * emission.w * (texel.rgb * quad_tint(primitive, bary)) *
+           EmissionWeight.read(start, address) * scale;
 }
 bool emits_on_side(ModMaterial material, bool front)
 {
@@ -192,16 +291,17 @@ public float3 material_emission<let AcceptedSample : bool = false>(uint primitiv
                                                                    bool front,
                                                                    float block_emission_scale)
 {
+    if (AcceptedSample)
+        return sampled_material_emission(primitive, bary, block_emission_scale);
     ModMaterial material = material_at(material_id(primitive));
-    if (!AcceptedSample && !emits_on_side(material, front))
+    if (!emits_on_side(material, front))
         return 0;
     float2 uv = material_uv(primitive, bary);
     float4 texel = sample_tinted_texel(primitive, bary, uv);
-    if ((!AcceptedSample || (EMITTER_CAPABILITIES & 2u) != 0) && (material.control.z & 8u) != 0 &&
-        texel.a < 0.5)
+    if ((material.control.z & 8u) != 0 && texel.a < 0.5)
         return 0;
     float3 result = material.emission.xyz * material.emission.w * texel.xyz;
-    if ((!AcceptedSample || (EMITTER_CAPABILITIES & 4u) != 0) && (material.control.z & 4u) != 0)
+    if ((material.control.z & 4u) != 0)
         result *= mers_atlas.Load(sprite_address(uv, material.uv_bounds)).y;
     return result * block_emission_scale;
 }
@@ -261,7 +361,7 @@ public uint mapped_shading_normal_known(uint primitive, float2 bary, float3 loca
 public uint mapped_shading_normal(uint primitive, float2 bary, float3 local_e1, float3 local_e2,
                                   float3x3 object_to_world, float3 normal)
 {
-    if ((material_at(material_id(primitive)).control.w & 1u) == 0)
+    if ((material_words.Load(material_id(primitive) * 112u + 76u) & 1u) == 0)
         return 0;
     return mapped_shading_normal_known(primitive, bary, local_e1, local_e2, object_to_world,
                                        normal);

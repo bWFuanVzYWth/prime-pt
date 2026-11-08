@@ -12,6 +12,7 @@ import bsdf.openpbr.flow;
 import params;
 import geometry.camera;
 import mod_scene;
+import mod_decode;
 import mod_guides;
 #ifndef OPENPBR_FLOW
 #error OPENPBR_FLOW must come from a material key or an explicit raygen placeholder
@@ -42,13 +43,8 @@ public struct HitScene : pt::IHitScene
     public uint program(HitObject object, float4 incident)
     {
         uint primitive = region_primitive(object.GetInstanceID(), object.GetPrimitiveIndex());
-        return material_at(material_id(primitive)).control.x >> 2u;
+        return material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
     }
-    public uint reorder_bits()
-    {
-        return 32u;
-    }
-
     public pt::SurfaceMaterial resolve(pt::Hit hit, uint cap, float4 incident)
     {
         return ModScene().resolve(hit, cap, incident);
@@ -107,8 +103,8 @@ void shade_hit(inout pt::MaterialCall call, BuiltInTriangleIntersectionAttribute
     hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
     hit.distance = RayTCurrent();
     hit.front = dot(WorldRayDirection(), hit.surface.normal) < 0;
-    pt::SurfaceMaterial material = resolve_material<true, true>(
-        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
+    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
+        hit, parameters[0].block_emission_scale, { auxiliary });
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(
         ModScene(), call, hit, material, WorldRayDirection(), settings(parameters[0]));
 }

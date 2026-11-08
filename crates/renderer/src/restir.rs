@@ -4,6 +4,7 @@
 //! 当帧反射率代理复用PT的normal暂存区，initial先写merge再读；不增加存储或跨SER活跃状态。
 //! 只允许连续成功提交的CV帧读取旧颜色；开关事件仅令颜色冷启动。
 //! 引擎FrameToken共同接受路径与ColorOutput生产结果，应用不另持有颜色连续性有效位。
+//! 前帧相机、原始主射线基、jitter和相机介质共同提交；取消帧不更新这组输入。
 //! 静态场景下的线性控制变量性质沿用引擎control_variate契约；当前场景重放不保证动态无偏。
 
 use super::{Error, materials, shader};
@@ -15,17 +16,20 @@ use simple_engine::vulkan::native::{
 
 const FUSION: restir_pt::Fusion = restir_pt::Fusion::DIRECTIONS;
 
+/// 与路径历史一同提交的主射线输入；拒绝的帧不能覆盖上一帧的介质或采样基。
+#[derive(Clone, Copy)]
+pub(super) struct PrimaryFrame {
+    pub camera: crate::reconstruction::CameraFrame,
+    pub direction: [[f32; 4]; 3],
+    pub jitter: [f32; 2],
+    pub medium: [f32; 4],
+}
+
 pub(super) struct Restir {
     renderer: Renderer<Buffer>,
     post: ComputePipeline,
-    pub previous_jitter: [f32; 2],
-    pending: Option<(
-        restir_pt::FrameToken,
-        crate::reconstruction::CameraFrame,
-        [f32; 2],
-        restir_pt::ColorOutput,
-    )>,
-    pub previous_camera: Option<crate::reconstruction::CameraFrame>,
+    pending: Option<(restir_pt::FrameToken, PrimaryFrame, restir_pt::ColorOutput)>,
+    pub previous_primary: Option<PrimaryFrame>,
     #[cfg(test)]
     timestamps: Option<simple_engine::vulkan::native::TimestampQueries>,
 }
@@ -208,8 +212,7 @@ impl Restir {
                     c"post_main",
                 ),
             )?,
-            previous_jitter: [0.; 2],
-            previous_camera: None,
+            previous_primary: None,
             pending: None,
             #[cfg(test)]
             timestamps: None,
@@ -322,8 +325,7 @@ impl Restir {
         Ok(Self {
             renderer: self.renderer.prepare_resize(context, bindings, buffers)?,
             post: self.post.rebind(context, post)?,
-            previous_jitter: [0.; 2],
-            previous_camera: None,
+            previous_primary: None,
             pending: None,
             #[cfg(test)]
             timestamps: None,
@@ -357,7 +359,7 @@ impl Restir {
     }
 
     pub const fn has_history(&self) -> bool {
-        self.previous_camera.is_some()
+        self.previous_primary.is_some()
     }
 
     pub const fn has_pending(&self) -> bool {
@@ -383,15 +385,14 @@ impl Restir {
             Histories::one(History::Paths),
             permit.request().reason(),
         ))?;
-        self.previous_camera = None;
+        self.previous_primary = None;
         Ok(())
     }
 
     pub fn record(
         &mut self,
         context: &mut Context,
-        camera: crate::reconstruction::CameraFrame,
-        jitter: [f32; 2],
+        primary: PrimaryFrame,
         cv: bool,
     ) -> Result<Recorded, Error> {
         #[cfg(test)]
@@ -407,7 +408,7 @@ impl Restir {
         } else {
             restir_pt::ColorOutput::Omitted
         };
-        self.pending = Some((frame.token, camera, jitter, color));
+        self.pending = Some((frame.token, primary, color));
         Ok(frame.commands)
     }
 
@@ -421,16 +422,15 @@ impl Restir {
     }
 
     pub fn completed(&mut self) -> Result<(), Error> {
-        if let Some((token, camera, jitter, color)) = self.pending.take() {
+        if let Some((token, primary, color)) = self.pending.take() {
             self.renderer.commit_with_color(token, color)?;
-            self.previous_camera = Some(camera);
-            self.previous_jitter = jitter;
+            self.previous_primary = Some(primary);
         }
         Ok(())
     }
 
     pub fn cancelled(&mut self) -> Result<(), Error> {
-        if let Some((token, _, _, _)) = self.pending.take() {
+        if let Some((token, _, _)) = self.pending.take() {
             self.renderer.reject(token)?;
         }
         Ok(())

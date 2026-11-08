@@ -24,8 +24,8 @@ RWStructuredBuffer<float4> probe_output;
 void material_route_probe()
 {
     uint2 pixel = DispatchRaysIndex().xy;
-    uint base = (pixel.y * parameters[0].image.x + pixel.x) * 23u;
-    for (uint i = 0; i < 23u; ++i)
+    uint base = (pixel.y * parameters[0].image.x + pixel.x) * 31u;
+    for (uint i = 0; i < 31u; ++i)
         probe_output[base + i] = 0;
     restir_pt::HitInfo identity = { probe_primary[restir_pt::reservoir_offset(
         pixel, restir_pt::screen_tiles(parameters[0].image.xy))] };
@@ -96,5 +96,26 @@ void material_route_probe()
         scene.shadeInitial(actual, float3(0.2, 0.3, 0.4), geometry.wo, -geometry.wo, false);
     probe_output[base + 20] = float4(legacy.emission, 0);
     probe_output[base + 21] = float4(reference.emission, 0);
-    probe_output[base + 22] = float4(1, material_id(primitive), 0, 0);
+    float3 random = float3((float2(pixel) + 0.5) / float2(parameters[0].image.xy),
+                           (float((pixel.x * 17u + pixel.y * 13u) & 31u) + 0.5) / 32.0);
+    restir_pt::BsdfSample sampled = scene.sampleBsdf(actual, random);
+    openpbr::Sample expected = openpbr::sample(ModScene().energy(), reference.pbr, normal,
+                                               actual.wo, random, incident, reference.transmitted);
+    probe_output[base + 22] = float4(sampled.direction, sampled.pdf);
+    probe_output[base + 23] = float4(expected.direction, expected.pdf);
+    probe_output[base + 24] =
+        float4(sampled.weight, uint(sampled.delta) | (uint(sampled.transmission) << 1));
+    probe_output[base + 25] =
+        float4(expected.pdf > 0 ? expected.response / expected.pdf : float3(0),
+               uint((expected.events & openpbr::DISCRETE) != 0) |
+                   (uint((expected.events & openpbr::TRANSMISSION) != 0) << 1));
+    probe_output[base + 26] = sampled.medium;
+    probe_output[base + 27] = expected.medium;
+    restir_pt::BsdfEvaluation evaluated = scene.evaluateBsdf(actual, expected.direction, -1);
+    openpbr::Evaluation expectedEvaluation =
+        openpbr::evaluate(ModScene().energy(), reference.pbr, normal, actual.wo, expected.direction,
+                          incident, reference.transmitted);
+    probe_output[base + 28] = float4(evaluated.value, evaluated.pdf);
+    probe_output[base + 29] = float4(expectedEvaluation.response, expectedEvaluation.pdf);
+    probe_output[base + 30] = float4(1, material_id(primitive), 0, 0);
 }

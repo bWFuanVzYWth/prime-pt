@@ -1,5 +1,9 @@
 /// 发光quad的应用绑定；alias/面积/PDF和连接误差使用引擎，不拥有材质或纹理。
 module mod_lights;
+
+#ifndef PRIMEPT_EMITTER_CAPABILITIES
+#define PRIMEPT_EMITTER_CAPABILITIES 7
+#endif
 import pt.scene;
 __exported import pt.light_proposal;
 import geometry.ray;
@@ -58,6 +62,41 @@ uint light_index(uint quad)
     }
     return 0xffffffffu;
 }
+public interface IEmitterArea
+{
+    static uint alias_offset(uint primitive);
+};
+public struct UniformArea : IEmitterArea
+{
+    public static uint alias_offset(uint primitive)
+    {
+        return 0;
+    }
+};
+public struct ResourceArea : IEmitterArea
+{
+    public static uint alias_offset(uint primitive)
+    {
+        return material_words.Load(material_id(primitive) * 112u + 76u) >> 1u;
+    }
+};
+#if PRIMEPT_EMITTER_CAPABILITIES & 1
+public typedef ResourceArea PublishedArea;
+#else
+public typedef UniformArea PublishedArea;
+#endif
+
+// 未知命中保留已发布灯域；已绑定PDF/发光入口只组合其资源键需要的proposal。
+#if defined(OPENPBR_VARIANT)
+#if OPENPBR_VARIANT == 0xffffffffu || (OPENPBR_VARIANT & 1024)
+public typedef PublishedArea SelectedEmitterArea;
+#else
+public typedef UniformArea SelectedEmitterArea;
+#endif
+#else
+public typedef PublishedArea SelectedEmitterArea;
+#endif
+
 public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sample, Params params)
 {
     pt::LightSample result = {};
@@ -73,8 +112,7 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
     uint index = light_alias[2u + selected.light / 4u][selected.light & 3u];
     uint4 meta = light_meta[index];
     uint primitive = meta.w * 2u;
-    uint alias_offset =
-        (EMITTER_CAPABILITIES & 1u) != 0 ? material_at(material_id(primitive)).control.w >> 1u : 0u;
+    uint alias_offset = PublishedArea.alias_offset(primitive);
     uint start = index * 3u;
     pt::LightQuadVertices vertices = pt::light_quad_vertices(
         light_vertices[start], light_vertices[start + 1u], light_vertices[start + 2u]);
@@ -115,11 +153,10 @@ public float3 quad_light_emission(pt::LightSample sample, float block_emission_s
 {
     uint flags = asuint(sample.emission.z);
     uint primitive = light_meta[sample.emission_reference].w * 2u + (flags & 1u);
-    return material_emission<true>(primitive, sample.emission.xy, (flags & 2u) != 0,
-                                   block_emission_scale);
+    return sampled_material_emission(primitive, sample.emission.xy, block_emission_scale);
 }
-public float quad_emission_pdf<let Known : bool = false, let Aliased : bool = false>(
-    pt::Hit hit, float3 previous, int3 anchor_region)
+public float quad_emission_pdf<Area : IEmitterArea>(pt::Hit hit, float3 previous,
+                                                    int3 anchor_region)
 {
     uint index = light_index(hit.identity.x >> 1u);
     if (index == 0xffffffffu)
@@ -130,14 +167,13 @@ public float quad_emission_pdf<let Known : bool = false, let Aliased : bool = fa
     pt::LightBvhProposal proposal = { light_alias, header.y, header.x };
     float pmf = proposal.pmf(receiver, uint(light_regions[index].w) >> 2u);
     uint4 meta = light_meta[index];
-    ModMaterial material = material_at(material_id(hit.identity.x));
-    uint alias_offset =
-        (EMITTER_CAPABILITIES & 1u) != 0 && (!Known || Aliased) ? material.control.w >> 1u : 0u;
+    uint alias_offset = Area.alias_offset(hit.identity.x);
     float2 uv = 0;
-    if ((EMITTER_CAPABILITIES & 1u) != 0 && (Known ? Aliased : alias_offset != 0u))
+    if (alias_offset != 0u)
     {
-        uv = (material_uv(hit.identity.x, asfloat(hit.identity.yz)) - material.uv_bounds.xy) /
-             (material.uv_bounds.zw - material.uv_bounds.xy);
+        float4 bounds = asfloat(material_words.Load4(material_id(hit.identity.x) * 112u + 80u));
+        uv = (material_uv(hit.identity.x, asfloat(hit.identity.yz)) - bounds.xy) /
+             (bounds.zw - bounds.xy);
     }
     else
     {

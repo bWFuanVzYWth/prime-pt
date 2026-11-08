@@ -14,6 +14,8 @@ use std::{cell::Cell, io::Write as _, mem::ManuallyDrop};
 #[path = "scene_bench.rs"]
 mod scene_bench;
 
+#[path = "capture_tests.rs"]
+mod capture_tests;
 #[path = "cv_tests.rs"]
 mod cv_tests;
 #[path = "features_tests.rs"]
@@ -26,6 +28,8 @@ mod region_update_tests;
 mod render_bench;
 #[path = "rendering_tests.rs"]
 mod rendering_tests;
+#[path = "restir_path_tests.rs"]
+mod restir_path_tests;
 
 struct Host {
     _entry: ManuallyDrop<Entry>,

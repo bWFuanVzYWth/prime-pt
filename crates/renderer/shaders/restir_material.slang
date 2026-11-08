@@ -1,6 +1,7 @@
 /// 资源准备时按真实Flow、材质解码能力和操作编译；材料相关控制域留在专用叶子。
 module restir_material;
 import mod_scene;
+import mod_decode;
 import restir_scene;
 import restir_call;
 import restir_geometry;
@@ -83,8 +84,8 @@ restir_pt::InitialVertex shade_initial_surface(restir_pt::Surface surface, pt::H
         restir_pt::store_color(initial_cv_proxy, pixel.y * parameters[0].image.x + pixel.x,
                                max(hit.texel.xyz, 0.04));
     }
-    pt::SurfaceMaterial material = resolve_material<true>(
-        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
+    pt::SurfaceMaterial material =
+        decode_surface<HitColor, CachedAux>(hit, parameters[0].block_emission_scale, { auxiliary });
     surface.transmitted = material.transmitted;
     float emissionPdf = 0;
     if ((OPENPBR_FLOW & openpbr::FLOW_EMISSION) != 0 &&
@@ -154,8 +155,8 @@ void restir_replay_flow(inout RestirReplayCall call)
     float4 auxiliary;
     pt::Hit hit = known_material_hit(call.hit, auxiliary);
     ModScene provider;
-    pt::SurfaceMaterial material = resolve_material<true, true>(
-        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
+    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
+        hit, parameters[0].block_emission_scale, { auxiliary });
     openpbr::Sample sampled = openpbr::sample_flow<OPENPBR_FLOW>(
         provider.energy(), material.pbr, pt::shading_normal(hit, material), call.wo, call.u,
         call.incident, material.transmitted);
@@ -178,8 +179,8 @@ void restir_evaluate_flow(inout RestirEvaluateCall call)
     pt::Hit hit = known_material_hit(call.hit, auxiliary);
     ModScene provider;
     float4 incident = float4(call.incident_ior, 0, 0, 0);
-    pt::SurfaceMaterial material = resolve_material<true, true>(
-        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
+    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
+        hit, parameters[0].block_emission_scale, { auxiliary });
     openpbr::Evaluation evaluated = openpbr::evaluate_flow<OPENPBR_FLOW>(
         provider.energy(), material.pbr, pt::shading_normal(hit, material), call.wo, call.direction,
         incident, material.transmitted);
@@ -192,8 +193,8 @@ void restir_connection_flow(inout RestirConnectionCall call)
     float4 auxiliary;
     pt::Hit hit = known_material_hit(call.hit, auxiliary);
     ModScene provider;
-    pt::SurfaceMaterial material = resolve_material<true, true>(
-        hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale, auxiliary);
+    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
+        hit, parameters[0].block_emission_scale, { auxiliary });
     restir_pt::Surface surface = {};
     surface.point = hit.surface;
     surface.wo = call.wo;
@@ -202,6 +203,7 @@ void restir_connection_flow(inout RestirConnectionCall call)
         surface, material, provider.energy(), call.direction, call.distance);
     call.hit.normal = result.transmittance;
     call.hit.identity = asuint(float4(result.bsdf.pdf, result.bsdf.value));
+    call.incident.x = result.incidentIor;
 }
 
 [shader("callable")]
@@ -212,11 +214,12 @@ void restir_metadata_flow(inout RestirMetadataCall call)
     hit.front = asuint(call.second.x) != 0;
     // 元数据只解码粗糙度/IOR/metalness；发光与逆向提案由各自叶子拥有。
     pt::SurfaceMaterial material =
-        resolve_material(hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale);
-    float4 incident = hit.front || (material.pbr.control.x & 3u) != 1u
-                          ? float4(1, 0, 0, 0)
-                          : float4(material.pbr.surface.x,
-                                   material_at(material_id(hit.identity.x)).extinction.yzw);
+        decode_surface<HitColor, FetchAux>(hit, parameters[0].block_emission_scale, {});
+    float4 incident =
+        hit.front || (material.pbr.control.x & 3u) != 1u
+            ? float4(1, 0, 0, 0)
+            : float4(material.pbr.surface.x,
+                     asfloat(material_words.Load3(material_id(hit.identity.x) * 112u + 36u)));
     call.store(material, incident,
                !openpbr::is_discrete_only_flow<OPENPBR_FLOW>(material.pbr, incident,
                                                              material.transmitted));
@@ -237,9 +240,8 @@ void restir_emitter_flow(inout RestirEmitterCall call)
             geometry::surface_point(restir_endpoint(hit.identity.x, asfloat(identity.data.zw)));
         hit.front = dot(call.normal, hit.surface.normal) >= 0;
         hit.texel = material_texel(hit.identity.x, asfloat(hit.identity.yz));
-        emission =
-            resolve_material(hit, OPENPBR_FLOW, OPENPBR_VARIANT, parameters[0].block_emission_scale)
-                .emission;
+        emission = decode_surface<HitColor, FetchAux>(hit, parameters[0].block_emission_scale, {})
+                       .emission;
         if (any(emission > 0))
             pdf = ModScene().emission_pdf(hit, call.position);
         position = hit.surface.position;

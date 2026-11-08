@@ -401,7 +401,18 @@ fn native_amplitude(level: u32) -> f32 {
     (level as f32 / 15.).powi(2)
 }
 
-fn definition(state: &State, q: &SourceQuad, s: &SpriteSource, m: &SpriteMaps) -> Definition {
+enum SurfaceSource {
+    Model,
+    Fluid,
+}
+
+fn definition(
+    source: SurfaceSource,
+    state: &State,
+    q: &SourceQuad,
+    s: &SpriteSource,
+    m: &SpriteMaps,
+) -> Definition {
     let mut v = Definition {
         uv_bounds: s.bounds,
         ..Definition::default()
@@ -427,12 +438,13 @@ fn definition(state: &State, q: &SourceQuad, s: &SpriteSource, m: &SpriteMaps) -
     if q.layer == 1 {
         v.control[1] = 3;
     }
-    if state.fluid_kind == 1 {
+    // 含水状态同时拥有模型面与流体面，只有流体几何使用水的介电界面。
+    if matches!(source, SurfaceSource::Fluid) && state.fluid_kind == 1 {
         v.control[0] = 1;
         v.surface = [1.333, 0., 0., 0.];
         v.extinction = [1.333, 0.2916, 0.04444, 0.010182];
         v.base_roughness[3] = 0.;
-    } else if state.flags & 768 != 0 {
+    } else if matches!(source, SurfaceSource::Model) && state.flags & 768 != 0 {
         v.control[0] = if state.flags & 512 != 0 { 3 } else { 1 };
         v.surface = [1.5, 0., 0., if state.flags & 512 != 0 { 0.01 } else { 0. }];
         v.extinction = [
@@ -544,7 +556,7 @@ impl PreparedCatalog<'_> {
                             }
                             let s = &self.next.sprites[&q.sprite];
                             let m = &maps[&q.sprite];
-                            let mut v = definition(state, q, s, m);
+                            let mut v = definition(SurfaceSource::Model, state, q, s, m);
                             let tint = match grass {
                                 GrassSide::Base { overlay } => {
                                     let top = &quads[overlay];
@@ -698,7 +710,13 @@ impl PreparedCatalog<'_> {
                         uv: [[0.; 2]; 4],
                     };
                     let maps = &maps[&sprite];
-                    let mut v = definition(state, &q, &self.next.sprites[&sprite], maps);
+                    let mut v = definition(
+                        SurfaceSource::Fluid,
+                        state,
+                        &q,
+                        &self.next.sprites[&sprite],
+                        maps,
+                    );
                     if let Some(power) = &maps.power
                         && state.emission > 0
                     {
@@ -777,6 +795,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn waterlogged_model_keeps_its_material_separate_from_fluid() -> Result<(), Error> {
+        for glass in [false, true] {
+            let mut catalog = crate::Catalog::default();
+            let mut prepared = catalog.stage_resources(&crate::fixtures::resource_packet())?;
+            let state = prepared.next.states.get_mut(&2).unwrap();
+            state.fluid_kind = 1;
+            state.fluid = 1;
+            if glass {
+                state.flags |= 512;
+            }
+            prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+            for quad in &prepared.next.states[&2].leaves[0].quads {
+                let material = prepared.next.definitions[quad.material.index() as usize];
+                assert_eq!(material.control[0], if glass { 3 } else { 0 });
+                assert_ne!(material.extinction[0], 1.333);
+                assert_ne!(material.control[2] & Definition::CUTOUT, 0);
+            }
+            let water = prepared.next.fluid_materials[&(2, 0)];
+            let material = prepared.next.definitions[water.index() as usize];
+            assert_eq!(material.control[0], 1);
+            assert_eq!(material.extinction[0], 1.333);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn dual_emitter_preserves_dark_texels_and_mixes_authored_and_host_power() -> Result<(), Error> {
         let mut catalog = crate::Catalog::default();
         let mut prepared = catalog.stage_resources(&crate::fixtures::resource_packet())?;
@@ -802,6 +846,42 @@ mod tests {
         assert_ne!(material.control[2] & Definition::TEXTURED_EMISSION, 0);
         assert!(green.contains(&0.));
         assert!((authored_mean * amplitude - expected_mean).abs() < 1e-7);
+        Ok(())
+    }
+
+    #[test]
+    fn end_rod_dark_base_keeps_the_zero_power_fallback() -> Result<(), Error> {
+        let mut catalog = crate::Catalog::default();
+        let mut prepared = catalog.stage_resources(&crate::fixtures::resource_packet())?;
+        let state = prepared.next.states.get_mut(&1).unwrap();
+        state.emission = 14;
+        let model = state.model;
+        let sprite = prepared.next.sprites.get_mut(&1).unwrap();
+        sprite.name = "minecraft:block/end_rod".into();
+        sprite.vanilla = true;
+        let bounds = sprite.bounds;
+        let Model::Mesh(quads) = prepared.next.models.get_mut(&model).unwrap() else {
+            unreachable!("夹具的固定立方体模型")
+        };
+        for quad in quads {
+            quad.uv = [
+                [0.375, 0.375],
+                [0.375, 0.125],
+                [0.125, 0.125],
+                [0.125, 0.375],
+            ]
+            .map(|point| {
+                std::array::from_fn(|axis| {
+                    bounds[axis] + point[axis] * (bounds[axis + 2] - bounds[axis])
+                })
+            });
+        }
+        prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+        for quad in &prepared.next.states[&1].leaves[0].quads {
+            let material = prepared.next.definitions[quad.material.index() as usize];
+            assert_ne!(material.control[2] & Definition::TEXTURED_EMISSION, 0);
+            assert_eq!(material.emission[3], 1.);
+        }
         Ok(())
     }
 

@@ -89,7 +89,7 @@ public struct GuideTrace : pt::IKeyGuideTrace
         pt::KeyGuideCall call = {};
         call.value.medium = incident;
 #ifdef PRIMEPT_SER
-        ReorderThread(program, 32u);
+        ReorderThread(found);
 #endif
         HitObject::Invoke(found, call);
         value = call.value;
@@ -138,7 +138,7 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
         pt::KeyGuideCall call = {};
         call.value.medium = data.path.medium;
 #ifdef PRIMEPT_SER
-        ReorderThread(program, 32u);
+        ReorderThread(found);
 #endif
         HitObject::Invoke(found, call);
         GuideTrace provider = { false };

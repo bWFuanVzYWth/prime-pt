@@ -2,6 +2,7 @@ package dev.primept.mixin;
 
 import com.mojang.renderpearl.backend.vulkan.VulkanGpuSurface;
 import dev.primept.StreamlineBootstrap;
+import dev.primept.WindowDiagnostic;
 import java.nio.LongBuffer;
 import org.lwjgl.sdl.*;
 import org.lwjgl.system.*;
@@ -10,10 +11,20 @@ import org.lwjgl.vulkan.*;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Redirect;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /** 窗口 surface 与宿主实例使用同一个 interposed dispatch。 */
 @Mixin(VulkanGpuSurface.class)
 abstract class StreamlineSurfaceMixin {
+    @Inject(method = "configure", at = @At("HEAD"))
+    private void primept$configureBegin(CallbackInfo callback) { WindowDiagnostic.mark("swapchain.configure BEGIN"); }
+    @Inject(method = "configure", at = @At("RETURN"))
+    private void primept$configureEnd(CallbackInfo callback) { WindowDiagnostic.mark("swapchain.configure END"); }
+    @Inject(method = "destroySwapchain", at = @At("HEAD"))
+    private void primept$destroyBegin(CallbackInfo callback) { WindowDiagnostic.mark("swapchain.destroy BEGIN"); }
+    @Inject(method = "destroySwapchain", at = @At("RETURN"))
+    private void primept$destroyEnd(CallbackInfo callback) { WindowDiagnostic.mark("swapchain.destroy END"); }
     @Redirect(method = "<init>", at = @At(value = "INVOKE", target = "Lorg/lwjgl/sdl/SDLVulkan;SDL_Vulkan_CreateSurface(JLorg/lwjgl/vulkan/VkInstance;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)Z"))
     private boolean primept$surface(long window, VkInstance instance, VkAllocationCallbacks allocator, LongBuffer output) {
         if (!StreamlineBootstrap.installed())

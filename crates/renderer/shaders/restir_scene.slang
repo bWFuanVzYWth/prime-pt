@@ -21,9 +21,10 @@ import atmosphere.sampling;
 public restir_pt::AdmissionSurface reuse_geometry(restir_pt::HitInfo hit,
                                                   geometry::SurfacePoint point)
 {
-    ModMaterial material = material_at(material_id(restir_primitive(hit)));
-    bool bothSides = (material.control.z & (64u | 1u | 256u)) != 0 ||
-                     (material.control.x & 2u) != 0 || material.surface.z > 0.0;
+    uint start = material_id(restir_primitive(hit)) * 112u;
+    uint3 control = material_words.Load3(start + 64u);
+    bool bothSides = (control.z & (64u | 1u | 256u)) != 0 || (control.x & 2u) != 0 ||
+                     asfloat(material_words.Load(start + 24u)) > 0.0;
     return restir_pt::admission_surface(point, parameters[0].origin.xyz, bothSides);
 }
 
@@ -97,9 +98,26 @@ public struct RestirScene : restir_pt::IRestirScene
         result.distance = distance;
         return result;
     }
+    /// 时间反向映射的目标是已提交的前帧主射线，包括当时相机所在的介质。
+    public restir_pt::Surface loadPreviousPrimary(restir_pt::HitInfo hit, uint2 pixel)
+    {
+        Params p = parameters[0];
+        restir_pt::Surface result = loadSurfaceFromOrigin(hit, p.previous_position.xyz, true);
+        result.wo = -geometry::camera_scaled_direction(
+            p.previous_ray_forward.xyz, p.previous_ray_right.xyz, p.previous_ray_up.xyz,
+            (float2(pixel) + 0.5 + p.restir.xy) / float2(p.image.xy));
+        setIncident(result, p.previous_medium);
+        return result;
+    }
     public geometry::SurfacePoint lightEndpoint(restir_pt::HitInfo hit, bool previous)
     {
         return geometry::surface_point(restir_endpoint(hit));
+    }
+    public bool emissionSideSupported(restir_pt::Surface surface)
+    {
+        uint2 control = material_words.Load2(material_id(surface.identity.x) * 112u + 68u);
+        uint side = surface.frontFacing ? 1u : 2u;
+        return (control.x & side) != 0 && (surface.frontFacing || (control.y & 32u) == 0);
     }
     public void setIncident(inout restir_pt::Surface surface, float4 medium)
     {
@@ -219,7 +237,8 @@ public struct RestirScene : restir_pt::IRestirScene
                                       distance };
         CallShader(program, call);
         return { { asfloat(call.hit.identity.yzw), asfloat(call.hit.identity.x) },
-                 call.hit.normal };
+                 call.hit.normal,
+                 call.incident.x };
     }
     public bool isSampleRough(restir_pt::Surface surface, uint component, float pdf,
                               float threshold)
@@ -242,11 +261,7 @@ public struct RestirScene : restir_pt::IRestirScene
     {
         if (parameters[0].lighting.w <= 0)
             return 0;
-        float cosine = cos(parameters[0].atmosphere.sun.z);
-        float sun = dot(direction, parameters[0].lighting.xyz) >= cosine
-                        ? 1.0 / (2.0 * atmosphere::PI * (1.0 - cosine))
-                        : 0;
-        return sun;
+        return sun_contains(direction) ? sun_pdf() : 0;
     }
     public restir_pt::LightSample sampleLight(restir_pt::Surface surface, float3 u)
     {

@@ -21,6 +21,22 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
     if modes.len() < 2 || modes.iter().any(|&v| v > 8) {
         return Err("至少两个有效实验分派".into());
     }
+    let source_roots: Vec<_> = std::env::var_os("PRIME_PT_DISPATCH_SOURCES")
+        .map(|paths| std::env::split_paths(&paths).collect())
+        .unwrap_or_default();
+    if !source_roots.is_empty() && source_roots.len() != modes.len() {
+        return Err("shader源码目录必须与variants一一对应".into());
+    }
+    let select_source = |gpu: &mut Gpu, index: usize| -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(root) = source_roots.get(index) {
+            let prime = root.join("prime");
+            let engine = root.join("engine");
+            gpu.compiler =
+                shader_build::RuntimeCompiler::new(root.join("cache"), &[&prime, &engine], &[])?;
+            gpu.shader_source = prime.join("primary.slang");
+        }
+        Ok(())
+    };
     let quality_mean = std::env::var_os("PRIME_PT_DISPATCH_QUALITY_MEAN").is_some();
     let rounds = if quality_mean { 1 } else { modes.len() * 2 };
     let extent = [3840, 2160];
@@ -46,8 +62,17 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("PRIME_PT_DISPATCH_CASE须省略或为pt/restir".into()),
         };
     let conductor = std::env::var("PRIME_PT_DISPATCH_SCENE").as_deref() == Ok("conductor");
+    let stress = std::env::var("PRIME_PT_DISPATCH_SCENE").as_deref() == Ok("stress");
+    let ser = std::env::var("PRIME_PT_DISPATCH_SER").as_deref() != Ok("0");
     let scale = (0.5f32).tan();
-    let fixed_camera = if conductor {
+    let fixed_camera = if stress {
+        Camera {
+            origin: [0., 100., -180., 0.],
+            forward: [0., -0.5, 0.8660254, 0.],
+            right: [scale * 3840. / 2160., 0., 0., 0.],
+            up: [0., scale * 0.8660254, scale * 0.5, 0.],
+        }
+    } else if conductor {
         Camera {
             origin: [32., 32., 48., 0.],
             forward: [0., 0., -1., 0.],
@@ -182,33 +207,112 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
             ]);
         }
     }
+    if stress {
+        definitions.resize(10, MaterialDefinition::default());
+        definitions[6].surface = [1.5, 0.37, 0.43, 0.];
+        definitions[7].control = [
+            0,
+            3,
+            MaterialDefinition::MERS | MaterialDefinition::AUXILIARY,
+            MaterialDefinition::AUTHORED_NORMAL,
+        ];
+        definitions[8].control = [
+            0,
+            1,
+            MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS,
+            0,
+        ];
+        definitions[8].uv_bounds = [0., 0., 0.5, 1.];
+        definitions[8].overlay_bounds = [0.5, 0., 1., 1.];
+        definitions[9].control = [3, 3, 0, 0];
+        definitions[9].surface[3] = 0.2;
+        definitions[9].extinction = [1.5, 0.2, 0.4, 0.6];
+        mesh.quads.clear();
+        for z in 0..64 {
+            for x in 0..64 {
+                let id = (x * 13 + z * 7) % 10;
+                let h = ((x * 5 + z * 3) % 13) as f32;
+                let (x, z) = (x as f32 * 4. - 128., z as f32 * 4. - 128.);
+                for points in [
+                    [
+                        [x, h, z],
+                        [x, h, z + 4.],
+                        [x + 4., h, z + 4.],
+                        [x + 4., h, z],
+                    ],
+                    [[x, 0., z], [x, h, z], [x + 4., h, z], [x + 4., 0., z]],
+                    [
+                        [x + 4., 0., z],
+                        [x + 4., h, z],
+                        [x + 4., h, z + 4.],
+                        [x + 4., 0., z + 4.],
+                    ],
+                ] {
+                    if h == 0. && points[0][1] == points[1][1] && points[0][2] == points[1][2] {
+                        continue;
+                    }
+                    mesh.quads.push(Quad::with_material(
+                        points,
+                        [[0., 0.], [0., 1.], [1., 1.], [1., 0.]],
+                        [0.8, 0.7, 0.6],
+                        MaterialId::new(id),
+                    ));
+                }
+            }
+        }
+    }
+    let atlas_extent = if stress { [4, 1] } else { [1, 1] };
+    let albedo: &[u8] = if stress {
+        &[
+            255, 255, 255, 255, 180, 210, 130, 255, 255, 255, 255, 0, 210, 230, 170, 255,
+        ]
+    } else {
+        &[255; 4]
+    };
+    let mers: &[u8] = if stress {
+        &[
+            0, 0, 230, 0, 255, 64, 50, 0, 79, 180, 110, 95, 153, 255, 190, 179,
+        ]
+    } else {
+        &[0, 0, 255, 0]
+    };
+    let auxiliary: &[u8] = if stress {
+        &[
+            140, 128, 30, 85, 120, 135, 80, 100, 128, 128, 0, 85, 144, 120, 120, 110,
+        ]
+    } else {
+        &[128, 128, 255, 128]
+    };
+    let light_areas = vec![[u32::MAX, 0, 0, 0]; definitions.len()];
     let mut session = host.gpu()?;
     let mut gpu = session.gpu();
     gpu.test_center_film = true;
     gpu.experiment_dispatch = modes[0];
+    select_source(&mut gpu, 0)?;
     let started = std::time::Instant::now();
     gpu.replace_resources(ResourceUpload {
         generation: gpu.resource_generation + 1,
-        extent: [1, 1],
-        albedo: &[255; 4],
+        extent: atlas_extent,
+        albedo,
         materials: &definitions,
-        mers: &[0, 0, 255, 0],
-        auxiliary: &[128, 128, 255, 128],
+        mers,
+        auxiliary,
         emission_alias_words: &[],
-        light_areas: &[[u32::MAX, 0, 0, 0]; 6],
+        light_areas: &light_areas,
     })?;
     let mut preparation =
         vec![serde_json::json!({"dispatch":modes[0],"host_ns":started.elapsed().as_nanos()})];
     let prepared = materials::bindings(
         gpu.resource_generation,
         &definitions,
-        [1, 1],
-        &[255; 4],
-        &[0, 0, 255, 0],
-        &[128, 128, 255, 128],
+        atlas_extent,
+        albedo,
+        mers,
+        auxiliary,
     )?;
     let mut variants = Vec::new();
-    for &mode in &modes[1..] {
+    for (index, &mode) in modes.iter().enumerate().skip(1) {
+        select_source(&mut gpu, index)?;
         let started = std::time::Instant::now();
         gpu.experiment_dispatch = mode;
         let (_, generation) = gpu.prepare_material_generation(
@@ -227,6 +331,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
     gpu.test_roots.extend(last.roots());
     variants.push(Some(last));
     gpu.generation = variants[0].take();
+    gpu.set_ser(ser)?;
     let mut active = 0;
     gpu.set_regions(RenderView {
         generation: gpu.resource_generation,
@@ -373,7 +478,9 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                                 queries.elapsed_ns(&gpu.context, ticks[2], ticks[3])?,
                             ]);
                         }
-                        if let Some(queries) = gpu.test_guide_timestamps {
+                        if gpu.guide_pipeline.is_some()
+                            && let Some(queries) = gpu.test_guide_timestamps
+                        {
                             let ticks = queries.read(&gpu.context)?.ok_or("Guide时间戳未完成")?;
                             guide_timings.push(queries.elapsed_ns(
                                 &gpu.context,
@@ -474,7 +581,7 @@ fn hardware_pt_dispatch_profile() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
                 let row = serde_json::json!({"renderer":format!("{renderer:?}"),"cv":cv,"round":round,"position":step,
                     "driver_stack_bytes":stacks,"immutable_programs":program_roots,"material_programs":material_programs,"frame_parameters":parameter_bytes.as_chunks::<4>().0.iter().map(|w|u32::from_le_bytes(*w)).collect::<Vec<_>>(),
-                    "variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"pt_trace_post_ns":pt_timings,"guide_ns":guide_timings,"quality_only":quality_mean,"mean_frames":if quality_mean {samples} else {0},"mean_image":mean_image,"mean_blake3":mean_blake3,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
+                    "scene":if stress {"stress"} else if conductor {"conductor"} else {"materials"},"ser":ser,"source_root":source_roots.get(index),"variant":index,"dispatch":modes[index],"cpu_gpu_ns":timings,"gpu_stage_ns":stage_timings,"pt_trace_post_ns":pt_timings,"guide_ns":guide_timings,"quality_only":quality_mean,"mean_frames":if quality_mean {samples} else {0},"mean_image":mean_image,"mean_blake3":mean_blake3,"image":image,"blake3":blake3::hash(&pixels).to_hex().as_str()});
                 std::fs::write(
                     directory.join(format!("{renderer:?}-cv{cv}-r{round}-v{index}.json")),
                     serde_json::to_vec_pretty(&row)?,

@@ -149,6 +149,9 @@ pub struct ResourceUpload<'a> {
     pub light_areas: &'a [[u32; 4]],
 }
 
+#[path = "capture.rs"]
+pub mod capture;
+
 #[derive(Clone, Copy)]
 struct MaterialGpu {
     table: Buffer,
@@ -423,7 +426,7 @@ impl View {
             .map(|stride| Buffer::new(context, pixels * stride, false))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
-        let params = Buffer::new(context, 720, true)?;
+        let params = Buffer::new(context, 784, true)?;
         let output = Buffer::new(context, pixels * 16, false)?;
         let rr = RrImages::new(
             context,
@@ -1061,6 +1064,7 @@ impl Gpu {
     }
 
     /// `runtime_root` 指向已提取并校验的发行资源。开发宿主传 `None`，从当前工作目录向上定位项目源码并使用本机 Slang。
+    /// 独立诊断运行目录可通过 `PRIME_PT_SOURCE_ROOT` 显式指定源码树；不影响发行资源来源。
     /// 发行资源的两套 shader 源码在会话期间保持有效，派生缓存写入同根 `cache/`。
     /// # Safety
     /// 句柄属于同一活动设备，已启用 RT pipeline、RayQuery、device address 与 position fetch；family/index
@@ -1087,7 +1091,10 @@ impl Gpu {
                 root.join("shaders/engine"),
             )
         } else {
-            let current = std::env::current_dir().map_err(Error::DevelopmentDirectory)?;
+            let current = match std::env::var_os("PRIME_PT_SOURCE_ROOT") {
+                Some(path) => PathBuf::from(path),
+                None => std::env::current_dir().map_err(Error::DevelopmentDirectory)?,
+            };
             let root = current
                 .ancestors()
                 .find(|path| path.join("crates/renderer/shaders/primary.slang").is_file())
@@ -3308,12 +3315,14 @@ impl Gpu {
                 self.restir
                     .as_ref()
                     .unwrap()
-                    .previous_camera
+                    .previous_primary
+                    .map(|p| p.camera)
                     .or(self.rr_previous)
             } else {
                 self.rr_previous
             };
-            let previous_jitter = self.restir.as_ref().map_or([0.; 2], |r| r.previous_jitter);
+            let previous_primary = self.restir.as_ref().and_then(|r| r.previous_primary);
+            let previous_jitter = previous_primary.map_or([0.; 2], |p| p.jitter);
             let cv_enabled = using_restir && self.tuning.restir_cv();
             let cv_history = cv_enabled
                 && restir_frame.is_some_and(|f| f.history_valid)
@@ -3440,6 +3449,21 @@ impl Gpu {
                     .len() as u32,
                 self.tuning.fresh_probability().to_bits(),
             ]);
+            let primary = restir::PrimaryFrame {
+                camera: current,
+                direction: [camera.forward, camera.right, camera.up],
+                jitter,
+                medium: self.initial_medium,
+            };
+            let previous_primary = previous_primary.unwrap_or(primary);
+            words.extend(previous_primary.medium.map(f32::to_bits));
+            words.extend(
+                previous_primary
+                    .direction
+                    .into_iter()
+                    .flatten()
+                    .map(f32::to_bits),
+            );
             view.params
                 .write(&mut self.context, 0, bytemuck::cast_slice(&words))?;
             if sky_enabled && let Some(recorded) = self.atmosphere.record(&mut self.context)? {
@@ -3470,7 +3494,7 @@ impl Gpu {
             }
             if using_restir {
                 let restir = self.restir.as_mut().unwrap();
-                result.push(restir.record(&mut self.context, current, jitter, cv_enabled)?);
+                result.push(restir.record(&mut self.context, primary, cv_enabled)?);
                 result.push(restir.post(&mut self.context)?);
             } else {
                 let renderer = self.renderer.as_ref().unwrap();
