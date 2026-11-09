@@ -1,6 +1,6 @@
 # 用 Nsight 抓取 Prime PT
 
-这份手册用于 **Windows 上的 Nsight Graphics 2026.1**。先抓 GPU 时间线，定位 PT（路径追踪）、ReSTIR（复用相邻帧和像素样本的路径追踪）或 RR（DLSS 光线重建）的耗时；需要分析寄存器时，再开启 shader（GPU 程序）采样。下面以源码位于 `C:\repositories\simple_engine\app\prime_pt` 为例。
+这份手册用于 **Windows 上的 Nsight Graphics 2026.1**。先抓 GPU 时间线，定位 PT（路径追踪）或 RR（DLSS 光线重建）的耗时；需要分析寄存器时，再开启 shader（GPU 程序）采样。下面以源码位于 `C:\repositories\simple_engine\app\prime_pt` 为例。
 
 ## 1. 准备一次，然后复制三个输入框
 
@@ -86,19 +86,16 @@ Get-Content -Raw .\target\nsight-launch\arguments.txt | Set-Clipboard
 /pt spp 1
 /pt ser on
 /pt diagnostic on
-/pt renderer path_trace
 ```
 
 回到画面，等待稳定，然后按刚设好的捕获快捷键。保存为 `pt-native.ngfx-gputrace`。切换下一组后等待稳定，再抓一份：
 
 | 要比较的组 | 在聊天框执行 | 建议文件名 |
 | --- | --- | --- |
-| ReSTIR 原生 | `/pt renderer restir_pt` | `restir-native.ngfx-gputrace` |
-| 普通 PT + RR | 依次执行 `/pt diagnostic off`、`/pt renderer path_trace`、`/pt quality dlaa`、`/pt rr on` | `pt-rr.ngfx-gputrace` |
-| ReSTIR + RR | `/pt renderer restir_pt` | `restir-rr.ngfx-gputrace` |
+| 普通 PT + RR | 依次执行 `/pt diagnostic off`、`/pt quality dlaa`、`/pt rr on` | `pt-rr.ngfx-gputrace` |
 | 同一组关闭 SER | `/pt ser off`；重新抓取后用 `/pt ser on` 恢复 | 在原文件名加 `-no-ser` |
 
-`diagnostic on` 暂时关闭 RR 和时间累积，便于比较算法。做完原生对照后用 `diagnostic off` 恢复偏好。设置生效情况以游戏的 Prime PT 设置页和日志为准，详见[视频设置](settings.md)。离线模式持续累积普通 PT，不能替代这里的 ReSTIR 对照。
+`diagnostic on` 暂时关闭 RR 和时间累积，便于比较算法。做完原生对照后用 `diagnostic off` 恢复偏好。设置生效情况以游戏的 Prime PT 设置页和日志为准，详见[视频设置](settings.md)。离线模式持续累积普通 PT，不能替代这里的实时测量。
 
 成功的报告应有实际世界画面、Vulkan 队列以及帧内光追或计算工作。只抓到菜单或空队列时，重新回到世界抓取。
 
@@ -110,12 +107,6 @@ Get-Content -Raw .\target\nsight-launch\arguments.txt | Set-Clipboard
 | --- | --- |
 | `guide_main` | RR 导引，包括法线、粗糙度、反照率和运动数据；与照明独立 |
 | `render_fused` / `shade_hit` | 普通 PT 调度及材质照明 |
-| `restir_initial` | ReSTIR 初始路径采样 |
-| `restir_temporal_direction` | 时间复用中的路径重放 |
-| `restir_temporal_combine` | 时间复用候选合并 |
-| `restir_spatial_work` | 空间邻居筛选与权重准备 |
-| `restir_spatial_direction` | 空间复用中的路径重放 |
-| `restir_merge` | 空间候选合并、颜色修正及输出 |
 | RR / Streamline / DLSS 工作 | SDK 重建；与 Guide 和照明分别统计 |
 
 分析 RR 对 PT 的影响时，将 **Guide、照明、后处理、SDK** 分别记录，另记整帧跨度。分析寄存器时选择实际活跃的 shader，区分“分配的寄存器数”和“活跃寄存器峰值”；寄存器多不等于已经证明发生 spill。找不到入口名时按实际管线和派发参数定位，不按调用序号猜测。
@@ -132,7 +123,7 @@ Get-Content -Raw .\target\nsight-launch\arguments.txt | Set-Clipboard
 
 开发编译日志中的 `shader_prepare complete` 分别报告 `shader_ms`（Slang 和缓存）、`pipeline_ms`（驱动管线准备）以及命中数量。无修改时应复用缓存；不要为了“确保更新”每次删除 `target/shaders` 或 `target/pipeline-cache`。[编译与缓存说明](build.md#运行开发客户端)
 
-将 `.ngfx-gputrace`、`run/logs/latest.log`、`target/nsight-launch/launch.json` 和本次源码版本一起保存到 `temp/` 的新目录。另记实际输入/输出尺寸、GPU/驱动、世界位置、SER/RR/CV 状态和采集选项；保留对应 DLL 与 shader 缓存。`target/` 仅存可再生产物，不能作为现场证据的唯一副本。已有文件的批量分析见引擎[离线读取手册](../../../manual/nsight.md)。
+将 `.ngfx-gputrace`、`run/logs/latest.log`、`target/nsight-launch/launch.json` 和本次源码版本一起保存到 `temp/` 的新目录。另记实际输入/输出尺寸、GPU/驱动、世界位置、SER/RR 状态和采集选项；保留对应 DLL 与 shader 缓存。`target/` 仅存可再生产物，不能作为现场证据的唯一副本。已有文件的批量分析见引擎[离线读取手册](../../../manual/nsight.md)。
 
 ## 常见问题
 

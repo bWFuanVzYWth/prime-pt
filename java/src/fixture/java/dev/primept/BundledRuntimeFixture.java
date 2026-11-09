@@ -34,25 +34,17 @@ final class BundledRuntimeFixture {
             for (var stage : new String[][] {
                     {"primary.slang", "shade_opaque", "131", "0", "callable"},
                     {"pt_hit.slang", "shade_hit", "131", "0", "closesthit"},
+                    {"primary_material.slang", "shade_primary", "131", "0", "callable"},
                     {"pt_hit.slang", "render_fused", "0", "0xffffffffu", "raygeneration"},
                     {"pt_hit.slang", "render_fused", "0", "0xffffffffu", "raygeneration", "0"},
-                    {"restir.slang", "restir_initial", "0", "0xffffffffu", "raygeneration"},
-                    {"restir_material.slang", "restir_initial_flow", "2255", "11", "callable"},
-                    {"restir_material.slang", "restir_initial_direct", "2255", "11", "callable"},
-                    {"restir_material.slang", "restir_replay_flow", "2255", "11", "callable"},
-                    {"restir_material.slang", "restir_evaluate_flow", "131", "0", "callable"},
-                    {"restir_material.slang", "restir_metadata_flow", "0", "11", "callable"},
-                    {"restir_material.slang", "restir_connection_flow", "338", "64", "callable"},
-                    {"restir_material.slang", "restir_emitter_flow", "1024", "1076", "callable"},
-                    {"restir_material.slang", "restir_pdf_flow", "0", "1024", "callable"},
-                    {"guide_material.slang", "guide_known", "2255", "11", "callable"},
+                    {"guide_material.slang", "guide_primary", "2255", "11", "callable"},
                     {"guide_material.slang", "guide_hit", "2255", "11", "closesthit"}}) {
             var builder = new ProcessBuilder(root.resolve("slang/slangc.exe").toString(), root.resolve("shaders/prime/" + stage[0]).toString(),
                     "-entry", stage[1], "-stage", stage[4], "-I", root.resolve("shaders/prime").toString(),
                     "-I", root.resolve("shaders/engine").toString(), "-std", "2026", "-target", "spirv",
                     "-profile", "spirv_1_4", "-emit-spirv-directly", "-fvk-use-entrypoint-name", "-O3", "-g0",
                     "-fp-mode", "precise", "-DOPENPBR_FLOW=" + stage[2], "-DOPENPBR_VARIANT=" + stage[3],
-                    "-DPRIMEPT_LIGHT_MASK=3", "-DPRIMEPT_EMITTER_CAPABILITIES=7", "-DPRIMEPT_RESTIR_SAMPLE=1",
+                    "-DPRIMEPT_LIGHT_MASK=3", "-DPRIMEPT_EMITTER_CAPABILITIES=7",
                     "-DPRIMEPT_COVERAGE_MASK=0", "-o", output.toString());
             if (stage[4].equals("closesthit")) {
                 builder.command().addAll(java.util.List.of("-capability", "spvRayTracingPositionFetchKHR"));

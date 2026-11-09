@@ -50,7 +50,7 @@ public final class Renderer {
         RenderSystem.assertOnRenderThread();
         if (!ensureRenderer()) return;
         await();
-        renderer.rendering(RenderMode.REALTIME, Settings.realtimeRenderer());
+        renderer.rendering(RenderMode.REALTIME);
         frozen=false;hasFrame=false;
         var next=SourceResources.prepareReload(Minecraft.getInstance());
         Atlas.send(renderer);renderer.sources(next.packet());next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;CHANGES.clear();
@@ -63,7 +63,7 @@ public final class Renderer {
         if (active != enabled) {
             if (renderer != null) {
                 await();
-                renderer.rendering(RenderMode.REALTIME, Settings.realtimeRenderer());
+                renderer.rendering(RenderMode.REALTIME);
                 if (!enabled) renderer.reset();
             }
             active = enabled;
@@ -162,7 +162,7 @@ public final class Renderer {
             }
         }
         long stage = System.nanoTime();
-        renderer.rendering(resetWorld ? RenderMode.REALTIME : Settings.mode(), Settings.realtimeRenderer());
+        renderer.rendering(resetWorld ? RenderMode.REALTIME : Settings.mode());
         renderer.updateRenderTuning(Settings.tuning());
         frozen = !resetWorld && Settings.offline() && hasFrame;
         if (!frozen) renderer.ser(Settings.requestedSer());
@@ -178,7 +178,7 @@ public final class Renderer {
         STAGES.putLong(8, STAGES.getLong(8) + System.nanoTime() - stage);
         if (resetWorld) {
             prepareFrame(minecraft, updateBudget);
-            renderer.rendering(Settings.mode(), Settings.realtimeRenderer());
+            renderer.rendering(Settings.mode());
         } else if (resume) prepareFrame(minecraft, updateBudget);
         renderer.updateDisplayOptions(Settings.display());
         int medium=switch(minecraft.gameRenderer.mainCamera().getFluidInCamera()){case WATER->1;case LAVA->2;default->0;};

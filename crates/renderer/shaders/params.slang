@@ -31,20 +31,14 @@ public struct Params
     public float4 previous_forward;
     public float4 previous_right;
     public float4 previous_up;
-    /// xy=输出尺寸；z bit0诊断、bit1 ReSTIR、bit2作者法线、bit3 CV、bit4已接受CV历史；w为历史M
-    /// cap。
+    /// xy=输出尺寸；z bit0诊断、bit2作者法线、bit5实时首面策略；w保留为零。
     public uint4 output_size;
     /// 当前64m anchor的整数region坐标；光源保持region-local不随anchor重打包。
     public int4 anchor_region;
     /// 宿主实际相机介质的IOR和RGB extinction。
     public float4 initial_medium;
-    /// xy为ReSTIR前帧jitter，z为callable数量的uint位模式，w为fresh输出概率。
-    public float4 restir;
-    /// 已提交前帧的相机介质与原始缩放射线基；不可从命中材质或重建点反推。
-    public float4 previous_medium;
-    public float4 previous_ray_forward;
-    public float4 previous_ray_right;
-    public float4 previous_ray_up;
+    /// z 为照明 hit/callable 数量，用于兼容管线的导引段偏移，其余保留为零。
+    public uint4 programs;
 };
 
 public pt::Settings settings(Params params)

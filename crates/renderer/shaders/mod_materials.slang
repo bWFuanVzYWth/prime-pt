@@ -35,7 +35,7 @@ public SamplerState atlas_sampler;
 /// GPU派生的112B七块表，物理字段与prime_scene::MaterialDefinition保持同位。
 /// control.x低2位为源OpenPBR flags，高30位由资源准备写入callable槽，不回写CPU定义。
 /// control.z高12位为GPU派生FlowKey，低20位保留原flags；身份与材质参数均不截断。
-/// control.y低2位为发光侧，高30位指向同buffer尾部的资源期操作槽记录（word地址）。
+/// control.y低2位为发光侧，高30位为资源期准备的导引槽。
 public struct ModMaterial
 {
     public float4 base_roughness;
@@ -53,7 +53,7 @@ public Texture2D<float4> mers_atlas;
 [[vk::binding(29, 0)]]
 public Texture2D<float4> aux_atlas;
 
-/// 前112B/材质保持源布局；逐块load供最终消费者裁剪，尾部操作表不进入材料值。
+/// 前112B/材质保持源布局；逐块load供最终消费者裁剪，导引槽不进入物理材料值。
 public ModMaterial material_at(uint index)
 {
     uint start = index * 112u;
@@ -63,51 +63,10 @@ public ModMaterial material_at(uint index)
              asfloat(material_words.Load4(start + 96u)) };
 }
 
-public static const uint MATERIAL_INITIAL = 0u;
-public static const uint MATERIAL_REPLAY = 1u;
-public static const uint MATERIAL_EVALUATE = 2u;
-public static const uint MATERIAL_METADATA = 3u;
-public static const uint MATERIAL_CONNECTION = 4u;
-public static const uint MATERIAL_EMITTER = 5u;
-public static const uint MATERIAL_PDF = 6u;
-public static const uint MATERIAL_GUIDE = 7u;
-public static const uint MATERIAL_INITIAL_DIRECT = 8u;
-
-public uint material_program(uint primitive, uint operation)
-{
-    uint pointer = material_words.Load(material_id(primitive) * 112u + 68u) >> 2u;
-    return material_words.Load((pointer + operation) * 4u);
-}
-
-/// metadata只在known-surface shift表中调度；初采由完整专用leaf一次求值。
-public uint metadata_program(uint primitive)
-{
-    uint2 control = material_words.Load2(material_id(primitive) * 112u + 64u);
-    uint pointer = control.y >> 2u;
-    uint local = material_words.Load((pointer + MATERIAL_METADATA) * 4u);
-    uint header = pointer - (control.x >> 2u) * 9u - 8u;
-    return local + material_words.Load((header + 1u) * 4u);
-}
-
-/// 独立Guide SBT只有本操作的紧凑槽，不读取其他积分器的段偏移。
+/// control.y 高 30 位是确定性导引的专用 SBT 槽。
 public uint guide_slot(uint primitive)
 {
-    uint pointer = material_words.Load(material_id(primitive) * 112u + 68u) >> 2u;
-    return material_words.Load((pointer + MATERIAL_GUIDE) * 4u);
-}
-
-public uint guide_program(uint primitive, bool known, bool restir)
-{
-    uint2 control = material_words.Load2(material_id(primitive) * 112u + 64u);
-    uint pointer = control.y >> 2u;
-    uint local = material_words.Load((pointer + MATERIAL_GUIDE) * 4u);
-    uint header = pointer - (control.x >> 2u) * 9u - 8u;
-#ifdef PRIMEPT_INITIAL_HIT
-    uint index = known ? 4u : (restir ? 5u : 2u);
-#else
-    uint index = known ? 3u : (restir ? 5u : 2u);
-#endif
-    return local + material_words.Load((header + index) * 4u);
+    return material_words.Load(material_id(primitive) * 112u + 68u) >> 2u;
 }
 
 public uint material_id(uint primitive)

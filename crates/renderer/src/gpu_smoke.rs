@@ -16,20 +16,19 @@ mod scene_bench;
 
 #[path = "capture_tests.rs"]
 mod capture_tests;
-#[path = "cv_tests.rs"]
-mod cv_tests;
+
 #[path = "features_tests.rs"]
 mod features_tests;
 #[path = "history_tests.rs"]
 mod history_tests;
 #[path = "region_update_tests.rs"]
 mod region_update_tests;
-#[path = "render_bench.rs"]
-mod render_bench;
+
 #[path = "rendering_tests.rs"]
 mod rendering_tests;
-#[path = "restir_path_tests.rs"]
-mod restir_path_tests;
+
+#[path = "pt_quality_bench.rs"]
+mod pt_quality_bench;
 
 struct Host {
     _entry: ManuallyDrop<Entry>,

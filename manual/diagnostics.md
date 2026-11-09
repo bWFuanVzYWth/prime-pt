@@ -2,7 +2,7 @@
 
 遇到启动或游玩问题，可以先看[安装后的检查步骤](build.md#安装发行包)和下方的[游戏诊断](#在游戏中读取诊断)。开发检查和性能测量的命令在 **PowerShell 7** 中运行，当前目录应是含有 `gradlew.bat` 的 Prime PT 根目录。工具链和设备要求见[构建手册](build.md)。
 
-需要检查实际游戏的光追、ReSTIR或RR成本时，按 [Nsight抓帧手册](nsight.md) 从工具启动客户端，先抓普通PT与ReSTIR的原生无累积对照，再展开热点。
+需要检查实际游戏的光追或RR成本时，按 [Nsight抓帧手册](nsight.md) 从工具启动客户端，先抓PT的原生与RR对照，再展开热点。
 
 ## 捕获可复现的世界画面
 
@@ -31,16 +31,59 @@ $env:PRIME_PT_REPLAY_FRAMES = '128'
 cargo test -p prime_renderer --release --lib hardware_world_capture_replay -- --ignored --nocapture --test-threads=1
 ```
 
-默认按 4K 回放普通 PT、只输出 ReSTIR 初采、ReSTIR 和 ReSTCV，关闭 RR 和跨帧 RGB 累积，
-保留各自内部路径复用。结果写入 `capture\replay`，包括每帧 HDR 最大值、极值像素位置、均值和高亮像素计数。
+默认按 4K 回放普通 PT，关闭 RR 和跨帧 RGB 累积。结果写入 `capture\replay`，包括每帧 HDR 最大值、极值像素位置、均值和高亮像素计数。
 `*-peak.rgba32fle` 和 `*-last.rgba32fle` 是小端 RGBA32F 原始数据，尺寸见同名 JSON；不是可直接打开的图片。
 需要重复运行时，将 `$env:PRIME_PT_REPLAY_OUTPUT` 设成另一个新子目录名。此过程包含大量读回和磁盘写入，不用于性能比较。
 SER 默认沿用快照开关；用 `$env:PRIME_PT_REPLAY_SER = '0'` 或 `'1'` 做独立对照。
 水下和玻璃后的稀有焦散可能长时间不收敛；短序列均值接近不能证明积分器正确。
-检查冻结场景的时间重放时，可设置 `$env:PRIME_PT_REPLAY_PROBE = 'previous'`：
-回放会从 4K 储层每隔 8 像素抽取路径，使用已提交的前帧相机输入再次求值，
-比较同一路径的积分值与单位 Jacobian。结果写入 `*-identity.json`，原始记录为 `*-identity.bin`。
-该检查覆盖抽到的路径及前帧输入契约，不证明所有路径的采样分布或统计收敛。
+## PT 等时间质量与 RR 对照
+
+无窗口入口使用生产材质与光传输程序，比较实时首表面策略和离线批量采样，不改变游戏设置。
+先按[构建手册](build.md)准备 Rust、Slang、Streamline SDK 和支持 SER 的 NVIDIA 显卡，关闭其他 GPU 程序。
+在 **PowerShell 7** 中，从 Prime PT 根目录执行；输出目录必须尚不存在：
+
+```powershell
+Set-Location 'C:\repositories\simple_engine\app\prime_pt'
+$env:STREAMLINE_SDK = 'C:\repositories\simple_engine\target\streamline-sdk'
+New-Item -ItemType Directory -Force 'C:\repositories\simple_engine\temp' | Out-Null
+$env:PT_QUALITY_CONFIG = 'C:\repositories\simple_engine\temp\pt-quality.json'
+@'
+{
+  "output": "C:\\repositories\\simple_engine\\temp\\pt-quality-01",
+  "scene": "occluded",
+  "width": 3840, "height": 2160,
+  "warmup": 20, "frames": 2048, "seeds": [17, 4106],
+  "gpu_checkpoints_ms": [250, 1000, 4000],
+  "variants": [
+    {"name": "pt1", "kind": "pt", "spp": 1},
+    {"name": "pt2", "kind": "pt", "spp": 2},
+    {"name": "offline4", "kind": "offline", "spp": 4}
+  ]
+}
+'@ | Set-Content -Encoding utf8 $env:PT_QUALITY_CONFIG
+cargo test -p prime_renderer --release --lib hardware_pt_equal_time_benchmark -- --ignored --nocapture --test-threads=1
+```
+
+成功时测试返回 `ok`，输出根目录有 `report.json`。每个变体和种子保留输入与原始记录；
+`mean-time-4000.f32` 是累计 GPU 时间首次达到 4 秒后的 HDR 算术均值，实际时间、帧数和尺寸见报告。
+文件是小端 RGBA32F 原始数据，不能直接当作图片打开。
+GPU 时间包括首视线、导引、照明、后处理及启用时的 RR；准备、测量用 GPU 累积、读回和写盘不计入。
+先做同版本 A/A 校准，再比较实际时间相近的结果；相同 spp 或帧数不等于相同成本。
+
+常用输入：
+
+- `scene`：`direct` 为直接照明室内，`occluded` 的灯光受挡板遮挡，`glossy` 另有倾斜金属面。
+- `kind`：`pt` 使用实时策略，`spp` 为 1 或 2；`offline` 使用原材质概率，批量为 1–64。
+- `rr: true` 固定原生 4K + DLAA。比较重建时删去 `offline4` 变体，保留正常镜头抖动与 RR 历史；输出 `rr-time-预算.f16` 为 RGBA16F。
+- `motion: true` 先静止 32 帧，再横移 32 帧，随后静止。此时删除 GPU 预算并设置固定帧数，例如 `frames: 96`；运动序列的跨帧均值不用于收敛判断。
+- `rr_frames`、`raw_frames` 指定额外保存图像的帧。默认保留末帧；`save_raw_final: false` 可省略未重建末帧。
+- `center_film` 在无 RR 时默认 `true`，固定像素中心以隔离采样误差；有 RR 时默认 `false`。制作 RR 参考图时使用 `offline` 并设为 `false`，覆盖像素内采样。
+- `metric_reference` 可指定同尺寸 RGBA32F 独立高采样参考图，配合 GPU 预算报告逐像素和不同区域尺度的误差。参考噪声不会被自动扣除，也不裁剪亮点。RR 模式不支持此项或 `save_means`。
+
+没有 GPU 预算时按固定帧数运行；有预算时 `frames` 是上限，未达到预算会返回错误。
+`frames-block16.f32` 保存逐帧 16×16 区域的 RGB 均值和极值，用于检查空间聚集与时间相关。
+大量筛选可设置 `save_means: false`、`save_raw_final: false`、`save_block_frames: false` 限制输出。
+失败时保留完整日志；已知 NGX 内部同步错误仍使进程失败，不能记为验证通过。
 
 ## F11 和窗口卡死
 
@@ -73,7 +116,6 @@ cargo test --locked -p prime_minecraft --lib -- --include-ignored
 
 ```powershell
 cargo test --locked -p prime_renderer --lib hardware_pt_material_reload -- --ignored --nocapture --test-threads=1
-cargo test --locked -p prime_renderer --lib hardware_pt_restir_ -- --ignored --nocapture --test-threads=1
 .\scripts\test-streamline.ps1 -InitializationOnly
 .\scripts\test-streamline.ps1
 ```
@@ -96,7 +138,7 @@ Set-Location 'C:\repositories\simple_engine\app\prime_pt'
 .\scripts\run-gpu-diagnostic.ps1 -Offline -Mode checkpoints
 ```
 
-最后一个脚本会启动游戏，前两个只检查工具和构建。进入原来发生问题的世界，保持相同的 RR、SER、ReSTCV 和分辨率设置，
+最后一个脚本会启动游戏，前两个只检查工具和构建。进入原来发生问题的世界，保持相同的 RR、SER 和分辨率设置，
 按原来的方式游玩或移动。不要开启 `/pt diagnostic on`，它是另一项关闭 RR 的图像诊断功能。
 已有本次源码构建出的 `target/release/prime_pt.dll` 时只需最后一条启动命令。
 缺少离线依赖时去掉 `-Offline`；只想检查启动输入而不打开游戏时加 `-PrepareOnly`。
@@ -147,21 +189,21 @@ Set-Location 'C:\repositories\simple_engine\app\prime_pt'
 
 ## 时间历史的显式管理
 
-普通PT的静态图像累积、RR重建、ReSTIR路径复用和ReSTCV颜色估计分别维护历史。失效由同一个事件入口管理，不在参数查询或描述符重绑时暗中清零。
+静态图像累积与 RR 重建分别维护历史，由同一个事件入口显式失效；参数查询或描述符重绑不暗中清零。
 
 | 事件 | 影响范围 |
 | --- | --- |
-| 切换世界、模型/材质身份域整体替换、切换渲染模式/积分器、显式请求全局失效 | 丢弃四个消费者的历史，保留曝光适应；绝对RR样本与jitter序号不回退。 |
-| 相机/FOV、anchor、日照、介质、seed/路径预算、区块/属性变化 | 普通PT静态均值显式重新开始；RR和ReSTIR继续，失效mesh按稳定身份局部拒绝。 |
-| RR、ReSTIR或诊断模式的逐帧图像输出 | 每帧显式重开RGB样本域，保留时间复用历史。 |
-| SER、M cap、fresh输出比例变化 | 保留路径工作集与时间历史。 |
-| ReSTCV开关变化 | 只显式失效颜色历史；不清路径、RR或普通PT均值。首个成功提交的启用帧建立新颜色历史。 |
-| 实际视图或SDK存储替换 | 分别记录冷启动；ReSTIR只有输入尺寸改变才更换其工作集，同尺寸重绑保留历史。 |
-| RR求值失败 | 显式失效RR，保留ReSTIR；未提交帧的取消不清除已接受路径或相机。 |
+| 切换世界、资源身份域替换、切换实时／离线或显式全局失效 | 丢弃累积和 RR 历史，保留曝光适应；随机与 jitter 序号不回退。 |
+| 相机、FOV、anchor、日照、介质、路径预算或区块变化 | 静态均值重新开始；RR 使用当前导引继续重建。 |
+| RR 或诊断模式的逐帧输出 | 每帧重开 RGB 样本域，保留 RR 历史。 |
+| SER 切换 | 保留时间历史。 |
+| 实际视图或 SDK 存储替换 | 单独记录存储冷启动。 |
+| RR 求值失败 | 显式失效 RR；取消未提交帧不推进已接受相机和样本身份。 |
 
-在游戏日志中搜索`pt.history`、`rr.history`、`restir.history`和`restcv.history`。`action=reset`表示显式失效，颜色消费者还可由`mode_changed`单独失效；`storage_cold`表示实际存储冷启动，`recovery_reset`表示RR失败恢复。`valid`记录此前是否存在已接受历史。每帧RGB样本域与静态均值的局部失效只计数，不逐帧打印日志。代码契约从[GPU模块文档](../target/doc/prime_renderer/gpu/index.html)查看。
-
-ReSTIR保留了缓存后缀的入射辐射，不保证任意动态光照下没有鬼影或完全无偏；M cap约束样本量，不是历史存活帧数。离线样本到达精确累积上限会报错，需显式重新进入离线模式，不自动清空图像。
+日志中的 `pt.history` 和 `rr.history` 记录显式事件。`action=reset` 表示失效，
+`storage_cold` 表示存储冷启动，`recovery_reset` 表示 RR 失败恢复；`valid` 记录此前是否存在已接受历史。
+逐帧 RGB 样本域和静态均值局部失效只计数，不逐帧打印。契约见[GPU 模块](../target/doc/prime_renderer/gpu/index.html)。
+离线样本到达精确累积上限会报错，需重新进入离线模式，不自动清空图像。
 
 ## 性能测量
 
@@ -181,13 +223,3 @@ cargo test --locked --release -p prime_renderer --lib hardware_pt_scene_baseline
 ```
 
 保留 `samples.jsonl`、输入摘要和构建身份。先冻结原始版本做同版本 A/A，再在同一环境对比成对样本。计时范围和排除项见 [CPU 基准注释](../crates/world/benches/source_pipeline.rs) 与 [GPU 场景基准注释](../crates/renderer/src/scene_bench.rs)。
-
-比较两种渲染器的固定场景成本时，需要支持 EXT SER 的设备，先关闭其他 GPU 程序，再运行：
-
-```powershell
-New-Item -ItemType Directory -Force temp | Out-Null
-$env:PRIME_PT_RENDER_BENCH_OUTPUT = Join-Path (Get-Location).Path "temp/render-$((Get-Date).ToString('yyyyMMdd-HHmmss')).json"
-cargo test --locked --release -p prime_renderer --lib hardware_pt_render_profile -- --ignored --nocapture --test-threads=1
-```
-
-JSON 保存普通PT、ReSTIR关闭CV及开启CV三组的每帧CPU录制时间和GPU时间戳跨度。默认输入是3840×2160、4096个四边形、每帧一个样本和12顶点预算；分辨率、路径预算及SER状态按本次实际设置写入JSON。各组至少预热两秒，不包含RR、Java捕获、场景更新和窗口呈现，不能换算为Minecraft帧率。编译后首次运行还会建立驱动缓存，应保留记录并单独重跑校准。

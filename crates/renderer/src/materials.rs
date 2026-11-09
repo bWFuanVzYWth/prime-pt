@@ -7,7 +7,6 @@ use simple_engine::{openpbr, scene_cache};
 const BLACK_CONDUCTOR: u32 = 1 << 13;
 const OVERLAY_COVERED: u32 = 1 << 14;
 const OVERLAY_EMPTY: u32 = 1 << 15;
-const OVERLAY_SHAPE: u32 = OVERLAY_COVERED | OVERLAY_EMPTY;
 
 /// 只有这些覆盖规则会拒绝硬件三角候选；透明度和光学透射彼此独立。
 pub(super) const fn tests_coverage(definition: &MaterialDefinition) -> bool {
@@ -131,102 +130,6 @@ pub(super) const fn scattering_key(
         flow.without_emission(),
         variant & !(4 | 16 | 32 | (1 << 10)),
     )
-}
-
-/// 初采消费完整散射与发光；命中灯逆向提案由独立alias能力决定。
-pub(super) const fn initial_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
-    key
-}
-
-/// 初采不延续时仅连续方向与发光有消费者；纯delta降为发光专用或零程序。
-pub(super) const fn initial_direct_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
-    if key.0.continuous() {
-        initial_key(key)
-    } else {
-        emitter_key(key)
-    }
-}
-
-const fn operation_flow(bits: u32) -> openpbr::FlowKey {
-    match openpbr::FlowKey::from_bits(bits) {
-        Ok(flow) => flow,
-        Err(_) => panic!("内部操作能力组合无效"),
-    }
-}
-
-/// 表面元数据不消费散射颜色、发光或命中光源的逆向提案密度。
-pub(super) const fn metadata_key(
-    (flow, variant): (openpbr::FlowKey, u32),
-) -> (openpbr::FlowKey, u32) {
-    let variant =
-        variant & !(4 | 16 | 32 | (1 << 10) | openpbr::Recipe::WEIGHT_BITS | BLACK_CONDUCTOR);
-    let variant = if variant & (1 | (1 << 9)) == 0 {
-        variant & !((1 << 8) | (1 << 9) | OVERLAY_SHAPE)
-    } else {
-        variant
-    };
-    let classification = if flow.bits()
-        & (openpbr::FlowKey::DELTA_REFLECTION | openpbr::FlowKey::DELTA_TRANSMISSION)
-        == 0
-        || flow.bits()
-            & (openpbr::FlowKey::SOLID_TRANSMISSION
-                | openpbr::FlowKey::THIN_TRANSMISSION
-                | openpbr::FlowKey::CONDUCTOR_REFLECTION)
-            == 0
-    {
-        operation_flow(0)
-    } else {
-        flow.without_emission()
-    };
-    (classification, variant)
-}
-
-/// 无连续lobe时纯求值恒为零，不按无消费者的贴图/法线能力复制入口。
-pub(super) const fn evaluate_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
-    if key.0.continuous() {
-        scattering_key(key)
-    } else {
-        (operation_flow(0), 0)
-    }
-}
-
-/// 连接Beer仅solid需要几何穿界；离散表面的连续BSDF求值本身恒为零。
-pub(super) const fn connection_key(key: (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
-    if key.0.continuous() {
-        scattering_key(key)
-    } else if key.0.bits() & openpbr::FlowKey::SOLID_TRANSMISSION != 0 {
-        (
-            operation_flow(
-                openpbr::FlowKey::SOLID_TRANSMISSION | openpbr::FlowKey::DELTA_TRANSMISSION,
-            ),
-            64,
-        )
-    } else {
-        (operation_flow(0), 0)
-    }
-}
-
-/// 已命中发光端只读发光侧、发光贴图和alias；overlay仅影响旧纹理发光的UV。
-pub(super) const fn emitter_key(
-    (flow, variant): (openpbr::FlowKey, u32),
-) -> (openpbr::FlowKey, u32) {
-    if !flow.emits() {
-        return (operation_flow(0), 0);
-    }
-    let overlay = if variant & 4 != 0 {
-        variant & ((1 << 8) | OVERLAY_SHAPE)
-    } else {
-        0
-    };
-    (
-        operation_flow(openpbr::FlowKey::EMISSION),
-        variant & (4 | 16 | 32 | (1 << 10)) | overlay,
-    )
-}
-
-/// 逆向提案只消费命中灯alias形态；不消费材料RGB、MERS、IOR或法线。
-pub(super) const fn pdf_key((_flow, variant): (openpbr::FlowKey, u32)) -> (openpbr::FlowKey, u32) {
-    (operation_flow(0), variant & (1 << 10))
 }
 
 pub(super) fn defaults() -> Vec<MaterialDefinition> {
@@ -665,78 +568,6 @@ mod tests {
         let (key, variant) = scattering_key((flow, 1 | 2 | 4 | 8 | 16 | 32));
         assert!(!key.emits());
         assert_eq!(variant, 1 | 2 | 8);
-    }
-
-    #[test]
-    fn alias_presence_only_separates_operations_that_read_the_emitter_proposal() {
-        let flow = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 0.)
-            .unwrap()
-            .flow(true);
-        let mut source = MaterialDefinition {
-            emission: [1.; 4],
-            ..Default::default()
-        };
-        let plain = (flow, variant(flow, &source));
-        source.control[3] = 2;
-        let aliased = (flow, variant(flow, &source));
-        assert_ne!(initial_key(plain), initial_key(aliased));
-        assert_ne!(emitter_key(plain), emitter_key(aliased));
-        assert_ne!(pdf_key(plain), pdf_key(aliased));
-        assert_eq!(scattering_key(plain), scattering_key(aliased));
-        assert_eq!(metadata_key(plain), metadata_key(aliased));
-    }
-
-    #[test]
-    fn delta_evaluation_is_shared_but_solid_connection_keeps_medium_crossing() {
-        let glass = simple_engine::openpbr::Material::dielectric(0., None)
-            .unwrap()
-            .flow(false);
-        let metal = simple_engine::openpbr::Material::opaque([0.5; 3], 0., 1.5, 1., 0.)
-            .unwrap()
-            .flow(false);
-        assert_eq!(
-            evaluate_key((glass, 64 | 1 | 2 | 8)),
-            evaluate_key((metal, 1))
-        );
-        assert_ne!(
-            connection_key((glass, 64 | 1 | 2 | 8)),
-            connection_key((metal, 1))
-        );
-    }
-
-    #[test]
-    fn metadata_does_not_split_on_scattering_lobes_or_emission() {
-        let diffuse = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 0.)
-            .unwrap()
-            .flow(false);
-        let sss = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 1.)
-            .unwrap()
-            .flow(true);
-        assert_eq!(
-            metadata_key((diffuse, 1 | 2 | 8)),
-            metadata_key((sss, 1 | 2 | 8 | 4 | 16 | 32 | 1024))
-        );
-    }
-
-    #[test]
-    fn terminal_initial_shares_delta_surfaces_but_keeps_continuous_proposals() {
-        let glass = simple_engine::openpbr::Material::dielectric(0., None)
-            .unwrap()
-            .flow(false);
-        let metal = simple_engine::openpbr::Material::opaque([0.5; 3], 0., 1.5, 1., 0.)
-            .unwrap()
-            .flow(false);
-        assert_eq!(
-            initial_direct_key((glass, 64 | 1 | 2 | 8)),
-            initial_direct_key((metal, 1))
-        );
-        let diffuse = simple_engine::openpbr::Material::opaque([0.5; 3], 0.4, 1.5, 0., 0.)
-            .unwrap()
-            .flow(false);
-        assert_eq!(
-            initial_direct_key((diffuse, 1 | 2 | 8)),
-            (diffuse, 1 | 2 | 8)
-        );
     }
 
     #[test]

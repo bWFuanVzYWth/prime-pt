@@ -1,4 +1,4 @@
-/// PT与ReSTIR共用的独立导引调度；SBT只含几何占位和精确Guide材质命中组。
+/// PT的独立导引调度；SBT只含几何占位和精确Guide材质命中组。
 module guides;
 import mod_guides;
 import mod_scene;
@@ -16,7 +16,7 @@ void guide_main()
     float2 film = (float2(pixel) + 0.5 + p.reconstruction.xy) / float2(p.image.xy);
     float3 direction =
         geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
-    GuideTrace trace = { false };
+    GuideTrace trace;
     pt::KeyGuideVertex first;
     bool found;
     if (realtime_pt())

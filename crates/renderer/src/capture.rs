@@ -84,12 +84,13 @@ impl Gpu {
                 options.bounces,
                 options.samples,
                 sample,
-                self.tuning.history_cap(),
-                self.tuning.restir_cv() as u32,
+                // PRSCENE1 保留旧配置字，维持已有捕获文件的读取兼容。
+                0,
+                0,
                 self.invocation_reorder as u32,
             ],
         )?;
-        pod(&mut out, &self.tuning.fresh_probability())?;
+        pod(&mut out, &0.0_f32)?;
         pod(&mut out, &(view.regions.len() as u64))?;
         for region in view.regions {
             pod(&mut out, &region.key)?;

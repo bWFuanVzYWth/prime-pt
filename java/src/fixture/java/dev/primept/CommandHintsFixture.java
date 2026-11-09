@@ -31,7 +31,7 @@ final class CommandHintsFixture {
 
     private static void nextKeyword(CommandDispatcher<Object> dispatcher) {
         require(Set.copyOf(texts(suggestions(dispatcher, "/pt ")))
-                .equals(Set.of("enabled", "mode", "renderer", "diagnostic", "mcap", "fresh", "cv", "ser", "rr", "quality", "ev", "exposure", "spp", "bounces", "reset")),
+                .equals(Set.of("enabled", "mode", "diagnostic", "ser", "rr", "quality", "ev", "exposure", "spp", "bounces", "reset")),
                 "空格后显示全部下级关键字");
         var suggestions = suggestions(dispatcher, "/pt qual");
         require(texts(suggestions).equals(List.of("quality"))
@@ -40,8 +40,7 @@ final class CommandHintsFixture {
     }
 
     private static void valueCompletion(CommandDispatcher<Object> dispatcher) {
-        require(Set.copyOf(texts(suggestions(dispatcher, "/pt cv "))).equals(Set.of("on", "off")),
-                "CV候选只包含有效开关");
+
         require(Set.copyOf(texts(suggestions(dispatcher, "/pt rr "))).equals(Set.of("on", "off")),
                 "RR 候选只包含有效开关");
         require(Set.copyOf(texts(suggestions(dispatcher, "/pt ser "))).equals(Set.of("on", "off")),

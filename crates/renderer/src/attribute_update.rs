@@ -141,7 +141,6 @@ impl Gpu {
         }
         metrics.publish_ns = elapsed_ns(started);
         metrics.resources_ns += metrics.publish_ns;
-        self.restir_dirty |= metrics.changed;
         self.scene_update = Some(metrics);
         Ok(true)
     }

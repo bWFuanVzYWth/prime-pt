@@ -6,7 +6,7 @@ Minecraft Java 版的路径追踪 mod，基于 Vulkan 硬件光追管线。
 
 - 写实风格，追求物理正确与色彩还原
 - 部分支持 Lab PBR 标准的资源包
-- 实时可选普通 PT 或 ReSTIR PT Enhanced；离线快照固定场景和相机后持续累积
+- 实时普通 PT，提供 1 spp 随机与 2 spp 分离策略；离线快照固定场景和相机后持续累积
 
 ## 需求
 

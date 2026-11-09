@@ -1,6 +1,6 @@
 //! 宿主无关的quad、材质身份及相机输入；不拥有游戏源、调度器或GPU资源。
 mod rendering;
-pub use rendering::{RealtimeRenderer, RenderMode, RenderTuning};
+pub use rendering::{RenderMode, RenderTuning};
 use simple_engine::camera;
 /// 场景输入域校验失败；相机数学保留底层来源。
 #[derive(Debug, thiserror::Error)]
@@ -195,7 +195,7 @@ const fn float_words(values: [f32; 4]) -> [u32; 4] {
 /// tint 为 quad 共享的未照明 sRGB；不支持逐顶点颜色、smooth normal 或第二组 UV。
 /// 这些能力需要明确扩展格式，不能从 quad 假设推导。位置和 UV 保留全部 FP32 位值；
 /// 不重建第四点，不使用体素坐标或隐式轴向。material 是真实预设选择，不作为对齐填充。
-/// 主查询强制 KHR position fetch，通过 AS 获取实际三角位置。需要恢复历史交点的 ReSTIR
+/// 主查询强制 KHR position fetch，通过 AS 获取实际三角位置。首视线缓存
 /// 另持有局部四角和 region 键，其独立工作集见渲染 crate。48B 属性记录以 primitive>>1
 /// 直接寻址；AS 构建临时输入不属于此常驻属性预算。
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]

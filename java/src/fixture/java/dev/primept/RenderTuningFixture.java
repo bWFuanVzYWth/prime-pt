@@ -9,17 +9,22 @@ final class RenderTuningFixture {
         var path = Path.of(arguments[0]);
         Files.createDirectories(path.getParent());
         Files.deleteIfExists(path);
+        Files.writeString(path, "realtime_renderer=restir_pt\nrestir.cv=true\nrestir.history_cap=20\nrestir.fresh_percent=40\nrr=false\nsamples=2\nexposure_ev=3\n");
+        var legacy = new SettingsConfig(path);
+        require(!legacy.rr() && legacy.samples() == 2 && legacy.ev() == 3,
+                "退役配置迁移保留独立设置，不能整体回退默认");
+        legacy.setBounces(8);
+        var migrated = Files.readString(path);
+        require(!migrated.contains("restir.") && !migrated.contains("realtime_renderer"),
+                "保存移除退役键");
+        Files.deleteIfExists(path);
         var config = new SettingsConfig(path);
-        require(config.tuning().equals(RenderTuning.DEFAULT), "默认M cap=20、fresh=40%、关闭诊断");
-        config.command("pt mcap 100");
-        require(config.tuning().restirCv(), "默认开启ReSTCV");
-        config.command("pt cv off");
-        config.command("pt fresh 100");
+        require(config.tuning().equals(RenderTuning.DEFAULT), "默认关闭诊断");
         config.command("pt diagnostic on");
         config.setSamples(2);
         config.setQuality(Quality.BALANCED);
         var saved = new SettingsConfig(path);
-        require(saved.tuning().equals(new RenderTuning(100, 100, true, false)), "命令保存CV开关，其他setter保留它们");
+        require(saved.tuning().equals(new RenderTuning(true)), "命令保存诊断偏好，其他 setter 保留它");
         require(saved.rr() && saved.samples() == 2 && saved.quality() == Quality.BALANCED,
                 "诊断保留请求的RR、SPP及画质偏好");
         var before = saved.tuning();
@@ -45,7 +50,7 @@ final class RenderTuningFixture {
                 "退出诊断不需要恢复被覆盖的偏好");
         saved.command("pt reset");
         require(new SettingsConfig(path).tuning().equals(RenderTuning.DEFAULT), "恢复默认同时重置新设置");
-        System.out.println("ReSTIR采样和原生诊断设置夹具通过");
+        System.out.println("配置迁移与原生诊断设置夹具通过");
     }
     private static void require(boolean value, String message) {
         if (!value) throw new AssertionError(message);

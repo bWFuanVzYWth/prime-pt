@@ -1,6 +1,6 @@
 //! 真正捕获的世界在无窗口设备上回放，统计单帧 HDR 极值及其时间增长。
 use super::*;
-use prime_scene::{MaterialDefinition, RealtimeRenderer, RenderMode, RenderRegion, RenderView};
+use prime_scene::{MaterialDefinition, RenderMode, RenderRegion, RenderView};
 use std::{
     fs::{self, File},
     io::{self, BufReader, Read},
@@ -64,7 +64,7 @@ fn hardware_scene_capture_fixture() -> Result {
         regions: &regions,
     };
     gpu.set_regions(view)?;
-    gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0.4, true, false)?)?;
+    gpu.set_render_tuning(prime_scene::RenderTuning::new(true))?;
     let environment = Environment {
         sun_direction: [0., 0., -1.],
         ..Default::default()
@@ -145,7 +145,7 @@ impl Reader {
 }
 
 #[test]
-#[ignore = "PRIME_PT_REPLAY 指定实际游戏捕获目录；4K 无窗口 PT/ReSTIR HDR 对照"]
+#[ignore = "PRIME_PT_REPLAY 指定实际游戏捕获目录；4K 无窗口 PT HDR 回放"]
 fn hardware_world_capture_replay() -> Result {
     let root = std::env::var_os("PRIME_PT_REPLAY").ok_or("缺少 PRIME_PT_REPLAY")?;
     let root = Path::new(&root);
@@ -172,8 +172,8 @@ fn hardware_world_capture_replay() -> Result {
     if captured_extent.contains(&0) {
         return Err("捕获尺寸不能为零".into());
     }
-    let [bounces, _, sample_start, history_cap, _, captured_ser]: [u32; 6] = frame.pod()?;
-    let captured_fresh: f32 = frame.pod()?;
+    let [bounces, _, sample_start, _, _, captured_ser]: [u32; 6] = frame.pod()?;
+    let _reserved: f32 = frame.pod()?;
     let count: u64 = frame.pod()?;
     let mut meshes = Vec::new();
     for _ in 0..count {
@@ -267,27 +267,17 @@ fn hardware_world_capture_replay() -> Result {
     fs::create_dir(&out)?;
     let mut reports = Vec::new();
     let selected = std::env::var("PRIME_PT_REPLAY_CASE").ok();
-    for (label, renderer, cv, fresh) in [
-        ("pt", RealtimeRenderer::PathTrace, false, 0.),
-        ("initial", RealtimeRenderer::RestirPt, false, 1.),
-        ("restir", RealtimeRenderer::RestirPt, false, captured_fresh),
-        ("restcv", RealtimeRenderer::RestirPt, true, captured_fresh),
-    ] {
+    for label in ["pt"] {
         if selected.as_deref().is_some_and(|value| value != label) {
             continue;
         }
-        gpu.set_rendering(RenderMode::Realtime, renderer)?;
+        gpu.set_rendering(RenderMode::Realtime)?;
         gpu.set_regions(RenderView {
             generation,
             anchor,
             regions: &regions,
         })?;
-        gpu.set_render_tuning(prime_scene::RenderTuning::new(
-            history_cap,
-            fresh,
-            true,
-            cv,
-        )?)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(true))?;
         gpu.invalidate_history(GlobalReset::RenderDomainChanged)?;
         gpu.absolute_sample = sample_start;
         let mut maxima = Vec::new();
@@ -362,13 +352,9 @@ fn hardware_world_capture_replay() -> Result {
             serde_json::to_vec_pretty(&report)?,
         )?;
         reports.push(report);
-        let probe = std::env::var("PRIME_PT_REPLAY_PROBE").unwrap_or_default();
-        if label != "pt" && matches!(probe.as_str(), "1" | "previous") {
-            inspect_replay(gpu, &materials, extent, &out, label, probe == "previous")?;
-        }
     }
     if reports.is_empty() {
-        return Err("PRIME_PT_REPLAY_CASE 须为 pt/initial/restir/restcv".into());
+        return Err("PRIME_PT_REPLAY_CASE 须为 pt".into());
     }
     fs::write(
         out.join("summary.json"),
@@ -380,145 +366,5 @@ fn hardware_world_capture_replay() -> Result {
         0,
         "Vulkan validation错误"
     );
-    Ok(())
-}
-
-/// 从4K路径储层中均匀抽取每8像素一条恒等重放，定位实际地图中的积分值漂移。
-fn inspect_replay(
-    gpu: &mut Gpu,
-    definitions: &[MaterialDefinition],
-    extent: [u32; 2],
-    out: &Path,
-    label: &str,
-    previous_primary: bool,
-) -> Result {
-    use simple_engine::vulkan::native::{RayTracingPipeline, Resource};
-    let probe_extent = extent.map(|v| v.div_ceil(8));
-    let readback = Buffer::new(
-        &mut gpu.context,
-        u64::from(probe_extent[0]) * u64::from(probe_extent[1]) * 80,
-        true,
-    )?;
-    let (scene, _) = gpu.renderer_bindings(
-        gpu.view.as_ref().unwrap(),
-        &gpu.atlas,
-        &gpu.scene,
-        gpu.material_gpu,
-        gpu.lighting_gpu,
-    );
-    let bindings = gpu.restir.as_ref().unwrap().test_bindings(
-        &mut gpu.context,
-        scene,
-        gpu.restir_geometry.unwrap(),
-        gpu.restir_lut,
-        Some(readback),
-    )?;
-    let source = gpu
-        .shader_source
-        .with_file_name("restir_replay_probe.slang");
-    let probe = gpu.compiler.compile(&shader_build::Recipe {
-        source: source.to_str().ok_or("probe路径不是UTF-8")?,
-        entry: "restir_replay_probe",
-        stage: "raygeneration",
-        output: "world-replay-probe.spv",
-        target: shader_build::Target::Spirv("spirv_1_4"),
-        args: if previous_primary {
-            &[
-                "-fp-mode",
-                "precise",
-                "-DRESTIR_PROBE_STRIDE=8",
-                "-DRESTIR_PREVIOUS_PRIMARY_PROBE=1",
-            ]
-        } else {
-            &["-fp-mode", "precise", "-DRESTIR_PROBE_STRIDE=8"]
-        },
-    })?;
-    let generation = gpu.generation.as_ref().unwrap();
-    let callables: Vec<_> = generation
-        .restir_programs
-        .iter()
-        .enumerate()
-        .skip(1)
-        .take(6)
-        .flat_map(|(role, set)| {
-            set.artifacts().iter().map(move |artifact| RayShader {
-                spirv: artifact.bytes(),
-                entry: match role {
-                    1 => c"restir_replay_flow",
-                    2 => c"restir_evaluate_flow",
-                    3 => c"restir_metadata_flow",
-                    4 => c"restir_connection_flow",
-                    5 => c"restir_emitter_flow",
-                    _ => c"restir_pdf_flow",
-                },
-            })
-        })
-        .collect();
-    let trace = super::super::programs(&[], false, materials::hit_features(definitions));
-    let pipeline = RayTracingPipeline::new(
-        &mut gpu.context,
-        bindings,
-        [
-            RayShader {
-                spirv: probe.bytes(),
-                entry: c"restir_replay_probe",
-            },
-            trace.miss,
-            trace.closest_hit,
-        ],
-        trace.any_hit,
-        &callables,
-    )?;
-    gpu.test_roots.extend([
-        Resource::from(readback),
-        Resource::from(bindings),
-        Resource::from(pipeline),
-    ]);
-    let mut commands = Commands::new(&gpu.context)?;
-    commands.trace(pipeline, probe_extent)?;
-    commands.barrier();
-    commands
-        .finish(&mut gpu.context)?
-        .submit_and_wait(&mut gpu.context)?;
-    let mut bytes = vec![0; readback.len() as usize];
-    readback.read(&mut gpu.context, 0, &mut bytes)?;
-    fs::write(out.join(format!("{label}-identity.bin")), &bytes)?;
-    let mut valid = 0u64;
-    let mut mismatched = 0u64;
-    let mut original = [0f64; 3];
-    let mut replayed = [0f64; 3];
-    let mut samples = Vec::new();
-    for (index, row) in bytes.as_chunks::<80>().0.iter().enumerate() {
-        let v: [f32; 20] =
-            std::array::from_fn(|i| f32::from_le_bytes(row[4 * i..4 * i + 4].try_into().unwrap()));
-        if !v[..8].iter().all(|x| x.is_finite()) {
-            return Err("实际地图重放包含非有限值".into());
-        }
-        if v[3] == 0. {
-            continue;
-        }
-        valid += 1;
-        for c in 0..3 {
-            original[c] += f64::from(v[c]) * f64::from(v[3]);
-            replayed[c] += f64::from(v[c + 4]) * f64::from(v[3]);
-        }
-        if (v[7] - 1.).abs() > 3e-3
-            || (0..3).any(|c| (v[c] - v[c + 4]).abs() > 5e-5 + 3e-3 * v[c].abs())
-        {
-            mismatched += 1;
-            if samples.len() < 20 {
-                samples.push(serde_json::json!({"pixel":[index % probe_extent[0] as usize * 8, index / probe_extent[0] as usize * 8],"original":&v[..4],"replay":&v[4..8],"flags":v[8].to_bits()}));
-            }
-        }
-    }
-    let report = serde_json::json!({"previous_primary":previous_primary,"valid":valid,"mismatched":mismatched,"weighted_original_sum":original,"weighted_replayed_sum":replayed,"samples":samples});
-    eprintln!("world_identity {label} {report}");
-    fs::write(
-        out.join(format!("{label}-identity.json")),
-        serde_json::to_vec_pretty(&report)?,
-    )?;
-    if previous_primary {
-        assert_eq!(mismatched, 0, "冻结场景的前帧主射线重放改变了储层积分值");
-    }
     Ok(())
 }

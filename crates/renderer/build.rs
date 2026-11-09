@@ -59,87 +59,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         })
         .collect();
-    recipes.push(Recipe {
-        source: "shaders/restir_probe.slang",
-        entry: "restir_light_family_probe",
-        stage: "compute",
-        output: "restir_light_family_probe.spv",
-        target: Target::Spirv("spirv_1_4"),
-        args: &["-fp-mode", "precise"],
-    });
-    for (source, entry, stage, output) in [
-        (
-            "shaders/restir.slang",
-            "restir_initial",
-            "raygeneration",
-            "restir-initial.spv",
-        ),
-        (
-            "shaders/restir.slang",
-            "restir_temporal_direction",
-            "raygeneration",
-            "restir-temporal-direction.spv",
-        ),
-        (
-            "shaders/restir.slang",
-            "restir_spatial_direction",
-            "raygeneration",
-            "restir-spatial-direction.spv",
-        ),
-        (
-            "shaders/restir.slang",
-            "restir_merge",
-            "compute",
-            "restir-merge.spv",
-        ),
-        (
-            "shaders/restir.slang",
-            "restir_temporal_combine",
-            "compute",
-            "restir-temporal-combine.spv",
-        ),
-        (
-            "shaders/restir.slang",
-            "restir_spatial_work",
-            "compute",
-            "restir-spatial-work.spv",
-        ),
-    ] {
-        recipes.push(Recipe {
-            source,
-            entry,
-            stage,
-            output,
-            target: Target::Spirv("spirv_1_4"),
-            args: &["-fp-mode", "precise"],
-        });
-    }
-    for (entry, output) in [
-        ("restir_initial", "restir-initial-ser.spv"),
-        (
-            "restir_temporal_direction",
-            "restir-temporal-direction-ser.spv",
-        ),
-        (
-            "restir_spatial_direction",
-            "restir-spatial-direction-ser.spv",
-        ),
-    ] {
-        recipes.push(Recipe {
-            source: "shaders/restir.slang",
-            entry,
-            stage: "raygeneration",
-            output,
-            target: Target::Spirv("spirv_1_4"),
-            args: &[
-                "-fp-mode",
-                "precise",
-                "-DPRIMEPT_SER=1",
-                "-capability",
-                "spvShaderInvocationReorderEXT",
-            ],
-        });
-    }
     for (output, args) in [
         (
             "anyhit-cutout.spv",
@@ -199,21 +118,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "region_primitive_probe.spv",
         ),
         ("shaders/post.slang", "post_main", "post.spv"),
-        (
-            "shaders/restir_probe.slang",
-            "restir_cv_neighbors",
-            "restir_cv_neighbors.spv",
-        ),
-        (
-            "shaders/restir_probe.slang",
-            "restir_donor_probe",
-            "restir_donor_probe.spv",
-        ),
-        (
-            "shaders/restir_probe.slang",
-            "restir_identity_probe",
-            "restir_identity_probe.spv",
-        ),
         ("shaders/present.slang", "present_main", "present.spv"),
         ("shaders/rr.slang", "pack_main", "rr_pack.spv"),
         ("shaders/rr.slang", "present_main", "rr_present.spv"),

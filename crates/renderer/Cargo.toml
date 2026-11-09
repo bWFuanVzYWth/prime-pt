@@ -14,7 +14,7 @@ simple_engine = { workspace = true, features = [
     "camera",
     "scene_cache",
     "pt_gpu",
-    "restir_pt_gpu",
+
     "dlss_rr",
     "openpbr_program",
     "shader_build",

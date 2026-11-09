@@ -25,18 +25,15 @@ final class ExposureFixture {
 
     private static void renderHierarchy(Path file) throws Exception {
         var config = new SettingsConfig(file);
-        config.command("pt renderer restir_pt");
         config.command("pt mode offline");
         config.command("pt enabled off");
         require(!config.selection().enabled() && !config.selection().offline()
-                && config.selection().mode() == RenderMode.OFFLINE
-                && config.selection().renderer() == RealtimeRenderer.RESTIR_PT,
+                && config.selection().mode() == RenderMode.OFFLINE,
                 "关闭 Mod 保留下层偏好，同时停止离线有效状态");
         config.command("pt enabled on");
         require(config.selection().offline(), "本次会话重新启用保留离线选择");
         var loaded = new SettingsConfig(file);
-        require(loaded.selection().enabled() && loaded.selection().mode() == RenderMode.REALTIME
-                && loaded.selection().renderer() == RealtimeRenderer.RESTIR_PT,
+        require(loaded.selection().enabled() && loaded.selection().mode() == RenderMode.REALTIME,
                 "重新加载只恢复 Mod 开关和实时选择，离线快照不跨会话恢复");
         config.reset();
     }
@@ -62,27 +59,27 @@ final class ExposureFixture {
         var config = new SettingsConfig(file);
         config.setExposure(-2.5f);
         config.setQuality(Quality.BALANCED);
-        config.setSamples(3);
+        config.setSamples(2);
         config.setBounces(8);
         config.setRequestedRr(false);
         config.setRequestedSer(false);
         config.setUpdateBudget(UpdateBudget.SMOOTH);
         var saved = new SettingsConfig(file);
-        require(saved.ev() == -2.5f && saved.quality() == Quality.BALANCED && saved.samples() == 3
+        require(saved.ev() == -2.5f && saved.quality() == Quality.BALANCED && saved.samples() == 2
                 && saved.bounces() == 8 && !saved.rr() && !saved.ser()
                 && saved.updateBudget() == UpdateBudget.SMOOTH, "界面 setter 同时持久化全部设置");
         require(saved.command("pt ev").contains("-2.5") && saved.command("pt quality").contains("balanced")
-                && saved.command("pt spp").contains("3") && saved.command("pt bounces").contains("8")
+                && saved.command("pt spp").contains("2") && saved.command("pt bounces").contains("8")
                 && saved.command("pt rr").contains("off") && saved.command("pt ser").contains("off"),
                 "命令查询直接读取同源模型");
         saved.command("pt ev 1");
         saved.command("pt quality quality");
-        saved.command("pt spp 5");
+        saved.command("pt spp 1");
         saved.command("pt bounces 16");
         saved.command("pt rr on");
         saved.command("pt ser on");
         var changed = new SettingsConfig(file);
-        require(changed.ev() == 1 && changed.quality() == Quality.QUALITY && changed.samples() == 5
+        require(changed.ev() == 1 && changed.quality() == Quality.QUALITY && changed.samples() == 1
                 && changed.bounces() == 16 && changed.rr() && changed.ser()
                 && changed.updateBudget() == UpdateBudget.SMOOTH, "命令写入与界面 setter 保持一致");
         changed.command("pt reset");
@@ -107,6 +104,7 @@ final class ExposureFixture {
         require(config.samples() == 1 && config.bounces() == 12 && config.quality() == Quality.PERFORMANCE
                 && config.rr() && config.ser(), "无效值保持原模型");
         config.command("pt ev -16");
+        config.command("pt mode offline");
         config.command("pt spp 64");
         config.command("pt bounces 1");
         require(config.ev() == -16 && config.samples() == 64 && config.bounces() == 1, "允许范围端点");
@@ -181,7 +179,7 @@ final class ExposureFixture {
         Files.writeString(blocked, "blocked");
         try {
             var config = new SettingsConfig(blocked.resolve("config.properties"));
-            require(config.command("pt spp 4").contains("保存失败") && config.samples() == 1,
+            require(config.command("pt spp 2").contains("保存失败") && config.samples() == 1,
                     "保存失败反馈给用户且保留原内存值");
         } finally { Files.delete(blocked); }
     }

@@ -18,7 +18,7 @@
 //! 源包只在调用内借用；palette/资源字典解码成自持输入，section编译及tint续接分阶段发布。
 //! 一个64m region合并4³个section；缺源section保留旧片段，已完成片段可发布。
 //! 使用 [`Quad`] 的直接寻址属性 ABI：任意四角、固定012/023、三角面退化为quad，
-//! 不要求轴对齐。普通 PT 的主查询只用 AS position fetch；ReSTIR 另按历史交点恢复需求
+//! 不要求轴对齐。PT 的主查询使用 AS position fetch；当帧首面缓存另为照明和导引
 //! 保存局部四角和 region 键，其所有者与释放边界见渲染 crate。
 //! 宿主必须启用 [KHR position fetch] 扩展和 feature，无回退；能力边界见 [`Quad`]。
 //!
@@ -216,42 +216,34 @@ fn with_live_engine(
     })
 }
 
-/// 请求渲染模式和实时积分器；0/1 分别为实时/离线和普通 PT/ReSTIR PT。
-/// 离线等待首个有效帧，冻结后拒绝实时源修改；退出保留实时积分器偏好。
+/// 请求渲染模式；0/1 分别为实时/离线，均使用普通 PT。
+/// 离线等待首个有效帧，冻结后拒绝实时源修改；退出恢复实时更新。
 ///
 /// # Safety
 /// 宿主已确认此前全部 GPU 命令完成，调用期间独占会话及队列。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn prime_set_rendering(id: u64, mode: u32, renderer: u32) -> i32 {
+pub unsafe extern "C" fn prime_set_rendering(id: u64, mode: u32) -> i32 {
     guarded(-1, || {
         let mode = prime_scene::RenderMode::try_from(mode)?;
-        let renderer = prime_scene::RealtimeRenderer::try_from(renderer)?;
         with_engine(id, |engine| {
-            engine.gpu.set_rendering(mode, renderer)?;
+            engine.gpu.set_rendering(mode)?;
             engine.rendering.select(mode);
             Ok(())
         })
     })
 }
 
-/// 设置历史M cap、固定fresh概率、原生诊断和ReSTCV；参数统一校验后发布。
-/// 诊断/CV均为0或1；CV只影响ReSTIR颜色历史，不清路径、RR或普通PT历史。
+/// 设置原生单帧诊断，参数校验后发布。
+/// 诊断开关为 0 或 1；离线模式忽略该偏好。
 /// # Safety
 /// 宿主已完成旧GPU命令，并独占会话及队列。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn prime_set_render_tuning(
-    id: u64,
-    cap: u32,
-    probability: f32,
-    diagnostic: u32,
-    restir_cv: u32,
-) -> i32 {
+pub unsafe extern "C" fn prime_set_render_tuning(id: u64, diagnostic: u32) -> i32 {
     guarded(-1, || {
-        if diagnostic > 1 || restir_cv > 1 {
-            return Err(Error::Input("诊断和ReSTCV开关须为0或1"));
+        if diagnostic > 1 {
+            return Err(Error::Input("诊断开关须为0或1"));
         }
-        let tuning =
-            prime_scene::RenderTuning::new(cap, probability, diagnostic != 0, restir_cv != 0)?;
+        let tuning = prime_scene::RenderTuning::new(diagnostic != 0);
         with_engine(id, |engine| {
             engine.gpu.set_render_tuning(tuning)?;
             Ok(())
@@ -1145,7 +1137,6 @@ pub unsafe extern "C" fn prime_tints(id: u64, colors: *const u32, count: u32) ->
 /// samples=1..=64；RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为最多表面反弹次数，默认12；末顶点保留发光与NEE。
 /// [`prime_set_rendering`] 选择离线时固定最近已接受帧的场景、相机、光照和路径预算，
 /// 只接受当前曝光、尺寸和每帧采样量；没有已接受帧时先绘制并接受首帧。离线禁用 RR，
-/// 实时 ReSTIR 固定每帧一个初始候选，其余实时模式使用 samples。
 /// 离线累积将超过2^24个样本时显式返回错误；由用户重新进入离线模式，不自动丢弃均值。
 /// 累积失效不回退独立的绝对随机基数；完整帧在宿主完成边界接受，取消不发布新序号。
 /// 宿主已确认前次 draw 完成，并独占 graphics queue；mesh 更新会同步提交构建命令。

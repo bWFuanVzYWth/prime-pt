@@ -22,10 +22,10 @@ final class NativeBatchFixture {
             var profile=linker.downcallHandle(symbols.find("prime_profile").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_LONG,JAVA_LONG,ADDRESS,ADDRESS,JAVA_INT,JAVA_INT));
             var display = Native.bindDisplayOptions(symbols);
             var tuning = Native.bindRenderTuning(symbols);
-            if ((int)tuning.invokeExact(0L, 20, 0.4f, 0, 2) != -1
-                    || !message(error).equals("诊断和ReSTCV开关须为0或1"))
-                throw new AssertionError("FFM的CV标记须在会话查找前拒绝非法值");
-            if (Native.invokeRenderTuning(tuning, 0L, new RenderTuning(100, 40, true, true)) != -1
+            if ((int)tuning.invokeExact(0L, 2) != -1
+                    || !message(error).equals("诊断开关须为0或1"))
+                throw new AssertionError("FFM的诊断标记须在会话查找前拒绝非法值");
+            if (Native.invokeRenderTuning(tuning, 0L, new RenderTuning(true)) != -1
                     || !message(error).equals("无效 native 句柄"))
                 throw new AssertionError("输出采样参数须通过实际FFM入口并抵达会话查找");
             if (Native.invokeDisplayOptions(display, 0L, DisplaySettings.DEFAULT) != -1 || !message(error).equals("无效 native 句柄"))

@@ -64,7 +64,6 @@ final class SettingsLanguageFixture {
                 try (var resources = new MultiPackResourceManager(PackType.CLIENT_RESOURCES, List.of(vanilla, pack))) {
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us"), false));
                     requireText("render", "PT rendering");
-                    requireText("restir_cv", "ReSTCV color estimate");
                     requireRenderingHierarchy("Prime PT", "Rendering mode", "Offline snapshot", "Realtime renderer");
                     requireWidgetText("Primary sampling", "2 spp separated", "DLSS quality", "Performance (2×)");
                     requireAutoExposure("Auto exposure strength");
@@ -72,7 +71,6 @@ final class SettingsLanguageFixture {
                     requireStartupNotice("Prime PT unavailable", "OpenGL is active.", "GPU or driver lacks:");
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "PT 渲染");
-                    requireText("restir_cv", "ReSTCV 颜色估计");
                     requireRenderingHierarchy("Prime PT 开关", "渲染模式", "离线快照", "实时渲染器");
                     requireWidgetText("首表面采样", "2 spp 分离", "DLSS 质量", "性能（2×）");
                     requireAutoExposure("自动曝光强度");
@@ -143,11 +141,7 @@ final class SettingsLanguageFixture {
                         Component.translatable("primept.settings.mode"), (button, value) -> {});
         require(modes.getMessage().getString().equals(CommonComponents.optionNameValue(
                 Component.literal(mode), Component.literal(offline)).getString()), "离线模式控件从游戏资源栈读取翻译");
-        var renderers = CycleButton.builder((RealtimeRenderer value) -> Component.translatable("primept.settings.realtime_renderer." + value.key), RealtimeRenderer.RESTIR_PT)
-                .withValues(List.of(RealtimeRenderer.values())).create(0, 0, 310, 20,
-                        Component.translatable("primept.settings.realtime_renderer"), (button, value) -> {});
-        require(renderers.getMessage().getString().equals(CommonComponents.optionNameValue(
-                Component.literal(renderer), Component.literal("ReSTIR PT Enhanced")).getString()), "实时渲染器控件标题和值只组合一次");
+
     }
 
     private static void requireAutoExposure(String caption) {

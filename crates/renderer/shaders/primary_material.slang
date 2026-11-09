@@ -1,7 +1,7 @@
 /// 缓存首表面的材质专用输运；EXT不能MakeHit，因而使用callable，后续反弹仍走hit group。
 module primary_material;
 import primary_cache;
-import restir_geometry;
+import known_geometry;
 import mod_decode;
 import pt.material_vertex;
 import mod_scene;
@@ -16,14 +16,13 @@ void shade_primary(inout pt::MaterialCall call)
     uint pixel = primary_pixel();
     pt::Hit hit = {};
     hit.identity = primary_identity[pixel];
-    hit.surface =
-        geometry::surface_point(restir_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
+    hit.surface = geometry::surface_point(known_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
     float4 ray = primary_ray[pixel];
     hit.distance = ray.w;
     hit.front = dot(ray.xyz, hit.surface.normal) < 0;
     float4 auxiliary = material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
     hit.identity.w =
-        restir_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
+        known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
     pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
         hit, parameters[0].block_emission_scale, { auxiliary });
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true>(

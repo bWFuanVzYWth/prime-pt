@@ -1,4 +1,4 @@
-/// 两种实时积分器共用的真实表面/反射代理导引；不维护独立历史。
+/// 实时 PT 的真实表面/反射代理导引；不维护独立历史。
 module mod_guides;
 import mod_scene;
 import params;
@@ -7,8 +7,6 @@ import pt.integrator;
 import pt.reconstruction;
 import pt.key_guides;
 import pt.hit_transport;
-import restir_pt.types;
-import restir_geometry;
 import geometry.camera;
 
 [[vk::binding(19, 0)]]
@@ -33,42 +31,8 @@ RWTexture2D<float> guide_distance;
 [[vk::image_format("rg16f")]]
 RWTexture2D<float2> guide_specular_motion;
 
-pt::KeyGuideVertex known_guide_vertex(restir_pt::HitInfo identity, float3 incoming, float4 incident)
-{
-    uint primitive = restir_primitive(identity);
-    uint program = guide_program(primitive, true, true);
-    pt::KeyGuideCall call = {};
-    call.value.point.position = asfloat(identity.data.xyz);
-    call.value.distance = asfloat(identity.data.w);
-    call.value.canonicalDirection = incoming;
-    call.value.medium = incident;
-#ifdef PRIMEPT_SER
-    ReorderThread(program, 32u);
-#endif
-    CallShader(program, call);
-    return call.value;
-}
-
-/// 无SER能力的ReSTIR仍按known-surface键处理辅助材料，不引入HitObject能力。
-public struct RestirGuideTrace : pt::IKeyGuideTrace
-{
-    public bool intersect_guide(float3 origin, float3 direction, float4 incident,
-                                out pt::KeyGuideVertex value)
-    {
-        value = {};
-        pt::Hit hit;
-        if (!ModScene().intersect(origin, direction, hit))
-            return false;
-        restir_pt::HitInfo identity = restir_stable_hit(hit.identity.x, asfloat(hit.identity.yz));
-        value = known_guide_vertex(identity, direction, incident);
-        value.distance = hit.distance;
-        return true;
-    }
-};
-
 public struct GuideTrace : pt::IKeyGuideTrace
 {
-    public bool restir;
 
     public bool intersect_guide(float3 origin, float3 direction, float4 incident,
                                 out pt::KeyGuideVertex value)
@@ -83,7 +47,7 @@ public struct GuideTrace : pt::IKeyGuideTrace
 #ifdef PRIMEPT_SEPARATE_GUIDES
         uint program = guide_slot(primitive);
 #else
-        uint program = guide_program(primitive, false, restir);
+        uint program = guide_slot(primitive) + parameters[0].programs.z;
 #endif
         found.SetShaderTableIndex(program + 1u);
         pt::KeyGuideCall call = {};
@@ -133,7 +97,7 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
     public void surface_hit(HitObject found, pt::TransportCall data)
     {
         uint primitive = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
-        uint program = guide_program(primitive, false, false);
+        uint program = guide_slot(primitive) + parameters[0].programs.z;
         found.SetShaderTableIndex(program + 1u);
         pt::KeyGuideCall call = {};
         call.value.medium = data.path.medium;
@@ -141,25 +105,11 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
         ReorderThread(found);
 #endif
         HitObject::Invoke(found, call);
-        GuideTrace provider = { false };
+        GuideTrace provider;
         write_key(provider, call.value, data.path.origin, data.path.direction, data.path.medium);
     }
 
-    public void surface_known(restir_pt::HitInfo identity, pt::TransportCall data)
-    {
-        pt::KeyGuideVertex first =
-            known_guide_vertex(identity, data.path.direction, data.path.medium);
-// 原生初采的兼容变体只用known-surface Guide；完整HG的Guide由独立管线调度。
-#if defined(PRIMEPT_SER) && !defined(PRIMEPT_INITIAL_HIT)
-        GuideTrace provider = { true };
-        write_key(provider, first, data.path.origin, data.path.direction, data.path.medium);
-#else
-        write_key(RestirGuideTrace(), first, data.path.origin, data.path.direction,
-                  data.path.medium);
-#endif
-    }
-
-    // mode0参考与未启用EXT的兼容PT保留旧导引；HG/PT和ReSTIR不经此通用翻译路径。
+    // mode0参考与未启用EXT的兼容PT保留旧导引；HG/PT不经此通用翻译路径。
     public void surface(pt::TransportCall data)
     {
         ModScene provider;

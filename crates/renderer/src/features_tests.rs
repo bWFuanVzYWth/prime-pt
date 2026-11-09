@@ -96,12 +96,9 @@ fn hardware_pt_resource_generation_survives_world_reset() -> Result<(), Box<dyn 
         &[],
         &[[u32::MAX, 0, 0, 0]],
     )?;
-    for renderer in [
-        prime_scene::RealtimeRenderer::PathTrace,
-        prime_scene::RealtimeRenderer::RestirPt,
-    ] {
+    {
         gpu.clear_world()?;
-        gpu.set_rendering(prime_scene::RenderMode::Realtime, renderer)?;
+        gpu.set_rendering(prime_scene::RenderMode::Realtime)?;
         publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
         host.render_options(
             &mut gpu,
@@ -160,7 +157,6 @@ fn hardware_pt_guide_source_reload_replaces_the_executed_program()
         .guide_regular
         .unwrap()
         .program_root(&gpu.context)?;
-    let restir = generation.restir.test_program_roots(&gpu.context)?;
     let pt = generation.code[0];
     std::fs::write(
         sources.join("guides.slang"),
@@ -176,7 +172,6 @@ fn hardware_pt_guide_source_reload_replaces_the_executed_program()
             .program_root(&gpu.context)?
     );
     assert_eq!(pt, generation.code[0]);
-    assert_eq!(restir, generation.restir.test_program_roots(&gpu.context)?);
     let guide = generation.guide_regular.unwrap();
     let view = View::new(&mut gpu.context, [32, 32], true)?;
     let (trace, _) = gpu.renderer_bindings(
@@ -314,218 +309,8 @@ fn hardware_pt_rr_keyed_program_preserves_opaque_and_glass_guides()
 }
 
 #[test]
-#[ignore = "真实Vulkan RT：紧凑SBT的元数据/发光/逆PDF/法线操作须路由到本材质专用叶子"]
-fn hardware_pt_material_operation_sbt_routes_all_material_keys()
--> Result<(), Box<dyn std::error::Error>> {
-    use simple_engine::light_sampling::emitter::{Coverage, EmissionProposal, EmitterAlias};
-    use simple_engine::vulkan::native::RayTracingPipeline;
-    let host = Host::new_ser()?;
-    let mut session = host.gpu()?;
-    let mut gpu = session.gpu();
-    let output = image(&mut gpu)?;
-    let mut definitions = vec![MaterialDefinition::default(); 12];
-    definitions[1].surface[1] = 1.;
-    definitions[1].base_roughness[3] = 0.;
-    definitions[2].control[0] = 1;
-    definitions[2].control[2] = MaterialDefinition::MERS;
-    definitions[2].base_roughness[3] = 0.;
-    definitions[3].control[0] = 1;
-    definitions[3].extinction = [1.33, 0.03, 0.01, 0.005];
-    definitions[3].base_roughness[3] = 0.5;
-    definitions[4].control[0] = 3;
-    definitions[4].control[2] = MaterialDefinition::MERS;
-    definitions[4].base_roughness[3] = 0.3;
-    definitions[5].control[2] = MaterialDefinition::MERS;
-    definitions[6].control[2] = MaterialDefinition::AUXILIARY;
-    definitions[6].control[3] = MaterialDefinition::AUTHORED_NORMAL;
-    definitions[6].base_roughness[3] = 0.3;
-    for (index, sides) in [(7, 1), (8, 2), (10, 3)] {
-        definitions[index].control[1] = sides;
-        definitions[index].emission = [0.8, 0.2, 0.6, 3.];
-    }
-    definitions[7].control[2] = MaterialDefinition::TEXTURED_EMISSION;
-    definitions[9].control[2] =
-        MaterialDefinition::MERS | MaterialDefinition::OVERLAY | MaterialDefinition::OVERLAY_MERS;
-    definitions[9].overlay_bounds = [0., 0., 1., 1.];
-    definitions[11] = definitions[9];
-    definitions[11].control[2] &= !MaterialDefinition::MERS;
-    definitions[11].base_roughness[3] = 0.;
-    definitions[10].control[2] = MaterialDefinition::MERS
-        | MaterialDefinition::AUXILIARY
-        | MaterialDefinition::TEXTURED_EMISSION;
-    definitions[10].control[3] = MaterialDefinition::AUTHORED_NORMAL | 2;
-    assert!(definitions.iter().all(|definition| definition.valid()));
-    let uv = [[0., 0.], [0., 1.], [1., 1.], [1., 0.]];
-    let mut mesh = Mesh::default();
-    for index in 0..definitions.len() {
-        let x = (index % 4) as f32 * 2. - 4.;
-        let y = (index / 4) as f32 * (8. / 3.) - 4.;
-        let mut points = [
-            [x, y, 4.],
-            [x, y + 8. / 3., 4.],
-            [x + 2., y + 8. / 3., 4.],
-            [x + 2., y, 4.],
-        ];
-        if index == 8 {
-            points.reverse();
-        }
-        mesh.quads.push(Quad::with_material(
-            points,
-            uv,
-            [0.8, 0.7, 0.6],
-            MaterialId::new(index as u32),
-        ));
-    }
-    let proposal = EmissionProposal::new([2, 1], &[0., 1.], &[255, 255])?.unwrap();
-    let alias = EmitterAlias::build(mesh.quads[10].positions(), uv, Coverage::Opaque, &proposal)?
-        .ok_or("alias样本没有建立纹理提案")?;
-    let mut words = vec![0];
-    words.extend_from_slice(alias.words());
-    gpu.replace_resources(ResourceUpload {
-        generation: gpu.resource_generation + 1,
-        extent: [2, 1],
-        albedo: &[255; 8],
-        materials: &definitions,
-        mers: &[64, 0, 153, 128, 192, 255, 204, 192],
-        auxiliary: &[200, 128, 64, 85, 200, 128, 64, 85],
-        emission_alias_words: &words,
-        light_areas: &[[u32::MAX, 0, 0, 0]; 12],
-    })?;
-    gpu.set_rendering(
-        prime_scene::RenderMode::Realtime,
-        prime_scene::RealtimeRenderer::RestirPt,
-    )?;
-    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
-    host.render_options(
-        &mut gpu,
-        &output,
-        &camera(),
-        Environment::default(),
-        Options::new(false, streamline::Quality::Dlaa, 1, 1)?,
-    )?;
-    let readback = Buffer::new(&mut gpu.context, 32 * 32 * 31 * 16, true)?;
-    let (scene, _) = gpu.renderer_bindings(
-        gpu.view.as_ref().unwrap(),
-        &gpu.atlas,
-        &gpu.scene,
-        gpu.material_gpu,
-        gpu.lighting_gpu,
-    );
-    let bindings = gpu.restir.as_ref().unwrap().test_bindings(
-        &mut gpu.context,
-        scene,
-        gpu.restir_geometry.unwrap(),
-        gpu.restir_lut,
-        Some(readback),
-    )?;
-    let generation = gpu.generation.as_ref().unwrap();
-    let guide_offset: usize = generation.restir_programs[1..7]
-        .iter()
-        .map(|set| set.artifacts().len())
-        .sum();
-    let define = format!("-DPRIMEPT_PROBE_GUIDE_OFFSET={guide_offset}");
-    let source = gpu.shader_source.with_file_name("material_probe.slang");
-    let probe = gpu.compiler.compile(&shader_build::Recipe {
-        source: source.to_str().ok_or("probe路径不是UTF-8")?,
-        entry: "material_route_probe",
-        stage: "raygeneration",
-        output: "material-route-probe.spv",
-        target: shader_build::Target::Spirv("spirv_1_4"),
-        args: &["-fp-mode", "precise", &define],
-    })?;
-    let callables: Vec<_> = generation
-        .restir_programs
-        .iter()
-        .enumerate()
-        .skip(1)
-        .take(7)
-        .flat_map(|(role, set)| {
-            set.artifacts().iter().map(move |artifact| RayShader {
-                spirv: artifact.bytes(),
-                entry: match role {
-                    1 => c"restir_replay_flow",
-                    2 => c"restir_evaluate_flow",
-                    3 => c"restir_metadata_flow",
-                    4 => c"restir_connection_flow",
-                    5 => c"restir_emitter_flow",
-                    6 => c"restir_pdf_flow",
-                    _ => c"guide_known",
-                },
-            })
-        })
-        .collect();
-    let trace = super::super::programs(
-        &[],
-        false,
-        materials::HitFeatures {
-            coverage: 0,
-            authored_normals: false,
-        },
-    );
-    let pipeline = RayTracingPipeline::new(
-        &mut gpu.context,
-        bindings,
-        [
-            RayShader {
-                spirv: probe.bytes(),
-                entry: c"material_route_probe",
-            },
-            trace.miss,
-            trace.closest_hit,
-        ],
-        trace.any_hit,
-        &callables,
-    )?;
-    let mut commands = Commands::new(&gpu.context)?;
-    commands.trace(pipeline, [32, 32])?;
-    commands.barrier();
-    commands
-        .finish(&mut gpu.context)?
-        .submit_and_wait(&mut gpu.context)?;
-    let mut bytes = vec![0; readback.len() as usize];
-    readback.read(&mut gpu.context, 0, &mut bytes)?;
-    let values: Vec<f32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|word| f32::from_le_bytes(*word))
-        .collect();
-    let mut seen = vec![0usize; definitions.len()];
-    for (pixel, rows) in values.as_chunks::<{ 31 * 4 }>().0.iter().enumerate() {
-        if rows[120] == 0. {
-            continue;
-        }
-        let material = rows[121] as usize;
-        assert!(
-            material < seen.len(),
-            "pixel={pixel}, invalid material={material}"
-        );
-        seen[material] += 1;
-        for pair in 0..15 {
-            for channel in 0..4 {
-                let actual = rows[pair * 8 + channel];
-                let expected = rows[pair * 8 + 4 + channel];
-                assert!(
-                    actual.is_finite()
-                        && expected.is_finite()
-                        && (actual - expected).abs() <= 2e-4 * expected.abs().max(1.),
-                    "material={material}, pixel={pixel}, role_pair={pair}, channel={channel}: {actual} != {expected}"
-                );
-            }
-        }
-    }
-    assert!(
-        seen.iter().all(|&count| count > 0),
-        "所有材质键都须实际命中: {seen:?}"
-    );
-    session.finish()?;
-    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
-    Ok(())
-}
-
-#[test]
-#[ignore = "真实Vulkan RT；超过八种材质能力仍可执行ReSTIR的独立操作叶子"]
-fn hardware_pt_restir_many_material_variants() -> Result<(), Box<dyn std::error::Error>> {
+#[ignore = "真实Vulkan RT；超过八种材质能力仍可执行PT的特化材质程序"]
+fn hardware_pt_many_material_variants() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
     let mut session = host.gpu()?;
     let mut gpu = session.gpu();
@@ -570,10 +355,7 @@ fn hardware_pt_restir_many_material_variants() -> Result<(), Box<dyn std::error:
             MaterialId::new(index),
         ));
     }
-    gpu.set_rendering(
-        prime_scene::RenderMode::Realtime,
-        prime_scene::RealtimeRenderer::RestirPt,
-    )?;
+    gpu.set_rendering(prime_scene::RenderMode::Realtime)?;
     publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
     for _ in 0..3 {
         host.render_options(
@@ -739,101 +521,6 @@ fn scene() -> Mesh {
             ),
         ],
     }
-}
-
-#[test]
-#[ignore = "真实Vulkan RT/compute；太阳和局部灯各自采样且条件PDF与逆向密度一致"]
-fn hardware_pt_restir_light_families_use_conditional_pdfs() -> Result<(), Box<dyn std::error::Error>>
-{
-    let host = Host::new()?;
-    let mut session = host.gpu()?;
-    let mut gpu = session.gpu();
-    let output = image(&mut gpu)?;
-    let receiver = MaterialDefinition::default();
-    let mut lamp = receiver;
-    lamp.emission = [1., 1., 1., 20.];
-    lamp.control[1] = 3;
-    upload(&mut gpu, &[receiver, lamp], &[], &[[u32::MAX, 0, 0, 0]; 2])?;
-    gpu.set_rendering(
-        prime_scene::RenderMode::Realtime,
-        prime_scene::RealtimeRenderer::RestirPt,
-    )?;
-    for (case, (local, sky)) in [(true, true), (false, true), (true, false), (false, false)]
-        .into_iter()
-        .enumerate()
-    {
-        let mut mesh = scene();
-        if !local {
-            mesh.quads.truncate(1);
-        }
-        publish(&mut gpu, &mesh, case as u64 + 1, case as u64 + 1, [0.; 3])?;
-        let environment = if sky {
-            Environment::default()
-        } else {
-            Environment {
-                sun_direction: [0.; 3],
-                ..Default::default()
-            }
-        };
-        host.render_environment(&mut gpu, &output, &camera(), environment)?;
-        let readback = Buffer::new(&mut gpu.context, 32 * 32 * 32, true)?;
-        let (scene, _) = gpu.renderer_bindings(
-            gpu.view.as_ref().unwrap(),
-            &gpu.atlas,
-            &gpu.scene,
-            gpu.material_gpu,
-            gpu.lighting_gpu,
-        );
-        let bindings = gpu.restir.as_ref().unwrap().test_bindings(
-            &mut gpu.context,
-            scene,
-            gpu.restir_geometry.unwrap(),
-            gpu.restir_lut,
-            Some(readback),
-        )?;
-        let pipeline = ComputePipeline::new(
-            &mut gpu.context,
-            bindings,
-            shader(
-                include_bytes!(concat!(env!("OUT_DIR"), "/restir_light_family_probe.spv")),
-                c"restir_light_family_probe",
-            ),
-        )?;
-        let mut commands = Commands::new(&gpu.context)?;
-        commands.dispatch(pipeline, [2, 2, 1])?;
-        commands.barrier();
-        commands
-            .finish(&mut gpu.context)?
-            .submit_and_wait(&mut gpu.context)?;
-        let mut bytes = vec![0; readback.len() as usize];
-        readback.read(&mut gpu.context, 0, &mut bytes)?;
-        let mut seen = [0; 2];
-        for row in bytes.as_chunks::<32>().0 {
-            let value = |i: usize| f32::from_le_bytes(row[4 * i..4 * i + 4].try_into().unwrap());
-            for (family, enabled) in [local, sky].into_iter().enumerate() {
-                let pdf = value(2 * family);
-                let reverse = value(2 * family + 1);
-                assert!(pdf.is_finite() && reverse.is_finite());
-                if pdf > 0. {
-                    assert!(enabled, "空灯族不能改投另一族");
-                    assert!(
-                        (pdf - reverse).abs() <= 2e-4 * pdf.max(1.),
-                        "family={family}, pdf={pdf}, reverse={reverse}"
-                    );
-                    assert_eq!(value(4 + family).to_bits(), if family == 0 { 1 } else { 0 });
-                    seen[family] += 1;
-                } else if !enabled {
-                    assert_eq!(pdf, 0.);
-                }
-            }
-        }
-        for (family, enabled) in [local, sky].into_iter().enumerate() {
-            assert_eq!(seen[family] > 512, enabled, "case={case}, seen={seen:?}");
-        }
-    }
-    session.finish()?;
-    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
-    Ok(())
 }
 
 #[test]
@@ -1618,7 +1305,7 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
         )?;
         publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
         gpu.set_ser(true)?;
-        gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0., !staged, false)?)?;
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(!staged))?;
         gpu.test_restart_sample_sequence(0)?;
         host.render_options(
             &mut gpu,

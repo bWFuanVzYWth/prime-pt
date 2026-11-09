@@ -57,11 +57,12 @@ final class SettingsConfig {
                     new SolarSettings(Integer.parseInt(properties.getProperty("astronomy.latitude_degrees", "30")),
                             Integer.parseInt(properties.getProperty("astronomy.solar_longitude_degrees", "0"))),
                     readDisplay(properties), readLighting(properties), new RenderSelection(
-                            parseBoolean(properties, "enabled", true), RenderMode.REALTIME,
-                            RealtimeRenderer.parse(properties.getProperty("realtime_renderer", "path_trace"))),
-                    new RenderTuning(readInt(properties, "restir.history_cap", 20),
-                        readInt(properties, "restir.fresh_percent", 40), parseBoolean(properties, "diagnostic.raw", false),
-                        parseBoolean(properties, "restir.cv", true)));
+                            parseBoolean(properties, "enabled", true), RenderMode.REALTIME),
+                    new RenderTuning(parseBoolean(properties, "diagnostic.raw", false)));
+            // 旧偏好只在读取边界迁移；保留 RR、采样、曝光等独立设置，下一次保存移除旧键。
+            if ("restir_pt".equals(properties.getProperty("realtime_renderer")))
+                System.getLogger("prime_pt").log(System.Logger.Level.WARNING,
+                        "ReSTIR PT 已退役，已切换为普通 PT");
         } catch (IOException | IllegalArgumentException error) {
             System.getLogger("prime_pt").log(System.Logger.Level.WARNING, "PT 配置无效，使用默认值", error);
         }
@@ -195,45 +196,28 @@ final class SettingsConfig {
         if (parts.length > 3) return usage();
         try {
             switch (parts[1]) {
-                case "cv" -> {
-                    if (parts.length == 3) {
-                        if (!parts[2].equals("on") && !parts[2].equals("off"))
-                            throw new IllegalArgumentException("ReSTCV开关必须为on或off");
-                        setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), tuning().diagnostic(), parts[2].equals("on")));
-                    }
-                    return "ReSTCV：" + (tuning().restirCv() ? "on" : "off");
-                }
+
                 case "diagnostic" -> {
                     if (parts.length == 3) {
                         if (!parts[2].equals("on") && !parts[2].equals("off")) throw new IllegalArgumentException("诊断开关必须为on或off");
-                        setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), parts[2].equals("on"), tuning().restirCv()));
+                        setTuning(new RenderTuning(parts[2].equals("on")));
                     }
                     return "原生无累积诊断：" + (tuning().diagnostic() ? "on" : "off");
                 }
-                case "mcap" -> {
-                    if (parts.length == 3) setTuning(new RenderTuning(Integer.parseInt(parts[2]), tuning().freshPercent(), tuning().diagnostic(), tuning().restirCv()));
-                    return "ReSTIR历史M上限：" + tuning().historyCap();
-                }
-                case "fresh" -> {
-                    if (parts.length == 3) setTuning(new RenderTuning(tuning().historyCap(), Integer.parseInt(parts[2]), tuning().diagnostic(), tuning().restirCv()));
-                    return "ReSTIR初采输出比例：" + tuning().freshPercent() + "%";
-                }
+
                 case "enabled" -> {
                     if (parts.length == 3) {
                         if (!parts[2].equals("on") && !parts[2].equals("off"))
                             throw new IllegalArgumentException("Mod 开关必须为 on 或 off");
-                        setSelection(new RenderSelection(parts[2].equals("on"), selection().mode(), selection().renderer()));
+                        setSelection(new RenderSelection(parts[2].equals("on"), selection().mode()));
                     }
                     return "Prime PT：" + (selection().enabled() ? "on" : "off");
                 }
                 case "mode" -> {
-                    if (parts.length == 3) setSelection(new RenderSelection(selection().enabled(), RenderMode.parse(parts[2]), selection().renderer()));
+                    if (parts.length == 3) setSelection(new RenderSelection(selection().enabled(), RenderMode.parse(parts[2])));
                     return "Prime PT 模式：" + selection().mode().key;
                 }
-                case "renderer" -> {
-                    if (parts.length == 3) setSelection(new RenderSelection(selection().enabled(), selection().mode(), RealtimeRenderer.parse(parts[2])));
-                    return "Prime PT 实时渲染器：" + selection().renderer().key;
-                }
+
                 case "ser" -> {
                     if (parts.length == 3) {
                         if (!parts[2].equals("on") && !parts[2].equals("off"))
@@ -288,9 +272,8 @@ final class SettingsConfig {
     }
 
     private String status() {
-        return "Prime " + selection().enabled() + " / " + selection().mode().key + " / " + selection().renderer().key + " / SER " + (ser() ? "on" : "off") + " / RR " + (rr() ? "on" : "off") + " / " + quality().key() + " / " + ev()
-                + " EV / " + samples() + " SPP / " + bounces() + " 顶点 / M cap " + tuning().historyCap()
-                + " / fresh " + tuning().freshPercent() + "% / ReSTCV " + (tuning().restirCv() ? "on" : "off")
+        return "Prime " + selection().enabled() + " / " + selection().mode().key + " / SER " + (ser() ? "on" : "off") + " / RR " + (rr() ? "on" : "off") + " / " + quality().key() + " / " + ev()
+                + " EV / " + samples() + " SPP / " + bounces() + " 顶点"
                 + " / 原生诊断 " + (tuning().diagnostic() ? "on" : "off");
     }
 
@@ -300,10 +283,8 @@ final class SettingsConfig {
         var temporary = Files.createTempFile(target.getParent(), "prime-pt-", ".properties");
         try {
             Files.writeString(temporary, "enabled=" + next.selection.enabled()
-                    + "\nrestir.history_cap=" + next.tuning.historyCap() + "\nrestir.fresh_percent=" + next.tuning.freshPercent()
                     + "\ndiagnostic.raw=" + next.tuning.diagnostic()
-                    + "\nrestir.cv=" + next.tuning.restirCv()
-                    + "\nrealtime_renderer=" + next.selection.renderer().key + "\nexposure_ev=" + next.ev + "\nrr=" + next.rr
+                    + "\nexposure_ev=" + next.ev + "\nrr=" + next.rr
                     + "\nquality=" + next.quality.key() + "\nsamples=" + next.samples + "\nbounces=" + next.bounces
                     + "\nser=" + next.ser + "\nupdate_budget=" + next.updateBudget.key
                     + "\nastronomy.latitude_degrees=" + next.solar.latitude()
@@ -341,7 +322,7 @@ final class SettingsConfig {
     }
 
     private static String usage() {
-        return "用法：/pt enabled [on|off]；/pt mode [realtime|offline]；/pt renderer [path_trace|restir_pt]；/pt ser [on|off]；/pt rr [on|off]；/pt quality [dlaa|quality|balanced|performance|ultra_performance]；"
-                + "/pt ev [EV]；/pt spp [1|2，离线1..64]；/pt bounces [1..64]；/pt mcap [1..100]；/pt fresh [0..100]；/pt cv [on|off]；/pt diagnostic [on|off]；/pt reset";
+        return "用法：/pt enabled [on|off]；/pt mode [realtime|offline]；/pt ser [on|off]；/pt rr [on|off]；/pt quality [dlaa|quality|balanced|performance|ultra_performance]；"
+                + "/pt ev [EV]；/pt spp [1|2，离线1..64]；/pt bounces [1..64]；/pt diagnostic [on|off]；/pt reset";
     }
 }

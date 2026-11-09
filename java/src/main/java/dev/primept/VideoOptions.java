@@ -23,7 +23,7 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, ENABLED, MODE, REALTIME_RENDERER, RESTIR_CAP, RESTIR_FRESH, RESTIR_CV, DIAGNOSTIC, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
+    enum Row { RESET, RENDER, ENABLED, MODE, DIAGNOSTIC, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
         LATITUDE, SOLAR_LONGITUDE,
         DISPLAY, EXPOSURE, AUTO_EXPOSURE, DRT_SATURATION, DRT_HUE, DRT_COMPRESSION_START }
 
@@ -56,9 +56,7 @@ public final class VideoOptions {
     private final List<Slider> sliders = new ArrayList<>();
     private CycleButton<Boolean> enabled;
     private CycleButton<RenderMode> mode;
-    private CycleButton<RealtimeRenderer> realtimeRenderer;
     private CycleButton<Boolean> diagnostic;
-    private CycleButton<Boolean> restirCv;
     private CycleButton<Boolean> rr;
     private CycleButton<Boolean> ser;
     private CycleButton<Quality> quality;
@@ -104,28 +102,7 @@ public final class VideoOptions {
                         }, this::failed);
                 list.addBig(mode);
             }
-            case REALTIME_RENDERER -> {
-                realtimeRenderer = cycle(CycleButton.builder(
-                                (RealtimeRenderer value) -> text("realtime_renderer." + value.key), Settings.realtimeRenderer())
-                        .withValues(List.of(RealtimeRenderer.values()))
-                        .withTooltip(OptionInstance.cachedConstantTooltip(text("realtime_renderer.tooltip"))),
-                        text("realtime_renderer"), Settings::realtimeRenderer, value -> {
-                            if (applyPendingSliders()) Settings.setRealtimeRenderer(value);
-                        }, this::failed);
-                list.addBig(realtimeRenderer);
-            }
-            case RESTIR_CAP -> addSlider("restir_cap", 1, 100, 1,
-                    () -> Settings.tuning().historyCap(), value -> Settings.setHistoryCap((int)value), ValueFormat.INTEGER);
-            case RESTIR_FRESH -> addSlider("restir_fresh", 0, 100, 1,
-                    () -> Settings.tuning().freshPercent(), value -> Settings.setFreshPercent((int)value), ValueFormat.PERCENT);
-            case RESTIR_CV -> {
-                restirCv = cycle(CycleButton.onOffBuilder(Settings.tuning().restirCv())
-                        .withTooltip(OptionInstance.cachedConstantTooltip(text("restir_cv.tooltip"))),
-                        text("restir_cv"), () -> Settings.tuning().restirCv(), value -> {
-                            if (applyPendingSliders()) Settings.setRestirCv(value);
-                        }, this::failed);
-                list.addBig(restirCv);
-            }
+
             case DIAGNOSTIC -> {
                 diagnostic = cycle(CycleButton.onOffBuilder(Settings.tuning().diagnostic())
                         .withTooltip(OptionInstance.cachedConstantTooltip(text("diagnostic.tooltip"))),
@@ -250,19 +227,15 @@ public final class VideoOptions {
     public void tick() {
         if (enabled.getValue() != Settings.enabled()) enabled.setValue(Settings.enabled());
         if (mode.getValue() != Settings.mode()) mode.setValue(Settings.mode());
-        if (realtimeRenderer.getValue() != Settings.realtimeRenderer()) realtimeRenderer.setValue(Settings.realtimeRenderer());
         mode.active = Settings.enabled();
         boolean realtime = Settings.enabled() && !Settings.offline();
-        realtimeRenderer.active = realtime;
-        restirCv.active = realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT;
-        if (restirCv.getValue() != Settings.tuning().restirCv()) restirCv.setValue(Settings.tuning().restirCv());
         ser.active = realtime;
         diagnostic.active = realtime;
         if (diagnostic.getValue() != Settings.tuning().diagnostic()) diagnostic.setValue(Settings.tuning().diagnostic());
         rr.active = realtime && !Settings.diagnostic();
         quality.active = realtime && !Settings.diagnostic() && Settings.requestedRr();
         updateBudget.active = realtime;
-        primarySampling.active = realtime && Settings.realtimeRenderer() == RealtimeRenderer.PATH_TRACE;
+        primarySampling.active = realtime;
         var strategy = PrimarySampling.fromSamples(Settings.samples());
         if (primarySampling.getValue() != strategy) primarySampling.setValue(strategy);
         for (var slider : sliders) {
@@ -271,9 +244,6 @@ public final class VideoOptions {
                 default -> false;
             };
             slider.active = Settings.enabled() && (!Settings.offline() || display || slider.key.equals("samples"));
-            if (realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT && slider.key.equals("samples")) slider.active = false;
-            if (slider.key.equals("restir_cap") || slider.key.equals("restir_fresh"))
-                slider.active = realtime && Settings.realtimeRenderer() == RealtimeRenderer.RESTIR_PT;
         }
         if (ser.getValue() != Settings.requestedSer()) ser.setValue(Settings.requestedSer());
         if (rr.getValue() != Settings.requestedRr()) rr.setValue(Settings.requestedRr());

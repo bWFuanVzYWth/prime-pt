@@ -158,26 +158,23 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'slang'
     }
     from('crates/renderer/shaders') {
-        include 'primary.slang', 'pt_hit.slang', 'restir.slang', 'guides.slang', 'guide_material.slang', 'initial_hit.slang',
-                'params.slang', 'mod_*.slang', 'restir_*.slang'
-        exclude 'restir_probe.slang', 'restir_replay_probe.slang'
+        include 'primary.slang', 'pt_hit.slang', 'guides.slang', 'guide_material.slang', 'primary_cache.slang', 'primary_material.slang',
+                'params.slang', 'mod_*.slang', 'known_geometry.slang'
         into 'shaders/prime'
     }
     from('../../shaders') {
         include 'atmosphere/*.slang', 'bsdf/openpbr/**/*.slang', 'color/*.slang',
-                'display/prime_drt.slang', 'geometry/*.slang', 'pt/*.slang', 'restir_pt/*.slang'
+                'display/prime_drt.slang', 'geometry/*.slang', 'pt/*.slang'
         into 'shaders/engine'
     }
     doLast {
         def directory = runtimeDirectory.get().asFile
         def required = nativeFiles + vcFiles + (slangFiles + vcFiles).collect { 'slang/' + it } +
                 ['slang/LICENSE', 'shaders/prime/primary.slang', 'shaders/prime/pt_hit.slang',
-                 'shaders/prime/guides.slang', 'shaders/prime/guide_material.slang', 'shaders/prime/initial_hit.slang',
-                 'shaders/prime/restir.slang',
-                 'shaders/prime/restir_geometry.slang', 'shaders/prime/restir_material.slang',
+                 'shaders/prime/guides.slang', 'shaders/prime/guide_material.slang', 'shaders/prime/primary_cache.slang', 'shaders/prime/primary_material.slang',
+                 'shaders/prime/known_geometry.slang',
                  'shaders/engine/pt/scene.slang', 'shaders/engine/pt/hit_transport.slang',
-                 'shaders/engine/pt/key_guides.slang', 'shaders/engine/restir_pt/initial_vertex.slang',
-                 'shaders/engine/restir_pt/material.slang',
+                 'shaders/engine/pt/key_guides.slang',
                  'shaders/engine/geometry/identity.slang']
         for (def path : required) {
             def file = new File(directory, path)
@@ -220,7 +217,6 @@ tasks.named('jar') {
     into('META-INF/licenses/simple-engine') {
         from('../../LICENSE', '../../NOTICE', '../../THIRD_PARTY_NOTICES.md')
         from('../../LICENSES') { into 'LICENSES' }
-        from(files('../../shaders/restir_pt/NOTICE.md', '../../shaders/restir_pt/LICENSE.txt')) { into 'shaders/restir_pt' }
     }
 }
 def releaseJar = tasks.named('jar').flatMap { it.archiveFile }

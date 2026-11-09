@@ -20,30 +20,20 @@ public final class Settings {
 
     public static boolean enabled() { return Holder.CONFIG.selection().enabled(); }
     public static RenderMode mode() { return Holder.CONFIG.selection().mode(); }
-    public static RealtimeRenderer realtimeRenderer() { return Holder.CONFIG.selection().renderer(); }
+
     public static boolean offline() { return Holder.CONFIG.selection().offline(); }
     static RenderTuning tuning() { return Holder.CONFIG.tuning(); }
     public static boolean diagnostic() { return tuning().diagnosticActive(Holder.CONFIG.selection()); }
-    static void setHistoryCap(int value) throws IOException {
-        Holder.CONFIG.setTuning(new RenderTuning(value, tuning().freshPercent(), tuning().diagnostic(), tuning().restirCv()));
-    }
-    static void setFreshPercent(int value) throws IOException {
-        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), value, tuning().diagnostic(), tuning().restirCv()));
-    }
+
     static void setDiagnostic(boolean value) throws IOException {
-        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), value, tuning().restirCv()));
+        Holder.CONFIG.setTuning(new RenderTuning(value));
     }
-    static void setRestirCv(boolean value) throws IOException {
-        Holder.CONFIG.setTuning(new RenderTuning(tuning().historyCap(), tuning().freshPercent(), tuning().diagnostic(), value));
-    }
+
     public static void setEnabled(boolean value) throws IOException {
-        Holder.CONFIG.setSelection(new RenderSelection(value, mode(), realtimeRenderer()));
+        Holder.CONFIG.setSelection(new RenderSelection(value, mode()));
     }
     public static void setMode(RenderMode value) throws IOException {
-        Holder.CONFIG.setSelection(new RenderSelection(enabled(), value, realtimeRenderer()));
-    }
-    public static void setRealtimeRenderer(RealtimeRenderer value) throws IOException {
-        Holder.CONFIG.setSelection(new RenderSelection(enabled(), mode(), value));
+        Holder.CONFIG.setSelection(new RenderSelection(enabled(), value));
     }
 
     public static float exposure() { return Holder.CONFIG.ev(); }

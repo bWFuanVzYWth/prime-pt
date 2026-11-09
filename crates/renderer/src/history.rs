@@ -1,7 +1,7 @@
 //! 所有时间消费者的显式失效入口；绑定更新、参数发布和帧取消自身不重置已接受历史。
 //!
 //! 与game相同，运动/FOV、anchor、太阳、介质、seed、路径预算和局部编辑不能宣布整个
-//! 重投影域失效。ReSTIR用稳定几何世代局部拒绝已删除/重建的表面；RR消费当前guide。
+//! 重投影域失效。RR消费当前guide。
 //! 缓存后缀辐射没有完整更新动态光照，保留历史不保证动态场景无偏或没有鬼影，M cap也不是TTL。
 //! 普通PT的静态RGB均值另有输入失效和逐帧输出事件，不能借此清除RR或路径历史。
 //! 曝光适应不属于这些复用域，所有事件均保留它。存储真实替换单独记录，不伪装成内容变化。
@@ -51,18 +51,8 @@ pub(super) enum Event {
     Accumulation(AccumulationEvent),
     ViewStorage(StorageEvent),
     RrStorage(StorageEvent),
-    RestirStorage(StorageEvent),
-    RestirColorModeChanged,
+
     RrEvaluationFailed,
-}
-
-/// 只有本模块能创建；路径工作集不接受无理由的reset调用。
-pub(super) struct ResetPermit(Invalidation);
-
-impl ResetPermit {
-    pub const fn request(self) -> Invalidation {
-        self.0
-    }
 }
 
 /// 只用固定键推进样本；输入比较和重置由Gpu的显式事件入口负责。
@@ -90,10 +80,9 @@ impl Accumulation {
 pub(super) struct Audit {
     pub accumulation_resets: u64,
     pub rr_resets: u64,
-    pub restir_resets: u64,
-    pub restir_color_resets: u64,
+
     pub view_storage: u64,
-    pub restir_storage: u64,
+
     pub last_accumulation: Option<AccumulationEvent>,
 }
 
@@ -110,13 +99,7 @@ impl Gpu {
             _ => None,
         };
         let selected = request.map_or(Histories::NONE, Invalidation::histories);
-        if (selected.contains(History::Paths)
-            || selected.contains(History::Color)
-            || matches!(event, Event::RestirColorModeChanged))
-            && self.restir.as_ref().is_some_and(|r| r.has_pending())
-        {
-            return Err(simple_engine::restir_pt::Error::PendingFrame.into());
-        }
+
         let accumulation = selected.contains(History::Accumulation)
             || matches!(event, Event::Accumulation(_) | Event::ViewStorage(_));
         if accumulation {
@@ -163,53 +146,12 @@ impl Gpu {
             self.rr_previous = None;
             self.history_audit.rr_resets = self.history_audit.rr_resets.saturating_add(1);
         }
-        if selected.contains(History::Paths) {
-            let request = request.expect("指定路径失效范围的请求");
-            if let Some(restir) = &mut self.restir {
-                record(
-                    "restir",
-                    request.reason().name(),
-                    "reset",
-                    restir.has_history(),
-                );
-                restir.invalidate(ResetPermit(request))?;
-            }
-            self.history_audit.restir_resets = self.history_audit.restir_resets.saturating_add(1);
-        }
-        if selected.contains(History::Color) || matches!(event, Event::RestirColorModeChanged) {
-            let name = request.map_or("mode_changed", |r| r.reason().name());
-            if let Some(restir) = &mut self.restir {
-                record("restcv", name, "reset", restir.color_history_valid());
-                restir.invalidate_color(ResetPermit(request.unwrap_or(Invalidation::new(
-                    Histories::one(History::Color),
-                    GlobalReset::ExplicitRequested,
-                ))))?;
-            }
-            self.history_audit.restir_color_resets =
-                self.history_audit.restir_color_resets.saturating_add(1);
-        }
+
         match event {
             Event::ViewStorage(_) => {
                 self.history_audit.view_storage = self.history_audit.view_storage.saturating_add(1)
             }
-            Event::RestirStorage(reason) => {
-                record(
-                    "restcv",
-                    reason.name(),
-                    "storage_cold",
-                    self.restir
-                        .as_ref()
-                        .is_some_and(|r| r.color_history_valid()),
-                );
-                record(
-                    "restir",
-                    reason.name(),
-                    "storage_cold",
-                    self.restir.as_ref().is_some_and(|r| r.has_history()),
-                );
-                self.history_audit.restir_storage =
-                    self.history_audit.restir_storage.saturating_add(1);
-            }
+
             Event::Accumulation(reason) => self.history_audit.last_accumulation = Some(reason),
             _ => {}
         }

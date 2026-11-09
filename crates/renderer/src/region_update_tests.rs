@@ -1,8 +1,8 @@
 //! 固定相机下的局部发布：真实主命中必须对应当前几何、材质和覆盖。
 use super::*;
 use prime_scene::{
-    FragmentMask, MaterialDefinition, MaterialId, MeshParts, PreparedParts, RealtimeRenderer,
-    RenderChange, RenderMode, RenderRegion, RenderView, TintPatch,
+    FragmentMask, MaterialDefinition, MaterialId, MeshParts, PreparedParts, RenderChange,
+    RenderMode, RenderRegion, RenderView, TintPatch,
 };
 
 fn face(slot: usize, z: f32, material: u32, extra: bool) -> Mesh {
@@ -70,8 +70,8 @@ fn publish(
 }
 
 #[test]
-#[ignore = "独立进程：原生4K DLAA+RR+SER+ReSTCV，固定相机局部更新后的真实命中与当前覆盖一致"]
-fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std::error::Error>> {
+#[ignore = "独立进程：原生4K DLAA+RR+SER，固定相机局部更新后的真实命中与当前覆盖一致"]
+fn hardware_pt_rr_stationary_partial_updates() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_rr_ser()?;
     let mut session = host.gpu()?;
     let gpu = session.gpu();
@@ -97,8 +97,8 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
         emission_alias_words: &[],
         light_areas: &[[u32::MAX, 0, 0, 0]; 2],
     })?;
-    gpu.set_rendering(RenderMode::Realtime, RealtimeRenderer::RestirPt)?;
-    gpu.set_render_tuning(prime_scene::RenderTuning::new(20, 0.4, false, true)?)?;
+    gpu.set_rendering(RenderMode::Realtime)?;
+    gpu.set_render_tuning(prime_scene::RenderTuning::new(false))?;
     let quality = match std::env::var("PRIME_PT_PARTIAL_QUALITY").as_deref() {
         Err(std::env::VarError::NotPresent) | Ok("dlaa") => streamline::Quality::Dlaa,
         Ok("performance") => streamline::Quality::Performance,
@@ -109,6 +109,12 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
     } else {
         [1920, 1080]
     };
+    let primary_readback = Buffer::new(
+        &mut gpu.context,
+        u64::from(input_extent[0]) * u64::from(input_extent[1]) * 16,
+        true,
+    )?;
+    gpu.test_roots.push(primary_readback.into());
     let options = Options::new(true, quality, 1, 6)?;
     writeln!(
         std::io::stderr().lock(),
@@ -124,12 +130,6 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
     let secondary = face(0, 4., 0, false);
     let mut geometry = 1;
     publish(gpu, parts.view(), geometry, 1, &secondary, 1)?;
-    let layout = simple_engine::restir_pt::Layout::with_color_estimates(
-        input_extent,
-        simple_engine::restir_pt::Fusion::DIRECTIONS,
-    )?;
-    let primary_readback = Buffer::new(&mut gpu.context, u64::from(layout.elements()) * 16, true)?;
-    gpu.test_roots.push(primary_readback.into());
     let mut cutout = [false; 4];
     let mut heights = [4.; 4];
     let mut extras = [false; 4];
@@ -171,18 +171,6 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
             )?;
             parts = candidate.finish(&mut parts);
         }
-        // 先检查生产上传的数据，阻止已知无效身份继续进入路径重放。
-        let positions = gpu.restir_geometry.unwrap();
-        let mut data = vec![0; positions.len() as usize];
-        positions.read(&mut gpu.context, 0, &mut data)?;
-        for record in gpu.geometry_identities.records() {
-            let [start, count, _] = record.source.location;
-            for quad in start..start + count {
-                let offset = 16 + quad as usize * 64 + 60;
-                let token = u32::from_le_bytes(data[offset..offset + 4].try_into()?);
-                assert_eq!(token, record.token, "frame={frame} 当前面身份与目录不一致");
-            }
-        }
         host.render_options(gpu, &output, &camera(), Environment::default(), options)?;
         assert!(gpu.rr_unavailable.is_none() && gpu.rr_previous.is_some());
         // 映射回读验证实际上传字节，不能只比较两份CPU目录。
@@ -199,7 +187,7 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
             bytemuck::cast_slice::<_, u8>(&expected),
             "frame={frame} 属性发布错位"
         );
-        let primary = gpu.restir.as_ref().unwrap().primary_history();
+        let primary = gpu.view.as_ref().unwrap().landing[5];
         primary.copy_prefix_to(&mut gpu.context, &primary_readback, primary_readback.len())?;
         for (slot, &transparent) in cutout.iter().enumerate() {
             let pixel = [
@@ -209,24 +197,22 @@ fn hardware_pt_rr_restcv_stationary_partial_updates() -> Result<(), Box<dyn std:
             let mut bytes = [0; 16];
             primary_readback.read(
                 &mut gpu.context,
-                u64::from(layout.reservoir_offset(pixel).unwrap()) * 16,
+                u64::from(pixel[1] * input_extent[0] + pixel[0]) * 16,
                 &mut bytes,
             )?;
-            let hit: [u32; 4] = std::array::from_fn(|i| {
-                u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
-            });
+            let primitive = u32::from_le_bytes(bytes[..4].try_into()?);
             let fragment = if transparent { 255 } else { slot };
-            let record = gpu
-                .geometry_identities
-                .records()
-                .iter()
-                .find(|record| record.source.key == ([0; 3], (fragment << 1) | 1))
-                .unwrap();
+            let preceding: usize = parts
+                .view()
+                .fragments()
+                .take_while(|(index, _)| *index != fragment)
+                .map(|(_, mesh)| mesh.quads.len())
+                .sum();
             assert_eq!(
-                hit[0], record.token,
-                "frame={frame} slot={slot} 主命中丢失或覆盖错误"
+                primitive / 2,
+                entry.range.start + preceding as u32,
+                "frame={frame} slot={slot} 当前主命中与几何或覆盖不符"
             );
-            assert!(hit[1] < 2, "frame={frame} slot={slot} 命中了视野外附加面");
         }
         if frame % 8 == 0 {
             writeln!(
