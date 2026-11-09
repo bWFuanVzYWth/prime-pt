@@ -555,6 +555,7 @@ fn programs<'a>(
 ) -> Programs<'a> {
     Programs {
         primary: None,
+        transport_pair: None,
         prefix: Some(shader(
             include_bytes!(concat!(env!("OUT_DIR"), "/prefix.spv")),
             c"prefix_main",
@@ -773,6 +774,8 @@ pub struct Gpu {
     test_guide_timestamps: Option<vulkan::native::TimestampQueries>,
     #[cfg(test)]
     test_center_film: bool,
+    #[cfg(test)]
+    test_split_transport: bool,
     #[cfg(test)]
     test_jitter_start: u32,
 
@@ -1174,6 +1177,8 @@ impl Gpu {
             test_guide_timestamps: None,
             #[cfg(test)]
             test_center_film: false,
+            #[cfg(test)]
+            test_split_transport: true,
             #[cfg(test)]
             test_jitter_start: 0,
 
@@ -1789,6 +1794,26 @@ impl Gpu {
             })
             .transpose()?;
         let guide_source = self.shader_source.with_file_name("guide_material.slang");
+        let mut transport_pair = Vec::new();
+        if dispatch == 8 {
+            for (reordered, args) in [(false, &native_args), (true, &ser_args)] {
+                if reordered && !self.context.capabilities().invocation_reorder {
+                    continue;
+                }
+                for lane in 0..2 {
+                    let lane_arg = format!("-DPT_TRANSPORT_LANE={lane}");
+                    let args: Vec<_> = args.iter().copied().chain([lane_arg.as_str()]).collect();
+                    transport_pair.push(compile_stage(
+                        &mut batch,
+                        program_source,
+                        "render_fused",
+                        "raygeneration",
+                        "render-pair.spv",
+                        &args,
+                    )?);
+                }
+            }
+        }
         let guide_hits = openpbr::program::ProgramSet::queue_hit_variants(
             &mut batch,
             programs
@@ -1860,6 +1885,10 @@ impl Gpu {
         let primary = primary.map(&mut take).transpose()?;
         let fused = fused.map(&mut take).transpose()?;
         let fused_ser = fused_ser.map(&mut take).transpose()?;
+        let transport_pair: Vec<_> = transport_pair
+            .into_iter()
+            .map(&mut take)
+            .collect::<Result<_, _>>()?;
         let guided = guided.map(&mut take).transpose()?;
         let guided_ser = guided_ser.map(&mut take).transpose()?;
 
@@ -1923,6 +1952,7 @@ impl Gpu {
                     .chain(primary.iter())
                     .chain(fused.iter())
                     .chain(fused_ser.iter())
+                    .chain(transport_pair.iter())
                     .chain(guide_hits.artifacts().iter().filter(|_| dispatch != 8)),
             ),
             program_identity(
@@ -1986,6 +2016,10 @@ impl Gpu {
                 }
             }
             if dispatch == 8 {
+                result.transport_pair = Some(std::array::from_fn(|lane| RayShader {
+                    spirv: transport_pair[usize::from(reordered) * 2 + lane].bytes(),
+                    entry: c"render_fused",
+                }));
                 result.primary = primary.as_ref().map(|a| RayShader {
                     spirv: a.bytes(),
                     entry: c"primary_main",
@@ -2920,7 +2954,9 @@ impl Gpu {
             let realtime_pt =
                 !self.offline && !diagnostic && self.generation.as_ref().unwrap().dispatch == 8;
             if realtime_pt && !matches!(self.settings.samples, 1 | 2) {
-                return Err(Error::Invalid("实时PT只接受1 spp随机或2 spp分离"));
+                return Err(Error::Invalid(
+                    "实时PT只接受性能（1 spp）或质量（2 spp）策略",
+                ));
             }
             if self.renderer.is_none() {
                 self.renderer = Some(self.create_renderer()?);
@@ -3037,7 +3073,7 @@ impl Gpu {
                             .is_some_and(|g| g.hit.authored_normals),
                     ) << 2)
                     | (u32::from(realtime_pt) << 5),
-                0,
+                u32::from(!self.offline && self.settings.samples == 2),
             ]);
             words.extend(self.anchor.map(|v| ((v / 64.) as i32) as u32));
             words.push(0);
@@ -3088,11 +3124,15 @@ impl Gpu {
             }
             {
                 let renderer = self.renderer.as_ref().unwrap();
+                let split_transport = batch.samples() == 2;
+                #[cfg(test)]
+                let split_transport = split_transport && self.test_split_transport;
                 #[cfg(not(test))]
                 let recorded = if realtime_pt {
                     renderer.record_realtime(
                         &mut self.context,
                         self.guide_pipeline.filter(|_| rr_enabled),
+                        split_transport,
                         None,
                         None,
                     )?
@@ -3104,6 +3144,7 @@ impl Gpu {
                     renderer.record_realtime(
                         &mut self.context,
                         self.guide_pipeline.filter(|_| rr_enabled),
+                        split_transport,
                         self.test_pt_timestamps,
                         self.test_guide_timestamps,
                     )?

@@ -15,8 +15,8 @@
   "primept.settings.quality.balanced": "均衡",
   "primept.settings.quality.performance": "性能（2×）",
   "primept.settings.quality.ultra_performance": "超级性能",
-  "primept.settings.samples": "首表面采样",
-  "primept.settings.samples.tooltip": "仅普通实时 PT：界面反射与进入内部固定概率选择，或各取一条路径。纯金属取两条高光。后续反弹不变；离线使用原材质概率，可用命令设置批大小。",
+  "primept.settings.sampling_strategy": "采样策略",
+  "primept.settings.sampling_strategy.tooltip": "性能：每像素1条随机路径。质量：每像素2条分离路径，并用平方根轮盘保留更多弱路径。只影响实时渲染；离线批大小通过 /pt spp 设置。\n命令：/pt sampling performance|quality",
   "primept.settings.bounces": "路径顶点预算",
   "primept.settings.bounces.tooltip": "每条路径最多 1–64 个顶点，包括主命中；最后一个顶点仍计算直接光与自发光。\n命令：/pt bounces 1..64",
   "primept.settings.display": "PT 显示",
@@ -53,6 +53,6 @@
   "primept.settings.mode.tooltip": "离线冻结当前场景、相机和光照，以完整输出分辨率持续累积独立路径；游戏逻辑仍继续运行。切回实时后恢复世界更新。离线模式仅在本次会话有效。\n命令：/pt mode realtime|offline",
   "primept.settings.diagnostic": "原生无累积诊断",
   "primept.settings.diagnostic.tooltip": "使用原生分辨率，关闭RR和跨帧图像累积。PT按所设SPP平均本帧样本；显示曝光与画质偏好保持。\n命令：/pt diagnostic on|off",
-  "primept.settings.samples.random": "1 spp 随机",
-  "primept.settings.samples.separated": "2 spp 分离"
+  "primept.settings.sampling_strategy.performance": "性能",
+  "primept.settings.sampling_strategy.quality": "质量"
 }

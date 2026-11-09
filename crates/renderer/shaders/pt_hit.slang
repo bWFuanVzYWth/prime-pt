@@ -150,6 +150,10 @@ void primary_main()
 void prefix_empty()
 {
 }
+#ifndef PT_TRANSPORT_LANE
+#define PT_TRANSPORT_LANE -1
+#endif
+
 [shader("raygeneration")]
 void render_fused()
 {
@@ -163,29 +167,47 @@ void render_fused()
         output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);
         return;
     }
-    uint paths = realtime_pt() ? params.image.w : 1u;
+    const bool separated = PT_TRANSPORT_LANE >= 0;
+    bool realtime = separated || realtime_pt();
+#if PT_TRANSPORT_LANE >= 0
+    const uint first_lane = PT_TRANSPORT_LANE;
+    const uint last_lane = PT_TRANSPORT_LANE + 1;
+    const uint paths = PT_TRANSPORT_LANE == 0 ? 1 : 2;
+#else
+    uint paths = realtime ? params.image.w : 1u;
+    uint first_lane = 0;
+    uint last_lane = paths;
+#endif
     pt::TransportCall data = {};
-    float distance = pt::FAR;
-    for (uint lane = 0; lane < paths; lane++)
+#if PT_TRANSPORT_LANE == 1
+    // 与单pass相同的加法顺序；第一条路径的失败状态不再启动第二条。
+    float4 previous = output_image[pixel];
+    if (previous.w < 0)
     {
-        // 已完成路径的辐射累加在同一个路径字段中，不跨下一条路径保活另一份RGB。
+        output_image[pixel] = float4(previous.xyz * 0.5, previous.w);
+        return;
+    }
+    data.path.radiance = previous.xyz;
+#endif
+    float distance = pt::FAR;
+    for (uint lane = first_lane; lane < last_lane; lane++)
+    {
         data.path.status = pt::PATH_ACTIVE;
         data.path.depth = 0;
         data.path.dielectric_events = 0;
         data.path.previous = 0;
         data.path.previous_pdf = 0;
         data.pixel = coordinate;
-        data.sample =
-            params.rr_sample + (realtime_pt() ? lane
-                                              : (sample_counts[pixel] >= params.image.z
-                                                     ? sample_counts[pixel] - params.image.z
-                                                     : 0u));
+        data.sample = params.rr_sample + (realtime ? lane
+                                                   : (sample_counts[pixel] >= params.image.z
+                                                          ? sample_counts[pixel] - params.image.z
+                                                          : 0u));
         float2 film = 0;
         data.path.origin = params.origin.xyz;
         data.path.throughput = 1;
         data.path.eta_scale = 1;
         data.path.medium = params.initial_medium;
-        if (realtime_pt())
+        if (realtime)
         {
             data.path.direction = primary_ray[pixel].xyz;
             uint primitive = primary_identity[pixel].x;
@@ -230,9 +252,11 @@ void render_fused()
         if (data.path.status == pt::PATH_INVALID || data.path.status == pt::PATH_DIELECTRIC_LIMIT)
             break;
     }
-    if (realtime_pt())
+#if PT_TRANSPORT_LANE != 1
+    if (realtime)
         distance = primary_ray[pixel].w;
     prefix_image[pixel] = float4(0, 0, 0, distance);
+#endif
     output_image[pixel] = float4(data.path.radiance / float(paths),
                                  data.path.status == pt::PATH_INVALID            ? -1
                                  : data.path.status == pt::PATH_DIELECTRIC_LIMIT ? -3

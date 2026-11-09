@@ -727,6 +727,55 @@ fn center(pixels: &[u8]) -> &[u8] {
 }
 
 #[test]
+#[ignore = "真实Vulkan RT；验证质量轮盘仅在实时质量档启用，覆盖Hit Group和兼容入口"]
+fn hardware_sampling_strategy_roulette_scope() -> Result<(), Box<dyn std::error::Error>> {
+    for hit_groups in [false, true] {
+        let host = Host::create(false, hit_groups)?;
+        let mut session = host.gpu()?;
+        let gpu = session.gpu();
+        let output = image(gpu)?;
+        let mut mesh = Mesh::default();
+        add_quad(&mut mesh, 2., [0.5; 2], [1.; 3], 1.5);
+        gpu.set_scene(&mesh)?;
+        for (mode, samples, expected) in [
+            (prime_scene::RenderMode::Realtime, 1, 0u32),
+            (prime_scene::RenderMode::Realtime, 2, 1),
+            (prime_scene::RenderMode::Offline, 2, 0),
+            (prime_scene::RenderMode::Realtime, 1, 0),
+        ] {
+            gpu.set_rendering(mode)?;
+            host.render_options(
+                gpu,
+                &output,
+                &camera(),
+                Environment::default(),
+                Options::new(false, streamline::Quality::Dlaa, samples, 8)?,
+            )?;
+            let view = gpu.view.as_ref().unwrap();
+            // 按Params字段定位output_size.w；缓冲容量还含未使用的预留空间。
+            let policy_offset = (16
+                + 4
+                + 4
+                + gpu.display_drt.to_array().len()
+                + 4
+                + gpu.atmosphere.parameters().words().len()
+                + 4
+                + 4
+                + 4
+                + 16
+                + 3)
+                * 4;
+            let mut policy = [0; 4];
+            view.params
+                .read(&mut gpu.context, policy_offset as u64, &mut policy)?;
+            assert_eq!(u32::from_le_bytes(policy), expected);
+        }
+        assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    }
+    Ok(())
+}
+
+#[test]
 #[ignore = "需要 EXT SER；验证重排不改变相同路径样本的 HDR 与宿主呈现"]
 fn hardware_pt_ser_matches_plain() -> Result<(), Box<dyn std::error::Error>> {
     const HDR_TOLERANCE: f32 = 1e-6;

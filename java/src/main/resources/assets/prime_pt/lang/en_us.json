@@ -15,8 +15,8 @@
   "primept.settings.quality.balanced": "Balanced",
   "primept.settings.quality.performance": "Performance (2×)",
   "primept.settings.quality.ultra_performance": "Ultra Performance",
-  "primept.settings.samples": "Primary sampling",
-  "primept.settings.samples.tooltip": "Realtime PT only: balance interface reflection and entry into the material, or sample both. Pure metals use two specular paths. Later bounces are unchanged. Offline PT retains material probabilities and command-controlled batch sizes.",
+  "primept.settings.sampling_strategy": "Sampling strategy",
+  "primept.settings.sampling_strategy.tooltip": "Performance: one random path per pixel. Quality: two separated paths with square-root Russian roulette to retain more low-throughput paths. Realtime only; use /pt spp for offline batch size.\nCommand: /pt sampling performance|quality",
   "primept.settings.bounces": "Path vertex budget",
   "primept.settings.bounces.tooltip": "Allow 1–64 vertices per path, including the primary hit. The last vertex still evaluates direct lighting and emission.\nCommand: /pt bounces 1..64",
   "primept.settings.display": "PT display",
@@ -53,6 +53,6 @@
   "primept.settings.mode.tooltip": "Offline freezes the current scene, camera and lighting and continuously accumulates independent paths at full output resolution. The game keeps running. Returning to realtime resumes world updates. Offline is session only.\nCommand: /pt mode realtime|offline",
   "primept.settings.diagnostic": "Native raw diagnostic",
   "primept.settings.diagnostic.tooltip": "Native resolution, no RR or frame accumulation. PT averages the configured SPP within each frame. Display exposure and quality preferences remain active.\nCommand: /pt diagnostic on|off",
-  "primept.settings.samples.random": "1 spp random",
-  "primept.settings.samples.separated": "2 spp separated"
+  "primept.settings.sampling_strategy.performance": "Performance",
+  "primept.settings.sampling_strategy.quality": "Quality"
 }

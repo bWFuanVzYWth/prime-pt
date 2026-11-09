@@ -31,7 +31,7 @@ public struct Params
     public float4 previous_forward;
     public float4 previous_right;
     public float4 previous_up;
-    /// xy=输出尺寸；z bit0诊断、bit2作者法线、bit5实时首面策略；w保留为零。
+    /// xy=输出尺寸；z bit0诊断、bit2作者法线、bit5实时首面策略；w非零启用质量档平方根轮盘。
     public uint4 output_size;
     /// 当前64m anchor的整数region坐标；光源保持region-local不随anchor重打包。
     public int4 anchor_region;
@@ -43,5 +43,6 @@ public struct Params
 
 public pt::Settings settings(Params params)
 {
-    return { params.options.x, params.options.y, params.options.z, params.options.w };
+    return { params.options.x, params.options.y, params.options.z, params.options.w,
+             params.output_size.w != 0 };
 }

@@ -40,6 +40,9 @@ public final class CommandHints {
                     .suggests((context, builder) -> suggest(builder, exposure.get(), "0", "-2", "-1", "1", "2"))
                     .executes(context -> 0)));
         }
+        var sampling = CommandHints.<S>command("sampling");
+        for (var strategy : SamplingStrategy.values()) sampling.then(command(strategy.key));
+        root.then(sampling);
         root.then(CommandHints.<S>command("spp").then(RequiredArgumentBuilder.<S, Integer>argument("样本数",
                         IntegerArgumentType.integer(SettingsConfig.MIN_SAMPLES, SettingsConfig.MAX_SAMPLES))
                 .suggests((context, builder) -> suggest(builder, Integer.toString(samples.getAsInt()), "1", "2"))

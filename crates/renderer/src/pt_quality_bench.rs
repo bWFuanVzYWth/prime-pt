@@ -1,4 +1,6 @@
 //! 普通 PT 原始输出／DLAA 的等时间基准；固定场景和原始 HDR 指标，独立于产品设置。
+//! 顶层ser控制重排；variant的split_transport选择实时2 spp的单／双输运pass。
+//! stage_timings_ns依次记录首视线、guide、完整输运、post和PT总跨度。
 use super::*;
 use prime_scene::{MaterialDefinition, MaterialId, RenderMode, RenderRegion, RenderView};
 use simple_engine::vulkan::native::Resource;
@@ -353,7 +355,7 @@ fn hardware_pt_equal_time_benchmark() -> Result {
     let gpu = session.gpu();
     gpu.test_center_film = config["center_film"].as_bool().unwrap_or(!rr);
     gpu.experiment_dispatch = 8;
-    gpu.set_ser(true)?;
+    gpu.set_ser(config["ser"].as_bool().unwrap_or(true))?;
     let (materials, mesh, mut base_camera) = fixture(scene_name, extent)?;
     let camera_x = config["camera_x"].as_f64().unwrap_or(0.);
     if !camera_x.is_finite() || camera_x.abs() > 4. {
@@ -393,6 +395,10 @@ fn hardware_pt_equal_time_benchmark() -> Result {
     ];
     gpu.test_roots.push(image.into());
     gpu.test_roots.extend(queries.map(Resource::from));
+    let pt_queries = vulkan::native::TimestampQueries::new(&mut gpu.context, 6)?;
+    let guide_queries = vulkan::native::TimestampQueries::new(&mut gpu.context, 2)?;
+    gpu.test_roots
+        .extend([pt_queries, guide_queries].map(Resource::from));
     let environment = Environment {
         sun_direction: [0.; 3],
         exposure_ev: 0.,
@@ -411,6 +417,9 @@ fn hardware_pt_equal_time_benchmark() -> Result {
         }
         let kind = variant["kind"].as_str().ok_or("variant缺少kind")?;
         let offline = kind == "offline";
+        gpu.test_split_transport = variant["split_transport"].as_bool().unwrap_or(true);
+        gpu.test_pt_timestamps = (!offline).then_some(pt_queries);
+        gpu.test_guide_timestamps = (!offline && rr).then_some(guide_queries);
 
         let no_history = variant["no_history"].as_bool().unwrap_or(false);
         let path_trace = matches!(kind, "offline" | "pt");
@@ -470,6 +479,7 @@ fn hardware_pt_equal_time_benchmark() -> Result {
             gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
             gpu.test_restart_sample_sequence(0)?;
             let mut timings = Vec::new();
+            let mut stage_timings = Vec::new();
             let mut frame_stats = Vec::new();
             let mut elapsed_gpu = 0u64;
             let mut checkpoint = 0usize;
@@ -501,6 +511,22 @@ fn hardware_pt_equal_time_benchmark() -> Result {
                     options,
                     Some(queries),
                 )?);
+                if !offline {
+                    let ticks = pt_queries.read(&gpu.context)?.ok_or("PT timestamp未就绪")?;
+                    let primary = pt_queries.elapsed_ns(&gpu.context, ticks[0], ticks[1])?;
+                    let trace = pt_queries.elapsed_ns(&gpu.context, ticks[2], ticks[3])?;
+                    let post = pt_queries.elapsed_ns(&gpu.context, ticks[4], ticks[5])?;
+                    let total = pt_queries.elapsed_ns(&gpu.context, ticks[0], ticks[5])?;
+                    let guide = if rr {
+                        let ticks = guide_queries
+                            .read(&gpu.context)?
+                            .ok_or("Guide timestamp未就绪")?;
+                        guide_queries.elapsed_ns(&gpu.context, ticks[0], ticks[1])?
+                    } else {
+                        0
+                    };
+                    stage_timings.push([primary, guide, trace, post, total]);
+                }
                 if rr
                     && (!gpu.view.as_ref().is_some_and(|view| view.rr_enabled)
                         || gpu.rr_unavailable.is_some())
@@ -631,7 +657,7 @@ fn hardware_pt_equal_time_benchmark() -> Result {
                 return Err("达到最大帧数仍未达到GPU预算；不记作完整测量".into());
             }
             let row = serde_json::json!({"name":name,"kind":kind,"seed":seed,"frames":timings.len(),"extent":extent,"coarse_extent":coarse_extent,
-                "checkpoints":checkpoints,"variant":variant,"timings_cpu_gpu_ns":timings,"frame_stats":frame_stats});
+                "checkpoints":checkpoints,"variant":variant,"timings_cpu_gpu_ns":timings,"stage_timings_ns":stage_timings,"stage_order":["primary","guide","transport","post","pt_total"],"frame_stats":frame_stats});
             fs::write(dir.join("report.json"), serde_json::to_vec_pretty(&row)?)?;
             reports.push(row);
         }

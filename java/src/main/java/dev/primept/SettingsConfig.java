@@ -244,7 +244,13 @@ final class SettingsConfig {
                 }
                 case "spp" -> {
                     if (parts.length == 3) setSamples(parseInteger(parts[2], "SPP"));
-                    return "PT SPP：" + samples() + (values.selection.mode() == RenderMode.OFFLINE ? "（离线批大小 [1, 64]）" : "（1 随机 / 2 首表面分离）");
+                    return "PT SPP：" + samples() + (values.selection.mode() == RenderMode.OFFLINE ? "（离线批大小 [1, 64]）" : "（1 性能 / 2 质量）");
+                }
+                case "sampling" -> {
+                    if (values.selection.mode() == RenderMode.OFFLINE)
+                        throw new IllegalArgumentException("采样策略仅用于实时模式；离线请使用 /pt spp");
+                    if (parts.length == 3) setSamples(SamplingStrategy.parse(parts[2]).samples);
+                    return "PT 采样策略：" + SamplingStrategy.fromSamples(samples()).key;
                 }
                 case "bounces" -> {
                     if (parts.length == 3) setBounces(parseInteger(parts[2], "路径顶点数"));
@@ -323,6 +329,6 @@ final class SettingsConfig {
 
     private static String usage() {
         return "用法：/pt enabled [on|off]；/pt mode [realtime|offline]；/pt ser [on|off]；/pt rr [on|off]；/pt quality [dlaa|quality|balanced|performance|ultra_performance]；"
-                + "/pt ev [EV]；/pt spp [1|2，离线1..64]；/pt bounces [1..64]；/pt diagnostic [on|off]；/pt reset";
+                + "/pt ev [EV]；/pt sampling [performance|quality]；/pt spp [1|2，离线1..64]；/pt bounces [1..64]；/pt diagnostic [on|off]；/pt reset";
     }
 }

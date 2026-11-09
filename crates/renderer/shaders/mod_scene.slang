@@ -109,7 +109,8 @@ public void finish_vertex(inout pt::TransportCall data)
             status = pt::PATH_DONE;
         else if (data.path.depth + 1 >= 2)
         {
-            float survival = pt::roulette_probability(data.path.throughput, data.path.eta_scale);
+            float survival = pt::roulette_probability(data.path.throughput, data.path.eta_scale,
+                                                      parameters[0].output_size.w != 0);
             pt::PathSampler sampler = pt::path_sampler(
                 data.pixel, data.sample, parameters[0].options.z, parameters[0].options.x);
             if (survival == 0 || (survival < 1 && sampler.roulette(data.path.depth) >= survival))
