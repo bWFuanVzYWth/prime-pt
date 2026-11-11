@@ -7,7 +7,6 @@ use std::{collections::HashMap, ops::Range};
 
 pub(super) struct Tables {
     pub coverage: Vec<bool>,
-    pub routes: Vec<u32>,
     pub sides: Vec<u32>,
     pub areas: Vec<[u32; 4]>,
     pub weights: Vec<f32>,
@@ -25,12 +24,12 @@ pub(super) struct FragmentSpan {
 pub(super) struct History {
     pub index: usize,
     pub resident: ResidentQuads,
-    pub lamps: Option<Vec<(u32, Record)>>,
+    pub lamps: Option<Vec<Record>>,
     pub maps: Vec<(u32, [u32; 2])>,
 }
 pub(super) struct Page {
     pub attrs: Vec<[[u32; 4]; 3]>,
-    pub lamps: Vec<(u32, Record)>,
+    pub lamps: Vec<Record>,
     pub geometry: PackedQuads,
     pub maps: Vec<(u32, [u32; 2])>,
     pub opaque: bool,
@@ -80,18 +79,13 @@ pub(super) fn encode(
         }
         opaque &= !coverage;
         if tables.sides.get(material as usize).is_some_and(|&s| s != 0)
-            && let Some(record) = record_for(q, key, 0, i, emitters)?
+            && let Some(record) = record_for(q, key, i, emitters)?
         {
             lamps.try_reserve(1).map_err(scene_cache::Error::from)?;
-            lamps.push((i as u32, record));
+            lamps.push(record);
         }
         if !checked {
-            encoder.push_routed(
-                q.positions(),
-                0,
-                q.attributes(),
-                tables.routes.get(material as usize).copied().unwrap_or(0),
-            )?;
+            encoder.push(q.positions(), 0, q.attributes())?;
         }
         if coverage
             && !tables.maps.is_empty()
@@ -111,10 +105,26 @@ pub(super) fn encode(
         lamps,
     })
 }
-fn records_in<T>(rows: &[(u32, T)], first: usize, len: usize) -> &[(u32, T)] {
-    let a = rows.partition_point(|(i, _)| (*i as usize) < first);
-    let b = a + rows[a..].partition_point(|(i, _)| (*i as usize) < first + len);
+fn records_in<T>(rows: &[T], first: usize, len: usize, index: impl Fn(&T) -> u32) -> &[T] {
+    let a = rows.partition_point(|r| (index(r) as usize) < first);
+    let b = a + rows[a..].partition_point(|r| (index(r) as usize) < first + len);
     &rows[a..b]
+}
+
+// 页与区域缓存均按源序排列；灯的属性槽在交给光源注册表前始终相对当前片段。
+fn append_lamps(
+    out: &mut Vec<Record>,
+    rows: &[Record],
+    origin: usize,
+    first: usize,
+) -> Result<(), Error> {
+    out.try_reserve(rows.len())
+        .map_err(scene_cache::Error::from)?;
+    out.extend(rows.iter().copied().map(|mut record| {
+        record.meta[3] = (first + (record.meta[3] as usize - origin)) as u32;
+        record
+    }));
+    Ok(())
 }
 
 pub(super) enum Piece {
@@ -129,7 +139,7 @@ pub(super) struct Check {
 pub(super) struct AttributeRows {
     pub attributes: Vec<[[u32; 4]; 3]>,
     pub ranges: Vec<(usize, Range<usize>)>,
-    pub lamps: Option<Vec<(u32, Record)>>,
+    pub lamps: Option<Vec<Record>>,
 }
 pub(super) enum Output {
     Geometry(RegionGpu, bool),
@@ -148,7 +158,7 @@ pub(super) struct Build {
     pub pieces: Vec<(usize, Piece)>,
 }
 impl Build {
-    pub fn finish(mut self, histories: &[History], tables: &Tables) -> Result<Output, Error> {
+    pub fn finish(mut self, histories: &[History]) -> Result<Output, Error> {
         let old = self.history.map(|i| &histories[i]);
         if let Some(check) = &self.check {
             let old = old.expect("复用候选持有原始面记录");
@@ -157,7 +167,7 @@ impl Build {
             for ((f, piece), &first) in self.pieces.iter().zip(&self.starts) {
                 let (records, origin, solid) = match piece {
                     Piece::Previous { first: prior, len } => (
-                        records_in(&old.maps, *prior, *len),
+                        records_in(&old.maps, *prior, *len, |r| r.0),
                         *prior,
                         self.fragments[*f].opaque,
                     ),
@@ -179,29 +189,19 @@ impl Build {
                     ranges: Vec::new(),
                     lamps: (!check.tint).then(Vec::new),
                 };
-                let mut order = old.resident.positions().order_cursor();
                 for ((_, piece), first) in self.pieces.into_iter().zip(self.starts) {
                     let page = match piece {
                         Piece::Previous { first: prior, len } => {
                             if let (Some(out), Some(previous)) = (&mut rows.lamps, &old.lamps) {
-                                let src = records_in(previous, prior, len);
-                                out.try_reserve(src.len())
-                                    .map_err(scene_cache::Error::from)?;
-                                for &(i, mut r) in src {
-                                    let logical = first + i as usize - prior;
-                                    r.meta[3] =
-                                        order.physical(logical).expect("继承面属于同一几何版本")
-                                            as u32;
-                                    out.push((logical as u32, r));
-                                }
+                                let src = records_in(previous, prior, len, |r| r.meta[3]);
+                                append_lamps(out, src, prior, first)?;
                             }
                             continue;
                         }
                         Piece::Fresh(Some(page)) => page,
                         Piece::Fresh(None) => unreachable!("属性页完整"),
                     };
-                    super::attribute_update::pack_physical(
-                        old.resident.positions(),
+                    super::attribute_update::pack_patch(
                         &self.range,
                         first,
                         page.attrs.into_iter(),
@@ -209,14 +209,7 @@ impl Build {
                         &mut rows.ranges,
                     )?;
                     if let Some(lamps) = &mut rows.lamps {
-                        lamps
-                            .try_reserve(page.lamps.len())
-                            .map_err(scene_cache::Error::from)?;
-                        for (i, mut r) in page.lamps {
-                            let source = first + i as usize;
-                            r.meta[3] = order.physical(source).expect("发光源属于属性域") as u32;
-                            lamps.push((source as u32, r));
-                        }
+                        append_lamps(lamps, &page.lamps, 0, first)?;
                     }
                 }
                 return Ok(Output::Attributes(check.old, rows));
@@ -229,13 +222,7 @@ impl Build {
                 };
                 let mut encoder = QuadEncoder::with_capacity(page.attrs.len())?;
                 for (i, attr) in page.attrs.drain(..).enumerate() {
-                    let m = attr[2][3] as usize;
-                    encoder.rebind(
-                        &old.resident,
-                        first + i,
-                        attr,
-                        tables.routes.get(m).copied().unwrap_or(0),
-                    )?;
+                    encoder.rebind(&old.resident, first + i, attr)?;
                 }
                 page.geometry = encoder.finish();
             }
@@ -252,28 +239,17 @@ impl Build {
                 Piece::Previous { first, len } => {
                     let old = old.expect("已发布分片持有历史");
                     encoder.extend_resident(&old.resident, first..first + len)?;
-                    let start = old.maps.partition_point(|(i, _)| (*i as usize) < first);
-                    let end = start
-                        + old.maps[start..].partition_point(|(i, _)| (*i as usize) < first + len);
-                    maps.try_reserve(end - start)
+                    let prior_maps = records_in(&old.maps, first, len, |r| r.0);
+                    maps.try_reserve(prior_maps.len())
                         .map_err(scene_cache::Error::from)?;
                     maps.extend(
-                        old.maps[start..end]
+                        prior_maps
                             .iter()
-                            .map(|(i, p)| ((base + *i as usize - first) as u32, *p)),
+                            .map(|&(i, p)| ((base + (i as usize - first)) as u32, p)),
                     );
                     if let Some(records) = &old.lamps {
-                        let from = records.partition_point(|(i, _)| (*i as usize) < first);
-                        let to = from
-                            + records[from..].partition_point(|(i, _)| (*i as usize) < first + len);
-                        lamps
-                            .try_reserve(to - from)
-                            .map_err(scene_cache::Error::from)?;
-                        lamps.extend(
-                            records[from..to]
-                                .iter()
-                                .map(|(i, r)| ((base + *i as usize - first) as u32, *r)),
-                        );
+                        let src = records_in(records, first, len, |r| r.meta[3]);
+                        append_lamps(&mut lamps, src, first, base)?;
                     }
                     base += len;
                 }
@@ -292,14 +268,7 @@ impl Build {
                             .into_iter()
                             .map(|(i, p)| ((base + i as usize) as u32, p)),
                     );
-                    lamps
-                        .try_reserve(page.lamps.len())
-                        .map_err(scene_cache::Error::from)?;
-                    lamps.extend(
-                        page.lamps
-                            .into_iter()
-                            .map(|(i, r)| ((base + i as usize) as u32, r)),
-                    );
+                    append_lamps(&mut lamps, &page.lamps, 0, base)?;
                     desc.opaque &= page.opaque;
                     base += n;
                 }
@@ -310,10 +279,6 @@ impl Build {
             old.map(|h| &h.resident),
             self.ids,
         )?;
-        let mut cursor = resident.positions().order_cursor();
-        for (i, r) in &mut lamps {
-            r.meta[3] = cursor.physical(*i as usize).expect("已编码的发光面") as u32;
-        }
         Ok(Output::Geometry(
             RegionGpu {
                 lamps: Some(lamps),

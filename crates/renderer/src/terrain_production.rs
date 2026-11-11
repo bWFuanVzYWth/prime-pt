@@ -88,7 +88,7 @@ impl Job {
         let built = pool.install(|| {
             self.regions
                 .into_par_iter()
-                .map(|r| r.finish(history, tables))
+                .map(|r| r.finish(history))
                 .collect::<Result<Vec<_>, _>>()
         })?;
         let mut built = built.into_iter();
@@ -243,8 +243,6 @@ pub(super) struct CpuPackets {
     feed: Option<Feed>,
     worker: scene_cache::Producer<Returned>,
     pool: Option<rayon::ThreadPool>,
-    routes: Vec<u32>,
-    routes_generation: Option<u64>,
 }
 impl CpuPackets {
     pub fn new() -> Result<Self, Error> {
@@ -260,8 +258,6 @@ impl CpuPackets {
             feed: None,
             worker: scene_cache::Producer::new("prime-terrain")?,
             pool: Some(pool),
-            routes: Vec::new(),
-            routes_generation: None,
         })
     }
     pub fn pending(&self) -> bool {
@@ -282,7 +278,6 @@ impl Gpu {
             self.light_sides = returned.tables.sides;
             self.light_areas = returned.tables.areas;
             self.light_weights = returned.tables.weights;
-            self.cpu_packets.routes = returned.tables.routes;
             self.opacity.indices = returned.tables.maps;
         }
         if self.scene.top == feed.top && self.resource_generation == feed.generation {
@@ -522,18 +517,6 @@ impl Gpu {
         history
             .try_reserve_exact(loan_indices.len())
             .map_err(scene_cache::Error::from)?;
-        if self.cpu_packets.routes_generation != Some(source.generation) {
-            self.cpu_packets.routes.clear();
-            if let Some(g) = &self.generation {
-                let v = g.programs.plan().bindings();
-                self.cpu_packets
-                    .routes
-                    .try_reserve_exact(v.len())
-                    .map_err(scene_cache::Error::from)?;
-                self.cpu_packets.routes.extend_from_slice(v);
-            }
-            self.cpu_packets.routes_generation = Some(source.generation);
-        }
         let pool = self.cpu_packets.pool.take().expect("一个在途批次独占池");
         let (sender, input) = mpsc::sync_channel(pool.current_num_threads() * 2);
         let (back, recycle) = mpsc::channel();
@@ -586,7 +569,6 @@ impl Gpu {
             weights: std::mem::take(&mut self.light_weights),
             coverage: std::mem::take(&mut self.material_coverage),
             maps: std::mem::take(&mut self.opacity.indices),
-            routes: std::mem::take(&mut self.cpu_packets.routes),
         };
         self.cpu_packets.worker.submit(move || {
             let started = Instant::now();

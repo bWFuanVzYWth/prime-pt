@@ -308,7 +308,7 @@ struct RegionGpu {
     revision: u64,
     baked_content: u64,
     fragments: Vec<FragmentSpan>,
-    lamps: Option<Vec<(u32, lighting::Record)>>,
+    lamps: Option<Vec<lighting::Record>>,
 
     range: std::ops::Range<u32>,
     blas: Option<vulkan::TriangleBlas>,
@@ -2616,10 +2616,7 @@ impl Gpu {
                         return Err(Error::Invalid("构建AS前quad记录或材质身份无效"));
                     }
                     opaque &= !coverage;
-                    let program = self.generation.as_ref().map_or(0, |generation| {
-                        generation.programs.plan().bindings()[quad.material_id().index() as usize]
-                    });
-                    encoder.push_routed(quad.positions(), 0, attributes, program)?;
+                    encoder.push(quad.positions(), 0, attributes)?;
                     if self.opacity.map.is_some() {
                         let pair = self.opacity.indices(quad.material_id().index(), quad.uv());
                         opacity_indices.extend(pair);
@@ -2870,7 +2867,7 @@ impl Gpu {
                     if !built && region.mesh.attribute_only() {
                         for patch in region.mesh.attribute_ranges() {
                             attribute_update::pack_patch(
-                                entry,
+                                &entry.range,
                                 patch.first,
                                 patch.attributes(),
                                 &mut attributes,
@@ -2891,7 +2888,7 @@ impl Gpu {
                             }
                         }
                         attribute_update::pack_patch(
-                            entry,
+                            &entry.range,
                             0,
                             region.mesh.attributes(),
                             &mut attributes,
@@ -2906,31 +2903,20 @@ impl Gpu {
             metrics.attribute_pack_ns += elapsed_ns(packing);
             metrics.geometry_ns += metrics.attribute_pack_ns;
             let light_started = std::time::Instant::now();
-            let bases: Vec<_> = entries
-                .iter()
-                .map(|e| e.get(self.region_cache.entries()).range.start)
-                .collect();
-            let orders: Vec<_> = entries
-                .iter()
-                .map(|entry| entry.get(self.region_cache.entries()).resident.positions())
-                .collect();
-            let cached: Vec<_> = entries
-                .iter()
-                .zip(source.regions)
-                .map(|(e, r)| {
-                    let entry = e.get(self.region_cache.entries());
-                    if let Some(rows) = baked_lamps.get(&r.key) {
-                        Some(rows.as_slice())
-                    } else if entry.baked_content == r.content_revision {
-                        entry.lamps.as_deref()
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let light_inputs = entries.iter().zip(source.regions).map(|(e, r)| {
+                let entry = e.get(self.region_cache.entries());
+                let lamps = if let Some(rows) = baked_lamps.get(&r.key) {
+                    Some(rows.as_slice())
+                } else if entry.baked_content == r.content_revision {
+                    entry.lamps.as_deref()
+                } else {
+                    None
+                };
+                (entry.range.start, lamps)
+            });
             let lights = self.lighting.prepare_backend(
                 source,
-                &bases,
+                light_inputs,
                 lighting::Emitters {
                     sides: &self.light_sides,
                     areas: &self.light_areas,
@@ -2939,8 +2925,6 @@ impl Gpu {
                 self.has_emission,
                 self.resource_generation,
                 true,
-                Some(&orders),
-                Some(&cached),
             )?;
             metrics.light_pack_ns = elapsed_ns(light_started);
             metrics.geometry_ns += metrics.light_pack_ns;
@@ -2972,8 +2956,19 @@ impl Gpu {
                 metrics.resources_ns += metrics.light_upload_ns;
             }
             // 实例身份只引用同序目录；属性槽可独立扩展。anchor变化和纯属性更新复用目录。
-            let base_write = (!same_acceleration && !bases.is_empty())
-                .then(|| (0, bytemuck::cast_slice(bases.as_slice())));
+            let mut bases = Vec::new();
+            if !same_acceleration {
+                bases
+                    .try_reserve_exact(entries.len())
+                    .map_err(scene_cache::Error::from)?;
+                bases.extend(
+                    entries
+                        .iter()
+                        .map(|e| e.get(self.region_cache.entries()).range.start),
+                );
+            }
+            let base_write =
+                (!bases.is_empty()).then(|| (0, bytemuck::cast_slice(bases.as_slice())));
             let instance_quad_bases = if let Some((_, bytes)) = base_write
                 && (bytes.len() as u64 > self.scene.instance_quad_bases.len()
                     || self.scene.instance_quad_bases == self.program_scene.instance_quad_bases)
@@ -3254,8 +3249,7 @@ impl Gpu {
             .iter()
             .map(|(offset, range)| (*offset, bytemuck::cast_slice(&attributes[range.clone()])))
             .collect();
-        let base_write = (!same_acceleration && !bases.is_empty())
-            .then(|| (0, bytemuck::cast_slice(bases.as_slice())));
+        let base_write = (!bases.is_empty()).then(|| (0, bytemuck::cast_slice(bases.as_slice())));
         let writes_attributes = !writes.is_empty() || base_write.is_some();
         if writes_attributes || light_patch_bytes != 0 || side_source.is_some() {
             let writing = std::time::Instant::now();

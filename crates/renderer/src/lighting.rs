@@ -168,20 +168,25 @@ impl Lighting {
         possible: bool,
         epoch: u64,
     ) -> Result<Preparation, Error> {
-        self.prepare_backend(source, bases, emitters, possible, epoch, false, None, None)
+        self.prepare_backend(
+            source,
+            bases.iter().map(|&base| (base, None)),
+            emitters,
+            possible,
+            epoch,
+            false,
+        )
     }
-    pub fn prepare_backend(
+    pub fn prepare_backend<'a>(
         &self,
         source: RenderView<'_>,
-        bases: &[u32],
+        regions: impl ExactSizeIterator<Item = (u32, Option<&'a [Record]>)>,
         emitters: Emitters<'_>,
         possible: bool,
         epoch: u64,
         device: bool,
-        orders: Option<&[&simple_engine::scene_cache::PackedQuads]>,
-        cached: Option<&[Option<&[(u32, Record)]>]>,
     ) -> Result<Preparation, Error> {
-        if source.regions.len() != bases.len() {
+        if source.regions.len() != regions.len() {
             return Err(Error::Invalid("发光region与属性槽目录长度不匹配"));
         }
         let mut entries = reserved(source.regions.len())?;
@@ -191,8 +196,7 @@ impl Lighting {
         let mut old_index = 0;
         let mut previous = None;
         let same_resources = self.epoch == epoch && self.possible == possible;
-        for (idx, (region, &base)) in source.regions.iter().zip(bases).enumerate() {
-            let order = orders.map(|orders| orders[idx]);
+        for (region, (base, cached)) in source.regions.iter().zip(regions) {
             if previous.is_some_and(|key| key >= region.key) {
                 return Err(Error::Invalid("发光region键须唯一且有序"));
             }
@@ -220,16 +224,6 @@ impl Lighting {
                 base,
                 quads: region.mesh.len(),
             };
-            if self.regions.is_empty() {
-                // 初载没有旧灯需要删除，直接流入连续新增阶段，不暂存第二份全局record。
-                let mut ids = Vec::new();
-                for (_, record) in collect(*region, base, emitters, possible, order)? {
-                    ids.try_reserve(1).map_err(prime_scene::Error::Allocation)?;
-                    ids.push(writer.add(record)?);
-                }
-                entries.push(PreparedRegion::Built(RegionLights { stamp, ids }));
-                continue;
-            }
             if let Some(index) = old {
                 let old = &self.regions[index];
                 if stamp.content < old.stamp.content || stamp.geometry < old.stamp.geometry {
@@ -255,24 +249,19 @@ impl Lighting {
                     continue;
                 }
             }
-            let lights = if let Some(rows) = cached.and_then(|v| v[idx]) {
-                let mut lights = reserved(rows.len())?;
-                for &(_, mut record) in rows {
-                    let local = record.meta[3];
-                    record.meta[3] = base
-                        .checked_add(local)
-                        .ok_or(Error::Invalid("发光槽溢出"))?;
-                    lights.push((local, record));
-                }
-                lights.sort_unstable_by_key(|v| v.0);
-                lights
-            } else {
-                collect(*region, base, emitters, possible, order)?
-            };
-            let mut ids = reserved(lights.len())?;
+            let mut ids = reserved(cached.map_or(0, <[Record]>::len))?;
             let old_region = old.map(|index| &self.regions[index]);
             let mut cursor = 0;
-            for (local_index, record) in lights {
+            for_each_light(*region, emitters, possible, cached, |mut record| {
+                ids.try_reserve(1).map_err(prime_scene::Error::Allocation)?;
+                let local_index = record.meta[3];
+                record.meta[3] = base
+                    .checked_add(local_index)
+                    .ok_or(Error::Invalid("发光属性槽溢出"))?;
+                if self.regions.is_empty() {
+                    ids.push(writer.add(record)?);
+                    return Ok(());
+                }
                 while let Some(old) = old_region
                     && let Some(&id) = old.ids.get(cursor)
                     && local(&self.registry, old, id)? < local_index
@@ -298,7 +287,8 @@ impl Lighting {
                     });
                     ids.push(u32::MAX);
                 }
-            }
+                Ok(())
+            })?;
             if let Some(old) = old_region {
                 for &id in &old.ids[cursor..] {
                     writer.remove(id)?;
@@ -422,46 +412,22 @@ fn local(registry: &Registry, region: &RegionLights, id: u32) -> Result<u32, Err
         .ok_or(Error::Invalid("发光局部身份超出region属性范围"))
 }
 
-fn collect(
+fn for_each_light(
     region: RenderRegion<'_>,
-    base: u32,
     emitters: Emitters<'_>,
     possible: bool,
-    order: Option<&simple_engine::scene_cache::PackedQuads>,
-) -> Result<Vec<(u32, Record)>, Error> {
-    let mut lights = Vec::new();
-    let mut cursor = order.map(|v| v.order_cursor());
-    each_light(region, base, emitters, possible, |local, mut record| {
-        let local = cursor.as_mut().map_or(local, |o| {
-            o.physical(local as usize).expect("已枚举的区域面") as u32
-        });
-        record.meta[3] = base
-            .checked_add(local)
-            .ok_or(Error::Invalid("发光槽溢出"))?;
-        lights
-            .try_reserve(1)
-            .map_err(prime_scene::Error::Allocation)?;
-        lights.push((local, record));
-        Ok(())
-    })?;
-    if order.is_some() {
-        lights.sort_unstable_by_key(|v| v.0);
-    }
-    Ok(lights)
-}
-
-fn each_light(
-    region: RenderRegion<'_>,
-    base: u32,
-    emitters: Emitters<'_>,
-    possible: bool,
-    mut output: impl FnMut(u32, Record) -> Result<(), Error>,
+    cached: Option<&[Record]>,
+    mut output: impl FnMut(Record) -> Result<(), Error>,
 ) -> Result<(), Error> {
-    if possible {
-        for (local, quad) in region.mesh.quads().enumerate() {
-            if let Some(record) = record_for(quad, region.key, base, local, emitters)? {
-                output(local as u32, record)?;
-            }
+    if !possible {
+        return Ok(());
+    }
+    if let Some(rows) = cached {
+        return rows.iter().copied().try_for_each(output);
+    }
+    for (index, quad) in region.mesh.quads().enumerate() {
+        if let Some(record) = record_for(quad, region.key, index, emitters)? {
+            output(record)?;
         }
     }
     Ok(())
@@ -470,7 +436,6 @@ fn each_light(
 pub(super) fn record_for(
     quad: &prime_scene::Quad,
     key: [i32; 3],
-    base: u32,
     local: usize,
     emitters: Emitters<'_>,
 ) -> Result<Option<Record>, Error> {
@@ -496,10 +461,7 @@ pub(super) fn record_for(
     if meta[0] == u32::MAX && degenerate(positions) {
         return Ok(None);
     }
-    let local = u32::try_from(local).map_err(|_| Error::Invalid("发光quad索引溢出"))?;
-    meta[3] = base
-        .checked_add(local)
-        .ok_or(Error::Invalid("发光属性槽溢出"))?;
+    meta[3] = u32::try_from(local).map_err(|_| Error::Invalid("发光quad索引溢出"))?;
     let area = light_sampling::QuadArea::new(&positions)?;
     let weight = *emitters
         .weights

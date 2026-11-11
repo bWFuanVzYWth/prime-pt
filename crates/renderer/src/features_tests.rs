@@ -154,15 +154,23 @@ fn streamed_fragment_reuses_encoding_after_an_earlier_fragment_grows()
     let host = Host::new()?;
     let mut session = host.gpu()?;
     let mut gpu = session.gpu();
+    let lamp = MaterialDefinition {
+        emission: [1., 1., 1., 20.],
+        ..Default::default()
+    };
+    upload(
+        &mut gpu,
+        &[MaterialDefinition::default(), lamp],
+        &[],
+        &[[u32::MAX, 0, 0, 0]; 2],
+    )?;
+    let output = image(&mut gpu)?;
     let q = scene().quads[0];
+    let mut tail = vec![q; 4097];
+    tail[4096] = Quad::with_material(q.positions(), q.uv(), q.tint(), MaterialId::new(1));
     let mut parts = prime_scene::MeshParts::default();
     parts.insert(0, Mesh { quads: vec![q] })?;
-    parts.insert(
-        19,
-        Mesh {
-            quads: vec![q; 4097],
-        },
-    )?;
+    parts.insert(19, Mesh { quads: tail })?;
     let drive = |gpu: &mut Gpu,
                  parts: &prime_scene::MeshParts,
                  geometry: u64,
@@ -192,10 +200,22 @@ fn streamed_fragment_reuses_encoding_after_an_earlier_fragment_grows()
             std::thread::yield_now();
         }
     };
+    let check_lamp = |gpu: &mut Gpu, local: u32| -> Result<(), Box<dyn std::error::Error>> {
+        host.render_environment(gpu, &output, &camera(), Environment::default())?;
+        gpu.complete_previous()?;
+        let mut meta = [0u32; 4];
+        gpu.lighting_gpu
+            .meta
+            .read(&mut gpu.context, 0, bytemuck::bytes_of_mut(&mut meta))?;
+        assert_eq!(meta[3], gpu.region_cache.entries()[0].range.start + local);
+        Ok(())
+    };
     assert_eq!(drive(&mut gpu, &parts, 1, 1)?, (4098, 0, 4098 * 96));
+    check_lamp(&mut gpu, 4097)?;
     let id = gpu.region_cache.entries()[0].resident.token(1);
     parts.insert(0, Mesh { quads: vec![q; 3] })?;
     assert_eq!(drive(&mut gpu, &parts, 2, 2)?, (3, 4097, 3 * 96));
+    check_lamp(&mut gpu, 4099)?;
     assert_eq!(gpu.region_cache.entries()[0].resident.token(3), id);
     assert_ne!(gpu.region_cache.entries()[0].resident.token(1), id);
     let top = gpu.scene.top;
@@ -207,6 +227,7 @@ fn streamed_fragment_reuses_encoding_after_an_earlier_fragment_grows()
         },
     )?;
     assert_eq!(drive(&mut gpu, &parts, 2, 3)?, (0, 4097, 3 * 96));
+    check_lamp(&mut gpu, 4099)?;
     assert_eq!(gpu.scene.top, top);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
@@ -309,6 +330,63 @@ fn publish(
 }
 
 #[test]
+#[ignore = "真实 Vulkan；混合格式的紧凑面与回退面按源序逐位展开"]
+fn mixed_quad_encodings_preserve_source_vertices() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    let positions = [
+        [
+            [241., 4., 0.],
+            [244., 4., 2.],
+            [244., 7., 2.],
+            [241., 7., 0.],
+        ],
+        [[4., 2., 0.], [5., 2., 0.], [5., 3., 1.], [4., 3., 1.]],
+        [
+            [200., 4., 2.],
+            [203., 7., 3.],
+            [207., 9., 1.],
+            [199., 8., 2.],
+        ],
+        [
+            [-1.5, 0., 0.],
+            [-0.5, 0., 0.],
+            [-0.5, 1., 0.],
+            [-1.5, 1., 0.],
+        ],
+        [[0., 0., 1.], [1., 0., 1.], [1., 1., 1.], [0., 1., 1.]],
+        [[0.1, 0., 0.], [1., 0., 0.], [1., 1., 0.], [0.1, 1., 0.]],
+    ];
+    let mesh = Mesh {
+        quads: positions
+            .into_iter()
+            .map(|p| Quad::with_material(p, [[0.; 2]; 4], [1.; 3], MaterialId::new(0)))
+            .collect(),
+    };
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    let range = gpu.region_cache.entries()[0].range.clone();
+    let bytes = u64::from(range.end) * 64;
+    let readback = Buffer::new(&mut gpu.context, bytes, true)?;
+    gpu.known_geometry
+        .unwrap()
+        .copy_prefix_to(&mut gpu.context, &readback, bytes)?;
+    let mut vertices = vec![[[0u32; 4]; 4]; positions.len()];
+    readback.read(
+        &mut gpu.context,
+        u64::from(range.start) * 64,
+        bytemuck::cast_slice_mut(&mut vertices),
+    )?;
+    for (quad, expected) in vertices.iter().zip(positions) {
+        for (actual, p) in quad.iter().zip(expected) {
+            assert_eq!(actual[..3], p.map(f32::to_bits));
+        }
+    }
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实 Vulkan；分帧上传完整后发布并验证驻留身份"]
 fn streamed_region_preserves_resident_quad_ids() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
@@ -316,17 +394,23 @@ fn streamed_region_preserves_resident_quad_ids() -> Result<(), Box<dyn std::erro
     let mut gpu = session.gpu();
     gpu.set_terrain_upload_budget(32)?;
     let output = image(&mut gpu)?;
-    let make = |x: u32| {
-        let x = x as f32;
+    let make = |cell: u32| {
+        let x = (cell % 32) as f32;
+        let y = (cell / 32) as f32;
         Quad::with_material(
-            [[x, 0., 1.], [x + 1., 0., 1.], [x + 1., 1., 1.], [x, 1., 1.]],
+            [
+                [x, y, 1.],
+                [x + 1., y, 1.],
+                [x + 1., y + 1., 1.],
+                [x, y + 1., 1.],
+            ],
             [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
             [1.; 3],
             MaterialId::new(0),
         )
     };
     let mut mesh = Mesh {
-        quads: (0..24).map(make).collect(),
+        quads: (0..69).rev().map(make).collect(),
     };
     let upload = |gpu: &mut Gpu,
                   mesh: &Mesh,
@@ -340,7 +424,7 @@ fn streamed_region_preserves_resident_quad_ids() -> Result<(), Box<dyn std::erro
             mesh: mesh.into(),
         }];
         let mut published = false;
-        for frame in 0..64 {
+        for frame in 0..512 {
             let ready = gpu.stream_regions(RenderView {
                 generation: gpu.resource_generation,
                 regions: &regions,
@@ -369,10 +453,7 @@ fn streamed_region_preserves_resident_quad_ids() -> Result<(), Box<dyn std::erro
             u64::from(range.start) * 8,
             bytemuck::cast_slice_mut(&mut result),
         )?;
-        let positions = gpu.region_cache.entries()[0].resident.positions();
-        Ok((0..result.len())
-            .map(|i| result[positions.physical(i).unwrap()])
-            .collect())
+        Ok(result)
     };
     let probe = |gpu: &mut Gpu| -> Result<[[u32; 4]; 2], Error> {
         let (mut bindings, _) = gpu.renderer_bindings(
@@ -402,13 +483,14 @@ fn streamed_region_preserves_resident_quad_ids() -> Result<(), Box<dyn std::erro
         Ok(words)
     };
     let old = upload(&mut gpu, &mesh, 1)?;
+    assert!(old.windows(2).all(|pair| pair[0] + 1 == pair[1]));
     let hits = probe(&mut gpu)?;
     assert_eq!(hits[0][3], 1);
     assert_eq!(hits[1][3], 1);
     assert_eq!(&hits[0][..2], &hits[1][..2]);
     assert_ne!(hits[0][2], hits[1][2]);
     mesh.quads.reverse();
-    mesh.quads[3] = make(42);
+    mesh.quads[3] = make(99);
     let new = upload(&mut gpu, &mesh, 2)?;
     assert_eq!(hits, probe(&mut gpu)?);
     for (i, &id) in new.iter().enumerate() {
@@ -1092,13 +1174,7 @@ fn hardware_pt_attribute_growth_keeps_existing_gpu_bytes() -> Result<(), Box<dyn
     let added = u64::from(gpu.region_cache.entries()[1].range.start) * 48;
     let mut first = [0; 48];
     gpu.scene.quads.read(&mut gpu.context, added, &mut first)?;
-    let original = gpu.region_cache.entries()[0]
-        .resident
-        .positions()
-        .physical(0)
-        .unwrap()
-        * 48;
-    assert_eq!(first[..], before[original..original + 48]);
+    assert_eq!(first[..], before[..48]);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

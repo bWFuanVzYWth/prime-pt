@@ -3,67 +3,34 @@ use super::{Error, Gpu, SceneUpdateTiming, elapsed_ns};
 use prime_scene::RenderChange;
 use simple_engine::{scene_cache, vulkan};
 
-/// 连续逻辑片段按创建 BLAS 时的局部顺序写回，完整 tile 形成一段物理写入。
+/// 将区域内连续的源 quad 属性写入同序 GPU 槽，相邻的写入合为一个范围。
 pub(super) fn pack_patch(
-    entry: &super::RegionGpu,
-    first: usize,
-    values: impl ExactSizeIterator<Item = [[u32; 4]; 3]>,
-    out: &mut Vec<[[u32; 4]; 3]>,
-    ranges: &mut Vec<(usize, std::ops::Range<usize>)>,
-) -> Result<(), Error> {
-    pack_physical(
-        entry.resident.positions(),
-        &entry.range,
-        first,
-        values,
-        out,
-        ranges,
-    )
-}
-pub(super) fn pack_physical(
-    positions: &scene_cache::PackedQuads,
     slots: &std::ops::Range<u32>,
     first: usize,
     values: impl ExactSizeIterator<Item = [[u32; 4]; 3]>,
     out: &mut Vec<[[u32; 4]; 3]>,
     ranges: &mut Vec<(usize, std::ops::Range<usize>)>,
 ) -> Result<(), Error> {
-    let mut values = values;
-    let end = first
-        .checked_add(values.len())
-        .filter(|&e| e <= slots.len())
-        .ok_or(Error::Invalid("属性补丁越界"))?;
-    out.try_reserve(values.len())
-        .map_err(scene_cache::Error::from)?;
-    let mut at = first;
-    while at < end {
-        let block = at / 64;
-        let next = end.min((block + 1) * 64);
-        let mut scratch = [[[0; 4]; 3]; 64];
-        for i in at..next {
-            scratch[i % 64] = values.next().expect("补丁输入已确认长度");
-        }
-        let order = positions.block_order(block);
-        for (physical, &lane) in order.iter().enumerate() {
-            let lane = usize::from(lane);
-            if lane < at % 64 || lane >= next - block * 64 {
-                continue;
-            }
-            let dest = (slots.start as usize + block * 64 + physical) * 48;
-            let start = out.len();
-            out.push(scratch[lane]);
-            if let Some((old, range)) = ranges.last_mut()
-                && *old + range.len() * 48 == dest
-                && range.end == start
-            {
-                range.end += 1;
-            } else {
-                ranges.try_reserve(1).map_err(scene_cache::Error::from)?;
-                ranges.push((dest, start..start + 1));
-            }
-        }
-        at = next;
+    let count = values.len();
+    if first.checked_add(count).is_none_or(|end| end > slots.len()) {
+        return Err(Error::Invalid("属性补丁越界"));
     }
+    if count == 0 {
+        return Ok(());
+    }
+    out.try_reserve(count).map_err(scene_cache::Error::from)?;
+    let dest = (slots.start as usize + first) * size_of::<[[u32; 4]; 3]>();
+    let start = out.len();
+    if let Some((old, range)) = ranges.last_mut()
+        && *old + range.len() * size_of::<[[u32; 4]; 3]>() == dest
+        && range.end == start
+    {
+        range.end += count;
+    } else {
+        ranges.try_reserve(1).map_err(scene_cache::Error::from)?;
+        ranges.push((dest, start..start + count));
+    }
+    out.extend(values);
     Ok(())
 }
 
@@ -170,7 +137,7 @@ impl Gpu {
             }
             for patch in region.mesh.attribute_ranges() {
                 pack_patch(
-                    old,
+                    &old.range,
                     patch.first,
                     patch.attributes(),
                     &mut attributes,
