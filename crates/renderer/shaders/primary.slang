@@ -1,5 +1,9 @@
 /// 只负责硬件命中和 K1/K2 交接；路径推进完全使用引擎 pt.integrator。
 module primary;
+#include "geometry/opacity.slang"
+#ifndef PRIMEPT_OMM
+#define PRIMEPT_OMM 0
+#endif
 import mod_scene;
 import mod_call;
 import mod_guides;
@@ -69,6 +73,9 @@ void primary_anyhit(inout TracePayload payload, BuiltInTriangleIntersectionAttri
 void primary_closesthit(inout TracePayload payload,
                         BuiltInTriangleIntersectionAttributes attributes)
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(primary_closesthit)
+#endif
     payload.primitive = region_primitive(InstanceID(), PrimitiveIndex());
     payload.bary = attributes.barycentrics;
     payload.distance = RayTCurrent();
@@ -120,6 +127,9 @@ pt::TransportCall load_landing(uint pixel, uint2 coordinate, uint flags)
 [shader("raygeneration")]
 void prefix_main()
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(prefix_main)
+#endif
     Params params = parameters[0];
     uint2 coordinate = DispatchRaysIndex().xy;
     uint pixel = coordinate.y * params.image.x + coordinate.x;
@@ -166,6 +176,9 @@ void prefix_main()
 [shader("raygeneration")]
 void render_main()
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_main)
+#endif
     Params params = parameters[0];
     uint2 coordinate = DispatchRaysIndex().xy;
     uint pixel = coordinate.y * params.image.x + coordinate.x;
@@ -191,6 +204,9 @@ void render_main()
 [shader("callable")]
 void shade_opaque(inout ModTransportCall call)
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(shade_opaque)
+#endif
     pt::TransportCall data = call.unpack();
     ModScene provider;
     pt::process_flow<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, false>(provider, data,
@@ -206,6 +222,9 @@ void shade_opaque(inout ModTransportCall call)
 [shader("closesthit")]
 void shade_hit(inout ModTransportCall call, BuiltInTriangleIntersectionAttributes attributes)
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(shade_hit)
+#endif
 #ifdef PRIMEPT_HIT_STUB
     call.state = pt::PATH_DONE;
     call.point.position = 0;
@@ -228,6 +247,9 @@ void shade_hit(inout ModTransportCall call, BuiltInTriangleIntersectionAttribute
 [shader("raygeneration")]
 void prefix_empty()
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(prefix_empty)
+#endif
 }
 
 bool shadow_occluded(geometry::Ray connection)
@@ -268,6 +290,9 @@ pt::Hit object_hit(HitObject object, float3 direction)
 [shader("raygeneration")]
 void render_fused()
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_fused)
+#endif
     Params params = parameters[0];
     uint2 coordinate = DispatchRaysIndex().xy;
     uint pixel = coordinate.y * params.image.x + coordinate.x;

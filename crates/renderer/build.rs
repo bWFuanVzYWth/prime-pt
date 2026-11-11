@@ -117,6 +117,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "region_primitive_probe_main",
             "region_primitive_probe.spv",
         ),
+        (
+            "shaders/light_test.slang",
+            "triangle_identity_probe_main",
+            "triangle_identity_probe.spv",
+        ),
         ("shaders/post.slang", "post_main", "post.spv"),
         ("shaders/present.slang", "present_main", "present.spv"),
         ("shaders/rr.slang", "pack_main", "rr_pack.spv"),

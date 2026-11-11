@@ -99,7 +99,7 @@ public final class Renderer {
         }
         if (!Bootstrap.rayTracingEnabled()) return false;
         encoder=device.createCommandEncoder();await();
-        renderer=new Native(device.instance().vkInstance().address(),device.vkDevice().getPhysicalDevice().address(),device.vkDevice().address(),device.graphicsQueue().vkQueue().address(),device.graphicsQueue().queueFamilyIndex(),Bootstrap.graphicsQueueIndex(),Bootstrap.invocationReorder(device.vkDevice()),Settings.requestedSer(),Bootstrap.diagnosticCheckpoints(device.vkDevice()));
+        renderer=new Native(device.instance().vkInstance().address(),device.vkDevice().getPhysicalDevice().address(),device.vkDevice().address(),device.graphicsQueue().vkQueue().address(),device.graphicsQueue().queueFamilyIndex(),Bootstrap.graphicsQueueIndex(),Bootstrap.invocationReorder(device.vkDevice()),Settings.requestedSer(),Bootstrap.diagnosticCheckpoints(device.vkDevice()),Bootstrap.opacityMicromap(device.vkDevice()));
         faultReported = false;
         return true;
     }

@@ -128,8 +128,8 @@ impl Measurement {
 }
 
 fn fixture(name: &str, extent: [u32; 2]) -> Result<(Vec<MaterialDefinition>, Mesh, Camera)> {
-    if !matches!(name, "direct" | "occluded" | "glossy") {
-        return Err("scene须为direct/occluded/glossy".into());
+    if !matches!(name, "direct" | "occluded" | "glossy" | "cutout") {
+        return Err("scene须为direct/occluded/glossy/cutout".into());
     }
     let mut materials = vec![MaterialDefinition::default(); 5];
     for material in &mut materials {
@@ -248,6 +248,26 @@ fn fixture(name: &str, extent: [u32; 2]) -> Result<(Vec<MaterialDefinition>, Mes
             3,
         );
     }
+    if name == "cutout" {
+        let mut cutout = materials[0];
+        cutout.control[2] = MaterialDefinition::CUTOUT;
+        materials.push(cutout);
+        for layer in 0..8 {
+            let z = 2. + layer as f32 * 0.7;
+            let x = layer as f32 * 0.11;
+            mesh.quads.push(Quad::with_material(
+                [
+                    [-8. + x, -4., z],
+                    [-8. + x, 6., z],
+                    [8. + x, 6., z],
+                    [8. + x, -4., z],
+                ],
+                [[0., 0.], [0., 1.], [1., 1.], [1., 0.]],
+                [1.; 3],
+                MaterialId::new(5),
+            ));
+        }
+    }
     let scale = 0.5f32.tan();
     Ok((
         materials,
@@ -350,7 +370,9 @@ fn hardware_pt_equal_time_benchmark() -> Result {
     if seeds.is_empty() || variants.is_empty() {
         return Err("seeds与variants均须非空".into());
     }
-    let host = Host::create(rr, true)?;
+    let mut host = Host::create(rr, true)?;
+    // 只收窄渲染器能力，用于隔离无 OMM 数据时的管线成本；不伪造设备支持。
+    host.opacity_micromap &= config["renderer_omm"].as_bool().unwrap_or(true);
     let mut session = host.gpu()?;
     let gpu = session.gpu();
     gpu.test_center_film = config["center_film"].as_bool().unwrap_or(!rr);
@@ -363,27 +385,55 @@ fn hardware_pt_equal_time_benchmark() -> Result {
     }
     base_camera.origin[0] += camera_x as f32;
     let generation = gpu.resource_generation + 1;
+    let textured = scene_name == "cutout";
+    let texture_extent = if textured { [32, 32] } else { [1, 1] };
+    let mut albedo = vec![255; (texture_extent[0] * texture_extent[1] * 4) as usize];
+    if textured {
+        for (i, pixel) in albedo.chunks_exact_mut(4).enumerate() {
+            pixel[3] = if ((i % 32) / 2 + (i / 32) / 2) % 2 == 0 {
+                255
+            } else {
+                0
+            };
+        }
+    }
+    let omm = config["omm"].as_bool().unwrap_or(false);
+    if omm && (!textured || !host.opacity_micromap) {
+        return Err("OMM测量需要cutout场景与实际KHR OMM设备".into());
+    }
+    let prototypes = [simple_engine::opacity::Quad {
+        material: 5,
+        uv: [[0., 0.], [0., 1.], [1., 1.], [1., 0.]],
+    }];
+    let prepare_started = std::time::Instant::now();
     gpu.replace_resources(ResourceUpload {
         generation,
-        extent: [1, 1],
-        albedo: &[255; 4],
+        extent: texture_extent,
+        albedo: &albedo,
         materials: &materials,
-        mers: &[0, 0, 128, 0],
-        auxiliary: &[128; 4],
+        mers: &[0, 0, 128, 0].repeat(albedo.len() / 4),
+        auxiliary: &vec![128; albedo.len()],
         emission_alias_words: &[],
+        opacity_quads: if omm { &prototypes } else { &[] },
         light_areas: &vec![[u32::MAX, 0, 0, 0]; materials.len()],
     })?;
+    let resource_prepare_ns = prepare_started.elapsed().as_nanos();
+    if omm && gpu.opacity.map.is_none() {
+        return Err("OMM测量未实际准备硬件map".into());
+    }
     let regions = [RenderRegion {
         key: [0; 3],
         geometry_revision: 1,
         content_revision: 1,
         mesh: (&mesh).into(),
     }];
+    let region_started = std::time::Instant::now();
     gpu.set_regions(RenderView {
         generation,
         anchor: [0.; 3],
         regions: &regions,
     })?;
+    let region_prepare_ns = region_started.elapsed().as_nanos();
     let image = Image::new(
         &mut gpu.context,
         [extent[0], extent[1], 1],
@@ -649,6 +699,41 @@ fn hardware_pt_equal_time_benchmark() -> Result {
                     eprintln!("PT {scene_name} {name} seed={seed} {}/{frames}", frame + 1);
                 }
                 if last {
+                    if let Some(probes) = config["probe_pixels"].as_array() {
+                        if probes.len() > 32 {
+                            return Err("最多读回32个首命中探针".into());
+                        }
+                        let mut rows = Vec::new();
+                        for probe in probes {
+                            let x = probe[0].as_u64().ok_or("探针x须为整数")?;
+                            let y = probe[1].as_u64().ok_or("探针y须为整数")?;
+                            if x >= u64::from(extent[0]) || y >= u64::from(extent[1]) {
+                                return Err("探针超出图像范围".into());
+                            }
+                            rows.push(serde_json::json!({"pixel":[x,y]}));
+                        }
+                        for (name, source) in [
+                            ("ray", gpu.view.as_ref().unwrap().landing[0]),
+                            ("identity", gpu.view.as_ref().unwrap().landing[5]),
+                        ] {
+                            source.copy_prefix_to(&mut gpu.context, &readback, source.len())?;
+                            for row in &mut rows {
+                                let pixel = row["pixel"][1].as_u64().unwrap()
+                                    * u64::from(extent[0])
+                                    + row["pixel"][0].as_u64().unwrap();
+                                let mut bytes = [0; 16];
+                                readback.read(&mut gpu.context, pixel * 16, &mut bytes)?;
+                                let words = std::array::from_fn::<_, 4, _>(|i| {
+                                    u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+                                });
+                                row[name] = serde_json::json!(words);
+                            }
+                        }
+                        fs::write(
+                            dir.join("primary-probes.json"),
+                            serde_json::to_vec_pretty(&rows)?,
+                        )?;
+                    }
                     break;
                 }
             }
@@ -667,6 +752,7 @@ fn hardware_pt_equal_time_benchmark() -> Result {
         output.join("report.json"),
         serde_json::to_vec_pretty(
             &serde_json::json!({"config":config,"validation_errors":errors,"records":reports,
+        "preparation":{"resource_ns":resource_prepare_ns,"region_ns":region_prepare_ns,"omm":omm},
         "scope":"同分辨率真实draw GPU跨度含RR；GPU统计/读回/写盘/准备不计时。HDR用GPU float32累积，块统计每32帧回读。静态帧算术均值为离线估计；运动序列均值不作收敛指标。"}),
         )?,
     )?;

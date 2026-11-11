@@ -31,7 +31,7 @@ fn blob(out: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
 /// I/O 失败直接返回，已存在文件不会覆盖。
 pub fn write_resources(directory: &Path, source: &ResourceUpload<'_>) -> io::Result<()> {
     let mut out = file(&directory.join(format!("resources-{}.bin", source.generation)))?;
-    out.write_all(b"PRASSET1")?;
+    out.write_all(b"PRASSET2")?;
     pod(&mut out, &source.generation)?;
     pod(&mut out, &source.extent)?;
     for bytes in [
@@ -43,6 +43,11 @@ pub fn write_resources(directory: &Path, source: &ResourceUpload<'_>) -> io::Res
         source.auxiliary,
     ] {
         blob(&mut out, bytes)?;
+    }
+    pod(&mut out, &(source.opacity_quads.len() as u64))?;
+    for quad in source.opacity_quads {
+        pod(&mut out, &quad.material)?;
+        pod(&mut out, &quad.uv)?;
     }
     out.flush()
 }

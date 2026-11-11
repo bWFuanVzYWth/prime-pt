@@ -64,6 +64,7 @@ fn hardware_pt_rr_streaming_motion() -> Result<(), Box<dyn std::error::Error>> {
         mers: &[0; 256],
         auxiliary: &auxiliary,
         emission_alias_words: &[],
+        opacity_quads: &[],
         light_areas: &[[u32::MAX, 0, 0, 0]; 12],
     })?;
     gpu.set_rendering(RenderMode::Realtime)?;
@@ -431,6 +432,7 @@ fn guided_suffix_across_materials(
         mers: &[0, 0, 255, 0],
         auxiliary: &[128, 128, 0, 85],
         emission_alias_words: &[],
+        opacity_quads: &[],
         light_areas: &[[u32::MAX, 0, 0, 0]; 3],
     })?;
     gpu.set_rendering(prime_scene::RenderMode::Realtime)?;

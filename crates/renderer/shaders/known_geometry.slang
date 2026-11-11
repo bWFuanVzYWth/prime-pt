@@ -3,17 +3,18 @@ module known_geometry;
 import mod_scene;
 import pt.light_sampling;
 import geometry.ray;
-[[vk::binding(37, 0)]]
+[[vk::binding(39, 0)]]
 StructuredBuffer<uint4> known_positions;
 
 public uint known_normal_xy<let Variant : uint>(uint primitive, float2 encoded, float3 normal)
 {
     if ((Variant & 8u) == 0)
         return 0;
-    uint start = 1u + (primitive >> 1u) * 4u;
-    pt::LightQuadVertices vertices = pt::light_quad_vertices(asfloat(known_positions[start]),
-                                                             asfloat(known_positions[start + 1u]),
-                                                             asfloat(known_positions[start + 2u]));
+    uint start = (primitive >> 1u) * 4u;
+    pt::LightQuadVertices vertices = { asfloat(known_positions[start].xyz),
+                                       asfloat(known_positions[start + 1u].xyz),
+                                       asfloat(known_positions[start + 2u].xyz),
+                                       asfloat(known_positions[start + 3u].xyz) };
     bool second = (primitive & 1u) != 0;
     return map_normal_xy(primitive, encoded, (second ? vertices.c : vertices.b) - vertices.a,
                          (second ? vertices.d : vertices.c) - vertices.a,
@@ -29,13 +30,17 @@ public uint known_normal<let Variant : uint>(uint primitive, float2 bary, float3
 
 public geometry::TriangleEndpoint known_endpoint(uint primitive, float2 bary)
 {
-    uint start = 1u + (primitive >> 1u) * 4u;
-    pt::LightQuadVertices vertices = pt::light_quad_vertices(asfloat(known_positions[start]),
-                                                             asfloat(known_positions[start + 1u]),
-                                                             asfloat(known_positions[start + 2u]));
+    uint start = (primitive >> 1u) * 4u;
+    pt::LightQuadVertices vertices = { asfloat(known_positions[start].xyz),
+                                       asfloat(known_positions[start + 1u].xyz),
+                                       asfloat(known_positions[start + 2u].xyz),
+                                       asfloat(known_positions[start + 3u].xyz) };
     pt::QuadAreaSample sample = { primitive & 1u, bary, 0 };
     float3 translation =
-        float3(asint(known_positions[start + 3u].xyz) - parameters[0].anchor_region.xyz) * 64.0;
+        float3(int3(asint(known_positions[start].w), asint(known_positions[start + 1u].w),
+                    asint(known_positions[start + 2u].w)) -
+               parameters[0].anchor_region.xyz) *
+        64.0;
     float3x4 transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);
     float3x4 inverse =

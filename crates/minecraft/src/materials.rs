@@ -28,6 +28,8 @@ pub struct MaterialResources<'a> {
     pub emission_alias_words: Vec<u32>,
     /// 与materials等长的静态两三角面积，过程几何以0xffffffff为sentinel。
     pub quad_areas: Vec<[u32; 4]>,
+    /// 资源期收集的唯一 cutout quad UV；渲染器仅对精确对齐者准备 OMM。
+    pub opacity_quads: Vec<simple_engine::opacity::Quad>,
 }
 struct SpriteMaps {
     authored: bool,
@@ -493,6 +495,8 @@ impl PreparedCatalog<'_> {
         ];
         let sentinel = [u32::MAX, 0, 0, 0];
         let mut areas = vec![sentinel; 2];
+        let mut opacity_quads = Vec::new();
+        let mut opacity_keys = HashSet::new();
         let mut intern = HashMap::new();
         for (id, v) in definitions.iter().enumerate() {
             intern.insert((v.words(), sentinel), MaterialId::new(id as u32));
@@ -666,6 +670,20 @@ impl PreparedCatalog<'_> {
                                 intern.insert(key, id);
                                 id
                             };
+                            if v.control[2] & (Definition::CUTOUT | Definition::FRONT_ONLY)
+                                == Definition::CUTOUT
+                            {
+                                let key = (id.index(), q.uv.map(|p| p.map(f32::to_bits)));
+                                if !opacity_keys.contains(&key) {
+                                    opacity_keys.try_reserve(1)?;
+                                    opacity_quads.try_reserve(1)?;
+                                    opacity_keys.insert(key);
+                                    opacity_quads.push(simple_engine::opacity::Quad {
+                                        material: id.index(),
+                                        uv: q.uv,
+                                    });
+                                }
+                            }
                             bound.push(BoundQuad {
                                 index,
                                 material: id,
@@ -786,6 +804,7 @@ impl PreparedCatalog<'_> {
             auxiliary,
             emission_alias_words: words,
             quad_areas: areas,
+            opacity_quads,
         })
     }
 }

@@ -2,6 +2,263 @@
 use super::*;
 use prime_scene::{MaterialDefinition, MaterialId, RenderRegion, RenderView};
 
+fn publish_stream(
+    gpu: &mut Gpu,
+    mesh: &Mesh,
+    geometry: u64,
+    content: u64,
+    anchor: [f64; 3],
+) -> Result<(), Error> {
+    let start = std::time::Instant::now();
+    loop {
+        if gpu.stream_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor,
+            regions: &[RenderRegion {
+                key: [0; 3],
+                geometry_revision: geometry,
+                content_revision: content,
+                mesh: mesh.into(),
+            }],
+        })? {
+            return Ok(());
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(30));
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+#[ignore = "真实 Vulkan；大批纯 tint 在后台准备，保持 BLAS 和未变化属性"]
+fn streamed_large_tint_only_touches_the_requested_faces() -> Result<(), Box<dyn std::error::Error>>
+{
+    use prime_scene::{FragmentMask, MeshParts, PreparedParts, RenderChange, TintPatch};
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    let output = image(&mut gpu)?;
+    let mut base = MeshParts::default();
+    base.insert(
+        11,
+        Mesh {
+            quads: vec![scene().quads[0]; 2048],
+        },
+    )?;
+    let region = RenderRegion {
+        key: [0; 3],
+        geometry_revision: 1,
+        content_revision: 1,
+        mesh: base.view(),
+    };
+    gpu.set_regions(RenderView {
+        generation: gpu.resource_generation,
+        anchor: [0.; 3],
+        regions: &[region],
+    })?;
+    let top = gpu.scene.top;
+    let patch = PreparedParts::prepare(&base, MeshParts::default(), FragmentMask::empty())?
+        .with_tints(&base, vec![TintPatch::new(11, 137, 1000, 0xff80_4020)?])?;
+    let updated = RenderRegion {
+        content_revision: 2,
+        mesh: patch.view(&base),
+        ..region
+    };
+    assert!(!gpu.try_attribute_changes(
+        gpu.resource_generation,
+        [0.; 3],
+        &[RenderChange::Upsert(updated)]
+    )?);
+    let start = std::time::Instant::now();
+    let mut source = 0;
+    loop {
+        let ready = gpu.stream_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor: [0.; 3],
+            regions: &[updated],
+        })?;
+        let t = gpu.scene_timing().unwrap();
+        source += t.cpu_source_bytes;
+        assert_eq!(t.build_quads, 0);
+        if ready {
+            break;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        std::thread::yield_now();
+    }
+    assert_eq!(source, 1000 * 48);
+    assert_eq!(gpu.scene.top, top);
+    host.render_environment(&mut gpu, &output, &camera(), Environment::default())?;
+    gpu.complete_previous()?;
+    let base = u64::from(gpu.region_cache.entries()[0].range.start);
+    let mut rows = [[0u32; 12]; 2];
+    gpu.scene.quads.read(
+        &mut gpu.context,
+        (base + 136) * 48,
+        bytemuck::cast_slice_mut(&mut rows),
+    )?;
+    assert_eq!(
+        &rows[1][8..11],
+        &[128, 64, 32].map(|v| (v as f32 / 255.).to_bits())
+    );
+    assert_ne!(rows[0][8], rows[1][8]);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；压紧包一次传完时仍将独立 BLAS 分散到不同帧"]
+fn streamed_build_budget_splits_regions_and_keeps_the_old_top()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let top = gpu.scene.top;
+    let mesh = Mesh {
+        quads: vec![scene().quads[0]; 80_000],
+    };
+    let regions = [0, 1].map(|x| RenderRegion {
+        key: [x, 0, 0],
+        geometry_revision: 1,
+        content_revision: 1,
+        mesh: (&mesh).into(),
+    });
+    let mut batches = Vec::new();
+    let start = std::time::Instant::now();
+    loop {
+        let done = gpu.stream_regions(RenderView {
+            generation: gpu.resource_generation,
+            anchor: [0.; 3],
+            regions: &regions,
+        })?;
+        let t = gpu.scene_timing().unwrap();
+        if t.build_quads != 0 {
+            batches.push(t.build_quads);
+        }
+        if done {
+            break;
+        }
+        assert_eq!(gpu.scene.top, top);
+        assert!(start.elapsed() < std::time::Duration::from_secs(30));
+        std::thread::yield_now();
+    }
+    assert_eq!(batches, [80_000, 80_000]);
+    assert_eq!(gpu.region_cache.entries().len(), 2);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；移动未变分片只重定位已有的面和驻留身份"]
+fn streamed_fragment_reuses_encoding_after_an_earlier_fragment_grows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    let q = scene().quads[0];
+    let mut parts = prime_scene::MeshParts::default();
+    parts.insert(0, Mesh { quads: vec![q] })?;
+    parts.insert(
+        19,
+        Mesh {
+            quads: vec![q; 4097],
+        },
+    )?;
+    let drive = |gpu: &mut Gpu,
+                 parts: &prime_scene::MeshParts,
+                 geometry: u64,
+                 content: u64|
+     -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
+        let start = std::time::Instant::now();
+        let mut stats = (0, 0, 0);
+        loop {
+            let ready = gpu.stream_regions(RenderView {
+                generation: gpu.resource_generation,
+                anchor: [0.; 3],
+                regions: &[RenderRegion {
+                    key: [0; 3],
+                    geometry_revision: geometry,
+                    content_revision: content,
+                    mesh: parts.view(),
+                }],
+            })?;
+            let t = gpu.scene_timing().unwrap();
+            stats.0 += t.encoded_quads;
+            stats.1 += t.reused_fragment_quads;
+            stats.2 += t.cpu_source_bytes;
+            if ready {
+                return Ok(stats);
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(15));
+            std::thread::yield_now();
+        }
+    };
+    assert_eq!(drive(&mut gpu, &parts, 1, 1)?, (4098, 0, 4098 * 96));
+    let id = gpu.region_cache.entries()[0].resident.token(1);
+    parts.insert(0, Mesh { quads: vec![q; 3] })?;
+    assert_eq!(drive(&mut gpu, &parts, 2, 2)?, (3, 4097, 3 * 96));
+    assert_eq!(gpu.region_cache.entries()[0].resident.token(3), id);
+    assert_ne!(gpu.region_cache.entries()[0].resident.token(1), id);
+    let top = gpu.scene.top;
+    let recolored = Quad::with_material(q.positions(), q.uv(), [0.25, 0.5, 1.], q.material_id());
+    parts.insert(
+        0,
+        Mesh {
+            quads: vec![recolored; 3],
+        },
+    )?;
+    assert_eq!(drive(&mut gpu, &parts, 2, 3)?, (0, 4097, 3 * 96));
+    assert_eq!(gpu.scene.top, top);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；快速移动时完成在途候选，再独立移动已发布 TLAS"]
+fn streamed_candidate_finishes_while_anchor_keeps_moving() -> Result<(), Box<dyn std::error::Error>>
+{
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    gpu.set_terrain_upload_budget(32)?;
+    let mesh = Mesh {
+        quads: vec![scene().quads[0]; 128],
+    };
+    let regions = [RenderRegion {
+        key: [0; 3],
+        geometry_revision: 1,
+        content_revision: 1,
+        mesh: (&mesh).into(),
+    }];
+    let start = std::time::Instant::now();
+    let mut target = [0.; 3];
+    let mut pinned = None;
+    loop {
+        let ready = gpu.stream_regions(RenderView {
+            generation: gpu.resource_generation,
+            regions: &regions,
+            anchor: target,
+        })?;
+        assert!(gpu.scene_timing().unwrap().terrain_upload_bytes <= 32);
+        if ready {
+            break;
+        }
+        if let Some(storage) = &gpu.pending_storage {
+            assert_eq!(*pinned.get_or_insert(storage.anchor), storage.anchor);
+            target[0] += 64.;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+        std::thread::yield_now();
+    }
+    assert_eq!(Some(gpu.scene_anchor()), pinned);
+    assert_ne!(gpu.scene_anchor(), target);
+    let blas = gpu.region_cache.entries()[0].blas;
+    publish_stream(&mut gpu, &mesh, 1, 1, target)?;
+    assert_eq!(gpu.scene_anchor(), target);
+    assert_eq!(gpu.region_cache.entries()[0].blas, blas);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
 fn upload(
     gpu: &mut Gpu,
     definitions: &[MaterialDefinition],
@@ -26,6 +283,7 @@ fn upload_auxiliary(
         mers: &[0, 255, 242, 0],
         auxiliary,
         emission_alias_words: words,
+        opacity_quads: &[],
         light_areas: areas,
     })
 }
@@ -48,6 +306,120 @@ fn publish(
         regions: &regions,
         anchor,
     })
+}
+
+#[test]
+#[ignore = "真实 Vulkan；分帧上传完整后发布并验证驻留身份"]
+fn streamed_region_preserves_resident_quad_ids() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    gpu.set_terrain_upload_budget(32)?;
+    let output = image(&mut gpu)?;
+    let make = |x: u32| {
+        let x = x as f32;
+        Quad::with_material(
+            [[x, 0., 1.], [x + 1., 0., 1.], [x + 1., 1., 1.], [x, 1., 1.]],
+            [[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
+            [1.; 3],
+            MaterialId::new(0),
+        )
+    };
+    let mut mesh = Mesh {
+        quads: (0..24).map(make).collect(),
+    };
+    let upload = |gpu: &mut Gpu,
+                  mesh: &Mesh,
+                  revision: u64|
+     -> Result<Vec<u64>, Box<dyn std::error::Error>> {
+        let top = gpu.scene.top;
+        let regions = [RenderRegion {
+            key: [0; 3],
+            geometry_revision: revision,
+            content_revision: revision,
+            mesh: mesh.into(),
+        }];
+        let mut published = false;
+        for frame in 0..64 {
+            let ready = gpu.stream_regions(RenderView {
+                generation: gpu.resource_generation,
+                regions: &regions,
+                anchor: [0.; 3],
+            })?;
+            let timing = gpu.scene_timing().unwrap();
+            assert!(timing.terrain_upload_bytes <= 32);
+            if ready {
+                assert!(frame > 0);
+                published = true;
+                break;
+            }
+            assert!(timing.upload_pending);
+            assert_eq!(gpu.scene.top, top);
+            if frame == 0 {
+                host.render_environment(gpu, &output, &camera(), Environment::default())?;
+            }
+        }
+        assert!(published);
+        host.render_environment(gpu, &output, &camera(), Environment::default())?;
+        gpu.complete_previous()?;
+        let range = gpu.region_cache.entries()[0].range.clone();
+        let mut result = vec![0u64; range.len()];
+        gpu.scene.tokens.read(
+            &mut gpu.context,
+            u64::from(range.start) * 8,
+            bytemuck::cast_slice_mut(&mut result),
+        )?;
+        let positions = gpu.region_cache.entries()[0].resident.positions();
+        Ok((0..result.len())
+            .map(|i| result[positions.physical(i).unwrap()])
+            .collect())
+    };
+    let probe = |gpu: &mut Gpu| -> Result<[[u32; 4]; 2], Error> {
+        let (mut bindings, _) = gpu.renderer_bindings(
+            gpu.view.as_ref().unwrap(),
+            &gpu.atlas,
+            &gpu.scene,
+            gpu.material_gpu,
+            gpu.lighting_gpu,
+        );
+        let read = Buffer::new(&mut gpu.context, 32, true)?;
+        bindings.push(Binding::StorageBuffer(read));
+        let bindings = Bindings::new(&mut gpu.context, &bindings)?;
+        let pipe = ComputePipeline::new(
+            &mut gpu.context,
+            bindings,
+            shader(
+                include_bytes!(concat!(env!("OUT_DIR"), "/triangle_identity_probe.spv")),
+                c"triangle_identity_probe_main",
+            ),
+        )?;
+        let mut cmds = Commands::new(&gpu.context)?;
+        cmds.dispatch(pipe, [1; 3])?;
+        cmds.finish(&mut gpu.context)?
+            .submit_and_wait(&mut gpu.context)?;
+        let mut words = [[0; 4]; 2];
+        read.read(&mut gpu.context, 0, bytemuck::cast_slice_mut(&mut words))?;
+        Ok(words)
+    };
+    let old = upload(&mut gpu, &mesh, 1)?;
+    let hits = probe(&mut gpu)?;
+    assert_eq!(hits[0][3], 1);
+    assert_eq!(hits[1][3], 1);
+    assert_eq!(&hits[0][..2], &hits[1][..2]);
+    assert_ne!(hits[0][2], hits[1][2]);
+    mesh.quads.reverse();
+    mesh.quads[3] = make(42);
+    let new = upload(&mut gpu, &mesh, 2)?;
+    assert_eq!(hits, probe(&mut gpu)?);
+    for (i, &id) in new.iter().enumerate() {
+        if i == 3 {
+            assert!(!old.contains(&id));
+        } else {
+            assert_eq!(id, old[old.len() - 1 - i]);
+        }
+    }
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
 }
 
 #[test]
@@ -174,14 +546,14 @@ fn hardware_pt_guide_source_reload_replaces_the_executed_program()
     assert_eq!(pt, generation.code[0]);
     let guide = generation.guide_regular.unwrap();
     let view = View::new(&mut gpu.context, [32, 32], true)?;
-    let (trace, _) = gpu.renderer_bindings(
+    let descriptors = gpu.renderer_bindings(
         &view,
         &gpu.atlas,
         &gpu.scene,
         gpu.material_gpu,
         gpu.lighting_gpu,
     );
-    let bindings = Bindings::new(&mut gpu.context, &trace)?;
+    let (bindings, _) = gpu.allocate_bindings(descriptors)?;
     let guide = guide.rebind(&mut gpu.context, bindings)?;
     let mut commands = Commands::new(&gpu.context)?;
     commands.trace(guide, [32, 32])?;
@@ -643,7 +1015,7 @@ fn hardware_pt_incremental_attributes_keep_storage_and_tlas()
     let storage = gpu.scene.quads;
     let top = gpu.scene.top;
     let blas = gpu.region_cache.entries()[0].blas;
-    let initial_bytes = gpu.scene_timing().unwrap().attribute_upload_bytes;
+    let initial_bytes = gpu.scene_timing().unwrap().terrain_upload_bytes;
     mesh.quads[0].set_tint([0.2, 0.8, 0.4]);
     submit(&mut gpu, &mesh, 2, [0.; 3])?;
     assert_eq!(gpu.scene.quads, storage);
@@ -651,7 +1023,7 @@ fn hardware_pt_incremental_attributes_keep_storage_and_tlas()
     assert_eq!(gpu.region_cache.entries()[0].blas, blas);
     let timing = gpu.scene_timing().unwrap();
     assert_eq!(timing.attribute_upload_bytes, 96);
-    assert!(timing.attribute_upload_bytes < initial_bytes);
+    assert!(timing.terrain_upload_bytes < initial_bytes);
     assert_eq!(timing.tlas_ns, 0);
     assert_eq!(timing.dirty_regions, 0);
     submit(&mut gpu, &mesh, 2, [0.; 3])?;
@@ -713,10 +1085,20 @@ fn hardware_pt_attribute_growth_keeps_existing_gpu_bytes() -> Result<(), Box<dyn
     let mut after = [0u8; 96];
     gpu.scene.quads.read(&mut gpu.context, offset, &mut after)?;
     assert_eq!(after, before);
-    assert_eq!(
-        gpu.scene_timing().unwrap().attribute_upload_bytes,
-        4096 * 48 + 8
-    );
+    // 两条实例目录记录经过主机，新增面的属性由压紧几何在 GPU 生成。
+    let update = gpu.scene_timing().unwrap();
+    assert_eq!(update.attribute_upload_bytes, 8);
+    assert!(update.batch.input_bytes >= 4096 * 8);
+    let added = u64::from(gpu.region_cache.entries()[1].range.start) * 48;
+    let mut first = [0; 48];
+    gpu.scene.quads.read(&mut gpu.context, added, &mut first)?;
+    let original = gpu.region_cache.entries()[0]
+        .resident
+        .positions()
+        .physical(0)
+        .unwrap()
+        * 48;
+    assert_eq!(first[..], before[original..original + 48]);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -806,6 +1188,8 @@ fn hardware_pt_block_ev_doubles_visible_and_sampled_emission()
     host.render_options(&mut gpu, &image, &camera(), environment, options)?;
     let baseline = accumulated_rgb(&mut gpu)?;
     gpu.set_lighting_options(0., 1.)?;
+    // EV 不重置生产绝对样本身份；线性倍率对照须显式复用同一组随机样本。
+    gpu.test_restart_sample_sequence(0)?;
     host.render_options(&mut gpu, &image, &camera(), environment, options)?;
     let brighter = accumulated_rgb(&mut gpu)?;
     assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 4);
@@ -930,6 +1314,7 @@ fn hardware_pt_static_emission_alias_and_dynamic_area_match_reverse_pdf()
             },
             auxiliary: &[128, 128, 0, 85, 128, 128, 0, 85],
             emission_alias_words: if static_alias { &words } else { &[] },
+            opacity_quads: &[],
             light_areas: &[[u32::MAX, 0, 0, 0]; 2],
         })?;
         publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
@@ -1024,10 +1409,10 @@ fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
     mesh.quads[1] =
         Quad::with_material(quad.positions(), quad.uv(), quad.tint(), MaterialId::new(0));
     publish(&mut gpu, &mesh, 1, 2, [0.; 3])?;
-    assert_eq!(gpu.lighting_gpu.roots(), lighting.roots());
+    assert_eq!(gpu.lighting_gpu.roots()[1..], lighting.roots()[1..]);
     mesh.quads.push(quad);
     publish(&mut gpu, &mesh, 2, 3, [0.; 3])?;
-    assert_eq!(gpu.lighting_gpu.roots(), lighting.roots());
+    assert_eq!(gpu.lighting_gpu.roots()[1..], lighting.roots()[1..]);
     let mut bytes = vec![0; lighting.alias.len() as usize];
     lighting.alias.read(&mut gpu.context, 0, &mut bytes)?;
     let selectors: Vec<u32> = bytes
@@ -1048,8 +1433,62 @@ fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
         quad.material_id(),
     );
     publish(&mut gpu, &mesh, 3, 4, [0.; 3])?;
-    assert_eq!(gpu.lighting_gpu.roots(), lighting.roots());
+    assert_eq!(gpu.lighting_gpu.roots()[1..], lighting.roots()[1..]);
     assert_light_pdfs(&host, &mut gpu, &image, "one_emitter_moved")?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；多组灯跨越 64 项排序块时，空间重排仍能按原 rank 反查"]
+fn hardware_pt_spatial_light_merge_keeps_inverse_paths() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    let image = image(&mut gpu)?;
+    let lamp = MaterialDefinition {
+        emission: [1., 1., 1., 20.],
+        ..Default::default()
+    };
+    upload(&mut gpu, &[lamp], &[], &[[u32::MAX, 0, 0, 0]])?;
+    let prototype = scene().quads[1];
+    let count = 149usize;
+    let mesh = Mesh {
+        quads: (0..count)
+            .map(|i| {
+                let x = (i * 71 % count) as f32 * 0.125;
+                Quad::with_material(
+                    prototype.positions().map(|p| [p[0] + x, p[1], p[2]]),
+                    prototype.uv(),
+                    prototype.tint(),
+                    MaterialId::new(0),
+                )
+            })
+            .collect(),
+    };
+    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    assert_light_pdfs(&host, &mut gpu, &image, "149_spatial_leaves")?;
+    let buffer = gpu.lighting_gpu.tree;
+    let readback = Buffer::new(&mut gpu.context, buffer.len(), true)?;
+    buffer.copy_prefix_to(&mut gpu.context, &readback, buffer.len())?;
+    let mut words = vec![0u32; buffer.len() as usize / 4];
+    readback.read(&mut gpu.context, 0, bytemuck::cast_slice_mut(&mut words))?;
+    let leaves = ((count - 1) * 10).next_multiple_of(8);
+    let mut ordered = Vec::new();
+    for rank in 0..count {
+        let leaf = &words[leaves + 8 * rank..];
+        let encoded = leaf[7];
+        let depth = encoded >> 27;
+        let path = (encoded & ((1 << 27) - 1)).reverse_bits();
+        assert!((7..=8).contains(&depth));
+        ordered.push((path, f32::from_bits(leaf[0])));
+    }
+    ordered.sort_unstable_by_key(|p| p.0);
+    assert!(
+        ordered
+            .windows(2)
+            .all(|p| p[0].0 < p[1].0 && p[0].1 < p[1].1)
+    );
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
@@ -1137,6 +1576,7 @@ fn hardware_pt_region_material_change_restores_cutout_coverage()
         mers: &[0, 0, 242, 0],
         auxiliary: &[128, 128, 0, 85],
         emission_alias_words: &[],
+        opacity_quads: &[],
         light_areas: &[[u32::MAX, 0, 0, 0]; 3],
     })?;
     let quad = |z, material| {
@@ -1154,11 +1594,11 @@ fn hardware_pt_region_material_change_restores_cutout_coverage()
         sun_direction: [0.; 3],
         ..Default::default()
     };
-    publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
+    publish_stream(&mut gpu, &mesh, 1, 1, [0.; 3])?;
     assert!(gpu.region_cache.entries()[0].opaque);
     let before = host.render_environment(&mut gpu, &image, &camera(), environment)?;
     mesh.quads[0] = quad(4., 2);
-    publish(&mut gpu, &mesh, 1, 2, [0.; 3])?;
+    publish_stream(&mut gpu, &mesh, 1, 2, [0.; 3])?;
     assert!(!gpu.region_cache.entries()[0].opaque);
     let after = host.render_environment(&mut gpu, &image, &camera(), environment)?;
     assert!(u16::from(center(&before)[0]) > u16::from(center(&before)[1]) + 20);
@@ -1196,6 +1636,7 @@ fn hardware_pt_grass_overlay_selects_tinted_grass_and_untinted_dirt()
         mers: &[0, 0, 242, 0].repeat(4),
         auxiliary: &[128, 128, 0, 85].repeat(4),
         emission_alias_words: &[],
+        opacity_quads: &[],
         light_areas: &[[u32::MAX, 0, 0, 0]],
     })?;
     let mesh = Mesh {
@@ -1377,4 +1818,150 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
     }
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
+}
+
+#[test]
+#[ignore = "原生 Vulkan 精确二值 OMM；主查询和阴影对照软件覆盖，不启动 Minecraft"]
+fn hardware_pt_exact_opacity_matches_software_and_rebinds_uv()
+-> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_ser()?;
+    if !host.opacity_micromap {
+        return Err("设备缺少 KHR OMM，不能计为通过".into());
+    }
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    gpu.experiment_dispatch = 8;
+    let mut cutout = MaterialDefinition::default();
+    cutout.control[2] = MaterialDefinition::CUTOUT;
+    let mut front = cutout;
+    front.control[2] |= MaterialDefinition::FRONT_ONLY;
+    let definitions = [cutout, front];
+    let normal = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
+    let rotated = [[1., 0.], [1., 1.], [0., 1.], [0., 0.]];
+    let shifted = [[0.01, 0.], [1., 0.], [1., 1.], [0.01, 1.]];
+    let mut mesh = Mesh::default();
+    let mut prototypes = Vec::new();
+    for (index, uv) in [normal, rotated, shifted, normal].into_iter().enumerate() {
+        let x = index as f32 * 3.;
+        let material = if index == 3 { 1 } else { 0 };
+        prototypes.push(simple_engine::opacity::Quad { material, uv });
+        mesh.quads.push(Quad::with_material(
+            [
+                [x - 1., -1., 1.],
+                [x + 1., -1., 1.],
+                [x + 1., 1., 1.],
+                [x - 1., 1., 1.],
+            ],
+            uv,
+            [1.; 3],
+            MaterialId::new(material),
+        ));
+    }
+    let mut reference = None;
+    for enabled in [false, true] {
+        gpu.replace_resources(ResourceUpload {
+            generation: gpu.resource_generation + 1,
+            extent: [2, 2],
+            albedo: &[
+                255, 255, 255, 127, 255, 255, 255, 128, 255, 255, 255, 255, 255, 255, 255, 0,
+            ],
+            materials: &definitions,
+            mers: &[0; 16],
+            auxiliary: &[128; 16],
+            emission_alias_words: &[],
+            light_areas: &[[u32::MAX, 0, 0, 0]; 2],
+            opacity_quads: if enabled { &prototypes } else { &[] },
+        })?;
+        assert_eq!(gpu.opacity.map.is_some(), enabled);
+        publish(gpu, &mesh, 1, 1, [0.; 3])?;
+        let actual = opacity_probe(gpu)?;
+        assert_eq!(&actual[..64], &actual[64..]);
+        assert!(actual.contains(&0) && actual.contains(&1));
+        if let Some(expected) = &reference {
+            assert_eq!(&actual, expected);
+        } else {
+            reference = Some(actual);
+        }
+    }
+    let old = gpu.region_cache.entries()[0].blas;
+    let positions = mesh.quads[0].positions();
+    mesh.quads[0] = Quad::with_material(positions, rotated, [1.; 3], MaterialId::new(0));
+    publish(gpu, &mesh, 1, 2, [0.; 3])?;
+    assert_ne!(gpu.region_cache.entries()[0].blas, old);
+    let changed = opacity_probe(gpu)?;
+    assert_ne!(&changed[..16], &reference.as_ref().unwrap()[..16]);
+    assert_eq!(&changed[..64], &changed[64..]);
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+fn opacity_probe(gpu: &mut Gpu) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let output = Buffer::new(&mut gpu.context, 128 * 4, true)?;
+    let mut descriptors = vec![
+        Binding::Acceleration(gpu.scene.top),
+        Binding::StorageBuffer(gpu.scene.quads),
+        Binding::SampledImage(gpu.atlas),
+        Binding::Sampler(gpu.nearest),
+        Binding::StorageBuffer(output),
+    ];
+    descriptors.resize(27, Binding::StorageBuffer(output));
+    descriptors.extend([
+        Binding::StorageBuffer(gpu.material_gpu.table),
+        Binding::SampledImage(gpu.material_gpu.mers),
+        Binding::SampledImage(gpu.material_gpu.auxiliary),
+    ]);
+    descriptors.resize(36, Binding::StorageBuffer(output));
+    descriptors.push(Binding::StorageBuffer(gpu.scene.instance_quad_bases));
+    let bindings = Bindings::new(&mut gpu.context, &descriptors)?;
+    let source = gpu.shader_source.with_file_name("opacity_test.slang");
+    let compile = |entry, stage| {
+        gpu.compiler.compile(&shader_build::Recipe {
+            source: source.to_str().unwrap(),
+            entry,
+            stage,
+            output: "opacity-test.spv",
+            target: shader_build::Target::Spirv("spirv_1_4"),
+            args: &[],
+        })
+    };
+    let trace = compile("trace_main", "raygeneration")?;
+    let query = compile("query_main", "compute")?;
+    let programs = programs(&[], false, gpu.generation.as_ref().unwrap().hit);
+    let trace = RayTracingPipeline::new(
+        &mut gpu.context,
+        bindings,
+        [
+            RayShader {
+                spirv: trace.bytes(),
+                entry: c"trace_main",
+            },
+            programs.miss,
+            programs.closest_hit,
+        ],
+        programs.any_hit,
+        &[],
+    )?;
+    let query = ComputePipeline::new(
+        &mut gpu.context,
+        bindings,
+        RayShader {
+            spirv: query.bytes(),
+            entry: c"query_main",
+        },
+    )?;
+    let mut commands = Commands::new(&gpu.context)?;
+    commands.trace(trace, [64, 1])?;
+    commands.barrier();
+    commands.dispatch(query, [1, 1, 1])?;
+    commands.barrier();
+    commands
+        .finish(&mut gpu.context)?
+        .submit_and_wait(&mut gpu.context)?;
+    let mut bytes = vec![0u8; 128 * 4];
+    output.read(&mut gpu.context, 0, &mut bytes)?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
+        .collect())
 }

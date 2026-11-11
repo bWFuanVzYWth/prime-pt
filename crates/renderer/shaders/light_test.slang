@@ -8,7 +8,7 @@ import pt.light_sampling;
 import geometry.ray;
 
 /// 每lane输出[forward_pdf,reverse_pdf,真实发光BT.709亮度,有效样本]；仅测试额外binding。
-[[vk::binding(37, 0)]]
+[[vk::binding(39, 0)]]
 RWStructuredBuffer<float4> probes;
 
 [shader("compute")]
@@ -17,6 +17,27 @@ void region_primitive_probe_main()
 {
     probes[0] = asfloat(uint4(region_primitive(0u, 0u), region_primitive(0u, 1u),
                               region_primitive(1u, 0u), region_primitive(1u, 3u)));
+}
+
+[shader("compute")]
+[numthreads(2, 1, 1)]
+void triangle_identity_probe_main(uint3 lane: SV_DispatchThreadID)
+{
+    float2 xy = lane.x == 0 ? float2(0.25, 0.75) : float2(0.75, 0.25);
+    RayDesc ray = { float3(xy, 2), 0.0, float3(0, 0, -1), 4.0 };
+    RayQuery<RAY_FLAG_FORCE_OPAQUE> query;
+    query.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
+    while (query.Proceed())
+    {
+    }
+    uint4 value = 0;
+    if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)
+    {
+        uint primitive =
+            region_primitive(query.CommittedInstanceID(), query.CommittedPrimitiveIndex());
+        value = uint4(stable_triangle(primitive), 1u);
+    }
+    probes[lane.x] = asfloat(value);
 }
 
 [shader("compute")]
@@ -39,9 +60,7 @@ void light_probe_main(uint3 id: SV_DispatchThreadID)
     uint index = sample.emission_reference;
     uint flags = asuint(sample.emission.z);
     pt::QuadAreaSample area = { flags & 1u, sample.emission.xy, 0 };
-    uint start = index * 3u;
-    pt::LightQuadVertices vertices = pt::light_quad_vertices(
-        light_vertices[start], light_vertices[start + 1u], light_vertices[start + 2u]);
+    pt::LightQuadVertices vertices = emitter_vertices(index);
     float3 translation = float3(light_regions[index].xyz - p.anchor_region.xyz) * 64.0;
     float3x4 transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);

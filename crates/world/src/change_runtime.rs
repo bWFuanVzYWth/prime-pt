@@ -330,7 +330,7 @@ impl Scene {
             self.refresh_job_projection(index);
         } else {
             self.mark_fragments(handle, mask, FragmentMask::empty());
-            self.reject_handle(handle)?;
+            self.revoke_upsert(handle)?;
             self.recover_candidate(handle)?;
             self.state.invalidate(handle)?;
             if interactive {
@@ -356,25 +356,6 @@ impl Scene {
             assert!(previous.is_none(), "一个节点最多一份未发布所有者");
             self.refresh_ledger(handle);
         }
-        Ok(())
-    }
-
-    pub(super) fn reject_handle(&mut self, handle: Handle) -> Result<(), Error> {
-        let Some(value) = self.state.chunk(handle) else {
-            return Ok(());
-        };
-        let mut index = 0;
-        while index < self.pending.len() {
-            let matched = matches!(self.pending[index].change, Change::Activate(key) | Change::Replace(key) | Change::Remove(key) if key == value);
-            if matched {
-                let patch = self.pending.swap_remove(index);
-                self.reject_token(patch)?;
-            } else {
-                index += 1;
-            }
-        }
-        self.view_changes.clear();
-        self.view_len = self.view.len();
         Ok(())
     }
 
@@ -488,7 +469,7 @@ impl Scene {
             if mask.is_empty() {
                 return Ok(());
             }
-            self.reject_handle(handle)?;
+            self.revoke_upsert(handle)?;
             self.recover_candidate(handle)?;
             self.mark_fragments(handle, FragmentMask::empty(), mask);
             self.state.invalidate(handle)?;

@@ -450,6 +450,8 @@ dependencies = [
 name = "light_sampling"
 version = "0.1.0"
 dependencies = [
+ "light_bvh",
+ "scene_cache",
  "thiserror",
 ]
 
@@ -616,6 +618,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "opacity"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "openpbr"
 version = "0.1.0"
 dependencies = [
@@ -732,6 +741,7 @@ dependencies = [
  "bytemuck",
  "prime_scene",
  "prime_world",
+ "rayon",
  "serde_json",
  "simple_engine",
  "thiserror",
@@ -949,8 +959,8 @@ dependencies = [
  "camera",
  "chunk_manager",
  "frame_loop",
- "light_bvh",
  "light_sampling",
+ "opacity",
  "openpbr",
  "pt",
  "scene_cache",
@@ -1134,9 +1144,12 @@ dependencies = [
  "ash 0.38.0+1.3.281",
  "ash 0.38.0+1.4.352",
  "blake3",
+ "bytemuck",
  "cc",
  "log",
  "pollster",
+ "scene_cache",
+ "shader_build",
  "thiserror",
  "vstd",
  "wgpu",

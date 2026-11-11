@@ -1,5 +1,9 @@
 /// 缓存首表面的材质专用输运；EXT不能MakeHit，因而使用callable，后续反弹仍走hit group。
 module primary_material;
+#include "geometry/opacity.slang"
+#ifndef PRIMEPT_OMM
+#define PRIMEPT_OMM 0
+#endif
 import primary_cache;
 import known_geometry;
 import mod_decode;
@@ -12,6 +16,9 @@ import params;
 [shader("callable")]
 void shade_primary(inout pt::MaterialCall call)
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(shade_primary)
+#endif
     call.initializePrimary(parameters[0].initial_medium);
     uint pixel = primary_pixel();
     pt::Hit hit = {};

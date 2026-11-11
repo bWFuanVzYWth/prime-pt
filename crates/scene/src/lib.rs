@@ -193,11 +193,9 @@ const fn float_words(values: [f32; 4]) -> [u32; 4] {
 /// 固定两片 012/023；允许任意朝向、非共面和非平行四边形。三角面以 `[A,B,C,C]`
 /// 表示，并复制第四角全部属性；AS 始终保留两输入槽，使 primitive>>1 直接寻址。
 /// tint 为 quad 共享的未照明 sRGB；不支持逐顶点颜色、smooth normal 或第二组 UV。
-/// 这些能力需要明确扩展格式，不能从 quad 假设推导。位置和 UV 保留全部 FP32 位值；
-/// 不重建第四点，不使用体素坐标或隐式轴向。material 是真实预设选择，不作为对齐填充。
-/// 主查询强制 KHR position fetch，通过 AS 获取实际三角位置。首视线缓存
-/// 另持有局部四角和 region 键，其独立工作集见渲染 crate。48B 属性记录以 primitive>>1
-/// 直接寻址；AS 构建临时输入不属于此常驻属性预算。
+/// 位置和 UV 保留完整 FP32 语义。传输边界只对可以无损还原的坐标和矩形使用紧凑格式。
+/// GPU 将每个面的四角连续写入共用顶点列，供 AS、已知首命中和发光面使用。
+/// 48B 着色属性独立存放，由区域基址加 primitive>>1 直接寻址。
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
 pub struct Quad {
@@ -352,10 +350,10 @@ impl Quad {
     }
 }
 
-/// 所有 section 的连续 quad；无 shader 索引表，AS 展开临时数据由构建边界持有。
+/// 各 section 的连续源 quad，构建边界负责打包并在 GPU 上安排物理顺序。
 #[derive(Default)]
 pub struct Mesh {
-    /// 源 quad 顺序保持到 GPU primitive 身份，不删除退化半面。
+    /// 源序用于局部补丁。每个面保留两片，包括退化半面；跨帧对应使用驻留身份。
     pub quads: Vec<Quad>,
 }
 

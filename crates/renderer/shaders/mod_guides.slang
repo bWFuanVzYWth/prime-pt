@@ -6,6 +6,7 @@ import pt.denoise;
 import pt.integrator;
 import pt.reconstruction;
 import pt.key_guides;
+import pt.guide_output;
 import pt.hit_transport;
 import geometry.camera;
 
@@ -68,30 +69,23 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
     public pt::DenoiseCamera current;
     public pt::DenoiseCamera previous;
 
+    pt::GuideImages images()
+    {
+        return { guide_depth,    guide_motion,   guide_normal,         guide_diffuse,
+                 guide_specular, guide_distance, guide_specular_motion };
+    }
+    pt::GuideFrame frame()
+    {
+        Params p = parameters[0];
+        return { current, previous, p.image.xy, p.options.y, p.reconstruction.z > 0 };
+    }
+
     public void write_key<Trace : pt::IKeyGuideTrace>(Trace provider, pt::KeyGuideVertex first,
                                                       float3 origin, float3 direction,
                                                       float4 incident, bool deltaOnly = false)
     {
-        Params p = parameters[0];
-        pt::KeyGuideEndpoint endpoint = pt::trace_key_guide(
-            provider, first, origin, direction, incident, p.options.y, false, deltaOnly);
-        pt::GuideProjection projection = pt::project_guide(
-            endpoint.endpoint, current, previous, film, p.image.xy, p.reconstruction.z > 0);
-        pt::DenoiseGuides albedos = endpoint.albedos;
-        guide_depth[coordinate] = projection.depth;
-        guide_motion[coordinate] = projection.motion;
-        guide_normal[coordinate] = float4(projection.normal, albedos.normal_roughness.w);
-        guide_diffuse[coordinate] = float4(albedos.diffuse_albedo, 0);
-        guide_specular[coordinate] = float4(albedos.specular_albedo, 0);
-
-        pt::KeyGuideEndpoint reflection = pt::trace_key_guide(
-            provider, first, origin, direction, incident, p.options.y, true, deltaOnly);
-        pt::GuideProjection reflected = pt::project_guide(reflection.endpoint, current, previous,
-                                                          film, p.image.xy, p.reconstruction.z > 0);
-        guide_distance[coordinate] =
-            (reflection.endpoint.flags & pt::GUIDE_SKY) != 0 ? 0 : reflection.endpoint.distance;
-        guide_specular_motion[coordinate] =
-            (reflected.flags & pt::GUIDE_INVALID) != 0 ? projection.motion : reflected.motion;
+        pt::write_key_guides(provider, images(), frame(), coordinate, film, first, origin,
+                             direction, incident, deltaOnly);
     }
 
     public void surface_hit(HitObject found, pt::TransportCall data)
@@ -112,25 +106,7 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
     // mode0参考与未启用EXT的兼容PT保留旧导引；HG/PT不经此通用翻译路径。
     public void surface(pt::TransportCall data)
     {
-        ModScene provider;
-        Params p = parameters[0];
-        pt::GuideEndpoint endpoint = pt::trace_guide(provider, data, p.options.y);
-        pt::GuideProjection projection = pt::project_guide(endpoint, current, previous, film,
-                                                           p.image.xy, p.reconstruction.z > 0);
-        pt::DenoiseGuides guides = pt::guide_albedos(provider.energy(), endpoint);
-        guide_depth[coordinate] = projection.depth;
-        guide_motion[coordinate] = projection.motion;
-        guide_normal[coordinate] = float4(projection.normal, guides.normal_roughness.w);
-        guide_diffuse[coordinate] = float4(guides.diffuse_albedo, 0);
-        guide_specular[coordinate] = float4(guides.specular_albedo, 0);
-
-        pt::GuideEndpoint reflection = pt::trace_reflection_guide(provider, data, p.options.y);
-        pt::GuideProjection reflected = pt::project_guide(reflection, current, previous, film,
-                                                          p.image.xy, p.reconstruction.z > 0);
-        guide_distance[coordinate] =
-            (reflection.flags & pt::GUIDE_SKY) != 0 ? 0 : reflection.distance;
-        guide_specular_motion[coordinate] =
-            (reflected.flags & pt::GUIDE_INVALID) != 0 ? projection.motion : reflected.motion;
+        pt::write_surface_guides(ModScene(), images(), frame(), coordinate, film, data);
     }
 
     public void environment(pt::TransportCall data)
@@ -140,17 +116,6 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
 
     public void sky(float3 direction)
     {
-        guide_depth[coordinate] = pt::DENOISE_SKY_DEPTH;
-        float2 pixels = 0;
-        if (parameters[0].reconstruction.z > 0 &&
-            (!pt::denoise_motion(previous, film, direction, true, parameters[0].image.xy, pixels) ||
-             any(abs(pixels) > 65504)))
-            pixels = 0;
-        guide_motion[coordinate] = pixels;
-        guide_normal[coordinate] = float4(0, 0, 0, 1);
-        guide_diffuse[coordinate] = float4(0.5, 0.5, 0.5, 0);
-        guide_specular[coordinate] = float4(0.5, 0.5, 0.5, 0);
-        guide_distance[coordinate] = 0;
-        guide_specular_motion[coordinate] = pixels;
+        pt::write_sky_guide(images(), frame(), coordinate, film, direction, 0);
     }
 };

@@ -95,6 +95,7 @@ fn hardware_pt_rr_stationary_partial_updates() -> Result<(), Box<dyn std::error:
         mers: &[0; 8],
         auxiliary: &[0; 8],
         emission_alias_words: &[],
+        opacity_quads: &[],
         light_areas: &[[u32::MAX, 0, 0, 0]; 2],
     })?;
     gpu.set_rendering(RenderMode::Realtime)?;

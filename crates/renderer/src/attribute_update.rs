@@ -3,6 +3,70 @@ use super::{Error, Gpu, SceneUpdateTiming, elapsed_ns};
 use prime_scene::RenderChange;
 use simple_engine::{scene_cache, vulkan};
 
+/// 连续逻辑片段按创建 BLAS 时的局部顺序写回，完整 tile 形成一段物理写入。
+pub(super) fn pack_patch(
+    entry: &super::RegionGpu,
+    first: usize,
+    values: impl ExactSizeIterator<Item = [[u32; 4]; 3]>,
+    out: &mut Vec<[[u32; 4]; 3]>,
+    ranges: &mut Vec<(usize, std::ops::Range<usize>)>,
+) -> Result<(), Error> {
+    pack_physical(
+        entry.resident.positions(),
+        &entry.range,
+        first,
+        values,
+        out,
+        ranges,
+    )
+}
+pub(super) fn pack_physical(
+    positions: &scene_cache::PackedQuads,
+    slots: &std::ops::Range<u32>,
+    first: usize,
+    values: impl ExactSizeIterator<Item = [[u32; 4]; 3]>,
+    out: &mut Vec<[[u32; 4]; 3]>,
+    ranges: &mut Vec<(usize, std::ops::Range<usize>)>,
+) -> Result<(), Error> {
+    let mut values = values;
+    let end = first
+        .checked_add(values.len())
+        .filter(|&e| e <= slots.len())
+        .ok_or(Error::Invalid("属性补丁越界"))?;
+    out.try_reserve(values.len())
+        .map_err(scene_cache::Error::from)?;
+    let mut at = first;
+    while at < end {
+        let block = at / 64;
+        let next = end.min((block + 1) * 64);
+        let mut scratch = [[[0; 4]; 3]; 64];
+        for i in at..next {
+            scratch[i % 64] = values.next().expect("补丁输入已确认长度");
+        }
+        let order = positions.block_order(block);
+        for (physical, &lane) in order.iter().enumerate() {
+            let lane = usize::from(lane);
+            if lane < at % 64 || lane >= next - block * 64 {
+                continue;
+            }
+            let dest = (slots.start as usize + block * 64 + physical) * 48;
+            let start = out.len();
+            out.push(scratch[lane]);
+            if let Some((old, range)) = ranges.last_mut()
+                && *old + range.len() * 48 == dest
+                && range.end == start
+            {
+                range.end += 1;
+            } else {
+                ranges.try_reserve(1).map_err(scene_cache::Error::from)?;
+                ranges.push((dest, start..start + 1));
+            }
+        }
+        at = next;
+    }
+    Ok(())
+}
+
 impl Gpu {
     /// 尝试共同发布有序唯一的纯tint变化与其内容版本。
     ///
@@ -18,6 +82,9 @@ impl Gpu {
         changes: &[RenderChange<'_>],
     ) -> Result<bool, Error> {
         self.scene_update = None;
+        if self.terrain_pending() {
+            return Ok(false);
+        }
         if generation != self.resource_generation {
             return Err(Error::Invalid("属性变化与材质资源世代不匹配"));
         }
@@ -32,6 +99,21 @@ impl Gpu {
             return Err(Error::Invalid("属性变化须按region有序唯一"));
         }
         if anchor != self.anchor || self.scene_resources_dirty() {
+            return Ok(false);
+        }
+        // 在写入打包前核算整个批，避免超额的纯 tint 在两个入口各打包一次。
+        let bytes = changes.iter().try_fold(0usize, |n, change| {
+            let RenderChange::Upsert(r) = change else {
+                return None;
+            };
+            if !r.mesh.attribute_only() {
+                return None;
+            }
+            r.mesh
+                .attribute_ranges()
+                .try_fold(n, |n, p| n.checked_add(p.quads.len().checked_mul(48)?))
+        });
+        if bytes.is_none_or(|v| v > self.terrain_uploads.limit().min(256 * 48)) {
             return Ok(false);
         }
         let started = std::time::Instant::now();
@@ -87,16 +169,13 @@ impl Gpu {
                 return Ok(false);
             }
             for patch in region.mesh.attribute_ranges() {
-                attributes
-                    .try_reserve(patch.quads.len())
-                    .map_err(scene_cache::Error::from)?;
-                ranges.try_reserve(1).map_err(scene_cache::Error::from)?;
-                let first = attributes.len();
-                attributes.extend(patch.attributes());
-                ranges.push((
-                    (old.range.start as usize + patch.first) * 48,
-                    first..attributes.len(),
-                ));
+                pack_patch(
+                    old,
+                    patch.first,
+                    patch.attributes(),
+                    &mut attributes,
+                    &mut ranges,
+                )?;
             }
             versions.push((stamp, region.content_revision));
             ack_changes
@@ -116,6 +195,11 @@ impl Gpu {
             .iter()
             .map(|(offset, range)| (*offset, bytemuck::cast_slice(&attributes[range.clone()])))
             .collect();
+        if self.terrain_uploads.pending()
+            || attributes.len().saturating_mul(48) > self.terrain_uploads.limit()
+        {
+            return Ok(false);
+        }
         self.complete_previous()?;
         let ack = self.lighting.prepare_attribute_ack(&ack_changes)?;
         if !writes.is_empty() {
@@ -126,6 +210,7 @@ impl Gpu {
             )?;
             metrics.attribute_upload_ns = elapsed_ns(started);
             metrics.attribute_upload_bytes = (attributes.len() * 48) as u64;
+            metrics.terrain_upload_bytes = metrics.attribute_upload_bytes;
             metrics.resources_ns = metrics.attribute_upload_ns;
         }
         let started = std::time::Instant::now();

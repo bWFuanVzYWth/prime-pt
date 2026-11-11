@@ -384,6 +384,15 @@ fn retint_does_not_apply_published_spans_to_an_untinted_replacement() -> Result<
 
 #[test]
 fn returning_to_a_pending_unload_keeps_cover_and_applies_new_tint() -> Result<(), Error> {
+    check_returning_unload(false)
+}
+
+#[test]
+fn returning_to_a_parked_unload_unlocks_the_region_before_capture() -> Result<(), Error> {
+    check_returning_unload(true)
+}
+
+fn check_returning_unload(park: bool) -> Result<(), Error> {
     let catalog = fixtures::catalog()?;
     let mut scene = Scene::with_threads(1)?;
     scene.source_generation(catalog.generation())?;
@@ -406,6 +415,10 @@ fn returning_to_a_pending_unload_keeps_cover_and_applies_new_tint() -> Result<()
         .iter()
         .find(|patch| patch.change == chunk_manager::Change::Remove(value))
         .expect("已签发旧覆盖的卸载");
+    if park {
+        assert!(scene.prepare()?);
+        scene.park_publication();
+    }
 
     scene.set_work_budget(crate::WorkBudget {
         publications: 0,
@@ -415,6 +428,10 @@ fn returning_to_a_pending_unload_keeps_cover_and_applies_new_tint() -> Result<()
     scene.plan(&away, 0, 0, 4, 0)?;
     scene.state.validate_patch(removal.token)?;
     scene.plan(&original, 0, 0, 4, 0)?;
+    assert_eq!(
+        scene.state.validate_patch(removal.token),
+        Err(chunk_manager::StateError::StalePatch)
+    );
     if scene.prepare()? {
         scene.commit()?;
     }

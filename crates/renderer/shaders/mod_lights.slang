@@ -5,7 +5,7 @@ module mod_lights;
 #define PRIMEPT_EMITTER_CAPABILITIES 7
 #endif
 import pt.scene;
-__exported import pt.light_proposal;
+__exported import pt.light_sampling;
 import geometry.ray;
 import params;
 import mod_materials;
@@ -14,10 +14,12 @@ import mod_materials;
 /// BVH按几何发布事务更新；纹理alias仍仅在资源准备阶段构建。
 [[vk::binding(30, 0)]]
 StructuredBuffer<uint4> light_alias;
+[[vk::binding(38, 0)]]
+StructuredBuffer<uint4> light_tree;
 /// 每灯[split,rho0,rho1,globalQuadSlot]。
 [[vk::binding(31, 0)]]
 public StructuredBuffer<uint4> light_meta;
-/// region-local四角，按light_sampling::pack_vertices编码，每灯三个float4。
+/// 与 BLAS 共读的四顶点列，发光目录只保存其 quad 槽。
 [[vk::binding(32, 0)]]
 public StructuredBuffer<float4> light_vertices;
 /// 首行[count,mask,1,0]，后续每桶[key=globalQuadSlot+1,dataSlot+1,0,0]。
@@ -30,6 +32,12 @@ public StructuredBuffer<int4> light_regions;
 [[vk::binding(35, 0)]]
 ByteAddressBuffer emission_alias_words;
 
+public pt::LightQuadVertices emitter_vertices(uint index)
+{
+    uint at = light_meta[index].w * 4u;
+    return { light_vertices[at].xyz, light_vertices[at + 1u].xyz, light_vertices[at + 2u].xyz,
+             light_vertices[at + 3u].xyz };
+}
 /// 本帧已发布的活动灯数；策略权重不依赖单次面积proposal的接受结果。
 public uint light_count()
 {
@@ -105,7 +113,7 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
         return result;
     int3 anchor = asint(light_alias[1].xyz);
     float3 receiver = point.position + float3(params.anchor_region.xyz - anchor) * 64.0;
-    pt::LightBvhProposal proposal = { light_alias, header.y, header.x };
+    pt::LightBvhProposal proposal = { light_tree, 0, header.x };
     pt::LightBvhSample selected = proposal.sample(receiver, sample.z);
     if (selected.pmf <= 0)
         return result;
@@ -113,38 +121,24 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
     uint4 meta = light_meta[index];
     uint primitive = meta.w * 2u;
     uint alias_offset = PublishedArea.alias_offset(primitive);
-    uint start = index * 3u;
-    pt::LightQuadVertices vertices = pt::light_quad_vertices(
-        light_vertices[start], light_vertices[start + 1u], light_vertices[start + 2u]);
+    pt::LightQuadVertices vertices = emitter_vertices(index);
     if (meta.x == 0xffffffffu)
         meta = pt::dynamic_quad_area(vertices);
     if (asfloat(meta.y) <= 0 && asfloat(meta.z) <= 0)
         return result;
     pt::LightSurfaceProposal emitter = { meta, alias_offset };
     pt::TexturedEmitterAlias distribution = { emission_alias_words };
-    pt::QuadAreaSample area = distribution.sample(emitter, sample.xy);
+    pt::QuadAreaSample area;
     float3 translation = float3(light_regions[index].xyz - params.anchor_region.xyz) * 64.0;
     float3x4 transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);
     float3x4 inverse =
         float3x4(1, 0, 0, -translation.x, 0, 1, 0, -translation.y, 0, 0, 1, -translation.z);
-    geometry::TriangleEndpoint target = pt::quad_endpoint(vertices, area, transform, inverse);
-    float3 delta = target.position - point.position;
-    float distance_squared = dot(delta, delta);
-    if (!(distance_squared > 0) || !isfinite(distance_squared))
-        return result;
-    result.direction = delta * rsqrt(distance_squared);
-    result.pdf = pt::quad_light_pdf(point.position, target.position, target.normal, area.density,
-                                    selected.pmf, uint(light_regions[index].w) & 3u);
-    if (result.pdf <= 0 || !geometry::connection_ray(point, target, result.visibility))
-    {
-        result.pdf = 0;
-        return result;
-    }
-    result.distance = sqrt(distance_squared);
-    bool front = dot(target.normal, -result.direction) >= 0;
-    // 此私有延迟参数仅由quad_light_emission解释，避免在遮挡之前读取发光贴图。
-    result.emission = float3(area.bary, asfloat(area.half | (uint(front) << 1u)));
+    result =
+        pt::sample_quad_emitter(distribution, emitter, vertices, point, sample.xy, selected.pmf,
+                                uint(light_regions[index].w) & 3u, transform, inverse, area);
+    // 遮挡确认后才按实际 bary 读取发光纹理。
+    result.emission = float3(area.bary, asfloat(area.half));
     result.emission_reference = index;
     return result;
 }
@@ -164,8 +158,7 @@ public float quad_emission_pdf<Area : IEmitterArea>(pt::Hit hit, float3 previous
     uint4 header = light_alias[0];
     int3 anchor = asint(light_alias[1].xyz);
     float3 receiver = previous + float3(anchor_region - anchor) * 64.0;
-    pt::LightBvhProposal proposal = { light_alias, header.y, header.x };
-    float pmf = proposal.pmf(receiver, uint(light_regions[index].w) >> 2u);
+    pt::LightBvhProposal proposal = { light_tree, 0, header.x };
     uint4 meta = light_meta[index];
     uint alias_offset = Area.alias_offset(hit.identity.x);
     float2 uv = 0;
@@ -179,14 +172,13 @@ public float quad_emission_pdf<Area : IEmitterArea>(pt::Hit hit, float3 previous
     {
         if (meta.x == 0xffffffffu)
         {
-            uint start = index * 3u;
-            meta = pt::dynamic_quad_area(pt::light_quad_vertices(
-                light_vertices[start], light_vertices[start + 1u], light_vertices[start + 2u]));
+            meta = pt::dynamic_quad_area(emitter_vertices(index));
         }
     }
     pt::LightSurfaceProposal emitter = { meta, alias_offset };
     pt::TexturedEmitterAlias distribution = { emission_alias_words };
-    float density = distribution.density(emitter, hit.identity.x & 1u, uv);
-    return pt::quad_light_pdf(previous, hit.surface.position, hit.surface.normal, density, pmf,
-                              uint(light_regions[index].w) & 3u);
+    return pt::quad_emitter_pdf(distribution, emitter, proposal, receiver,
+                                uint(light_regions[index].w) >> 2u, previous, hit.surface.position,
+                                hit.surface.normal, hit.identity.x & 1u, uv,
+                                uint(light_regions[index].w) & 3u);
 }

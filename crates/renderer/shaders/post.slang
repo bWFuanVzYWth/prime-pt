@@ -38,7 +38,8 @@ void post_main(uint3 id: SV_DispatchThreadID)
     uint count = sample_counts[pixel];
     float4 prefix = prefix_image[pixel];
     float3 radiance = prefix.xyz + tail.xyz;
-    if (tail.w >= 0 && prefix.w < pt::FAR && params.lighting.w > 0)
+    if (tail.w >= 0 && prefix.w < pt::FAR && params.lighting.w > 0 &&
+        all(params.initial_medium == float4(1, 0, 0, 0)))
     {
         pt::PathSampler sampler = pt::path_sampler(
             id.xy, params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u),
@@ -50,8 +51,8 @@ void post_main(uint3 id: SV_DispatchThreadID)
         atmosphere::AerialSample aerial =
             atmosphere::aerial_sample(aerial_light, aerial_transmittance, linear_sampler, film,
                                       prefix.w * 0.001, params.atmosphere_settings.w);
-        radiance = color::rec2020_to_bt709(aerial.radiance + color::bt709_to_rec2020(radiance) *
-                                                                 aerial.transmittance);
+        radiance = color::rec2020_to_bt709(
+            atmosphere::composite_aerial(aerial, color::bt709_to_rec2020(radiance)));
         if ((params.output_size.z & 8u) == 0)
             radiance = max(radiance, 0);
     }

@@ -49,6 +49,12 @@ public final class Bootstrap {
             new VulkanFeature(VulkanFeatureSets.VK12_FEATURES_STRUCT, "descriptorIndexing", VkPhysicalDeviceVulkan12Features.DESCRIPTORINDEXING),
             new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageExtendedFormats"),
             new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat"));
+    private static final String OMM_EXTENSION = "VK_KHR_opacity_micromap";
+    private static final VulkanFeature OMM_FEATURE = new VulkanFeature(
+            new VulkanPNextStruct(VkPhysicalDeviceOpacityMicromapFeaturesKHR.class),
+            "micromap", VkPhysicalDeviceOpacityMicromapFeaturesKHR.MICROMAP);
+    private static long ommPhysical;
+    private static long ommDevice;
     private static final String SER_EXTENSION = "VK_EXT_ray_tracing_invocation_reorder";
     private static final String CHECKPOINT_EXTENSION = "VK_NV_device_diagnostic_checkpoints";
     private static final VulkanFeature SER_FEATURE = new VulkanFeature(
@@ -86,6 +92,7 @@ public final class Bootstrap {
         ptPhysical = ptDevice = 0;
         rrPhysical = 0;
         serPhysical = 0;
+        ommPhysical = ommDevice = 0;
         serDevice = 0;
         checkpointDevice = 0;
         serStatus = "缺少 EXT SER 扩展或特性";
@@ -154,6 +161,15 @@ public final class Bootstrap {
                     || (subgroupOps.supportedOperations() & operations) != operations)
                 missing.add("compute subgroup32 BASIC/BALLOT/ARITHMETIC");
             if (!missing.isEmpty()) return unsupported(original, missing);
+            if (physical.hasDeviceExtension(OMM_EXTENSION)) {
+                var omm = VkPhysicalDeviceOpacityMicromapFeaturesKHR.calloc(stack).sType$Default();
+                VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(omm));
+                if (omm.micromap()) {
+                    extensions.add(OMM_EXTENSION);
+                    features.add(OMM_FEATURE);
+                    ommPhysical = physical.vkPhysicalDevice().address();
+                }
+            }
             boolean supported = physical.hasDeviceExtension(SER_EXTENSION);
             if (supported) {
                 var reorder = VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.calloc(stack).sType$Default();
@@ -209,6 +225,8 @@ public final class Bootstrap {
             return;
         }
         ptDevice = device.address();
+        ommDevice = ommPhysical == device.getPhysicalDevice().address() && enabled.extensions().contains(OMM_EXTENSION)
+                && enabled.features().contains(OMM_FEATURE) ? device.address() : 0;
         if ("1".equals(System.getenv("PRIME_PT_DIAGNOSTIC_CHECKPOINTS"))
                 && enabled.extensions().contains(CHECKPOINT_EXTENSION)
                 && device.getCapabilities().VK_NV_device_diagnostic_checkpoints) {
@@ -244,6 +262,9 @@ public final class Bootstrap {
 
     /** 仅显式诊断请求且逻辑设备实际启用 NV 检查点时返回 true。 */
     public static boolean diagnosticCheckpoints(VkDevice device) { return checkpointDevice != 0 && checkpointDevice == device.address(); }
+
+    /** 只声明创建回调确认的逻辑设备 OMM 特性。 */
+    public static boolean opacityMicromap(VkDevice device) { return ommDevice != 0 && ommDevice == device.address(); }
 
     /** 设置界面和命令显示的实际设备协商状态。 */
     public static String serStatus() { return serStatus; }

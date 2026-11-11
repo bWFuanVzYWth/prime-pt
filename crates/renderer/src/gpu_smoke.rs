@@ -41,6 +41,7 @@ struct Host {
     errors: ManuallyDrop<Box<AtomicUsize>>,
     streamline: Option<StreamlineBootstrap>,
     invocation_reorder: bool,
+    opacity_micromap: bool,
     diagnostic_checkpoints: bool,
     retained: Cell<bool>,
 }
@@ -124,8 +125,20 @@ unsafe extern "system" fn diagnostic(
 ) -> vk::Bool32 {
     unsafe {
         let message = CStr::from_ptr((*data).p_message).to_string_lossy();
-        if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) {
+        // AGENTS.md 中用户批准的第三方例外；原始消息仍完整写入日志。
+        let known_sl = message.starts_with("vkCmdClearColorImage(): WRITE_AFTER_WRITE")
+            && message.contains("[nv.ngx.dlssd.resource]")
+            && message.contains("vkCmdPipelineBarrier[nv.ngx.dlssd.Evaluate]")
+            && message.contains("VK_ACCESS_2_TRANSFER_WRITE_BIT")
+            && message.contains("VK_PIPELINE_STAGE_2_CLEAR_BIT");
+        if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) && !known_sl {
             (*user.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed);
+        }
+        if known_sl {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "known_third_party: SL 内部 clear 同步诊断，按 AGENTS.md 忽略 1 条"
+            );
         }
         let _ = writeln!(std::io::stderr().lock(), "validation: {message}");
     }
@@ -252,6 +265,7 @@ impl Host {
                 errors: ManuallyDrop::new(errors),
                 streamline,
                 invocation_reorder,
+                opacity_micromap: false,
                 diagnostic_checkpoints: std::env::var_os("PRIME_PT_DIAGNOSTIC_CHECKPOINTS")
                     .is_some_and(|value| value == "1"),
                 retained: Cell::new(false),
@@ -312,6 +326,18 @@ impl Host {
                 else {
                     continue;
                 };
+                let supports_omm = extensions.iter().any(|extension| {
+                    CStr::from_ptr(extension.extension_name.as_ptr())
+                        == ash::khr::opacity_micromap::NAME
+                });
+                let mut omm = vk::PhysicalDeviceOpacityMicromapFeaturesKHR::default();
+                if supports_omm {
+                    host.instance.get_physical_device_features2(
+                        physical,
+                        &mut vk::PhysicalDeviceFeatures2::default().push(&mut omm),
+                    );
+                }
+                host.opacity_micromap = supports_omm && omm.micromap != 0;
                 let mut commands = vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR::default();
                 let mut acceleration =
                     vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default();
@@ -358,7 +384,10 @@ impl Host {
                 let queues = [vk::DeviceQueueCreateInfo::default()
                     .queue_family_index(family as u32)
                     .queue_priorities(&priorities)];
-                let extensions: Vec<_> = required.iter().map(|name| name.as_ptr()).collect();
+                let mut extensions: Vec<_> = required.iter().map(|name| name.as_ptr()).collect();
+                if host.opacity_micromap {
+                    extensions.push(ash::khr::opacity_micromap::NAME.as_ptr());
+                }
                 let mut commands = vk::PhysicalDeviceDeviceAddressCommandsFeaturesKHR::default()
                     .device_address_commands(true);
                 let mut acceleration =
@@ -395,6 +424,9 @@ impl Host {
                 device_info = device_info.push(&mut core12).push(&mut core13);
                 if invocation_reorder {
                     device_info = device_info.push(&mut reorder);
+                }
+                if host.opacity_micromap {
+                    device_info = device_info.push(&mut omm);
                 }
                 host.device = host.instance.create_device(physical, &device_info, None)?;
                 host.physical = physical;
@@ -475,27 +507,18 @@ impl Host {
         }
         // SAFETY: Host 比会话活得更久；测试同步提交，销毁前没有在途命令。
         let mut gpu = unsafe {
-            if self.invocation_reorder {
-                Gpu::attach_options(
-                    self.instance.handle().as_raw(),
-                    self.physical.as_raw(),
-                    self.device.handle().as_raw(),
-                    self.queue.as_raw(),
-                    self.family,
-                    0,
-                    true,
-                    requested,
-                    None,
-                )?
-            } else {
-                Gpu::attach(
-                    self.instance.handle().as_raw(),
-                    self.physical.as_raw(),
-                    self.device.handle().as_raw(),
-                    self.queue.as_raw(),
-                    self.family,
-                )?
-            }
+            Gpu::attach_options(
+                self.instance.handle().as_raw(),
+                self.physical.as_raw(),
+                self.device.handle().as_raw(),
+                self.queue.as_raw(),
+                self.family,
+                0,
+                self.invocation_reorder,
+                self.opacity_micromap,
+                requested,
+                None,
+            )?
         };
         if self.diagnostic_checkpoints {
             // SAFETY: Host::create 在该测试逻辑设备显式启用同一 NV 扩展。

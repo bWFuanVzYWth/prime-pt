@@ -321,7 +321,7 @@ pub unsafe extern "C" fn prime_create(
     unsafe { prime_create_options(instance, physical, device, queue, family, queue_index, 0) }
 }
 
-/// 带设备能力声明的会话创建；flags bit0 声明 EXT SER，bit1 关闭初始 SER，bit2 启用 NV 异步检查点，其余位拒绝。
+/// 带设备能力声明的会话创建；flags bit0 声明 EXT SER，bit1 关闭初始 SER，bit2 启用 NV 异步检查点，bit3 声明 KHR OMM，其余位拒绝。
 /// bit1 只允许与 bit0 同时设置；失败返回 0。
 ///
 /// # Safety
@@ -329,6 +329,7 @@ pub unsafe extern "C" fn prime_create(
 /// `VK_EXT_ray_tracing_invocation_reorder` 与 `rayTracingInvocationReorder`。
 /// 初始选择由 bit1 决定，之后可用 [`prime_set_ser`] 切换；不以物理支持替代逻辑设备启用。
 /// bit2 为 1 时必须在该逻辑设备启用 `VK_NV_device_diagnostic_checkpoints`。
+/// bit3 为 1 时必须启用 `VK_KHR_opacity_micromap` 及其 `micromap` 特性。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prime_create_options(
     instance: u64,
@@ -340,7 +341,7 @@ pub unsafe extern "C" fn prime_create_options(
     flags: u32,
 ) -> u64 {
     guarded(0, || {
-        if flags & !7 != 0 || flags & 3 == 2 {
+        if flags & !15 != 0 || flags & 3 == 2 {
             return Err(Error::Input("未知设备能力 flags"));
         }
         if [instance, physical, device, queue].contains(&0) {
@@ -358,6 +359,7 @@ pub unsafe extern "C" fn prime_create_options(
                 family,
                 queue_index,
                 flags & 1 != 0,
+                flags & 8 != 0,
                 flags & 2 == 0,
                 runtime::root(),
             )?
@@ -491,17 +493,18 @@ pub unsafe extern "C" fn prime_reset(id: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn prime_set_update_budget(id: u64, preset: u32) -> i32 {
     guarded(-1, || {
-        let (mesh_slabs, publish_geometry_quads, publish_attribute_quads) = match preset {
-            0 => (48, 65_536, 131_072),
-            1 => (96, 131_072, 262_144),
-            2 => (128, 262_144, 524_288),
+        let (mesh_slabs, upload_mib) = match preset {
+            0 => (48, 32),
+            1 => (96, 64),
+            2 => (128, 128),
             _ => return Err(Error::Input("未知场景更新档位")),
         };
         with_engine(id, |engine| {
+            engine
+                .gpu
+                .set_terrain_upload_budget(upload_mib * 1024 * 1024)?;
             engine.scene.set_work_budget(scene::WorkBudget {
                 mesh_slabs,
-                publish_geometry_quads,
-                publish_attribute_quads,
                 ..engine.scene.work_budget()
             });
             Ok(())
@@ -697,7 +700,7 @@ pub extern "C" fn prime_fail_capture(id: u64, request: u64) -> i32 {
 ///
 /// elapsed_ns=0清空滚动窗口并跳过暂停间隔，保留会话最慢记录。
 /// stages为14个little-endian u64纳秒：等待、tint/源维护、规划、宿主捕获、网格编译/合并、
-/// 三角编码、属性打包、BLAS准备/等待、属性分配/写入、TLAS准备/等待、场景提交/回收、
+/// 几何交接、属性打包、BLAS准备/等待、属性分配/写入、TLAS准备/等待、场景提交/回收、
 /// native录制/SDK、宿主提交、未归因。最近场景更新规模按独立序号导出，非所选柱的规模。
 /// plan内的同步编译从规划移到网格项；native场景细分从录制总耗时扣除，
 /// 视图准备归场景准备/提交，余量由引擎统计补齐；不提供GPU timestamp。
@@ -860,6 +863,7 @@ pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i3
                     mers: &materials.mers,
                     auxiliary: &materials.auxiliary,
                     emission_alias_words: &materials.emission_alias_words,
+                    opacity_quads: &materials.opacity_quads,
                     light_areas: &materials.quad_areas,
                 };
                 if let Some(capture) = &engine.capture {
@@ -1187,7 +1191,7 @@ pub unsafe extern "C" fn prime_draw(
                 bounces,
             });
             let anchor = frame.camera.anchor()?;
-            let camera = frame.camera.relative(anchor)?;
+
             let environment = frame.environment;
             let options = if engine.rendering.mode() == prime_scene::RenderMode::Offline {
                 gpu::Options::new(
@@ -1208,8 +1212,11 @@ pub unsafe extern "C" fn prime_draw(
             if !frozen {
                 engine.scene.rebase(anchor);
             }
-            let changed =
-                !frozen && (engine.scene.prepare()? || engine.gpu.scene_resources_dirty());
+            let changed = !frozen
+                && (engine.scene.prepare()?
+                    || engine.gpu.scene_resources_dirty()
+                    || engine.gpu.scene_anchor() != engine.scene.anchor()
+                    || engine.gpu.terrain_pending());
             engine.profile.scene[0] = elapsed_ns(prepare_started);
             if changed {
                 let scene_started = std::time::Instant::now();
@@ -1220,20 +1227,23 @@ pub unsafe extern "C" fn prime_draw(
                         engine.scene.anchor(),
                         &changes,
                     )? {
-                        return Ok(());
+                        return Ok(true);
                     }
                     let regions: Vec<_> = engine.scene.render_regions().collect();
-                    engine.gpu.set_regions(prime_scene::RenderView {
+                    engine.gpu.stream_regions(prime_scene::RenderView {
                         generation: engine.scene.generation(),
                         regions: &regions,
                         anchor: engine.scene.anchor(),
                     })
                 })();
-                if let Err(error) = publication {
-                    engine.scene.reject()?;
-                    return Err(error.into());
+                match publication {
+                    Ok(true) => engine.scene.commit()?,
+                    Ok(false) => engine.scene.park_publication(),
+                    Err(error) => {
+                        engine.scene.reject()?;
+                        return Err(error.into());
+                    }
                 }
-                engine.scene.commit()?;
                 let timing = engine.gpu.scene_timing().expect("成功发布保存当前计时");
                 engine.profile.scene[1] = timing
                     .geometry_ns
@@ -1251,10 +1261,8 @@ pub unsafe extern "C" fn prime_draw(
                 engine.profile.update = Some(diagnostics::SceneInfo {
                     dirty_regions: timing.dirty_regions as u64,
                     instances: timing.instances as u64,
-                    triangle_bytes: timing.triangle_bytes,
-                    attribute_bytes: timing.attribute_upload_bytes
-                        + timing.attribute_copy_bytes
-                        + timing.light_upload_bytes,
+                    terrain_upload_bytes: timing.terrain_upload_bytes,
+                    device_copy_bytes: timing.attribute_copy_bytes,
                     as_wait_ns: timing.as_submit_wait_ns,
                     tlas_ns: timing.tlas_ns,
                     attribute_ns: timing.attribute_upload_ns + timing.light_upload_ns,
@@ -1267,6 +1275,8 @@ pub unsafe extern "C" fn prime_draw(
                     "离线样本达到精确累积上限；请显式重新进入离线模式",
                 ));
             }
+            let published_anchor = engine.gpu.scene_anchor();
+            let camera = frame.camera.relative(published_anchor)?;
             if engine.capture.as_mut().is_some_and(capture::Capture::frame) {
                 let capture = engine.capture.take().expect("捕获计数到达零");
                 let regions: Vec<_> = engine.scene.render_regions().collect();
@@ -1277,7 +1287,7 @@ pub unsafe extern "C" fn prime_draw(
                         prime_scene::RenderView {
                             generation: engine.scene.generation(),
                             regions: &regions,
-                            anchor: engine.scene.anchor(),
+                            anchor: published_anchor,
                         },
                         &camera,
                         environment,

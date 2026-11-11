@@ -37,3 +37,4 @@
 - 通用发光采样、材质推导及渲染算法下沉引擎，Minecraft 策略留在版本适配层。数据布局依据实际消费者与测量，优先消除重复展开、整场景复制和隐式同步。
 - 区块编辑和 LOD 替换遵循引擎 `chunk_manager::State` 的无缝发布契约；缺源、失败或内存压力保留旧覆盖，完整候选及 GPU 准备成功后才共同发布与退役。实际退出需求域的卸载与同覆盖替换分别处理。
 - 编译、CPU 测试、无窗口 GPU 验证、性能测量和实际游戏验收分别报告。游戏验收由用户执行；没有新的明确请求，不启动 Minecraft 或占用前台。
+- 已知第三方错误：SL/DLSS RR 首次 Evaluate 内部对 `nv.ngx.dlssd.resource` 执行 `vkCmdClearColorImage` 时，验证层可能报告 `WRITE_AFTER_WRITE`，前序写入来自 `vkCmdPipelineBarrier[nv.ngx.dlssd.Evaluate]` 的布局转换，缺少 `CLEAR/TRANSFER_WRITE` 访问范围。用户已明确允许忽略这一特定 SDK 内部诊断；保留原始日志和忽略数量，不计为项目验收失败，不屏蔽其他同步或 Vulkan 错误。原始现场见引擎 `temp/sampling-unification-20261110/prime-before.log`；不修改第三方 SDK 实现。

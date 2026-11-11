@@ -10,7 +10,7 @@ fixtures = []
 prime_scene = { path = "../scene" }
 thiserror = "2"
 png = "0.18.1"
-simple_engine = { workspace = true, features = ["light_sampling"] }
+simple_engine = { workspace = true, features = ["light_sampling", "opacity"] }
 
 [lints.rust]
 missing_docs = "deny"

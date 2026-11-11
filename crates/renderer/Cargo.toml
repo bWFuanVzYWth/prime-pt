@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rayon = "1.12"
 prime_scene = { path = "../scene" }
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 blake3 = "1.8.7"
 simple_engine = { workspace = true, features = [
-    "light_sampling",
-    "light_bvh",
+    "light_sampling", "opacity",
     "camera",
     "scene_cache",
     "pt_gpu",

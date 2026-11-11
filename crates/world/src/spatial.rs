@@ -69,31 +69,7 @@ fn unrotated(value: Key, axis: usize) -> Key {
     key
 }
 
-/// `outer \ inner` 的至多六个不相交盒；内部仅由已校验边界构造。
-pub(crate) fn difference(outer: Bounds, inner: Bounds) -> Vec<Bounds> {
-    let low: [i64; 3] =
-        std::array::from_fn(|axis| outer.minimum()[axis].max(inner.minimum()[axis]));
-    let high: [i64; 3] =
-        std::array::from_fn(|axis| outer.maximum()[axis].min(inner.maximum()[axis]));
-    if (0..3).any(|axis| low[axis] >= high[axis]) {
-        return vec![outer];
-    }
-    let mut result = Vec::with_capacity(6);
-    let mut remaining_low = outer.minimum();
-    let mut remaining_high = outer.maximum();
-    for axis in 0..3 {
-        if remaining_low[axis] < low[axis] {
-            let mut edge = remaining_high;
-            edge[axis] = low[axis];
-            result.push(Bounds::new(remaining_low, edge).expect("非空前沿盒"));
-            remaining_low[axis] = low[axis];
-        }
-        if high[axis] < remaining_high[axis] {
-            let mut edge = remaining_low;
-            edge[axis] = high[axis];
-            result.push(Bounds::new(edge, remaining_high).expect("非空前沿盒"));
-            remaining_high[axis] = high[axis];
-        }
-    }
-    result
+/// 引擎的无分配半开盒差集。
+pub(crate) fn difference(outer: Bounds, inner: Bounds) -> impl ExactSizeIterator<Item = Bounds> {
+    outer.difference(inner)
 }

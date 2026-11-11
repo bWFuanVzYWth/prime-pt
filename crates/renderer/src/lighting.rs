@@ -1,14 +1,14 @@
 //! 发光实例的增量目录；静态texel alias属于资源世代，运行期只注册活动quad。
+use light_sampling::registry;
 use simple_engine::light_sampling;
-#[path = "light_registry.rs"]
-mod registry;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use prime_scene::{RenderChange, RenderRegion, RenderView};
 
 use crate::gpu::Error;
-use registry::{Record, Registry, Writer, reserved};
+pub(super) use registry::Record;
+use registry::{Registry, Writer, reserved};
 pub(super) use registry::{TablePatches, Tables};
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
@@ -70,6 +70,7 @@ pub(super) struct Preparation {
     update: LightingUpdate,
     pub tables: Option<Tables>,
     pub patches: TablePatches,
+    pub device: Option<registry::DeviceProposal>,
 }
 
 /// 独占已校验的CPU目录；GPU原子写成功后提交，丢弃则旧目录不变。
@@ -96,6 +97,7 @@ impl LightingPublication<'_> {
             mut update,
             tables,
             patches: _,
+            device: _,
         } = prepared;
         let mut current = std::mem::take(&mut lighting.regions)
             .into_iter()
@@ -147,7 +149,7 @@ impl Lighting {
             .map_err(|_| Error::Invalid("发光目录所有者身份耗尽"))?;
         Ok(Self {
             regions: Vec::new(),
-            registry: Registry::default(),
+            registry: Registry::new(64.0)?,
             owner,
             version: 0,
             epoch: 0,
@@ -157,6 +159,7 @@ impl Lighting {
 
     /// 与有序region输入线性合并，仅变化几何枚举quad；颜色覆盖只更新stamp。
     /// 同epoch须对应同一份已准备材质side/area表，prepare失败不修改当前分布。
+    #[cfg(test)]
     pub fn prepare(
         &self,
         source: RenderView<'_>,
@@ -164,6 +167,19 @@ impl Lighting {
         emitters: Emitters<'_>,
         possible: bool,
         epoch: u64,
+    ) -> Result<Preparation, Error> {
+        self.prepare_backend(source, bases, emitters, possible, epoch, false, None, None)
+    }
+    pub fn prepare_backend(
+        &self,
+        source: RenderView<'_>,
+        bases: &[u32],
+        emitters: Emitters<'_>,
+        possible: bool,
+        epoch: u64,
+        device: bool,
+        orders: Option<&[&simple_engine::scene_cache::PackedQuads]>,
+        cached: Option<&[Option<&[(u32, Record)]>]>,
     ) -> Result<Preparation, Error> {
         if source.regions.len() != bases.len() {
             return Err(Error::Invalid("发光region与属性槽目录长度不匹配"));
@@ -175,7 +191,8 @@ impl Lighting {
         let mut old_index = 0;
         let mut previous = None;
         let same_resources = self.epoch == epoch && self.possible == possible;
-        for (region, &base) in source.regions.iter().zip(bases) {
+        for (idx, (region, &base)) in source.regions.iter().zip(bases).enumerate() {
+            let order = orders.map(|orders| orders[idx]);
             if previous.is_some_and(|key| key >= region.key) {
                 return Err(Error::Invalid("发光region键须唯一且有序"));
             }
@@ -206,11 +223,10 @@ impl Lighting {
             if self.regions.is_empty() {
                 // 初载没有旧灯需要删除，直接流入连续新增阶段，不暂存第二份全局record。
                 let mut ids = Vec::new();
-                each_light(*region, base, emitters, possible, |_, record| {
+                for (_, record) in collect(*region, base, emitters, possible, order)? {
                     ids.try_reserve(1).map_err(prime_scene::Error::Allocation)?;
                     ids.push(writer.add(record)?);
-                    Ok(())
-                })?;
+                }
                 entries.push(PreparedRegion::Built(RegionLights { stamp, ids }));
                 continue;
             }
@@ -239,7 +255,20 @@ impl Lighting {
                     continue;
                 }
             }
-            let lights = collect(*region, base, emitters, possible)?;
+            let lights = if let Some(rows) = cached.and_then(|v| v[idx]) {
+                let mut lights = reserved(rows.len())?;
+                for &(_, mut record) in rows {
+                    let local = record.meta[3];
+                    record.meta[3] = base
+                        .checked_add(local)
+                        .ok_or(Error::Invalid("发光槽溢出"))?;
+                    lights.push((local, record));
+                }
+                lights.sort_unstable_by_key(|v| v.0);
+                lights
+            } else {
+                collect(*region, base, emitters, possible, order)?
+            };
             let mut ids = reserved(lights.len())?;
             let old_region = old.map(|index| &self.regions[index]);
             let mut cursor = 0;
@@ -288,7 +317,12 @@ impl Lighting {
             };
             region.ids[addition.position] = id;
         }
-        let (registry, tables, patches) = writer.finish()?;
+        let (registry, tables, patches, device) = if device {
+            writer.finish_for_gpu()?
+        } else {
+            let (r, t, p) = writer.finish()?;
+            (r, t, p, None)
+        };
         Ok(Preparation {
             update: LightingUpdate {
                 owner: self.owner,
@@ -302,6 +336,7 @@ impl Lighting {
             },
             tables,
             patches,
+            device,
         })
     }
 
@@ -392,15 +427,26 @@ fn collect(
     base: u32,
     emitters: Emitters<'_>,
     possible: bool,
+    order: Option<&simple_engine::scene_cache::PackedQuads>,
 ) -> Result<Vec<(u32, Record)>, Error> {
     let mut lights = Vec::new();
-    each_light(region, base, emitters, possible, |local, record| {
+    let mut cursor = order.map(|v| v.order_cursor());
+    each_light(region, base, emitters, possible, |local, mut record| {
+        let local = cursor.as_mut().map_or(local, |o| {
+            o.physical(local as usize).expect("已枚举的区域面") as u32
+        });
+        record.meta[3] = base
+            .checked_add(local)
+            .ok_or(Error::Invalid("发光槽溢出"))?;
         lights
             .try_reserve(1)
             .map_err(prime_scene::Error::Allocation)?;
         lights.push((local, record));
         Ok(())
     })?;
+    if order.is_some() {
+        lights.sort_unstable_by_key(|v| v.0);
+    }
     Ok(lights)
 }
 
@@ -413,53 +459,60 @@ fn each_light(
 ) -> Result<(), Error> {
     if possible {
         for (local, quad) in region.mesh.quads().enumerate() {
-            let material = quad.material_id().index() as usize;
-            let &sides = emitters
-                .sides
-                .get(material)
-                .ok_or(Error::Invalid("quad材质索引不属于当前资源世代"))?;
-            if sides == 0 {
-                continue;
+            if let Some(record) = record_for(quad, region.key, base, local, emitters)? {
+                output(local as u32, record)?;
             }
-            if sides > 3 {
-                return Err(Error::Invalid("发光侧掩码须属于1..=3"));
-            }
-            let positions = quad.positions();
-            if !positions.iter().flatten().all(|v| v.is_finite()) {
-                return Err(Error::Invalid("发光quad位置不是有限值"));
-            }
-            let mut meta = *emitters
-                .areas
-                .get(material)
-                .ok_or(Error::Invalid("quad静态面积身份不属于当前资源世代"))?;
-            if meta[0] == u32::MAX && degenerate(positions) {
-                continue;
-            }
-            let local = u32::try_from(local).map_err(|_| Error::Invalid("发光quad索引溢出"))?;
-            meta[3] = base
-                .checked_add(local)
-                .ok_or(Error::Invalid("发光属性槽溢出"))?;
-            let area = light_sampling::QuadArea::new(&positions)?;
-            let weight = *emitters
-                .weights
-                .get(material)
-                .ok_or(Error::Invalid("发光亮度不属于当前资源世代"))?;
-            let power = light_sampling::emitter_power(area.area(), weight, sides)?;
-            let record = Record {
-                power,
-                meta,
-                vertices: light_sampling::pack_vertices(positions),
-                region: [
-                    region.key[0] as u32,
-                    region.key[1] as u32,
-                    region.key[2] as u32,
-                    sides,
-                ],
-            };
-            output(local, record)?;
         }
     }
     Ok(())
+}
+
+pub(super) fn record_for(
+    quad: &prime_scene::Quad,
+    key: [i32; 3],
+    base: u32,
+    local: usize,
+    emitters: Emitters<'_>,
+) -> Result<Option<Record>, Error> {
+    let material = quad.material_id().index() as usize;
+    let &sides = emitters
+        .sides
+        .get(material)
+        .ok_or(Error::Invalid("quad材质索引不属于当前资源世代"))?;
+    if sides == 0 {
+        return Ok(None);
+    }
+    if sides > 3 {
+        return Err(Error::Invalid("发光侧掩码须属于1..=3"));
+    }
+    let positions = quad.positions();
+    if !positions.iter().flatten().all(|v| v.is_finite()) {
+        return Err(Error::Invalid("发光quad位置不是有限值"));
+    }
+    let mut meta = *emitters
+        .areas
+        .get(material)
+        .ok_or(Error::Invalid("quad静态面积身份不属于当前资源世代"))?;
+    if meta[0] == u32::MAX && degenerate(positions) {
+        return Ok(None);
+    }
+    let local = u32::try_from(local).map_err(|_| Error::Invalid("发光quad索引溢出"))?;
+    meta[3] = base
+        .checked_add(local)
+        .ok_or(Error::Invalid("发光属性槽溢出"))?;
+    let area = light_sampling::QuadArea::new(&positions)?;
+    let weight = *emitters
+        .weights
+        .get(material)
+        .ok_or(Error::Invalid("发光亮度不属于当前资源世代"))?;
+    let power = light_sampling::emitter_power(area.area(), weight, sides)?;
+    let record = Record {
+        power,
+        meta,
+        vertices: light_sampling::pack_vertices(positions),
+        region: [key[0] as u32, key[1] as u32, key[2] as u32, sides],
+    };
+    Ok(Some(record))
 }
 
 fn degenerate(p: [[f32; 3]; 4]) -> bool {

@@ -114,6 +114,44 @@ impl<'a> MeshView<'a> {
             self.base.revision(slot)
         }
     }
+    /// 单片本次生效的颜色覆盖，按局部起点排序。
+    pub fn fragment_tints(self, slot: usize) -> &'a [TintPatch] {
+        let from = self.tints.partition_point(|p| p.fragment() < slot);
+        let to = from + self.tints[from..].partition_point(|p| p.fragment() == slot);
+        &self.tints[from..to]
+    }
+    /// 借出一个有界的源片段范围。目录源继续由世界持有，可分批复制给跨帧生产者。
+    pub fn fragment_slice(self, slot: usize, range: std::ops::Range<usize>) -> Option<&'a [Quad]> {
+        self.fragment(slot)?.quads.get(range)
+    }
+    /// 将已验证的单个分片窗口移交给独立工作缓存，应用覆盖在此窗口内的 tint。
+    /// 只复制要求的连续四角记录，分配或失效的范围返回错误。
+    pub fn copy_fragment(
+        self,
+        slot: usize,
+        range: std::ops::Range<usize>,
+        dst: &mut Vec<Quad>,
+    ) -> Result<(), crate::Error> {
+        let source = self
+            .fragment_slice(slot, range.clone())
+            .ok_or(crate::Error::Input("分片交接范围失效"))?;
+        dst.clear();
+        dst.try_reserve_exact(source.len())?;
+        dst.extend_from_slice(source);
+        let patches = self.fragment_tints(slot);
+        let first = patches.partition_point(|p| p.end() <= range.start);
+        for p in patches[first..]
+            .iter()
+            .take_while(|p| p.first() < range.end)
+        {
+            for q in &mut dst
+                [p.first().max(range.start) - range.start..p.end().min(range.end) - range.start]
+            {
+                q.set_tint(p.rgb());
+            }
+        }
+        Ok(())
+    }
     /// 实际quad量，O(1)。
     pub const fn len(self) -> usize {
         self.len

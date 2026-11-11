@@ -42,6 +42,10 @@ final class Native implements AutoCloseable {
     }
 
     Native(long instance, long physical, long device, long queue, int family, int queueIndex, boolean ser, boolean requested, boolean checkpoints) {
+        this(instance, physical, device, queue, family, queueIndex, ser, requested, checkpoints, false);
+    }
+
+    Native(long instance, long physical, long device, long queue, int family, int queueIndex, boolean ser, boolean requested, boolean checkpoints, boolean omm) {
         SymbolLookup symbols;
         try {
             symbols = NativeRuntime.open(NativeRuntime.locate(), arena);
@@ -49,7 +53,7 @@ final class Native implements AutoCloseable {
             arena.close();
             throw failure;
         }
-        var create = ser || checkpoints
+        var create = ser || checkpoints || omm
                 ? bind(symbols, "prime_create_options", FunctionDescriptor.of(JAVA_LONG,
                         JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT))
                 : bind(symbols, "prime_create", FunctionDescriptor.of(JAVA_LONG,
@@ -87,9 +91,9 @@ final class Native implements AutoCloseable {
                 JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
         error = bind(symbols, "prime_error", FunctionDescriptor.of(ADDRESS));
         try {
-            handle = ser || checkpoints
+            handle = ser || checkpoints || omm
                     ? (long) create.invokeExact(instance, physical, device, queue, family, queueIndex,
-                            (ser ? (requested ? 1 : 3) : 0) | (checkpoints ? 4 : 0))
+                            (ser ? (requested ? 1 : 3) : 0) | (checkpoints ? 4 : 0) | (omm ? 8 : 0))
                     : (long) create.invokeExact(instance, physical, device, queue, family, queueIndex);
             if (handle == 0) throw failure();
             serRequested = requested;

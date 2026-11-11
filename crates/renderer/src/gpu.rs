@@ -28,8 +28,17 @@ mod attribute_update;
 mod lighting;
 #[path = "materials.rs"]
 mod materials;
+#[path = "opacity.rs"]
+mod opacity;
 #[path = "region_match.rs"]
 mod region_match;
+#[path = "scene_upload.rs"]
+mod scene_upload;
+#[path = "terrain_packets.rs"]
+mod terrain_packets;
+#[path = "terrain_production.rs"]
+mod terrain_production;
+use terrain_production::{CpuPackets, FragmentSpan};
 
 #[path = "known_geometry.rs"]
 mod known_geometry;
@@ -55,6 +64,12 @@ use simple_engine::vulkan::{
 /// 渲染输入、资源、程序或SDK失败；保留实际底层来源。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// 后台地形生产者创建或交接失败。
+    #[error(transparent)]
+    Production(#[from] scene_cache::ProducerError),
+    /// 并行工作池的系统创建错误。
+    #[error(transparent)]
+    TerrainWorkers(#[from] rayon::ThreadPoolBuildError),
     /// GPU 故障进度无法写入宿主标准错误；保留原始 IO 失败。
     #[error("写入 GPU 故障诊断失败")]
     DiagnosticOutput(#[source] std::io::Error),
@@ -101,12 +116,18 @@ pub enum Error {
     /// 材质特化程序创建失败。
     #[error(transparent)]
     MaterialPrograms(#[from] openpbr::program::Error),
+    /// 精确二值 OMM 输入或内存申请失败。
+    #[error(transparent)]
+    Opacity(#[from] simple_engine::opacity::Error),
     /// 光源选择或面积输入无效。
     #[error(transparent)]
     Lights(#[from] light_sampling::Error),
+    /// 活动光源目录准备失败。
+    #[error(transparent)]
+    LightRegistry(#[from] light_sampling::registry::Error),
     /// 光源BVH输入或构建失败。
     #[error(transparent)]
-    LightBvh(#[from] simple_engine::light_bvh::Error),
+    LightBvh(#[from] simple_engine::light_sampling::bvh::Error),
     /// 无法读取开发宿主的工作目录。
     #[error("无法读取开发宿主的工作目录")]
     DevelopmentDirectory(#[source] std::io::Error),
@@ -119,6 +140,7 @@ pub enum Error {
 struct Scene {
     top: AccelerationStructure,
     quads: Buffer,
+    tokens: Buffer,
     instance_quad_bases: Buffer,
 }
 
@@ -141,6 +163,8 @@ pub struct ResourceUpload<'a> {
     pub emission_alias_words: &'a [u32],
     /// 与材质等长的静态quad面积分布；过程几何以首word=0xffffffff声明动态面积。
     pub light_areas: &'a [[u32; 4]],
+    /// 完整资源期实际 cutout UV；未列出的几何保持软件覆盖，不运行期懒准备。
+    pub opacity_quads: &'a [simple_engine::opacity::Quad],
 }
 
 #[path = "capture.rs"]
@@ -156,9 +180,9 @@ struct MaterialGpu {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct LightingGpu {
+    tree: Buffer,
     alias: Buffer,
     meta: Buffer,
-    vertices: Buffer,
     inverse: Buffer,
     regions: Buffer,
 }
@@ -172,6 +196,7 @@ impl LightingGpu {
             Ok(buffer)
         };
         Ok(Self {
+            tree: Buffer::new(context, 32, false)?,
             alias: upload(
                 context,
                 tables.map_or(&[0u8; 16], |t| bytemuck::cast_slice(&t.selection)),
@@ -179,10 +204,6 @@ impl LightingGpu {
             meta: upload(
                 context,
                 tables.map_or(&[], |t| bytemuck::cast_slice(&t.meta)),
-            )?,
-            vertices: upload(
-                context,
-                tables.map_or(&[], |t| bytemuck::cast_slice(&t.vertices)),
             )?,
             inverse: upload(
                 context,
@@ -196,33 +217,129 @@ impl LightingGpu {
     }
     fn roots(self) -> [vulkan::native::Resource; 5] {
         [
+            self.tree.into(),
             self.alias.into(),
             self.meta.into(),
-            self.vertices.into(),
             self.inverse.into(),
             self.regions.into(),
         ]
     }
 }
 
+struct PackedRegions {
+    patches: std::collections::BTreeMap<usize, terrain_packets::AttributeRows>,
+    update: scene_cache::Update<RegionGpu>,
+    pending: Vec<(usize, std::ops::Range<usize>)>,
+    opacity_indices: Vec<u32>,
+}
+// 整个候选只生成一次的 CPU 写入和光源事务；设备列在完成前作为 collect 的根。
+struct Transfer {
+    upload: vulkan::ColumnUpload,
+    attributes: Vec<[[u32; 4]; 3]>,
+    ranges: Vec<(usize, std::ops::Range<usize>)>,
+    versions: Vec<([i32; 3], u64)>,
+    bases: Vec<u32>,
+    lights: lighting::Preparation,
+    lighting_gpu: LightingGpu,
+    instance_quad_bases: Buffer,
+    columns: scene_upload::Columns,
+}
+struct PendingStorage {
+    transfer: Option<Transfer>,
+    anchor: [f64; 3],
+    packed: Option<PackedRegions>,
+    generation: u64,
+    published: AccelerationStructure,
+    stamps: Vec<([i32; 3], u64, u64)>,
+    quads: Buffer,
+    tokens: Buffer,
+    vertices: Option<Buffer>,
+    capacity: u32,
+}
+impl PendingStorage {
+    fn matches(
+        &self,
+        source: prime_scene::RenderView<'_>,
+        published: AccelerationStructure,
+    ) -> bool {
+        self.published == published
+            && self.generation == source.generation
+            && self.stamps.iter().copied().eq(source
+                .regions
+                .iter()
+                .map(|r| (r.key, r.geometry_revision, r.content_revision)))
+    }
+    fn capture(
+        source: prime_scene::RenderView<'_>,
+        published: AccelerationStructure,
+        quads: Buffer,
+        tokens: Buffer,
+        vertices: Option<Buffer>,
+        capacity: u32,
+        packed: PackedRegions,
+        transfer: Transfer,
+    ) -> Result<Self, Error> {
+        let mut stamps = Vec::new();
+        stamps
+            .try_reserve_exact(source.regions.len())
+            .map_err(scene_cache::Error::from)?;
+        stamps.extend(
+            source
+                .regions
+                .iter()
+                .map(|r| (r.key, r.geometry_revision, r.content_revision)),
+        );
+        Ok(Self {
+            generation: source.generation,
+            transfer: Some(transfer),
+            anchor: source.anchor,
+            published,
+            packed: Some(packed),
+            stamps,
+            quads,
+            tokens,
+            vertices,
+            capacity,
+        })
+    }
+}
 struct RegionGpu {
     key: [i32; 3],
     revision: u64,
+    baked_content: u64,
+    fragments: Vec<FragmentSpan>,
+    lamps: Option<Vec<(u32, lighting::Record)>>,
 
     range: std::ops::Range<u32>,
     blas: Option<vulkan::TriangleBlas>,
     opaque: bool,
+    opacity_slots: Vec<(u32, [u32; 2])>,
+    resident: scene_cache::ResidentQuads,
 }
 
 /// 单次成功region发布的主机墙钟与工作集；三个主阶段互斥，细分字段仅作诊断。
 /// 不包含宿主旧帧完成等待，也不是GPU timestamp；失败更新不发布快照。
 #[derive(Clone, Copy, Default)]
 pub struct SceneUpdateTiming {
-    /// 源Mesh到dirty三角/输入及属性编码；不含AS构建、属性上传和发布。
+    /// 变化区域从源 quad 到紧凑几何和属性的准备时间。
     pub geometry_ns: u64,
+    /// 从后台领取的区域编码批墙钟，包括供页等待；不计入绘制线程。
+    pub worker_geometry_ns: u64,
+    /// 帧线程本轮交给 CPU 生产者的源字节，与 PCIe 上传分别计量。
+    pub cpu_source_bytes: u64,
+    /// 本次完成的批中需要重新识别与编码的 quad 数。
+    pub encoded_quads: u64,
+    /// 本帧送入展开与硬件 BLAS 构建的 quad 数。
+    pub build_quads: u64,
+    /// 本次完成的批中由不可变分片直接继承的 quad 数。
+    pub reused_fragment_quads: u64,
     /// 是否发布了GPU场景或资源绑定；管理器空发布为false。
     pub changed: bool,
-    /// BLAS与TLAS构建的主机墙钟，含同步提交与完成等待。
+    /// 本批只传输部分地形，保留上一份场景直到跨帧输入完整。
+    pub upload_pending: bool,
+    /// 本次实际跨 CPU/GPU 传输的地形缓冲字节，包括实例、身份、OMM、灯表和补丁。
+    pub terrain_upload_bytes: u64,
+    /// BLAS 与 TLAS 准备的主机墙钟，同步入口另含完成等待。
     pub acceleration_ns: u64,
     /// 属性上传及目录/场景发布；与其余两个主阶段互斥。
     pub resources_ns: u64,
@@ -252,9 +369,9 @@ pub struct SceneUpdateTiming {
     pub publish_ns: u64,
     /// 旧资源目录回收，已计入resources_ns。
     pub collect_ns: u64,
-    /// dirty region三角有效字节。
+    /// 压缩区域输入逻辑字节；分帧模式使用 terrain_upload_bytes 观察当帧实际传输。
     pub triangle_bytes: u64,
-    /// dirty region三角容器容量字节。
+    /// 压缩区域输入的 CPU 保留容量。
     pub triangle_capacity_bytes: u64,
     /// 待回填region目录容量字节。
     pub pending_capacity_bytes: u64,
@@ -726,12 +843,17 @@ pub struct Gpu {
     scene: Scene,
     anchor: [f64; 3],
     region_cache: scene_cache::Cache<RegionGpu>,
+    terrain_uploads: vulkan::TerrainUploads,
+    pending_storage: Option<PendingStorage>,
+    cpu_packets: CpuPackets,
+    cpu_ready: Option<PackedRegions>,
     attribute_revisions: Vec<([i32; 3], u64)>,
     scene_update: Option<SceneUpdateTiming>,
     // 程序模板只保留初始空场景，不能钉住重载时完整 mesh／AS 的工作集。
     program_scene: Scene,
     atlas: Image,
     material_gpu: MaterialGpu,
+    opacity: opacity::Prepared,
     material_coverage: Vec<bool>,
     light_sides: Vec<u32>,
     light_weights: Vec<f32>,
@@ -828,11 +950,6 @@ impl Gpu {
         self.collect_resources()
     }
 
-    // 已知首面与历史重连共享目录；旧兼容输运不保留这个工作集。
-    const fn needs_known_geometry(&self) -> bool {
-        matches!(&self.generation, Some(generation) if generation.dispatch == 8)
-    }
-
     /// 当前独立累积域已接受的样本数；尚无视图时为零，RR 每帧重开累积域。
     pub const fn accumulated_samples(&self) -> u32 {
         match &self.view {
@@ -843,14 +960,18 @@ impl Gpu {
 
     /// 世界退出后释放场景及模式工作集，保留已准备的资源世代；宿主须先完成旧命令。
     pub fn clear_world(&mut self) -> Result<(), Error> {
+        self.cancel_packets()?;
         self.complete_previous()?;
         self.invalidate_history(GlobalReset::WorldReplaced)?;
         self.scene = Scene {
             top: self.program_scene.top,
             quads: self.program_scene.quads,
+            tokens: self.program_scene.tokens,
             instance_quad_bases: self.program_scene.instance_quad_bases,
         };
         self.region_cache = scene_cache::Cache::new()?;
+        self.terrain_uploads.clear();
+        self.pending_storage = None;
         self.attribute_revisions.clear();
         self.lighting = lighting::Lighting::new()?;
         self.lighting_gpu = self.program_lighting;
@@ -969,6 +1090,7 @@ impl Gpu {
                 family,
                 queue_index,
                 false,
+                false,
                 true,
                 None,
             )
@@ -982,6 +1104,7 @@ impl Gpu {
     /// 句柄属于同一活动设备，已启用 RT pipeline、RayQuery、device address 与 position fetch；family/index
     /// 对应借出的 queue。宿主独占 queue，并在每次调用和销毁前等待前次命令完成。
     /// invocation_reorder 为 true 时设备须另启用 EXT SER 扩展与特性。
+    /// opacity_micromap 为 true 时须启用 VK_KHR_opacity_micromap 与 micromap 特性。
     /// 设备须启用 Vulkan 1.3 subgroupSizeControl，compute 支持请求32-lane subgroup。
     /// ser_requested 为当前偏好；关闭不抹去逻辑设备能力。
     #[allow(clippy::too_many_arguments)]
@@ -993,6 +1116,7 @@ impl Gpu {
         family: u32,
         queue_index: u32,
         invocation_reorder: bool,
+        opacity_micromap: bool,
         ser_requested: bool,
         runtime_root: Option<&Path>,
     ) -> Result<Self, Error> {
@@ -1043,14 +1167,15 @@ impl Gpu {
                 ray_tracing: true,
                 position_fetch: true,
                 invocation_reorder,
+                opacity_micromap,
                 ..Default::default()
             },
         };
         // SAFETY: 外部生命周期由导出会话契约维持；本对象不销毁宿主句柄。
         let mut context = unsafe { Context::from_raw(raw)? };
         context.enable_pipeline_cache(&cache.join("pipeline-cache"));
-        let attribute_slots =
-            context.max_storage_buffer_range() / size_of::<[[u32; 4]; 3]>() as u32;
+        context.prepare_quad_expansion()?;
+        let attribute_slots = context.max_storage_buffer_range() / 64;
         let attribute_slot_limit = attribute_slots
             .checked_ilog2()
             .map_or(0, |shift| 1 << shift);
@@ -1076,7 +1201,7 @@ impl Gpu {
         let lighting_gpu = LightingGpu::upload(&mut context, None)?;
         let nearest = Sampler::new(&mut context, false)?;
         let linear = Sampler::new(&mut context, true)?;
-        let scene = Self::build_scene(&mut context, &Mesh::default())?;
+        let (scene, _) = Self::build_scene(&mut context, &Mesh::default())?;
         let program_scene = scene;
         let mut atmosphere = atmosphere::native::Atmosphere::new(&mut context)?;
         atmosphere
@@ -1131,11 +1256,16 @@ impl Gpu {
             scene,
             anchor: [0.0; 3],
             region_cache: scene_cache::Cache::new()?,
+            terrain_uploads: vulkan::TerrainUploads::default(),
+            pending_storage: None,
+            cpu_packets: CpuPackets::new()?,
+            cpu_ready: None,
             attribute_revisions: Vec::new(),
             scene_update: None,
             program_scene,
             atlas,
             material_gpu,
+            opacity: opacity::Prepared::default(),
             material_coverage: definitions.iter().map(materials::tests_coverage).collect(),
             light_areas: vec![[u32::MAX, 0, 0, 0]; definitions.len()],
             light_sides: vec![0; definitions.len()],
@@ -1243,40 +1373,56 @@ impl Gpu {
         Ok(())
     }
 
-    fn build_scene(context: &mut Context, mesh: &Mesh) -> Result<Scene, Error> {
+    fn build_scene(context: &mut Context, mesh: &Mesh) -> Result<(Scene, Option<Buffer>), Error> {
         if mesh.quads.len() > 4 * 1024 * 1024 || mesh.quads.iter().any(|q| !q.valid()) {
-            return Err(Error::Invalid("quad 非有限、材质预设无效或超过 4M 面预算"));
+            return Err(Error::Invalid("quad 非有限或超过 4M 面预算"));
         }
-        // 稳定记录明确驻留 DeviceLocal；一次 dirty 上传，无 shader 索引和逐帧转置。
-        let attributes: Vec<_> = mesh.quads.iter().map(|q| q.attributes()).collect();
-        let bytes = bytemuck::cast_slice(&attributes);
-        let quads = Buffer::mapped_device_local(context, bytes.len().max(48) as u64)?;
-        quads.write(context, 0, if bytes.is_empty() { &[0; 48] } else { bytes })?;
-        // AS 构建仍使用两输入槽，不能删退化半面后改变 primitive>>1 身份。
-        let triangles: Vec<_> = mesh
-            .quads
-            .iter()
-            .flat_map(|quad| {
-                let [a, b, c, d] = quad.positions();
-                [[a, b, c], [a, c, d]]
-            })
-            .collect();
-        let instances = if triangles.is_empty() {
-            Vec::new()
+        let n = mesh.quads.len().max(1) as u64;
+        let quads = Buffer::mapped_device_local(context, n * 48)?;
+        let tokens = Buffer::mapped_device_local(context, n * 8)?;
+        let instance_quad_bases = Buffer::upload(context, &[0; 4])?;
+        let (top, vertices) = if mesh.quads.is_empty() {
+            (context.acceleration_instances(&[])?, None)
         } else {
-            vec![TriangleInstance {
-                geometry: context.triangle_blas(&triangles, false)?,
+            let mut encoder = scene_cache::QuadEncoder::with_capacity(mesh.quads.len())?;
+            for q in &mesh.quads {
+                encoder.push(q.positions(), 0, q.attributes())?;
+            }
+            let owner = scene_cache::Cache::<()>::new()?;
+            let mut update = owner.begin(0)?;
+            let resident =
+                scene_cache::ResidentQuads::prepare(encoder.finish(), None, update.parts_mut().2)?;
+            let vertices = Buffer::new(context, n * 64, false)?;
+            let input = vulkan::QuadBlasInput {
+                quads: &resident,
+                opaque: false,
+                opacity: None,
+                output: vulkan::QuadOutput {
+                    attributes: Some(quads),
+                    identities: Some(tokens),
+                    vertices: Some(vertices),
+                    ..Default::default()
+                },
+            };
+            let instance = TriangleInstance {
+                geometry: vulkan::BatchBlas::New(0),
                 transform: [[1., 0., 0., 0.], [0., 1., 0., 0.], [0., 0., 1., 0.]],
                 custom_index: 0,
-            }]
+            };
+            (
+                context.quad_scene_batch(&[input], &[instance])?.top,
+                Some(vertices),
+            )
         };
-        let top = context.acceleration_instances(&instances)?;
-        let instance_quad_bases = Buffer::upload(context, &[0; size_of::<u32>()])?;
-        Ok(Scene {
-            top,
-            quads,
-            instance_quad_bases,
-        })
+        Ok((
+            Scene {
+                top,
+                quads,
+                tokens,
+                instance_quad_bases,
+            },
+            vertices,
+        ))
     }
 
     /// 完成旧提交后选择已准备的照明与导引程序；保留数据和 PT/RR 历史。
@@ -1356,6 +1502,7 @@ impl Gpu {
     }
 
     fn complete_previous(&mut self) -> Result<(), Error> {
+        self.context.poll_terrain()?;
         if self
             .pending_absolute
             .is_some_and(|(_, remaining)| remaining != 0)
@@ -1419,6 +1566,7 @@ impl Gpu {
             self.material_gpu,
             &prepared.keys,
             &definitions,
+            self.opacity.map.is_some(),
         )?;
         self.invalidate_history(GlobalReset::SceneDomainReplaced)?;
         self.atlas = atlas;
@@ -1434,6 +1582,7 @@ impl Gpu {
     /// 全部图像、静态alias、材质范围、程序和可用SER变体成功后一次发布。
     /// 旧命令须已完成；调用后在绘制前提交同一资源世代的region视图。
     pub fn replace_resources(&mut self, source: ResourceUpload<'_>) -> Result<(), Error> {
+        self.cancel_packets()?;
         self.complete_previous()?;
         let result = (|| {
             let bytes = u64::from(source.extent[0])
@@ -1488,6 +1637,7 @@ impl Gpu {
                     0
                 }
             }));
+            let opacity = opacity::Prepared::new(&mut self.context, &source, definitions)?;
             let has_emission = light_sides.iter().any(|&side| side != 0);
             let light_weights = materials::emission_weights(definitions)?;
             let mut material_coverage = Vec::new();
@@ -1521,9 +1671,17 @@ impl Gpu {
                     },
                 )?,
             };
-            let (resources, generation) =
-                self.prepare_material_generation(atlas, resources, keys, definitions)?;
-            let candidates: Vec<_> = generation.roots().collect();
+            let (resources, generation) = self.prepare_material_generation(
+                atlas,
+                resources,
+                keys,
+                definitions,
+                opacity.map.is_some(),
+            )?;
+            let candidates: Vec<_> = generation
+                .roots()
+                .chain(opacity.map.map(vulkan::native::Resource::from))
+                .collect();
             self.collect_with(&candidates)?;
             // 此后只移动已经准备的所有者；不得以清理失败向宿主报告“保留旧世代”。
             self.renderer = None;
@@ -1532,10 +1690,13 @@ impl Gpu {
             self.atlas = atlas;
             self.material_gpu = resources;
             self.material_coverage = material_coverage;
+            self.opacity = opacity;
             self.light_sides = light_sides;
             self.light_weights = light_weights;
             self.has_emission = has_emission;
             self.region_cache = region_cache;
+            self.terrain_uploads.clear();
+            self.pending_storage = None;
             self.attribute_revisions.clear();
             self.scene.top = self.program_scene.top;
             self.scene.instance_quad_bases = self.program_scene.instance_quad_bases;
@@ -1562,6 +1723,7 @@ impl Gpu {
         mut resources: MaterialGpu,
         keys: &[materials::Key],
         definitions: &[MaterialDefinition],
+        opacity_enabled: bool,
     ) -> Result<(MaterialGpu, MaterialGeneration), Error> {
         if keys.len() != definitions.len() {
             return Err(Error::Invalid("材质Flow与输入定义数量不匹配"));
@@ -1586,6 +1748,12 @@ impl Gpu {
             )
             .unwrap(),
             Err(_) => return Err(Error::Invalid("PRIME_PT_SHADER_JOBS须为正整数")),
+        };
+        // 空 OMM 世代无需 RayQuery 的 micromap 模式；有表时能力已由构建边界建立。
+        let omm = if opacity_enabled {
+            "-DPRIMEPT_OMM=1"
+        } else {
+            "-DPRIMEPT_OMM=0"
         };
         let mut batch = self.compiler.batch();
         let hit = materials::hit_features(definitions);
@@ -1629,6 +1797,7 @@ impl Gpu {
                     lights,
                     &coverage,
                     &emitters,
+                    omm,
                     "-capability",
                     "spvRayTracingPositionFetchKHR",
                 ],
@@ -1641,6 +1810,7 @@ impl Gpu {
             lights,
             &coverage,
             &emitters,
+            omm,
         ];
         let primary_source = self.shader_source.with_file_name("primary_material.slang");
         let primary_materials = (dispatch == 8)
@@ -1685,6 +1855,7 @@ impl Gpu {
                              stage,
                              output,
                              args: &[&str]| {
+            let args: Vec<_> = args.iter().copied().chain([omm]).collect();
             batch.queue(&shader_build::Recipe {
                 source: source.to_str().ok_or(shader_build::Error::Configuration(
                     "shader路径不是UTF-8".into(),
@@ -1693,7 +1864,7 @@ impl Gpu {
                 stage,
                 output,
                 target: shader_build::Target::Spirv("spirv_1_4"),
-                args,
+                args: &args,
             })
         };
         let dispatch_arg = format!("-DPRIMEPT_DISPATCH={dispatch}");
@@ -2149,7 +2320,7 @@ impl Gpu {
 
     /// 材质域更新后，即使管理器没有几何patch，也须重新准备发光分布。
     pub const fn scene_resources_dirty(&self) -> bool {
-        self.lighting_dirty || (self.needs_known_geometry() && self.known_geometry.is_none())
+        self.lighting_dirty
     }
 
     #[cfg(test)]
@@ -2163,17 +2334,15 @@ impl Gpu {
 
     #[cfg(test)]
     fn set_scene_inner(&mut self, mesh: &Mesh) -> Result<(), Error> {
-        let scene = Self::build_scene(&mut self.context, mesh)?;
-        let mut geometry = vec![0u32; 4];
-        for quad in &mesh.quads {
-            geometry.extend(quad.positions().into_iter().flatten().map(f32::to_bits));
-            geometry.extend([0, 0, 0, 0]);
-        }
-        let positions = Buffer::upload(&mut self.context, bytemuck::cast_slice(&geometry))?;
+        self.cancel_packets()?;
+        let (scene, vertices) = Self::build_scene(&mut self.context, mesh)?;
         self.invalidate()?;
-        self.known_geometry = Some(positions);
+        self.known_geometry = vertices;
+        self.known_geometry_capacity = mesh.quads.len() as u32;
         self.scene = scene;
         self.region_cache = scene_cache::Cache::new()?;
+        self.terrain_uploads.clear();
+        self.pending_storage = None;
         self.attribute_revisions.clear();
         Ok(())
     }
@@ -2181,12 +2350,13 @@ impl Gpu {
     /// 发布已排序、唯一且完整的region借用视图；输入只在调用内有效。
     ///
     /// 宿主须已确认旧命令完成。几何revision决定BLAS，content revision决定属性写入；
-    /// 属性buffer容量保留并仅写变化范围，只有增长才重写全部活动范围。
+    /// 新几何在 GPU 生成属性，内容更新仅写变化范围。扩容时在设备端复制旧数据。
     /// 管理器空发布不触碰GPU；anchor只改变TLAS。准备或映射失败保留旧目录和属性。
     pub fn set_regions(&mut self, source: prime_scene::RenderView<'_>) -> Result<(), Error> {
         self.scene_update = None;
         self.complete_previous()?;
-        let result = self.set_regions_inner(source);
+        self.cancel_packets()?;
+        let result = self.set_regions_inner(source, false);
         if result.is_ok() && self.scene_update.is_some_and(|timing| !timing.changed) {
             return result;
         }
@@ -2196,12 +2366,86 @@ impl Gpu {
         result
     }
 
+    /// 当前可绘制 TLAS 的世界原点。候选移动或上传时相机仍相对这个已发布原点。
+    pub const fn scene_anchor(&self) -> [f64; 3] {
+        self.anchor
+    }
+
     /// 最近一次成功场景调用的墙钟及工作集；失败时为None，空发布保存零工作量。
     pub const fn scene_timing(&self) -> Option<SceneUpdateTiming> {
         self.scene_update
     }
 
-    fn set_regions_inner(&mut self, source: prime_scene::RenderView<'_>) -> Result<(), Error> {
+    /// 按原生队列顺序发布 64³ 地形。变化页经有界通道交予后台编码池，未变分片复用源版本。
+    /// 返回 false 时宿主保留管理器发布令牌并继续绘制旧覆盖。生产错误可能在后续领取时返回。
+    /// 同一候选分帧传输期间固定其原点，发布后下一次调用可单独移动 TLAS。
+    /// GPU 展开、AS、灯树及表补丁在同队列执行。
+    /// # Errors
+    /// 与同步场景入口相同；失败撤销候选，已排队的独占临时资源按 fence 退役。
+    pub fn stream_regions(
+        &mut self,
+        mut source: prime_scene::RenderView<'_>,
+    ) -> Result<bool, Error> {
+        self.scene_update = None;
+        if source.anchor.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Invalid("场景原点须有限"));
+        }
+        self.complete_previous()?;
+        self.cpu_packets.handoff_bytes = 0;
+        self.cpu_packets.encoded = 0;
+        self.cpu_packets.reused = 0;
+        self.terrain_uploads.begin_frame();
+        let polling = std::time::Instant::now();
+        let worker_ns = self.poll_packets(source)?;
+        let handoff = elapsed_ns(polling);
+        if self.cpu_packets.pending() {
+            self.scene_update = Some(SceneUpdateTiming {
+                upload_pending: true,
+                geometry_ns: handoff,
+                cpu_source_bytes: self.cpu_packets.handoff_bytes as u64,
+                worker_geometry_ns: worker_ns,
+                instances: source.regions.len(),
+                ..Default::default()
+            });
+            return Ok(false);
+        }
+        if let Some(storage) = &self.pending_storage
+            && storage.matches(source, self.scene.top)
+        {
+            source.anchor = storage.anchor;
+        }
+        let result = self.set_regions_inner(source, true);
+        if let Some(t) = &mut self.scene_update {
+            t.geometry_ns += handoff;
+            t.worker_geometry_ns = worker_ns;
+            t.build_quads = self.terrain_uploads.built_quads() as u64;
+            t.cpu_source_bytes = self.cpu_packets.handoff_bytes as u64;
+            t.encoded_quads = self.cpu_packets.encoded;
+            t.reused_fragment_quads = self.cpu_packets.reused;
+        }
+        if result.is_err() || self.terrain_pending() {
+            self.collect_resources()?;
+        }
+        result.map(|()| self.scene_update.is_some_and(|v| !v.upload_pending))
+    }
+
+    /// CPU 页或 GPU 上传仍在途。即使当前没有新编辑，宿主也须继续推进并保留旧覆盖。
+    pub fn terrain_pending(&self) -> bool {
+        self.cpu_packets.pending()
+            || self.pending_storage.is_some()
+            || self.terrain_uploads.pending()
+    }
+
+    /// 设置一帧可传的地形字节，默认 64 MiB。零值或非 4B 对齐返回错误。
+    pub fn set_terrain_upload_budget(&mut self, bytes: usize) -> Result<(), Error> {
+        self.terrain_uploads.set_limit(bytes)?;
+        Ok(())
+    }
+    fn set_regions_inner(
+        &mut self,
+        source: prime_scene::RenderView<'_>,
+        queued: bool,
+    ) -> Result<(), Error> {
         if source.generation != self.resource_generation {
             return Err(Error::Invalid("region与材质资源世代不匹配"));
         }
@@ -2237,6 +2481,11 @@ impl Gpu {
             && source.anchor == self.anchor
             && !self.scene_resources_dirty()
         {
+            if self.terrain_uploads.pending() || self.pending_storage.is_some() {
+                self.terrain_uploads.clear();
+                self.pending_storage = None;
+                self.collect_resources()?;
+            }
             self.scene_update = Some(metrics);
             return Ok(());
         }
@@ -2246,31 +2495,76 @@ impl Gpu {
             &self.attribute_revisions,
         )?;
         // 同一几何版本可以更换材质。颜色补丁不影响覆盖，其余属性更新只有在旧 BLAS
-        // 跳过覆盖时才需要检查是否仍可复用。非 opaque 的旧 BLAS 对所有材质都正确。
-        for (region, matched) in source.regions.iter().zip(&mut matches) {
-            if matched.attributes_dirty
-                && !region.mesh.attribute_only()
-                && matched
-                    .reuse
-                    .is_some_and(|i| self.region_cache.entries()[i].opaque)
-                && region.mesh.quads().any(|quad| {
-                    self.material_coverage
-                        .get(quad.material_id().index() as usize)
-                        .is_none_or(|&coverage| coverage)
-                })
-            {
-                matched.reuse = None;
+        // 跳过覆盖时检查是否仍可复用；下面另外核对已绑定 OMM 的 UV／材质身份。
+        if !queued {
+            for (region, matched) in source.regions.iter().zip(&mut matches) {
+                if matched.attributes_dirty
+                    && !region.mesh.attribute_only()
+                    && matched
+                        .reuse
+                        .is_some_and(|i| self.region_cache.entries()[i].opaque)
+                    && region.mesh.quads().any(|quad| {
+                        self.material_coverage
+                            .get(quad.material_id().index() as usize)
+                            .is_none_or(|&coverage| coverage)
+                    })
+                {
+                    matched.reuse = None;
+                }
+            }
+            for (region, matched) in source.regions.iter().zip(&mut matches) {
+                if matched.attributes_dirty
+                    && !region.mesh.attribute_only()
+                    && self.opacity.map.is_some()
+                    && let Some(index) = matched.reuse
+                {
+                    let actual = region.mesh.quads().enumerate().filter_map(|(i, q)| {
+                        let pair = self.opacity.indices(q.material_id().index(), q.uv());
+                        (pair != [vulkan::OPACITY_UNKNOWN; 2]).then_some((i as u32, pair))
+                    });
+                    if !actual.eq(self.region_cache.entries()[index]
+                        .opacity_slots
+                        .iter()
+                        .copied())
+                    {
+                        matched.reuse = None;
+                    }
+                }
             }
         }
-        let mut update = self.region_cache.begin(source.regions.len())?;
-        let (slots, entries, _) = update.parts_mut();
         let started = std::time::Instant::now();
-        let dirty_triangles =
-            source
-                .regions
+        let packed = self
+            .pending_storage
+            .as_mut()
+            .filter(|p| queued && p.matches(source, self.scene.top))
+            .and_then(|p| p.packed.take())
+            .or_else(|| self.cpu_ready.take());
+        let PackedRegions {
+            mut patches,
+            mut update,
+            pending,
+            opacity_indices,
+        } = if let Some(packed) = packed {
+            packed
+        } else if queued
+            && matches
                 .iter()
-                .zip(&matches)
-                .try_fold(0usize, |count, (region, matched)| {
+                .any(|m| m.reuse.is_none() || m.attributes_dirty)
+        {
+            self.start_packets(source, &matches)?;
+            self.scene_update = Some(SceneUpdateTiming {
+                upload_pending: true,
+                geometry_ns: elapsed_ns(started),
+                instances: source.regions.len(),
+                ..Default::default()
+            });
+            return Ok(());
+        } else {
+            let mut update = self.region_cache.begin(source.regions.len())?;
+            let (slots, entries, ids) = update.parts_mut();
+            let dirty_triangles = source.regions.iter().zip(&matches).try_fold(
+                0usize,
+                |count, (region, matched)| {
                     if matched.reuse.is_some() {
                         Ok(count)
                     } else {
@@ -2284,66 +2578,517 @@ impl Gpu {
                             )
                             .ok_or(Error::Invalid("dirty三角数量溢出"))
                     }
-                })?;
-        let mut triangles = Vec::new();
-        triangles
-            .try_reserve_exact(dirty_triangles)
-            .map_err(scene_cache::Error::from)?;
-        let mut pending = Vec::with_capacity(source.regions.len());
-        for (region, matched) in source.regions.iter().zip(&matches) {
-            if let Some(index) = matched.reuse {
-                entries.push(scene_cache::Prepared::Reused(index));
-                continue;
+                },
+            )?;
+            let mut opacity_indices = Vec::new();
+            if self.opacity.map.is_some() {
+                opacity_indices
+                    .try_reserve_exact(dirty_triangles)
+                    .map_err(scene_cache::Error::from)?;
             }
-            let count = u32::try_from(region.mesh.len())
-                .map_err(|_| Error::Invalid("region面索引超过u32"))?;
-            let range = slots.take(count)?;
-            if range.end > self.attribute_slot_limit {
-                return Err(Error::Invalid("region属性槽超过设备缓冲容量"));
-            }
-            let start = triangles.len();
-            let mut opaque = true;
-            for quad in region.mesh.quads() {
-                let coverage = self
-                    .material_coverage
-                    .get(quad.material_id().index() as usize)
-                    .ok_or(Error::Invalid("构建AS前quad记录或材质身份无效"))?;
-                if !quad.valid() {
-                    return Err(Error::Invalid("构建AS前quad记录或材质身份无效"));
+            let mut pending = Vec::with_capacity(source.regions.len());
+            for (region, matched) in source.regions.iter().zip(&matches) {
+                if let Some(index) = matched.reuse {
+                    entries.push(scene_cache::Prepared::Reused(index));
+                    continue;
                 }
-                opaque &= !coverage;
-                let [a, b, c, d] = quad.positions();
-                triangles.extend([[a, b, c], [a, c, d]]);
-            }
-            pending.push((entries.len(), start..triangles.len()));
+                let count = u32::try_from(region.mesh.len())
+                    .map_err(|_| Error::Invalid("region面索引超过u32"))?;
+                let range = slots.take(count)?;
+                if range.end > self.attribute_slot_limit {
+                    return Err(Error::Invalid("region属性槽超过设备缓冲容量"));
+                }
+                let start = opacity_indices.len();
+                let mut encoder = scene_cache::QuadEncoder::with_capacity(count as usize)?;
+                let mut opaque = true;
+                let mut opacity_slots = Vec::new();
+                for (local, (quad, attributes)) in region
+                    .mesh
+                    .quads()
+                    .zip(region.mesh.attributes())
+                    .enumerate()
+                {
+                    let coverage = self
+                        .material_coverage
+                        .get(quad.material_id().index() as usize)
+                        .ok_or(Error::Invalid("构建AS前quad记录或材质身份无效"))?;
+                    if !quad.valid() {
+                        return Err(Error::Invalid("构建AS前quad记录或材质身份无效"));
+                    }
+                    opaque &= !coverage;
+                    let program = self.generation.as_ref().map_or(0, |generation| {
+                        generation.programs.plan().bindings()[quad.material_id().index() as usize]
+                    });
+                    encoder.push_routed(quad.positions(), 0, attributes, program)?;
+                    if self.opacity.map.is_some() {
+                        let pair = self.opacity.indices(quad.material_id().index(), quad.uv());
+                        opacity_indices.extend(pair);
+                        if pair != [vulkan::OPACITY_UNKNOWN; 2] {
+                            opacity_slots
+                                .try_reserve(1)
+                                .map_err(scene_cache::Error::from)?;
+                            opacity_slots.push((local as u32, pair));
+                        }
+                    }
+                }
+                pending.push((entries.len(), start..opacity_indices.len()));
+                let old = self
+                    .region_cache
+                    .entries()
+                    .binary_search_by_key(&region.key, |e| e.key)
+                    .ok()
+                    .map(|index| &self.region_cache.entries()[index].resident);
+                let resident = scene_cache::ResidentQuads::prepare(encoder.finish(), old, ids)?;
+                metrics.triangle_bytes += resident.positions().bytes() as u64;
+                metrics.triangle_capacity_bytes += resident.positions().retained_bytes() as u64;
 
-            entries.push(scene_cache::Prepared::Built(RegionGpu {
-                key: region.key,
-                revision: region.geometry_revision,
-                range,
-                blas: None,
-                opaque,
-            }));
-        }
+                entries.push(scene_cache::Prepared::Built(RegionGpu {
+                    key: region.key,
+                    revision: region.geometry_revision,
+                    baked_content: region.content_revision,
+                    fragments: Vec::new(),
+                    lamps: None,
+                    range,
+                    blas: None,
+                    opaque,
+                    opacity_slots,
+                    resident,
+                }));
+            }
+            PackedRegions {
+                patches: Default::default(),
+                update,
+                pending,
+                opacity_indices,
+            }
+        };
+        let (_, entries, _) = update.parts_mut();
         let same_acceleration = same_geometry && pending.is_empty();
+        let rebuild_top = !same_acceleration || source.anchor != self.anchor;
         metrics.dirty_regions = pending.len();
+        let end = entries
+            .iter()
+            .map(|e| e.get(self.region_cache.entries()).range.end)
+            .max()
+            .unwrap_or(0);
+        let grow = u64::from(end) * 48 > self.scene.quads.len();
+        let packet_ns = elapsed_ns(started);
+        let (quads, tokens, vertex_buffer, vertex_capacity, mut allocation_ns) =
+            if let Some(saved) = self
+                .pending_storage
+                .as_ref()
+                .filter(|v| queued && v.matches(source, self.scene.top))
+            {
+                (saved.quads, saved.tokens, saved.vertices, saved.capacity, 0)
+            } else {
+                let uploading = std::time::Instant::now();
+                let quads = if grow {
+                    let capacity = end
+                        .max(4096)
+                        .checked_next_power_of_two()
+                        .ok_or(Error::Invalid("属性容量溢出"))?;
+                    let buffer =
+                        Buffer::mapped_device_local(&mut self.context, u64::from(capacity) * 48)?;
+                    // 旧槽只复制需继承的前缀，完整替换的槽由后续属性写入覆盖。
+                    let retained_end = source
+                        .regions
+                        .iter()
+                        .zip(entries.iter())
+                        .zip(&matches)
+                        .filter(|((region, entry), matched)| {
+                            !matches!(entry, scene_cache::Prepared::Built(_))
+                                && (!matched.attributes_dirty || region.mesh.attribute_only())
+                        })
+                        .map(|((_, entry), _)| entry.get(self.region_cache.entries()).range.end)
+                        .max()
+                        .unwrap_or(0);
+                    if retained_end != 0 {
+                        metrics.attribute_copy_bytes = u64::from(retained_end) * 48;
+                        if queued {
+                            self.context.enqueue_copy(
+                                self.scene.quads,
+                                buffer,
+                                metrics.attribute_copy_bytes,
+                            )?;
+                        } else {
+                            self.scene.quads.copy_prefix_to(
+                                &mut self.context,
+                                &buffer,
+                                metrics.attribute_copy_bytes,
+                            )?;
+                        }
+                    }
+                    buffer
+                } else {
+                    self.scene.quads
+                };
+
+                let tokens = if u64::from(end) * 8 > self.scene.tokens.len() {
+                    let buffer =
+                        Buffer::mapped_device_local(&mut self.context, quads.len() / 48 * 8)?;
+                    let retained = entries
+                        .iter()
+                        .filter_map(|e| match e {
+                            scene_cache::Prepared::Reused(i) => {
+                                Some(self.region_cache.entries()[*i].range.end)
+                            }
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    if retained != 0 {
+                        if queued {
+                            self.context.enqueue_copy(
+                                self.scene.tokens,
+                                buffer,
+                                u64::from(retained) * 8,
+                            )?;
+                        } else {
+                            self.scene.tokens.copy_prefix_to(
+                                &mut self.context,
+                                &buffer,
+                                u64::from(retained) * 8,
+                            )?;
+                        }
+                    }
+                    buffer
+                } else {
+                    self.scene.tokens
+                };
+
+                let (vertex_buffer, vertex_capacity) =
+                    self.prepare_vertices(entries, end, queued)?;
+                let allocation_ns = elapsed_ns(uploading);
+
+                (quads, tokens, vertex_buffer, vertex_capacity, allocation_ns)
+            };
+        let descriptors = std::time::Instant::now();
         let inputs: Vec<_> = pending
             .iter()
-            .map(|(index, range)| vulkan::TriangleBlasInput {
-                triangles: &triangles[range.clone()],
-                opaque: entries[*index].get(self.region_cache.entries()).opaque,
-                opacity: None,
+            .map(|(index, range)| {
+                let entry = entries[*index].get(self.region_cache.entries());
+                vulkan::QuadBlasInput {
+                    quads: &entry.resident,
+                    output: vulkan::QuadOutput {
+                        first: entry.range.start,
+                        region: entry.key,
+                        attributes: Some(quads),
+                        identities: Some(tokens),
+                        vertices: vertex_buffer,
+                        cells: None,
+                    },
+                    opaque: entry.opaque,
+                    opacity: self
+                        .opacity
+                        .map
+                        .filter(|_| !range.is_empty())
+                        .map(|map| (map, &opacity_indices[range.clone()])),
+                }
             })
             .collect();
-        metrics.geometry_ns = elapsed_ns(started);
-        metrics.triangle_bytes = size_of_val(triangles.as_slice()) as u64;
-        metrics.triangle_capacity_bytes =
-            (triangles.capacity() * size_of::<[[f32; 3]; 3]>()) as u64;
+        metrics.geometry_ns = packet_ns + elapsed_ns(descriptors);
         metrics.pending_capacity_bytes =
             (pending.capacity() * size_of::<(usize, std::ops::Range<usize>)>()) as u64;
         metrics.input_capacity_bytes =
-            (inputs.capacity() * size_of::<vulkan::TriangleBlasInput<'_>>()) as u64;
-        let top = if !same_acceleration || source.anchor != self.anchor {
+            (inputs.capacity() * size_of::<vulkan::QuadBlasInput<'_>>()) as u64;
+        let saved_transfer = self
+            .pending_storage
+            .as_mut()
+            .filter(|p| queued && p.matches(source, self.scene.top) && p.anchor == source.anchor)
+            .and_then(|p| p.transfer.take());
+        let transfer = if let Some(saved) = saved_transfer {
+            saved
+        } else {
+            let packing = std::time::Instant::now();
+            let mut baked_lamps = std::collections::BTreeMap::new();
+            let mut attributes = Vec::new();
+            let dirty_count = source
+                .regions
+                .iter()
+                .zip(entries.iter())
+                .zip(&matches)
+                .enumerate()
+                .filter(|(i, ((_, e), m))| {
+                    !patches.contains_key(i)
+                        && matches!(e, scene_cache::Prepared::Reused(_))
+                        && m.attributes_dirty
+                })
+                .map(|(_, v)| v)
+                .try_fold(0usize, |n, ((r, e), _)| {
+                    let partial =
+                        !matches!(e, scene_cache::Prepared::Built(_)) && r.mesh.attribute_only();
+                    let count = if partial {
+                        r.mesh
+                            .attribute_ranges()
+                            .map(|range| range.quads.len())
+                            .sum()
+                    } else {
+                        r.mesh.len()
+                    };
+                    n.checked_add(count).ok_or(Error::Invalid("属性数量溢出"))
+                })?;
+            attributes
+                .try_reserve_exact(dirty_count)
+                .map_err(scene_cache::Error::from)?;
+            let mut ranges = Vec::with_capacity(source.regions.len());
+            let mut versions = Vec::with_capacity(source.regions.len());
+            for (row, ((region, entry), matched)) in source
+                .regions
+                .iter()
+                .zip(entries.iter())
+                .zip(&matches)
+                .enumerate()
+            {
+                if let Some(mut p) = patches.remove(&row) {
+                    if let Some(lamps) = p.lamps.take() {
+                        baked_lamps.insert(region.key, lamps);
+                    }
+                    let base = attributes.len();
+                    if attributes.is_empty() {
+                        attributes = p.attributes;
+                    } else {
+                        attributes
+                            .try_reserve(p.attributes.len())
+                            .map_err(scene_cache::Error::from)?;
+                        attributes.append(&mut p.attributes);
+                    }
+                    ranges
+                        .try_reserve(p.ranges.len())
+                        .map_err(scene_cache::Error::from)?;
+                    ranges.extend(
+                        p.ranges
+                            .into_iter()
+                            .map(|(o, r)| (o, base + r.start..base + r.end)),
+                    );
+                    versions.push((region.key, region.content_revision));
+                    continue;
+                }
+                let built = matches!(entry, scene_cache::Prepared::Built(_));
+                let entry = entry.get(self.region_cache.entries());
+                let dirty = !built && matched.attributes_dirty;
+                if dirty {
+                    if !built && region.mesh.attribute_only() {
+                        for patch in region.mesh.attribute_ranges() {
+                            attribute_update::pack_patch(
+                                entry,
+                                patch.first,
+                                patch.attributes(),
+                                &mut attributes,
+                                &mut ranges,
+                            )?;
+                        }
+                    } else {
+                        // 新几何已在AS输入边界校验；复用几何的普通属性候选仍需检查。
+                        if !built {
+                            for quad in region.mesh.quads() {
+                                if !quad.valid()
+                                    || quad.material_id().index() as usize >= self.light_sides.len()
+                                {
+                                    return Err(Error::Invalid(
+                                        "quad记录或材质身份不属于当前资源世代",
+                                    ));
+                                }
+                            }
+                        }
+                        attribute_update::pack_patch(
+                            entry,
+                            0,
+                            region.mesh.attributes(),
+                            &mut attributes,
+                            &mut ranges,
+                        )?;
+                    }
+                }
+                versions.push((region.key, region.content_revision));
+            }
+            metrics.attribute_capacity_bytes =
+                (attributes.capacity() * size_of::<[[u32; 4]; 3]>()) as u64;
+            metrics.attribute_pack_ns += elapsed_ns(packing);
+            metrics.geometry_ns += metrics.attribute_pack_ns;
+            let light_started = std::time::Instant::now();
+            let bases: Vec<_> = entries
+                .iter()
+                .map(|e| e.get(self.region_cache.entries()).range.start)
+                .collect();
+            let orders: Vec<_> = entries
+                .iter()
+                .map(|entry| entry.get(self.region_cache.entries()).resident.positions())
+                .collect();
+            let cached: Vec<_> = entries
+                .iter()
+                .zip(source.regions)
+                .map(|(e, r)| {
+                    let entry = e.get(self.region_cache.entries());
+                    if let Some(rows) = baked_lamps.get(&r.key) {
+                        Some(rows.as_slice())
+                    } else if entry.baked_content == r.content_revision {
+                        entry.lamps.as_deref()
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let lights = self.lighting.prepare_backend(
+                source,
+                &bases,
+                lighting::Emitters {
+                    sides: &self.light_sides,
+                    areas: &self.light_areas,
+                    weights: &self.light_weights,
+                },
+                self.has_emission,
+                self.resource_generation,
+                true,
+                Some(&orders),
+                Some(&cached),
+            )?;
+            metrics.light_pack_ns = elapsed_ns(light_started);
+            metrics.geometry_ns += metrics.light_pack_ns;
+            let light_started = std::time::Instant::now();
+            let lighting_gpu = if let Some(tables) = &lights.tables {
+                if queued {
+                    let alloc = |ctx: &mut Context, n: usize| {
+                        Buffer::mapped_device_local(ctx, n.max(16) as u64)
+                    };
+                    LightingGpu {
+                        tree: self.lighting_gpu.tree,
+                        alias: alloc(&mut self.context, tables.selection.len() * 16)?,
+                        meta: alloc(&mut self.context, tables.meta.len() * 16)?,
+                        regions: alloc(&mut self.context, tables.regions.len() * 16)?,
+                        inverse: alloc(&mut self.context, tables.inverse.len() * 16)?,
+                    }
+                } else {
+                    LightingGpu::upload(&mut self.context, Some(tables))?
+                }
+            } else {
+                self.lighting_gpu
+            };
+            if lights.tables.is_some() {
+                metrics.light_upload_ns = elapsed_ns(light_started);
+                metrics.light_upload_bytes = lighting_gpu.alias.len()
+                    + lighting_gpu.meta.len()
+                    + lighting_gpu.inverse.len()
+                    + lighting_gpu.regions.len();
+                metrics.resources_ns += metrics.light_upload_ns;
+            }
+            // 实例身份只引用同序目录；属性槽可独立扩展。anchor变化和纯属性更新复用目录。
+            let base_write = (!same_acceleration && !bases.is_empty())
+                .then(|| (0, bytemuck::cast_slice(bases.as_slice())));
+            let instance_quad_bases = if let Some((_, bytes)) = base_write
+                && (bytes.len() as u64 > self.scene.instance_quad_bases.len()
+                    || self.scene.instance_quad_bases == self.program_scene.instance_quad_bases)
+            {
+                let started = std::time::Instant::now();
+                let capacity = bytes.len().max(256).next_power_of_two();
+                let buffer = Buffer::mapped_device_local(&mut self.context, capacity as u64)?;
+                allocation_ns += elapsed_ns(started);
+                buffer
+            } else {
+                self.scene.instance_quad_bases
+            };
+            let mut columns = scene_upload::Columns::default();
+
+            if queued {
+                if let Some((offset, bytes)) = base_write {
+                    columns.append(instance_quad_bases, offset, bytes)?;
+                }
+                if let Some(t) = &lights.tables {
+                    columns.append(lighting_gpu.alias, 0, bytemuck::cast_slice(&t.selection))?;
+                    columns.append(lighting_gpu.meta, 0, bytemuck::cast_slice(&t.meta))?;
+                    columns.append(lighting_gpu.regions, 0, bytemuck::cast_slice(&t.regions))?;
+                    columns.append(lighting_gpu.inverse, 0, bytemuck::cast_slice(&t.inverse))?;
+                } else {
+                    let p = &lights.patches;
+                    columns.rows(lighting_gpu.alias, &p.alias)?;
+                    columns.rows(lighting_gpu.meta, &p.meta)?;
+                    columns.rows(lighting_gpu.regions, &p.regions)?;
+                    columns.rows(lighting_gpu.inverse, &p.inverse)?;
+                }
+            }
+            Transfer {
+                upload: Default::default(),
+                attributes,
+                ranges,
+                versions,
+                bases,
+                lights,
+                lighting_gpu,
+                instance_quad_bases,
+                columns,
+            }
+        };
+        let Transfer {
+            mut upload,
+            attributes,
+            ranges,
+            versions,
+            bases,
+            lights,
+            mut lighting_gpu,
+            instance_quad_bases,
+            columns,
+        } = transfer;
+        let mut attribute_source = None;
+        let mut side_source = None;
+        let mut leaf_source = None;
+        if queued {
+            let mut parts = Vec::new();
+            if !attributes.is_empty() {
+                parts.push(bytemuck::cast_slice(attributes.as_slice()));
+            }
+            let side_index = parts.len();
+            if !columns.bytes.is_empty() {
+                parts.push(columns.bytes.as_slice());
+            }
+            let leaf_index = parts.len();
+            if let Some(p) = &lights.device
+                && !p.leaves.is_empty()
+            {
+                parts.push(bytemuck::cast_slice(&p.leaves));
+            }
+            let staged = upload.stage(&mut self.context, &mut self.terrain_uploads, &parts)?;
+            let Some(staged) = staged else {
+                metrics.attribute_upload_bytes = self.terrain_uploads.transferred() as u64;
+                metrics.triangle_bytes = 0;
+                metrics.upload_pending = true;
+                metrics.terrain_upload_bytes = self.terrain_uploads.transferred() as u64;
+                self.pending_storage = Some(PendingStorage::capture(
+                    source,
+                    self.scene.top,
+                    quads,
+                    tokens,
+                    vertex_buffer,
+                    vertex_capacity,
+                    PackedRegions {
+                        patches,
+                        update,
+                        pending,
+                        opacity_indices,
+                    },
+                    Transfer {
+                        upload,
+                        attributes,
+                        ranges,
+                        versions,
+                        bases,
+                        lights,
+                        lighting_gpu,
+                        instance_quad_bases,
+                        columns,
+                    },
+                )?);
+                self.scene_update = Some(metrics);
+                return Ok(());
+            };
+            if !columns.bytes.is_empty() {
+                side_source = Some(staged[side_index]);
+            }
+            if !attributes.is_empty() {
+                attribute_source = Some(staged[0]);
+            }
+            leaf_source = staged.get(leaf_index).copied();
+        }
+        let top = if rebuild_top {
             let packing = std::time::Instant::now();
             let mut instances = Vec::new();
             instances
@@ -2377,15 +3122,61 @@ impl Gpu {
             }
             metrics.instance_capacity_bytes =
                 (instances.capacity() * size_of::<TriangleInstance<vulkan::BatchBlas>>()) as u64;
-            metrics.attribute_pack_ns = elapsed_ns(packing);
+            let instance_ns = elapsed_ns(packing);
+            metrics.attribute_pack_ns += instance_ns;
+            metrics.geometry_ns += instance_ns;
             let accelerating = std::time::Instant::now();
-            let batch = self.context.triangle_scene_batch(&inputs, &instances)?;
+            let batch = if queued {
+                let allowance = self.terrain_uploads.remaining();
+                let submitted = self.context.stream_quad_scene(
+                    &mut self.terrain_uploads,
+                    allowance,
+                    &inputs,
+                    &instances,
+                )?;
+                metrics.triangle_bytes = self.terrain_uploads.transferred() as u64;
+                let Some(batch) = submitted else {
+                    metrics.upload_pending = true;
+                    metrics.terrain_upload_bytes = self.terrain_uploads.transferred() as u64;
+                    self.pending_storage = Some(PendingStorage::capture(
+                        source,
+                        self.scene.top,
+                        quads,
+                        tokens,
+                        vertex_buffer,
+                        vertex_capacity,
+                        PackedRegions {
+                            patches,
+                            update,
+                            pending,
+                            opacity_indices,
+                        },
+                        Transfer {
+                            upload,
+                            attributes,
+                            ranges,
+                            versions,
+                            bases,
+                            lights,
+                            lighting_gpu,
+                            instance_quad_bases,
+                            columns,
+                        },
+                    )?);
+                    self.scene_update = Some(metrics);
+                    return Ok(());
+                };
+                batch
+            } else {
+                self.context.quad_scene_batch(&inputs, &instances)?
+            };
             metrics.acceleration_ns = elapsed_ns(accelerating);
             metrics.tlas_ns = batch.tlas_prepare_ns;
             metrics.as_submit_wait_ns = batch.blas.timing.submit_wait_ns;
             if !inputs.is_empty() {
                 metrics.batch = batch.blas.timing;
             }
+            drop(inputs);
             for ((index, _), blas) in pending.iter().zip(batch.blas.blases) {
                 let scene_cache::Prepared::Built(entry) = &mut entries[*index] else {
                     unreachable!("dirty输入对应新记录");
@@ -2396,173 +3187,28 @@ impl Gpu {
         } else {
             self.scene.top
         };
-        drop(inputs);
-        drop(triangles);
         drop(pending);
-        let packing = std::time::Instant::now();
-        let end = entries
-            .iter()
-            .map(|e| e.get(self.region_cache.entries()).range.end)
-            .max()
-            .unwrap_or(0);
-        let grow = u64::from(end) * 48 > self.scene.quads.len();
-        let mut attributes = Vec::new();
-        let dirty_count = source
-            .regions
-            .iter()
-            .zip(entries.iter())
-            .zip(&matches)
-            .filter(|((_, e), matched)| {
-                matches!(e, scene_cache::Prepared::Built(_)) || matched.attributes_dirty
-            })
-            .try_fold(0usize, |n, ((r, e), _)| {
-                let partial =
-                    !matches!(e, scene_cache::Prepared::Built(_)) && r.mesh.attribute_only();
-                let count = if partial {
-                    r.mesh
-                        .attribute_ranges()
-                        .map(|range| range.quads.len())
-                        .sum()
-                } else {
-                    r.mesh.len()
-                };
-                n.checked_add(count).ok_or(Error::Invalid("属性数量溢出"))
-            })?;
-        attributes
-            .try_reserve_exact(dirty_count)
-            .map_err(scene_cache::Error::from)?;
-        let mut ranges = Vec::with_capacity(source.regions.len());
-        let mut versions = Vec::with_capacity(source.regions.len());
-        for ((region, entry), matched) in source.regions.iter().zip(entries.iter()).zip(&matches) {
-            let built = matches!(entry, scene_cache::Prepared::Built(_));
-            let entry = entry.get(self.region_cache.entries());
-            let dirty = built || matched.attributes_dirty;
-            if dirty {
-                if !built && region.mesh.attribute_only() {
-                    for patch in region.mesh.attribute_ranges() {
-                        let start = attributes.len();
-                        attributes.extend(patch.attributes());
-                        ranges.push((
-                            (entry.range.start as usize + patch.first) * 48,
-                            start..attributes.len(),
-                        ));
-                    }
-                } else {
-                    let start = attributes.len();
-                    // 新几何已在AS输入边界校验；复用几何的普通属性候选仍需检查。
-                    if !built {
-                        for quad in region.mesh.quads() {
-                            if !quad.valid()
-                                || quad.material_id().index() as usize >= self.light_sides.len()
-                            {
-                                return Err(Error::Invalid("quad记录或材质身份不属于当前资源世代"));
-                            }
-                        }
-                    }
-                    attributes.extend(region.mesh.attributes());
-                    ranges.push((entry.range.start as usize * 48, start..attributes.len()));
-                }
+        if let Some(proposal) = &lights.device {
+            let vertices = vertex_buffer.unwrap_or(self.geometry_placeholder);
+            lighting_gpu.tree = if queued {
+                self.context.enqueue_light_tree_from(
+                    vertices,
+                    &proposal.leaves,
+                    proposal.anchor,
+                    false,
+                    leaf_source,
+                )?
+            } else {
+                self.context
+                    .build_light_tree(vertices, &proposal.leaves, proposal.anchor, false)?
             }
-            versions.push((region.key, region.content_revision));
+            .tree;
+            metrics.light_upload_bytes += size_of_val(proposal.leaves.as_slice()) as u64;
         }
-        metrics.attribute_capacity_bytes =
-            (attributes.capacity() * size_of::<[[u32; 4]; 3]>()) as u64;
-        metrics.attribute_pack_ns += elapsed_ns(packing);
-        metrics.geometry_ns += metrics.attribute_pack_ns;
-        let light_started = std::time::Instant::now();
-        let bases: Vec<_> = entries
-            .iter()
-            .map(|e| e.get(self.region_cache.entries()).range.start)
-            .collect();
-        let lights = self.lighting.prepare(
-            source,
-            &bases,
-            lighting::Emitters {
-                sides: &self.light_sides,
-                areas: &self.light_areas,
-                weights: &self.light_weights,
-            },
-            self.has_emission,
-            self.resource_generation,
-        )?;
-        metrics.light_pack_ns = elapsed_ns(light_started);
-        metrics.geometry_ns += metrics.light_pack_ns;
-        let light_started = std::time::Instant::now();
-        let lighting_gpu = if let Some(tables) = &lights.tables {
-            LightingGpu::upload(&mut self.context, Some(tables))?
-        } else {
-            self.lighting_gpu
-        };
-        if lights.tables.is_some() {
-            metrics.light_upload_ns = elapsed_ns(light_started);
-            metrics.light_upload_bytes = lighting_gpu.alias.len()
-                + lighting_gpu.meta.len()
-                + lighting_gpu.vertices.len()
-                + lighting_gpu.inverse.len()
-                + lighting_gpu.regions.len();
-            metrics.resources_ns += metrics.light_upload_ns;
-        }
-        let writes: Vec<_> = ranges
-            .iter()
-            .map(|(offset, range)| (*offset, bytemuck::cast_slice(&attributes[range.clone()])))
-            .collect();
-        let uploading = std::time::Instant::now();
-        let quads = if grow {
-            let capacity = end
-                .max(4096)
-                .checked_next_power_of_two()
-                .ok_or(Error::Invalid("属性容量溢出"))?;
-            let buffer = Buffer::mapped_device_local(&mut self.context, u64::from(capacity) * 48)?;
-            // 旧槽只复制需继承的前缀，完整替换的槽由后续属性写入覆盖。
-            let retained_end = source
-                .regions
-                .iter()
-                .zip(entries.iter())
-                .zip(&matches)
-                .filter(|((region, entry), matched)| {
-                    !matches!(entry, scene_cache::Prepared::Built(_))
-                        && (!matched.attributes_dirty || region.mesh.attribute_only())
-                })
-                .map(|((_, entry), _)| entry.get(self.region_cache.entries()).range.end)
-                .max()
-                .unwrap_or(0);
-            if retained_end != 0 {
-                metrics.attribute_copy_bytes = u64::from(retained_end) * 48;
-                self.scene.quads.copy_prefix_to(
-                    &mut self.context,
-                    &buffer,
-                    metrics.attribute_copy_bytes,
-                )?;
-            }
-            buffer
-        } else {
-            self.scene.quads
-        };
-        let mut allocation_ns = if grow { elapsed_ns(uploading) } else { 0 };
-        // 实例身份只引用同序目录；属性槽可独立扩展。anchor变化和纯属性更新复用目录。
-        let base_write = (!same_acceleration && !bases.is_empty())
-            .then(|| (0, bytemuck::cast_slice(bases.as_slice())));
-        let instance_quad_bases = if let Some((_, bytes)) = base_write
-            && (bytes.len() as u64 > self.scene.instance_quad_bases.len()
-                || self.scene.instance_quad_bases == self.program_scene.instance_quad_bases)
-        {
-            let started = std::time::Instant::now();
-            let capacity = bytes.len().max(256).next_power_of_two();
-            let buffer = Buffer::mapped_device_local(&mut self.context, capacity as u64)?;
-            allocation_ns += elapsed_ns(started);
-            buffer
-        } else {
-            self.scene.instance_quad_bases
-        };
-        let geometry_started = std::time::Instant::now();
-        let known_geometry = self.prepare_known_geometry(source, entries, end)?;
-        metrics.geometry_ns += elapsed_ns(geometry_started);
-        let geometry_bytes = known_geometry.written_bytes();
-
-        let geometry_writes = known_geometry.writes();
-        let geometry_buffer = known_geometry.buffer.unwrap_or(self.geometry_placeholder);
-        let bindings_changed = known_geometry.buffer != self.known_geometry
+        let geometry_buffer = vertex_buffer.unwrap_or(self.geometry_placeholder);
+        let bindings_changed = vertex_buffer != self.known_geometry
             || top != self.scene.top
+            || tokens != self.scene.tokens
             || quads != self.scene.quads
             || instance_quad_bases != self.scene.instance_quad_bases
             || lighting_gpu != self.lighting_gpu;
@@ -2572,9 +3218,12 @@ impl Gpu {
             candidates.extend([
                 vulkan::native::Resource::from(top),
                 quads.into(),
+                tokens.into(),
                 instance_quad_bases.into(),
                 geometry_buffer.into(),
             ]);
+            candidates.extend(side_source.map(vulkan::native::Resource::from));
+            candidates.extend(attribute_source.map(vulkan::native::Resource::from));
             self.collect_with(&candidates)?;
             metrics.collect_ns = elapsed_ns(collecting);
         }
@@ -2585,7 +3234,6 @@ impl Gpu {
             .prepare(update, |entry| entry.range.clone())?;
         let light_publication = self.lighting.publication(lights)?;
 
-        {}
         let patches = light_publication.patches();
         fn rows(values: &[(usize, [u32; 4])]) -> Vec<(usize, &[u8])> {
             values
@@ -2597,34 +3245,50 @@ impl Gpu {
         let meta_writes = rows(&patches.meta);
         let inverse_writes = rows(&patches.inverse);
         let region_writes = rows(&patches.regions);
-        let vertex_writes: Vec<_> = patches
-            .vertices
-            .iter()
-            .map(|(row, value)| (row * 16, bytemuck::bytes_of(value)))
-            .collect();
-        let light_patch_bytes = (alias_writes.len()
-            + meta_writes.len()
-            + inverse_writes.len()
-            + region_writes.len()
-            + vertex_writes.len()) as u64
-            * 16;
+        let light_patch_bytes =
+            (alias_writes.len() + meta_writes.len() + inverse_writes.len() + region_writes.len())
+                as u64
+                * 16;
 
+        let writes: Vec<_> = ranges
+            .iter()
+            .map(|(offset, range)| (*offset, bytemuck::cast_slice(&attributes[range.clone()])))
+            .collect();
+        let base_write = (!same_acceleration && !bases.is_empty())
+            .then(|| (0, bytemuck::cast_slice(bases.as_slice())));
         let writes_attributes = !writes.is_empty() || base_write.is_some();
-        if writes_attributes || light_patch_bytes != 0 || !geometry_writes.is_empty() {
+        if writes_attributes || light_patch_bytes != 0 || side_source.is_some() {
             let writing = std::time::Instant::now();
-            Buffer::write_scattered_batches(
-                &mut self.context,
-                &[
-                    (&quads, &writes),
-                    (&geometry_buffer, &geometry_writes),
-                    (&instance_quad_bases, base_write.as_slice()),
-                    (&lighting_gpu.alias, &alias_writes),
-                    (&lighting_gpu.meta, &meta_writes),
-                    (&lighting_gpu.vertices, &vertex_writes),
-                    (&lighting_gpu.inverse, &inverse_writes),
-                    (&lighting_gpu.regions, &region_writes),
-                ],
-            )?;
+            let patches: &[(&Buffer, &vulkan::native::BufferWriteRanges<'_>)] = &[
+                (&quads, &writes),
+                (&instance_quad_bases, base_write.as_slice()),
+                (&lighting_gpu.alias, &alias_writes),
+                (&lighting_gpu.meta, &meta_writes),
+                (&lighting_gpu.inverse, &inverse_writes),
+                (&lighting_gpu.regions, &region_writes),
+            ];
+            if queued {
+                if let Some(buffer) = attribute_source {
+                    let copies: Vec<_> = ranges
+                        .iter()
+                        .map(|(to, r)| {
+                            (
+                                quads,
+                                (r.start * 48) as u64,
+                                *to as u64,
+                                (r.len() * 48) as u64,
+                            )
+                        })
+                        .collect();
+                    self.context.enqueue_buffer_ranges(buffer, &copies)?;
+                }
+                if let Some(buffer) = side_source {
+                    self.context
+                        .enqueue_buffer_ranges(buffer, &columns.copies)?;
+                }
+            } else {
+                Buffer::write_scattered_batches(&mut self.context, patches)?;
+            }
             // 共同映射/复制的墙钟只归因一次，不能按buffer把同一等待重复累加。
             let wall = elapsed_ns(writing);
             if !writes_attributes {
@@ -2639,23 +3303,22 @@ impl Gpu {
         }
         metrics.attribute_upload_ns += allocation_ns;
         metrics.attribute_upload_bytes =
-            (attributes.len() * 48 + base_write.map_or(0, |(_, bytes)| bytes.len())) as u64
-                + geometry_bytes;
+            (attributes.len() * 48 + base_write.map_or(0, |(_, bytes)| bytes.len())) as u64;
         metrics.resources_ns += metrics.attribute_upload_ns;
         let publishing = std::time::Instant::now();
         publication.commit();
         light_publication.commit();
-        {}
         self.lighting.set_epoch(self.resource_generation);
         self.lighting_gpu = lighting_gpu;
         self.lighting_dirty = false;
         self.scene = Scene {
             top,
             quads,
+            tokens,
             instance_quad_bases,
         };
-        self.known_geometry = known_geometry.buffer;
-        self.known_geometry_capacity = known_geometry.capacity;
+        self.known_geometry = vertex_buffer;
+        self.known_geometry_capacity = vertex_capacity;
 
         self.anchor = source.anchor;
         self.attribute_revisions = versions;
@@ -2669,6 +3332,20 @@ impl Gpu {
         metrics.publish_ns = elapsed_ns(publishing);
         metrics.resources_ns += metrics.publish_ns;
         metrics.changed = true;
+        metrics.terrain_upload_bytes = if queued {
+            self.terrain_uploads.transferred() as u64
+        } else {
+            metrics.batch.input_bytes
+                + metrics.attribute_upload_bytes
+                + metrics.light_upload_bytes
+                + if rebuild_top {
+                    metrics.instances as u64 * 64
+                } else {
+                    0
+                }
+        };
+        self.terrain_uploads.clear();
+        self.pending_storage = None;
         self.scene_update = Some(metrics);
         Ok(())
     }
@@ -2692,9 +3369,11 @@ impl Gpu {
         let mut roots = vec![
             self.scene.top.into(),
             self.scene.quads.into(),
+            self.scene.tokens.into(),
             self.scene.instance_quad_bases.into(),
             self.program_scene.top.into(),
             self.program_scene.quads.into(),
+            self.program_scene.tokens.into(),
             self.program_scene.instance_quad_bases.into(),
             self.atlas.into(),
             self.energy.into(),
@@ -2707,6 +3386,7 @@ impl Gpu {
             self.material_gpu.auxiliary.into(),
         ]);
         roots.push(self.material_gpu.emission_alias.into());
+        roots.extend(self.opacity.map.map(vulkan::native::Resource::from));
         roots.extend(self.lighting_gpu.roots());
         roots.extend(self.program_lighting.roots());
         roots.extend(self.atmosphere.roots());
@@ -2726,6 +3406,16 @@ impl Gpu {
 
         #[cfg(test)]
         roots.extend(self.test_roots.iter().copied());
+        roots.extend(self.terrain_uploads.roots());
+        if let Some(v) = &self.pending_storage {
+            roots.extend([v.quads, v.tokens].map(vulkan::native::Resource::from));
+            roots.extend(v.vertices.map(vulkan::native::Resource::from));
+            if let Some(t) = &v.transfer {
+                roots.extend(t.upload.roots());
+                roots.extend(t.lighting_gpu.roots());
+                roots.push(t.instance_quad_bases.into());
+            }
+        }
         roots.extend_from_slice(extra);
         self.context.collect(&roots)?;
         Ok(())
@@ -2767,11 +3457,13 @@ impl Gpu {
             Binding::SampledImage(materials.auxiliary),
             buffer(&lighting.alias),
             buffer(&lighting.meta),
-            buffer(&lighting.vertices),
+            buffer(&self.known_geometry.unwrap_or(self.geometry_placeholder)),
             buffer(&lighting.inverse),
             buffer(&lighting.regions),
             buffer(&materials.emission_alias),
             buffer(&scene.instance_quad_bases),
+            buffer(&scene.tokens),
+            buffer(&lighting.tree),
         ]);
         let post = vec![
             buffer(&view.params),

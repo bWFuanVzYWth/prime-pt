@@ -70,7 +70,49 @@ impl<'a> Iterator for Regions<'a> {
 }
 impl ExactSizeIterator for Regions<'_> {}
 
+fn reject_token(state: &mut State<RegionMesh>, patch: Patch) -> Result<(), Error> {
+    match state.reject_patch(patch.token) {
+        Ok(()) | Err(cm::StateError::StalePatch) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn revoke_matching(
+    state: &mut State<RegionMesh>,
+    patches: &mut Vec<Patch>,
+    matches: impl Fn(Change) -> bool,
+) -> Result<(), Error> {
+    let mut at = 0;
+    while at < patches.len() {
+        if matches(patches[at].change) {
+            reject_token(state, patches[at])?;
+            patches.swap_remove(at);
+        } else {
+            at += 1;
+        }
+    }
+    Ok(())
+}
+
 impl Scene {
+    pub(super) fn revoke_upsert(&mut self, handle: Handle) -> Result<(), Error> {
+        let Some(value) = self.state.chunk(handle) else {
+            return Ok(());
+        };
+        // GPU 已取得带版本的独占输入。取回世界候选前，先解除该区域本帧或上一帧保留的锁。
+        for patches in [&mut self.pending, &mut self.parked] {
+            revoke_matching(
+                &mut self.state,
+                patches,
+                |c| matches!(c, Change::Activate(chunk) | Change::Replace(chunk) if chunk == value),
+            )?;
+        }
+        self.view_changes.clear();
+        self.view_len = self.view.len();
+        self.view_membership_changed = false;
+        Ok(())
+    }
+
     fn publication_class(&self, change: Change) -> usize {
         usize::from(match change {
             Change::Activate(value) | Change::Replace(value) => self
@@ -116,15 +158,12 @@ impl Scene {
 
     pub(super) fn cancel_returned_removals(&mut self, bounds: Bounds) -> Result<(), Error> {
         // 返回需求域的区块在规划前解除卸载锁，无需等待发布额度。
-        let mut at = 0;
-        while at < self.removes.len() {
-            if matches!(self.removes[at].change, Change::Remove(value) if bounds.intersects(value))
-            {
-                let patch = self.removes.swap_remove(at);
-                self.reject_token(patch)?;
-            } else {
-                at += 1;
-            }
+        for patches in [&mut self.removes, &mut self.parked, &mut self.pending] {
+            revoke_matching(
+                &mut self.state,
+                patches,
+                |c| matches!(c, Change::Remove(value) if bounds.intersects(value)),
+            )?;
         }
         Ok(())
     }
@@ -190,8 +229,15 @@ impl Scene {
     /// 多数轮先处理编辑候选，每四轮先处理普通候选。每类首个因工作量等待的候选
     /// 在该类优先轮有专用重试名额。单个超额 region 可独立发布。
     /// 宿主从准备视图建立 GPU 候选，期间保持世界输入和规划静止，随后调用
-    /// [`Self::commit`] 或 [`Self::reject`] 结束本次事务。
+    /// [`Self::commit`] 或 [`Self::reject`] 结束本次事务。跨帧上传调用 [`Self::park_publication`]
+    /// 交还借用视图；后续捕获可撤销已过期的区域令牌，其他区域仍可续传。
     pub fn prepare(&mut self) -> Result<bool, Error> {
+        let resume = !self.parked.is_empty();
+        if resume {
+            // 新就绪的独立区域仍由状态机持有。上一批仍可提交时，优先完成同一组令牌。
+            self.dismiss_view()?;
+            std::mem::swap(&mut self.pending, &mut self.parked);
+        }
         let bounds = self.state.config().bounds().expect("有界region域");
         if self.pending.len() > 1 {
             let edit_first = !self.turn.is_multiple_of(4);
@@ -235,16 +281,14 @@ impl Scene {
                                     })
                                 })
                     }
+                    Change::Remove(value) => !bounds.intersects(value),
                     _ => false,
                 };
-            let work = if valid {
-                let value = match patch.change {
-                    Change::Activate(value) | Change::Replace(value) => value,
-                    _ => unreachable!("只计有效覆盖"),
-                };
-                self.publication_cost(value)
-            } else {
-                [0; 2]
+            let work = match patch.change {
+                Change::Activate(value) | Change::Replace(value) if valid => {
+                    self.publication_cost(value)
+                }
+                _ => [0; 2],
             };
             let next = std::array::from_fn(|i| used[i].saturating_add(work[i]));
             // 零成本变化与独立超额首项均可推进，超额首项之后只接受零成本项。
@@ -261,17 +305,18 @@ impl Scene {
                     let class = self.publication_class(patch.change);
                     self.publication_retry[class].get_or_insert(patch.change);
                 }
-                self.reject_token(patch)?;
+                reject_token(&mut self.state, patch)?;
             }
         }
         self.pending.truncate(accepted);
         self.prepared_publication_work = used;
         let mut at = 0;
-        while at < self.removes.len() && self.pending.len() < self.publication_remaining {
+        while !resume && at < self.removes.len() && self.pending.len() < self.publication_remaining
+        {
             let patch = self.removes[at];
             if self.state.validate_patch(patch.token).is_err() {
                 self.removes.swap_remove(at);
-                self.reject_token(patch)?;
+                reject_token(&mut self.state, patch)?;
             } else if let Change::Remove(value) = patch.change
                 && !bounds.intersects(value)
             {
@@ -383,8 +428,23 @@ impl Scene {
 
     /// GPU拒绝只撤候选目录和patch；旧目录、片段与已完成候选仍归原所有者。
     pub fn reject(&mut self) -> Result<(), Error> {
+        while let Some(patch) = self.parked.pop() {
+            reject_token(&mut self.state, patch)?;
+        }
+        self.dismiss_view()
+    }
+    /// GPU 或包生产者仍在处理已选择的覆盖。保留其管理器令牌；下一轮继续捕获和建网，
+    /// 并在重建借用视图时重新校验来源版本与目标域。失效令牌会走普通撤销路径。
+    pub fn park_publication(&mut self) {
+        assert!(self.parked.is_empty(), "一次只有一份已选择的覆盖");
+        std::mem::swap(&mut self.pending, &mut self.parked);
+        self.view_changes.clear();
+        self.view_len = self.view.len();
+        self.view_membership_changed = false;
+    }
+    pub(super) fn dismiss_view(&mut self) -> Result<(), Error> {
         while let Some(patch) = self.pending.pop() {
-            self.reject_token(patch)?;
+            reject_token(&mut self.state, patch)?;
         }
         self.view_changes.clear();
         self.view_len = self.view.len();

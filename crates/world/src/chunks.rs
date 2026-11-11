@@ -117,6 +117,7 @@ pub struct Scene {
     state: State<RegionMesh>,
     batch: cm::Plan,
     pending: Vec<Patch>,
+    parked: Vec<Patch>,
     removes: Vec<Patch>,
     view: Vec<View>,
     view_changes: Vec<ViewChange>,
@@ -267,6 +268,7 @@ impl Scene {
             )?),
             batch: cm::Plan::with_capacity(JOBS, SWITCHES),
             pending: Vec::with_capacity(SWITCHES),
+            parked: Vec::with_capacity(SWITCHES),
             removes: Vec::with_capacity(SWITCHES),
             view: Vec::new(),
             view_changes: Vec::new(),
@@ -358,6 +360,7 @@ impl Scene {
         self.state = state;
         self.batch.clear();
         self.pending.clear();
+        self.parked.clear();
         self.publication_retry = [None; 2];
         self.removes.clear();
         self.view.clear();
@@ -474,7 +477,7 @@ impl Scene {
                                     || !self.state.is_visible(entry.handle)
                                         && self.state.resource(entry.handle).is_some()
                                 {
-                                    self.reject_handle(entry.handle)?;
+                                    self.revoke_upsert(entry.handle)?;
                                     if let Some(candidate) =
                                         self.state.take_unpublished(entry.handle)?
                                     {
@@ -834,7 +837,7 @@ impl Scene {
             min_section_y,
             max_section_y_exclusive,
         )?;
-        self.reject()?;
+        self.dismiss_view()?;
         self.output.clear();
         self.prioritize_edit_sources(camera)?;
         self.process_changes()?;
@@ -897,7 +900,7 @@ impl Scene {
                 switches: self
                     .publication_remaining
                     .min(SWITCHES)
-                    .saturating_sub(self.pending.len())
+                    .saturating_sub(self.pending.len() + self.parked.len())
                     .saturating_sub(usize::from(hold_edit_slot)),
             },
             &mut self.batch,
@@ -1480,13 +1483,6 @@ impl Scene {
         Ok(())
     }
 
-    fn reject_token(&mut self, patch: Patch) -> Result<(), Error> {
-        match self.state.reject_patch(patch.token) {
-            Ok(()) | Err(cm::StateError::StalePatch) => Ok(()),
-            Err(error) => Err(error.into()),
-        }
-    }
-
     #[cfg(any(test, feature = "test-fixtures"))]
     /// 测量夹具的收敛条件；预算排除是已解析结果，通过pressure另行报告。
     pub fn pending(&self) -> bool {
@@ -1504,6 +1500,7 @@ impl Scene {
             || !self.captures.is_empty()
             || !self.jobs.is_empty()
             || !self.pending.is_empty()
+            || !self.parked.is_empty()
             || !self.removes.is_empty()
             || self.state.retired_len() != 0
             || self.state.pending_requests() != 0

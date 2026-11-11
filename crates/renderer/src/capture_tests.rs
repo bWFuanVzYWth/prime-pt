@@ -35,6 +35,7 @@ fn hardware_scene_capture_fixture() -> Result {
         mers: &[0, 0, 128, 0],
         auxiliary: &[128, 128, 128, 128],
         emission_alias_words: &[0; 4],
+        opacity_quads: &[],
         light_areas: &[[u32::MAX, 0, 0, 0]],
     };
     crate::capture::write_resources(root, &source)?;
@@ -189,10 +190,13 @@ fn hardware_world_capture_replay() -> Result {
         ));
     }
     frame.finish()?;
-    let mut resources = Reader::open(
-        &root.join(format!("resources-{generation}.bin")),
-        b"PRASSET1",
-    )?;
+    let resource_path = root.join(format!("resources-{generation}.bin"));
+    let mut magic = [0; 8];
+    File::open(&resource_path)?.read_exact(&mut magic)?;
+    if magic != *b"PRASSET1" && magic != *b"PRASSET2" {
+        return Err("资源格式无效".into());
+    }
+    let mut resources = Reader::open(&resource_path, &magic)?;
     if resources.pod::<u64>()? != generation {
         return Err("资源世代不匹配".into());
     }
@@ -203,6 +207,20 @@ fn hardware_world_capture_replay() -> Result {
     let albedo = resources.blob::<u8>()?;
     let mers = resources.blob::<u8>()?;
     let auxiliary = resources.blob::<u8>()?;
+    let mut opacity_quads = Vec::new();
+    if magic == *b"PRASSET2" {
+        let count: u64 = resources.pod()?;
+        if count > resources.left / 36 {
+            return Err("OMM 资源原型数量超出文件".into());
+        }
+        opacity_quads.try_reserve_exact(usize::try_from(count)?)?;
+        for _ in 0..count {
+            opacity_quads.push(simple_engine::opacity::Quad {
+                material: resources.pod()?,
+                uv: resources.pod()?,
+            });
+        }
+    }
     resources.finish()?;
     let host = Host::new_ser()?;
     let mut session = host.gpu()?;
@@ -222,6 +240,7 @@ fn hardware_world_capture_replay() -> Result {
         mers: &mers,
         auxiliary: &auxiliary,
         emission_alias_words: &alias,
+        opacity_quads: &opacity_quads,
         light_areas: &areas,
     })?;
     let regions: Vec<_> = meshes

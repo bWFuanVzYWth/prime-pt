@@ -79,8 +79,8 @@ impl Default for WorkBudget {
             mesh_slabs: 128,
             planner_visits: 1024,
             publications: 64,
-            publish_geometry_quads: 131_072,
-            publish_attribute_quads: 262_144,
+            publish_geometry_quads: usize::MAX,
+            publish_attribute_quads: usize::MAX,
             maintenance: 256,
         }
     }

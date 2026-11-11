@@ -5,6 +5,7 @@ import display.prime_drt;
 import display.exposure;
 import pt.spatial_denoise;
 import pt.denoise;
+import pt.guide_output;
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<Params> parameters;
@@ -45,13 +46,15 @@ public struct SpatialInput : pt::ISpatialImage
     {
         float4 hdr = pixels[pixel.y * parameters[0].image.x + pixel.x];
         float depth = guide_depth.Load(int3(pixel, 0));
+        float4 albedo = guide_diffuse.Load(int3(pixel, 0));
+        uint flags = uint(round(albedo.w * 255));
         return { hdr.xyz,
                  depth,
                  guide_normal.Load(int3(pixel, 0)),
-                 guide_diffuse.Load(int3(pixel, 0)).xyz,
+                 albedo.xyz,
                  guide_specular.Load(int3(pixel, 0)).xyz,
-                 depth != pt::DENOISE_SKY_DEPTH,
-                 hdr.w >= 0 };
+                 (flags & pt::GUIDE_FOREGROUND) != 0,
+                 hdr.w >= 0 && (flags & pt::GUIDE_INVALID) == 0 };
     }
 };
 
@@ -63,7 +66,7 @@ void pack_main(uint3 id: SV_DispatchThreadID)
     if (any(id.xy >= p.image.xy))
         return;
     float4 hdr = pixels[id.y * p.image.x + id.x];
-    noisy[id.xy] = float4(clamp(hdr.xyz, 0, 65504), 1);
+    noisy[id.xy] = pt::reconstruction_input(hdr.xyz);
 }
 
 [shader("compute")]

@@ -1,5 +1,9 @@
 /// 普通PT生产入口；材质来源单独适配，路径和数值叶子由引擎维护。
 module pt_hit;
+#include "geometry/opacity.slang"
+#ifndef PRIMEPT_OMM
+#define PRIMEPT_OMM 0
+#endif
 #ifndef PT_HIT_SER
 #define PT_HIT_SER 0
 #endif
@@ -7,6 +11,7 @@ module pt_hit;
 #define PRIMEPT_RECONSTRUCTION 1
 #endif
 import pt.hit_transport;
+import pt.pixel_transport;
 import pt.material_vertex;
 import pt.scene;
 import pt.denoise;
@@ -98,6 +103,9 @@ public struct HitScene : pt::IHitScene
 [shader("closesthit")]
 void shade_hit(inout pt::MaterialCall call, BuiltInTriangleIntersectionAttributes attributes)
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(shade_hit)
+#endif
     float3 a = HitTriangleVertexPosition(0), b = HitTriangleVertexPosition(1),
            c = HitTriangleVertexPosition(2);
     pt::Hit hit = {};
@@ -121,6 +129,9 @@ void shade_hit(inout pt::MaterialCall call, BuiltInTriangleIntersectionAttribute
 [shader("raygeneration")]
 void primary_main()
 {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(primary_main)
+#endif
     Params p = parameters[0];
     uint2 coordinate = DispatchRaysIndex().xy;
     uint pixel = primary_pixel();
@@ -147,66 +158,37 @@ void primary_main()
 }
 
 [shader("raygeneration")]
-void prefix_empty()
-{
+void prefix_empty() {
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(prefix_empty)
+#endif
 }
 #ifndef PT_TRANSPORT_LANE
 #define PT_TRANSPORT_LANE -1
 #endif
 
-[shader("raygeneration")]
-void render_fused()
+public struct PixelAdapter : pt::IPixelTransport
 {
-
-    Params params = parameters[0];
-    uint2 coordinate = DispatchRaysIndex().xy;
-    uint pixel = coordinate.y * params.image.x + coordinate.x;
-    bool diagnostic = (params.output_size.z & 1u) != 0;
-    if (!diagnostic && accumulation[pixel].w < 0)
+    public uint2 coordinate;
+    public uint pixel;
+    public uint sample_index(uint lane, bool realtime)
     {
-        output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);
-        return;
+        Params params = parameters[0];
+        uint count = realtime ? 0u : sample_counts[pixel];
+        return pt::pixel_sample_index(params.rr_sample, lane, realtime, count, params.image.z);
     }
-    const bool separated = PT_TRANSPORT_LANE >= 0;
-    bool realtime = separated || realtime_pt();
-#if PT_TRANSPORT_LANE >= 0
-    const uint first_lane = PT_TRANSPORT_LANE;
-    const uint last_lane = PT_TRANSPORT_LANE + 1;
-    const uint paths = PT_TRANSPORT_LANE == 0 ? 1 : 2;
-#else
-    uint paths = realtime ? params.image.w : 1u;
-    uint first_lane = 0;
-    uint last_lane = paths;
-#endif
-    pt::TransportCall data = {};
-#if PT_TRANSPORT_LANE == 1
-    // 与单pass相同的加法顺序；第一条路径的失败状态不再启动第二条。
-    float4 previous = output_image[pixel];
-    if (previous.w < 0)
+    public float3 origin()
     {
-        output_image[pixel] = float4(previous.xyz * 0.5, previous.w);
-        return;
+        return parameters[0].origin.xyz;
     }
-    data.path.radiance = previous.xyz;
-#endif
-    float distance = pt::FAR;
-    for (uint lane = first_lane; lane < last_lane; lane++)
+    public float4 initial_medium()
     {
-        data.path.status = pt::PATH_ACTIVE;
-        data.path.depth = 0;
-        data.path.dielectric_events = 0;
-        data.path.previous = 0;
-        data.path.previous_pdf = 0;
-        data.pixel = coordinate;
-        data.sample = params.rr_sample + (realtime ? lane
-                                                   : (sample_counts[pixel] >= params.image.z
-                                                          ? sample_counts[pixel] - params.image.z
-                                                          : 0u));
+        return parameters[0].initial_medium;
+    }
+    public float2 start_path(inout pt::TransportCall data, uint lane, bool realtime)
+    {
+        Params params = parameters[0];
         float2 film = 0;
-        data.path.origin = params.origin.xyz;
-        data.path.throughput = 1;
-        data.path.eta_scale = 1;
-        data.path.medium = params.initial_medium;
         if (realtime)
         {
             data.path.direction = primary_ray[pixel].xyz;
@@ -236,6 +218,11 @@ void render_fused()
             data.path.direction = geometry::camera_scaled_direction(
                 params.forward.xyz, params.right.xyz, params.up.xyz, film);
         }
+        return film;
+    }
+    public float trace(inout pt::TransportCall data, float2 film)
+    {
+        Params params = parameters[0];
 #if PRIMEPT_RECONSTRUCTION
         pt::DenoiseCamera current = geometry::camera_from_scaled(
             params.origin.xyz, params.forward.xyz, params.right.xyz, params.up.xyz);
@@ -243,22 +230,43 @@ void render_fused()
                                        params.previous_right, params.previous_up };
         Guides guides = { coordinate, film, current, previous };
         if (params.reconstruction.w == 2)
-            distance = pt::trace_hit_path(HitScene(), guides, data);
+            return pt::trace_hit_path(HitScene(), guides, data);
         else
-            distance = pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
+            return pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
 #else
-        distance = pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
+        return pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
 #endif
-        if (data.path.status == pt::PATH_INVALID || data.path.status == pt::PATH_DIELECTRIC_LIMIT)
-            break;
     }
+};
+
+[shader("raygeneration")]
+void render_fused()
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_fused)
+#endif
+
+    Params params = parameters[0];
+    uint2 coordinate = DispatchRaysIndex().xy;
+    uint pixel = coordinate.y * params.image.x + coordinate.x;
+    bool diagnostic = (params.output_size.z & 1u) != 0;
+    if (!diagnostic && accumulation[pixel].w < 0)
+    {
+        output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);
+        return;
+    }
+    bool realtime = PT_TRANSPORT_LANE >= 0 || realtime_pt();
+    pt::PixelTransportInput input = { coordinate, params.image.w, realtime };
+    float4 previous = 0;
+#if PT_TRANSPORT_LANE == 1
+    previous = output_image[pixel];
+#endif
+    PixelAdapter adapter = { coordinate, pixel };
+    pt::PixelTransportResult result = pt::integrate_pixel(adapter, input, previous);
 #if PT_TRANSPORT_LANE != 1
-    if (realtime)
-        distance = primary_ray[pixel].w;
+    float distance =
+        input.realtime || PT_TRANSPORT_LANE >= 0 ? primary_ray[pixel].w : result.distance;
     prefix_image[pixel] = float4(0, 0, 0, distance);
 #endif
-    output_image[pixel] = float4(data.path.radiance / float(paths),
-                                 data.path.status == pt::PATH_INVALID            ? -1
-                                 : data.path.status == pt::PATH_DIELECTRIC_LIMIT ? -3
-                                                                                 : 0);
+    output_image[pixel] = result.radiance;
 }

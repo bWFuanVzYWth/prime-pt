@@ -1,7 +1,116 @@
 //! 完整 LOD0 ticket 路径的 GPU 窗口消费者，不使用 PRT1 fixture 旁路。
 
 use super::*;
+
+#[test]
+#[ignore = "真实 Vulkan；宿主每帧重新 plan，未传完的 64³ 区域须最终共同发布"]
+fn hardware_pt_manager_publishes_a_region_over_successive_frame_budgets() -> Result {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    gpu.set_atlas(16, 16, &atlas())?;
+    gpu.set_terrain_upload_budget(1024)?;
+    let mut scene = prime_world::Scene::new()?;
+    let camera = world_camera(Camera {
+        origin: [8., 8., -12., 0.],
+        forward: [0., 0., 1., 0.],
+        right: [0.8, 0., 0., 0.],
+        up: [0., 0.8, 0., 0.],
+    });
+    let input = sources(&[[0; 3]], false, 0x00bf_d9a6, false);
+    scene.rebase(camera.anchor()?);
+    let mut waited = false;
+    for _ in 0..2048 {
+        let requests = scene
+            .plan(&camera, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?
+            .to_vec();
+        if !requests.is_empty() {
+            scene.apply(&packet(&requests, &input))?;
+        }
+        if scene.prepare()? || gpu.scene_resources_dirty() {
+            let regions: Vec<_> = scene.render_regions().collect();
+            let ready = gpu.stream_regions(prime_scene::RenderView {
+                generation: scene.generation(),
+                anchor: scene.anchor(),
+                regions: &regions,
+            })?;
+            assert!(gpu.scene_timing().unwrap().terrain_upload_bytes <= 1024);
+            if ready {
+                scene.commit()?;
+            } else {
+                waited = true;
+                scene.park_publication();
+            }
+        }
+        if !scene.pending() && !gpu.terrain_uploads.pending() {
+            break;
+        }
+    }
+    assert!(waited && !scene.pending() && !gpu.terrain_uploads.pending());
+    assert_eq!(scene.entries().len(), 1);
+    assert_eq!(gpu.region_cache.entries().len(), 1);
+    let image = image(&mut gpu)?;
+    host.render(&mut gpu, &image, &camera.relative(scene.anchor())?)?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
 use simple_engine::vulkan;
+
+#[test]
+#[ignore = "真实 Vulkan；分帧上传途中撤销编辑，继续使用完整原场景"]
+fn hardware_pt_superseded_upload_keeps_published_geometry() -> Result {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    gpu.set_atlas(16, 16, &atlas())?;
+    let mut scene = prime_world::Scene::new()?;
+    let camera = world_camera(Camera {
+        origin: [24., 24., -12., 0.],
+        ..super::super::camera()
+    });
+    let original = sources(&[EDIT_KEY], false, 0x00bf_d9a6, false);
+    let edited = sources(&[EDIT_KEY], true, 0x00bf_d9a6, false);
+    settle(&mut scene, gpu, &camera, &original)?;
+    let top = gpu.scene.top;
+    gpu.set_terrain_upload_budget(1024)?;
+    scene.invalidate_section(EDIT_KEY)?;
+    let mut superseded = false;
+    let start = std::time::Instant::now();
+    loop {
+        let requests = scene.plan(&camera, VIEW_DISTANCE, MIN_SECTION_Y, MAX_SECTION_Y, 64)?;
+        if !requests.is_empty() {
+            let packet = packet(requests, if superseded { &original } else { &edited });
+            scene.apply(&packet)?;
+        }
+        if scene.prepare()? || gpu.terrain_pending() {
+            let regions: Vec<_> = scene.render_regions().collect();
+            if gpu.stream_regions(prime_scene::RenderView {
+                generation: scene.generation(),
+                anchor: scene.anchor(),
+                regions: &regions,
+            })? {
+                scene.commit()?;
+            } else {
+                scene.park_publication();
+                if !superseded && gpu.scene_timing().unwrap().terrain_upload_bytes != 0 {
+                    scene.invalidate_section(EDIT_KEY)?;
+                    superseded = true;
+                }
+            }
+        }
+        assert_eq!(gpu.scene.top, top, "失效版本不得替换已发布的 TLAS");
+        if superseded && !scene.pending() && !gpu.terrain_pending() {
+            break;
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(15));
+        std::thread::yield_now();
+    }
+    let output = image(gpu)?;
+    let camera = camera.relative(gpu.scene_anchor())?;
+    host.render(gpu, &output, &camera)?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
 
 fn blases(gpu: &Gpu) -> std::collections::BTreeMap<[i32; 3], Option<vulkan::TriangleBlas>> {
     gpu.region_cache
@@ -35,6 +144,8 @@ fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result
         [[-1, 0, 0], [0, 0, 0]]
     );
     let image = image(&mut gpu)?;
+    // 两次像素比较共用射线样本与 jitter 起点。场景更新会保留绝对随机序号。
+    gpu.test_restart_sample_sequence(0)?;
     let before = host.render(&mut gpu, &image, &original.relative(scene.anchor())?)?;
 
     let moved = crate::scene::WorldCamera {
@@ -89,6 +200,7 @@ fn hardware_pt_lod0_window_keeps_overlap_through_movement_and_return() -> Result
         [[-1, 0, 0], [0, 0, 0]]
     );
     assert_eq!(returned[&[0, 0, 0]], initial[&[0, 0, 0]]);
+    gpu.test_restart_sample_sequence(0)?;
     let after = host.render(&mut gpu, &image, &original.relative(scene.anchor())?)?;
     assert!(
         before.iter().zip(&after).all(|(&a, &b)| a.abs_diff(b) <= 1),

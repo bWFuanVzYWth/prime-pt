@@ -44,6 +44,14 @@ Texture2D<float4> sky_texture;
 Texture2D<float4> optical_depth;
 [[vk::binding(36, 0)]]
 StructuredBuffer<uint> instance_quad_bases;
+[[vk::binding(37, 0)]]
+StructuredBuffer<uint2> resident_quad_tokens;
+
+/// 当前驻留 quad 的 64 位身份与其有向半面；各帧的 primitive 槽可不同。
+public uint3 stable_triangle(uint primitive)
+{
+    return uint3(resident_quad_tokens[primitive >> 1u], primitive & 1u);
+}
 
 /// 实例自定义索引只选择对应区块的属性起点。每个 quad 在 BLAS 中占两个三角形。
 public uint region_primitive(uint instance, uint local_primitive)
@@ -71,16 +79,10 @@ float3 solar_radiance(float3 direction, float altitude_km)
 {
     atmosphere::Params p = parameters[0].atmosphere;
     p.view.w = altitude_km;
-    float4 spectrum =
-        p.solar * atmosphere::view_transmittance(p, optical_depth, linear_sampler, direction);
-    float3 rgb = spectrum.x * p.rgb[0].xyz + spectrum.y * p.rgb[1].xyz + spectrum.z * p.rgb[2].xyz +
-                 spectrum.w * p.rgb[3].xyz;
-    // 辐照度按太阳盘投影立体角换算，采样 PDF 则使用未投影立体角。
-    float sine = sin(p.sun.z);
-    float projected_solid_angle = atmosphere::PI * sine * sine;
-    return max(color::rec2020_to_bt709(rgb * parameters[0].atmosphere_settings.xyz /
-                                       projected_solid_angle),
-               0);
+    return max(
+        color::rec2020_to_bt709(atmosphere::solar_radiance(
+            p, optical_depth, linear_sampler, direction, parameters[0].atmosphere_settings.xyz)),
+        0);
 }
 
 /// 主查询只交接硬件命中引用；OpenPBR 翻译在消费交点时执行。

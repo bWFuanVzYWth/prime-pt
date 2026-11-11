@@ -475,7 +475,8 @@ impl Scene {
     }
     /// 先验证整包票据、坐标、世代和 Catalog 身份，再共同接受原始压缩数据。
     /// 旧票据忽略。等价快照恢复可用性并保留内容版本，实际状态差分精确唤醒受影响候选。
-    /// 持有本轮准备视图的宿主须先结束 GPU 准备和发布，再交付后续源包。
+    /// 宿主交还本轮准备视图后可继续交包，包括 [`Self::park_publication`] 后仍在上传的阶段。
+    /// 变化的源会撤销受影响区域的待发布版本，旧的可见覆盖保留到新版本提交。
     pub fn apply_compact(&mut self, bytes: &[u8], catalog: &Catalog) -> Result<(), Error> {
         let sources = prime_minecraft::decode_sections(bytes)?;
         let mut accepted = Vec::new();

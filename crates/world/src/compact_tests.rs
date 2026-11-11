@@ -94,6 +94,33 @@ fn overlapping_source_deltas_dirty_exact_region_fragments() -> Result<(), Error>
 }
 
 #[test]
+fn newer_source_reply_supersedes_a_parked_activation() -> Result<(), Error> {
+    let (mut scene, catalog) = ready_tinted()?;
+    let colors = vec![0xffff_ffff; scene.tint_requests().len()];
+    scene.apply_tints(&colors)?;
+    for _ in 0..128 {
+        scene.plan(&camera(), 0, 0, 4, 64)?;
+        scene.compile_sources(&catalog)?;
+        if scene.prepare()? && scene.render_regions().len() == 1 {
+            break;
+        }
+    }
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 1536);
+    scene.park_publication();
+    scene.invalidate_section([0; 3])?;
+    let request = scene.plan(&camera(), 0, 0, 4, 64)?[0];
+    assert_eq!(request.section, [0; 3]);
+    scene.apply_compact(
+        &fixtures::section_packet(&[(request.id, request.section, Pattern::Sparse)]),
+        &catalog,
+    )?;
+    assert_eq!(scene.render_regions().len(), 0);
+    publish(&mut scene, &catalog)?;
+    assert_eq!(scene.render_regions().next().unwrap().mesh.len(), 384);
+    Ok(())
+}
+
+#[test]
 fn completed_visible_edit_can_publish_in_the_same_turn() -> Result<(), Error> {
     for distance in [8, 32] {
         let (mut scene, catalog) = ready_tinted()?;
@@ -246,6 +273,14 @@ fn changed_halo_keeps_outgoing_region_until_removal_commits() -> Result<(), Erro
     assert!(scene.state.is_visible(handle));
     scene.apply_compact(&packet, &catalog)?;
     assert!(scene.state.is_visible(handle));
+    assert!(scene.prepare()?);
+    assert!(
+        scene.render_changes().any(
+            |change| matches!(change, prime_scene::RenderChange::Remove(key) if key == outgoing)
+        )
+    );
+    scene.park_publication();
+    scene.plan(&next_camera, 0, 0, 4, 0)?;
     assert!(scene.prepare()?);
     assert!(
         scene.render_changes().any(
@@ -414,6 +449,9 @@ fn newer_tint_replaces_unpublished_tint_candidate() -> Result<(), Error> {
         [1., 0., 0.],
     );
 
+    scene.plan(&camera(), 0, 0, 4, 0)?;
+    assert!(scene.prepare()?);
+    scene.park_publication();
     finish_tint(&mut scene, 0xff00_00ff)?;
     publish(&mut scene, &catalog)?;
     let region = scene.render_regions().next().unwrap();
