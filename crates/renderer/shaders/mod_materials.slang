@@ -1,6 +1,7 @@
 /// 资源世代的材质表、真实quad UV/tint与PBR纹理；不查询宿主或拥有GPU资源。
 module mod_materials;
 import pt.scene;
+import mod_coverage;
 import bsdf.openpbr.api;
 import bsdf.openpbr.flow;
 
@@ -79,25 +80,11 @@ public float3 material_linear(float3 value)
 }
 public float2 material_uv(uint primitive, float2 barycentrics)
 {
-    uint base = (primitive >> 1) * 3u;
-    bool second = (primitive & 1u) != 0;
-    float4 uv01 = asfloat(quads[base]), uv23 = asfloat(quads[base + 1u]);
-    float3 bary = float3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
-    float2 uv = 0;
-    uv += uv01.xy * bary.x;
-    uv += (second ? uv23.xy : uv01.zw) * bary.y;
-    uv += (second ? uv23.zw : uv23.xy) * bary.z;
-    return uv;
+    return prime_coverage::material_uv(quads, primitive, barycentrics);
 }
-// 材质图按最近点读取。UV 在 sprite 边缘或越界时仍落在准备阶段扫描的像素矩形内。
 public int3 sprite_address(float2 uv, float4 bounds)
 {
-    uint w, h;
-    atlas.GetDimensions(w, h);
-    float2 size = float2(w, h);
-    int2 lo = clamp(int2(floor(bounds.xy * size)), int2(0), int2(w - 1, h - 1));
-    int2 hi = clamp(int2(ceil(bounds.zw * size)) - 1, lo, int2(w - 1, h - 1));
-    return int3(clamp(int2(floor(uv * size)), lo, hi), 0);
+    return prime_coverage::sprite_address(atlas, uv, bounds);
 }
 
 public float4 material_aux<let Variant : uint = ~0u>(uint primitive, float2 bary)
@@ -130,53 +117,10 @@ public float4 material_texel(uint primitive, float2 barycentrics)
     return sample_tinted_texel(primitive, barycentrics, material_uv(primitive, barycentrics));
 }
 /// CUTOUT来自实际源layer；opaque/透射界面不将alpha误解释为二值孔洞。
-interface ICoverage
-{
-    static bool accepts(uint primitive, float2 bary, bool front);
-};
-struct AllFaces : ICoverage
-{
-    static bool accepts(uint primitive, float2 bary, bool front)
-    {
-        return true;
-    }
-};
-struct FrontFaces : ICoverage
-{
-    static bool accepts(uint primitive, float2 bary, bool front)
-    {
-        return front || (material_words.Load(material_id(primitive) * 112u + 72u) & 32u) == 0;
-    }
-};
-struct AlphaFaces<F : ICoverage> : ICoverage
-{
-    static bool accepts(uint primitive, float2 bary, bool front)
-    {
-        if (!F.accepts(primitive, bary, front))
-            return false;
-        uint start = material_id(primitive) * 112u;
-        if ((material_words.Load(start + 72u) & 8u) == 0)
-            return true;
-        return atlas
-                   .Load(sprite_address(material_uv(primitive, bary),
-                                        asfloat(material_words.Load4(start + 80u))))
-                   .a >= 0.5;
-    }
-};
-#if PRIMEPT_COVERAGE_MASK == 0
-typedef AllFaces PublishedCoverage;
-#elif PRIMEPT_COVERAGE_MASK == 8
-typedef AlphaFaces<AllFaces> PublishedCoverage;
-#elif PRIMEPT_COVERAGE_MASK == 32
-typedef FrontFaces PublishedCoverage;
-#elif PRIMEPT_COVERAGE_MASK == 40
-typedef AlphaFaces<FrontFaces> PublishedCoverage;
-#else
-#error invalid coverage recipe
-#endif
 public bool material_accepts(uint primitive, float2 bary, bool front)
 {
-    return PublishedCoverage.accepts(primitive, bary, front);
+    return prime_coverage::accepts<PRIMEPT_COVERAGE_MASK>(quads, atlas, material_words, primitive,
+                                                          bary, front);
 }
 
 interface IEmissionWeight

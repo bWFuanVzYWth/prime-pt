@@ -2041,3 +2041,316 @@ fn opacity_probe(gpu: &mut Gpu) -> Result<Vec<u32>, Box<dyn std::error::Error>> 
         .map(|v| u32::from_le_bytes(v.try_into().unwrap()))
         .collect())
 }
+
+#[test]
+#[ignore = "真实 Vulkan；静止相机下局部拆除屋顶分批刷新，不清空体积光"]
+fn local_roof_edit_refreshes_volume_while_camera_is_stationary()
+-> Result<(), Box<dyn std::error::Error>> {
+    use simple_engine::pt::history::{Histories, History, Invalidation};
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = image(gpu)?;
+    exposure_view(gpu)?;
+    let ray = Camera {
+        right: [0.005, 0., 0., 0.],
+        up: [0., 0.005, 0., 0.],
+        ..camera()
+    };
+    let options = Options::new(false, streamline::Quality::Dlaa, 1, 1)?;
+    let env = Environment {
+        sun_direction: [0., 1., 0.],
+        ..Default::default()
+    };
+    let mut mesh = Mesh {
+        quads: vec![Quad::with_material(
+            [
+                [-512., 40., -128.],
+                [-512., 40., 2048.],
+                [512., 40., 2048.],
+                [512., 40., -128.],
+            ],
+            [[0.5; 2]; 4],
+            [1.; 3],
+            MaterialId::new(0),
+        )],
+    };
+    let render = |gpu: &mut Gpu| -> Result<f32, Box<dyn std::error::Error>> {
+        gpu.invalidate_histories(Invalidation::new(
+            Histories::one(History::Accumulation),
+            GlobalReset::ExplicitRequested,
+        ))?;
+        gpu.absolute_sample = 0;
+        host.render_options(gpu, &output, &ray, env, options)?;
+        let rgb = accumulated_rgb(gpu)?;
+        Ok(rgb.iter().map(|p| p[1]).sum::<f32>() / rgb.len() as f32)
+    };
+    publish(gpu, &mesh, 1, 1, [0.; 3])?;
+    let shade = render(gpu)?;
+    mesh.quads[0].translate([6000., 0., 0.]);
+    publish(gpu, &mesh, 2, 2, [0.; 3])?;
+    let first = render(gpu)?;
+    let mut clear = first;
+    for _ in 1..16 {
+        clear = render(gpu)?;
+    }
+    assert!(
+        first < clear && shade < clear,
+        "遮挡 {shade}，首帧 {first}，收敛 {clear}"
+    );
+    gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+    let rebuilt = render(gpu)?;
+    assert!(
+        (clear - rebuilt).abs() < 0.001 * (1. + clear),
+        "自然刷新 {clear}，全量 {rebuilt}"
+    );
+    eprintln!("体积光静止编辑，旧值 {shade}，首帧 {first}，自然收敛 {clear}，显式重建 {rebuilt}");
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+fn black_cave_material() -> MaterialDefinition {
+    let mut material = MaterialDefinition::default();
+    material.control[2] = 0;
+    material.base_roughness = [0., 0., 0., 1.];
+    material.surface[0] = 1.;
+    material
+}
+
+fn cave_wall(points: [[f32; 3]; 4]) -> Quad {
+    Quad::with_material(points, [[0.5; 2]; 4], [0.; 3], MaterialId::new(0))
+}
+
+fn volume_peak(
+    host: &Host,
+    gpu: &mut Gpu,
+    output: &Image,
+    ray: &Camera,
+    sun: Environment,
+) -> Result<f32, Box<dyn std::error::Error>> {
+    use simple_engine::pt::history::{Histories, History, Invalidation};
+    gpu.invalidate_histories(Invalidation::new(
+        Histories::one(History::Accumulation),
+        GlobalReset::ExplicitRequested,
+    ))?;
+    gpu.absolute_sample = 0;
+    host.render_options(
+        gpu,
+        output,
+        ray,
+        sun,
+        Options::new(false, streamline::Quality::Dlaa, 1, 1)?,
+    )?;
+    let pixels = accumulated_rgb(gpu)?;
+    assert!(pixels.iter().flatten().all(|v| v.is_finite()));
+    Ok(pixels.into_iter().flatten().fold(0., f32::max))
+}
+
+#[test]
+#[ignore = "真实 Vulkan；封闭无光洞穴的有限空气段不产生散射"]
+fn sealed_cave_has_no_solar_in_scattering() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = image(gpu)?;
+    exposure_view(gpu)?;
+    upload(gpu, &[black_cave_material()], &[], &[[u32::MAX, 0, 0, 0]])?;
+    let env = Environment {
+        sun_direction: [0., 1., 0.],
+        ..Default::default()
+    };
+    for (revision, back, half_fov) in [(1, 96., 0.02), (2, 3032., 0.001)] {
+        let a = [-12., -8., -8.];
+        let b = [12., 8., back];
+        let mut mesh = Mesh::default();
+        for axis in 0..3 {
+            let u = (axis + 1) % 3;
+            let v = (axis + 2) % 3;
+            for side in [a[axis], b[axis]] {
+                let mut corners = [a; 4];
+                for corner in &mut corners {
+                    corner[axis] = side;
+                }
+                corners[1][u] = b[u];
+                corners[2][u] = b[u];
+                corners[2][v] = b[v];
+                corners[3][v] = b[v];
+                mesh.quads.push(cave_wall(corners));
+            }
+        }
+        publish(gpu, &mesh, revision, revision, [0.; 3])?;
+        gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+        let ray = Camera {
+            origin: [0., 0., 32., 0.],
+            right: [half_fov, 0., 0., 0.],
+            up: [0., half_fov, 0., 0.],
+            ..camera()
+        };
+        let daylight = volume_peak(&host, gpu, &output, &ray, env)?;
+        gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+        let oblique = volume_peak(
+            &host,
+            gpu,
+            &output,
+            &ray,
+            Environment {
+                sun_direction: [0.6, 0.8, 0.],
+                ..env
+            },
+        )?;
+        let unlit = volume_peak(
+            &host,
+            gpu,
+            &output,
+            &ray,
+            Environment {
+                sun_direction: [0.; 3],
+                ..env
+            },
+        )?;
+        eprintln!(
+            "封闭洞穴 {} m，HDR 峰值，正午 {daylight:.9}，斜射 {oblique:.9}，关闭太阳 {unlit:.9}",
+            back - 32.
+        );
+        assert!(
+            unlit == 0. && daylight.max(oblique) <= 1e-7,
+            "封闭洞穴出现入散射 {daylight} / {oblique}"
+        );
+        if revision == 2 {
+            mesh.quads.remove(3); // +Y 屋顶，远处的黑色接收面保持原样。
+            publish(gpu, &mesh, 3, 3, [0.; 3])?;
+            gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+            let open = volume_peak(&host, gpu, &output, &ray, env)?;
+            eprintln!("打开 3000 m 洞穴屋顶，HDR 峰值 {open:.9}");
+            assert!(open > 0.001, "开阔空气失去了太阳散射 {open}");
+        }
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；太阳列从光源侧反向查询，遵循接收点所见的单面镂空覆盖"]
+fn volume_columns_respect_receiver_facing_cutout() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = image(gpu)?;
+    exposure_view(gpu)?;
+    let mut sided = MaterialDefinition::default();
+    sided.control[2] = MaterialDefinition::FRONT_ONLY | MaterialDefinition::CUTOUT;
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [2, 1],
+        albedo: &[255, 255, 255, 0, 255, 255, 255, 255],
+        materials: &[black_cave_material(), sided],
+        mers: &[0; 8],
+        auxiliary: &[0; 8],
+        emission_alias_words: &[],
+        opacity_quads: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]; 2],
+    })?;
+    let up = [
+        [-100., 8., -20.],
+        [-100., 8., 100.],
+        [100., 8., 100.],
+        [100., 8., -20.],
+    ];
+    let down = [up[3], up[2], up[1], up[0]];
+    let camera = Camera {
+        right: [0.01, 0., 0., 0.],
+        up: [0., 0.01, 0., 0.],
+        ..camera()
+    };
+    let env = Environment {
+        sun_direction: [0., 1., 0.],
+        ..Default::default()
+    };
+    let mut peaks = [0.; 2];
+    for (i, below) in [0.75, 0.25].into_iter().enumerate() {
+        let mesh = Mesh {
+            quads: vec![
+                Quad::with_material(
+                    [
+                        [-12., -8., 64.],
+                        [12., -8., 64.],
+                        [12., 8., 64.],
+                        [-12., 8., 64.],
+                    ],
+                    [[0.75, 0.5]; 4],
+                    [0.; 3],
+                    MaterialId::new(0),
+                ),
+                Quad::with_material(down, [[below, 0.5]; 4], [1.; 3], MaterialId::new(1)),
+                Quad::with_material(up, [[1. - below, 0.5]; 4], [1.; 3], MaterialId::new(1)),
+            ],
+        };
+        publish(gpu, &mesh, i as u64 + 1, i as u64 + 1, [0.; 3])?;
+        gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+        peaks[i] = volume_peak(&host, gpu, &output, &camera, env)?;
+    }
+    eprintln!(
+        "接收侧单面覆盖，不透明 {:.9}，镂空 {:.9}",
+        peaks[0], peaks[1]
+    );
+    assert!(
+        peaks[0] <= 1e-7 && peaks[1] > 0.0001,
+        "接收侧不透明/镂空 {peaks:?}"
+    );
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；太阳阻挡列相同时仍按移动后墙体的首命中更新可见空气"]
+fn moving_cave_wall_refreshes_the_visible_air_segment() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = image(gpu)?;
+    exposure_view(gpu)?;
+    upload(gpu, &[black_cave_material()], &[], &[[u32::MAX, 0, 0, 0]])?;
+    let ray = Camera {
+        right: [0.01, 0., 0., 0.],
+        up: [0., 0.01, 0., 0.],
+        ..camera()
+    };
+    let sun = Environment {
+        sun_direction: [0., 1., 0.],
+        ..Default::default()
+    };
+    let mut mesh = Mesh {
+        quads: vec![
+            cave_wall([
+                [-12., -8., 8.],
+                [12., -8., 8.],
+                [12., 8., 8.],
+                [-12., 8., 8.],
+            ]),
+            cave_wall([
+                [-100., 8., -20.],
+                [-100., 8., 40.],
+                [100., 8., 40.],
+                [100., 8., -20.],
+            ]),
+        ],
+    };
+    publish(gpu, &mesh, 1, 1, [0.; 3])?;
+    let shade = volume_peak(&host, gpu, &output, &ray, sun)?;
+    // 墙面平行于竖直的太阳射线。平移只改变相机最近命中，屋顶遮挡范围相同。
+    mesh.quads[0].translate([0., 0., 88.]);
+    publish(gpu, &mesh, 2, 2, [0.; 3])?;
+    let mut refreshed = 0.;
+    for _ in 0..16 {
+        refreshed = volume_peak(&host, gpu, &output, &ray, sun)?;
+    }
+    gpu.invalidate_history(GlobalReset::ExplicitRequested)?;
+    let rebuilt = volume_peak(&host, gpu, &output, &ray, sun)?;
+    eprintln!("只移动洞壁，近墙 {shade:.9}，自然刷新 {refreshed:.9}，显式重建 {rebuilt:.9}");
+    assert!(shade <= 1e-7 && rebuilt > 0.001 && (refreshed - rebuilt).abs() < 1e-6);
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}

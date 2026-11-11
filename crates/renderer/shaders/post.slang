@@ -4,8 +4,8 @@ import params;
 import pt.post;
 import pt.scene;
 import pt.path_sampler;
-import atmosphere.sampling;
-import color.primaries;
+import atmosphere.terrain_composite;
+import atmosphere.terrain_frame;
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<Params> parameters;
@@ -23,6 +23,12 @@ Texture3D<float4> aerial_light;
 Texture3D<float4> aerial_transmittance;
 [[vk::binding(7, 0)]]
 SamplerState linear_sampler;
+[[vk::binding(8, 0)]]
+StructuredBuffer<atmosphere::TerrainFrame> terrain_frames;
+[[vk::binding(9, 0)]]
+Texture3D<float4> terrain_radiance;
+[[vk::binding(10, 0)]]
+StructuredBuffer<uint> first_hits;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -38,8 +44,7 @@ void post_main(uint3 id: SV_DispatchThreadID)
     uint count = sample_counts[pixel];
     float4 prefix = prefix_image[pixel];
     float3 radiance = prefix.xyz + tail.xyz;
-    if (tail.w >= 0 && prefix.w < pt::FAR && params.lighting.w > 0 &&
-        all(params.initial_medium == float4(1, 0, 0, 0)))
+    if (tail.w >= 0 && params.lighting.w > 0 && all(params.initial_medium == float4(1, 0, 0, 0)))
     {
         pt::PathSampler sampler = pt::path_sampler(
             id.xy, params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u),
@@ -48,11 +53,10 @@ void post_main(uint3 id: SV_DispatchThreadID)
                             ? 0.5 + params.reconstruction.xy
                             : sampler.film();
         float2 film = (float2(id.xy) + offset) / float2(params.image.xy);
-        atmosphere::AerialSample aerial =
-            atmosphere::aerial_sample(aerial_light, aerial_transmittance, linear_sampler, film,
-                                      prefix.w * 0.001, params.atmosphere_settings.w);
-        radiance = color::rec2020_to_bt709(
-            atmosphere::composite_aerial(aerial, color::bt709_to_rec2020(radiance)));
+        radiance = atmosphere::composite_terrain_bt709(
+            aerial_light, aerial_transmittance, terrain_radiance, first_hits, linear_sampler,
+            terrain_frames[0], film, prefix.w, params.atmosphere_settings.w, prefix.w < pt::FAR,
+            radiance);
         if ((params.output_size.z & 8u) == 0)
             radiance = max(radiance, 0);
     }

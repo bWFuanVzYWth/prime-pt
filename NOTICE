@@ -4,3 +4,7 @@ Copyright (c) 2026 linlin
 项目自有代码和文档采用 GPL-3.0-only，完整条款见 LICENSE。
 依赖 simple_engine；第三方 Streamline、DLSS 与 Vulkan-Headers 保留各自许可，见 licenses/。
 SDK 构建和部署由 simple_engine 的受控安装器维护，不纳入本仓库。
+
+太阳体积光包含对 Intel Outdoor Light Scattering（Copyright 2017 Intel Corporation）的适配。
+其 Apache-2.0 许可与来源通知随 JAR 放在 META-INF/licenses/simple-engine/LICENSES/，
+文件名前缀为 intel-outdoor-light-scattering-。

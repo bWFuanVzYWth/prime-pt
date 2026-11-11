@@ -99,6 +99,10 @@ impl Gpu {
             _ => None,
         };
         let selected = request.map_or(Histories::NONE, Invalidation::histories);
+        if let Some(request) = request.filter(|r| r.histories().contains(History::TerrainLight)) {
+            let valid = self.terrain_light.reset_history();
+            record("volume", request.reason().name(), "reset", valid);
+        }
 
         let accumulation = selected.contains(History::Accumulation)
             || matches!(event, Event::Accumulation(_) | Event::ViewStorage(_));

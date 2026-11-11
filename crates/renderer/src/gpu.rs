@@ -869,6 +869,10 @@ pub struct Gpu {
     nearest: Sampler,
     linear: Sampler,
     atmosphere: atmosphere::native::Atmosphere,
+    terrain_light: atmosphere::terrain::TerrainLight,
+    terrain_input: Buffer,
+    shadow_resolver: ComputePipeline,
+    shadow_scene: (AccelerationStructure, Buffer, Buffer, Image, Buffer),
     atmosphere_pending: bool,
     solar_reference_scale: f32,
     sun_gain: f32,
@@ -1223,6 +1227,36 @@ impl Gpu {
         let mut display_timeline = simple_engine::display::exposure::Timeline::default();
         display_timeline
             .set_compensation(simple_engine::display::exposure::DEFAULT_COMPENSATION)?;
+        let terrain_input = Buffer::new(
+            &mut context,
+            atmosphere::terrain::TerrainUpdate::INPUT_BYTES as u64,
+            true,
+        )?;
+        let model = atmosphere.terrain_model(&mut context)?;
+        let terrain_light =
+            atmosphere::terrain::TerrainLight::new(&mut context, model, terrain_input)?;
+        let shadow_scene = (
+            scene.top,
+            scene.quads,
+            scene.instance_quad_bases,
+            atlas,
+            material_gpu.table,
+        );
+        let shadow_resolver = terrain_light.resolver(
+            &mut context,
+            None,
+            shader(
+                include_bytes!(concat!(env!("OUT_DIR"), "/shadow_columns.spv")),
+                c"shadow_columns",
+            ),
+            scene.top,
+            &[
+                Binding::StorageBuffer(scene.quads),
+                Binding::StorageBuffer(scene.instance_quad_bases),
+                Binding::SampledImage(atlas),
+                Binding::StorageBuffer(material_gpu.table),
+            ],
+        )?;
         let geometry_placeholder = Buffer::mapped_device_local(&mut context, 64)?;
 
         let gpu = Self {
@@ -1281,6 +1315,10 @@ impl Gpu {
             nearest,
             linear,
             atmosphere,
+            terrain_light,
+            terrain_input,
+            shadow_resolver,
+            shadow_scene,
             atmosphere_pending: false,
             solar_reference_scale: 8.0 / solar_y,
             sun_gain: 1.0,
@@ -1518,6 +1556,7 @@ impl Gpu {
         if std::mem::take(&mut self.atmosphere_pending) {
             self.atmosphere.submitted();
         }
+        self.terrain_light.submitted();
         self.display_timeline.submitted();
 
         if let Some((next, _)) = self.pending_absolute.take() {
@@ -1573,6 +1612,8 @@ impl Gpu {
         self.material_gpu = resources;
         self.material_coverage = definitions.iter().map(materials::tests_coverage).collect();
         self.generation = Some(generation);
+        self.renderer = None;
+        self.guide_pipeline = None;
 
         Ok(())
     }
@@ -3311,6 +3352,13 @@ impl Gpu {
             tokens,
             instance_quad_bases,
         };
+        if matches
+            .iter()
+            .zip(source.regions)
+            .any(|(m, r)| m.attributes_dirty && !r.mesh.attribute_only())
+        {
+            self.terrain_light.request_refresh();
+        }
         self.known_geometry = vertex_buffer;
         self.known_geometry_capacity = vertex_capacity;
 
@@ -3355,7 +3403,38 @@ impl Gpu {
     }
 
     // 单场景和两个视图的固定根；录制命令另由Context保护短命绑定。
+    fn refresh_shadow_scene(&mut self) -> Result<(), Error> {
+        let key = (
+            self.scene.top,
+            self.scene.quads,
+            self.scene.instance_quad_bases,
+            self.atlas,
+            self.material_gpu.table,
+        );
+        if key != self.shadow_scene {
+            self.shadow_resolver = self.terrain_light.resolver(
+                &mut self.context,
+                Some(self.shadow_resolver),
+                shader(
+                    include_bytes!(concat!(env!("OUT_DIR"), "/shadow_columns.spv")),
+                    c"shadow_columns",
+                ),
+                key.0,
+                &[
+                    Binding::StorageBuffer(key.1),
+                    Binding::StorageBuffer(key.2),
+                    Binding::SampledImage(key.3),
+                    Binding::StorageBuffer(key.4),
+                ],
+            )?;
+            self.shadow_scene = key;
+            self.terrain_light.request_refresh();
+        }
+        Ok(())
+    }
+
     fn collect_resources(&mut self) -> Result<(), Error> {
+        self.refresh_shadow_scene()?;
         self.collect_with(&[])
     }
 
@@ -3395,6 +3474,9 @@ impl Gpu {
             roots.extend(renderer.roots());
         }
         roots.extend(self.guide_pipeline.map(vulkan::native::Resource::from));
+        roots.extend(self.terrain_light.roots());
+        roots.push(self.terrain_input.into());
+        roots.push(self.shadow_resolver.into());
         roots.extend([self.geometry_placeholder].map(vulkan::native::Resource::from));
         roots.extend(self.known_geometry.map(vulkan::native::Resource::from));
 
@@ -3459,6 +3541,7 @@ impl Gpu {
             buffer(&scene.tokens),
             buffer(&lighting.tree),
         ]);
+        let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![
             buffer(&view.params),
             buffer(&view.output),
@@ -3468,6 +3551,9 @@ impl Gpu {
             Binding::SampledImage(*self.atmosphere.bindings().aerial_light),
             Binding::SampledImage(*self.atmosphere.bindings().aerial_transmittance),
             Binding::Sampler(self.linear),
+            Binding::StorageBuffer(terrain_frame),
+            Binding::SampledImage(terrain_radiance),
+            Binding::StorageBuffer(first_hits),
         ];
         (trace, post)
     }
@@ -3568,19 +3654,33 @@ impl Gpu {
                 1.0
             };
             if sky_enabled {
-                self.atmosphere.prepare(
-                    &mut self.context,
-                    atmosphere::View {
-                        altitude_km: (0.5 + (camera.origin[1] - environment.sea_level) * 0.001)
-                            .clamp(0.0, 36000.0),
-                        forward: camera.forward[..3].try_into().unwrap(),
-                        right: camera.right[..3].try_into().unwrap(),
-                        up: camera.up[..3].try_into().unwrap(),
-                        sun_direction: environment.sun_direction,
-                        max_distance_km: 64.0,
-                        radiance_scale: [solar_scale; 3],
-                    },
-                )?;
+                let sky = atmosphere::View {
+                    altitude_km: (0.5 + (camera.origin[1] - environment.sea_level) * 0.001)
+                        .clamp(0.0, 36000.0),
+                    forward: camera.forward[..3].try_into().unwrap(),
+                    right: camera.right[..3].try_into().unwrap(),
+                    up: camera.up[..3].try_into().unwrap(),
+                    sun_direction: environment.sun_direction,
+                    max_distance_km: 64.0,
+                    radiance_scale: [solar_scale; 3],
+                };
+                self.atmosphere.prepare(&mut self.context, sky)?;
+                self.refresh_shadow_scene()?;
+                let active =
+                    self.known_geometry.is_some() && self.initial_medium == [1., 0., 0., 0.];
+                if let Some(update) = self.terrain_light.prepare(
+                    sky,
+                    camera.origin[..3].try_into().unwrap(),
+                    std::array::from_fn(|i| self.anchor[i] + f64::from(camera.origin[i])),
+                    active,
+                )? {
+                    self.terrain_input
+                        .write(&mut self.context, 0, update.bytes())?;
+                    result.push(
+                        self.terrain_light
+                            .record(&mut self.context, self.shadow_resolver)?,
+                    );
+                }
             }
             if self.view.as_ref().is_none_or(|view| {
                 view.output_extent != extent
@@ -3908,6 +4008,7 @@ impl Gpu {
     }
 
     fn cancel_recordings(&mut self, recordings: Vec<Recorded>) -> Result<(), Error> {
+        self.terrain_light.cancel();
         self.pending_absolute = None;
 
         if self.offline {

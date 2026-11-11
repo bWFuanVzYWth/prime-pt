@@ -1340,6 +1340,7 @@ fn hardware_pt_sky_direction() -> Result<(), Box<dyn std::error::Error>> {
     let mut rotated = camera();
     rotated.forward = [1., 0., 0., 0.];
     rotated.right = [0., 0., -1., 0.];
+    gpu.absolute_sample = 0; // 旋转对照使用与首帧相同的亚像素样本。
     let rotated = host.render_environment(&mut gpu, &image, &rotated, environment)?;
     assert!(
         forward
@@ -1532,6 +1533,7 @@ fn hardware_pt_sun_ev_doubles_disk_and_scattered_sky() -> Result<(), Box<dyn std
     host.render_options(&mut gpu, &image, &camera, Environment::default(), options)?;
     let baseline = accumulated_rgb(&mut gpu)?;
     gpu.set_lighting_options(1., 0.)?;
+    gpu.absolute_sample = 0; // 同一组相机射线只改变太阳强度。
     host.render_options(&mut gpu, &image, &camera, Environment::default(), options)?;
     let brighter = accumulated_rgb(&mut gpu)?;
     assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 1);
@@ -2213,6 +2215,69 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     );
     fallback_session.finish()?;
     session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；屋顶不进入视野，材质覆盖改变相机空气段的太阳遮挡"]
+fn terrain_volume_uses_cutout_blockers_outside_the_view() -> Result<(), Box<dyn std::error::Error>>
+{
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = image(gpu)?;
+    exposure_view(gpu)?;
+    let ray = Camera {
+        right: [0.005, 0., 0., 0.],
+        up: [0., 0.005, 0., 0.],
+        ..camera()
+    };
+    let options = Options::new(false, streamline::Quality::Dlaa, 1, 1)?;
+    let environment = Environment {
+        sun_direction: [0., 1., 0.],
+        ..Default::default()
+    };
+    let mesh = Mesh {
+        quads: vec![prime_scene::Quad::with_material(
+            [
+                [-512., 40., -128.],
+                [-512., 40., 2048.],
+                [512., 40., 2048.],
+                [512., 40., -128.],
+            ],
+            [[0.5; 2]; 4],
+            [1.; 3],
+            prime_scene::MaterialId::new(0),
+        )],
+    };
+    let cutout = MaterialDefinition::default();
+    let render = |gpu: &mut Gpu, alpha: u8| -> Result<f32, Box<dyn std::error::Error>> {
+        gpu.replace_resources(ResourceUpload {
+            generation: gpu.resource_generation + 1,
+            extent: [1, 1],
+            albedo: &[255, 255, 255, alpha],
+            materials: &[cutout],
+            mers: &[0, 255, 242, 0],
+            auxiliary: &[128, 128, 0, 85],
+            emission_alias_words: &[],
+            opacity_quads: &[],
+            light_areas: &[[u32::MAX, 0, 0, 0]],
+        })?;
+        gpu.set_scene(&mesh)?;
+        gpu.absolute_sample = 0;
+        host.render_options(gpu, &output, &ray, environment, options)?;
+        Ok(accumulated_rgb(gpu)?[16 * 32 + 16][1])
+    };
+    let clear = render(gpu, 0)?;
+    let shade = render(gpu, 255)?;
+    let restored = render(gpu, 0)?;
+    assert!(shade < clear && shade > 0., "屋顶 {shade}，透明 {clear}");
+    assert!(
+        (restored - clear).abs() < 0.002 * (1. + clear),
+        "透明 {clear} -> {restored}"
+    );
+    eprintln!("地形体积光，透明 {clear}，遮挡 {shade}，恢复 {restored}");
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
