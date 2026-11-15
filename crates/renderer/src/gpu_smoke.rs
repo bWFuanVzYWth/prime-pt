@@ -1573,6 +1573,7 @@ fn hardware_pt_auto_exposure_preserves_hdr() -> Result<(), Box<dyn std::error::E
     let manual = image.download(&mut gpu.context)?;
     let manual_hdr = exposure_hdr(&mut gpu)?;
     gpu.invalidate()?;
+    gpu.test_restart_sample_sequence(0)?;
     gpu.display_timeline.set_enabled(true);
     host.render_options(&mut gpu, &image, &camera(), environment, options)?;
     let automatic = image.download(&mut gpu.context)?;
@@ -1630,6 +1631,7 @@ fn hardware_pt_drt_controls_only_change_display() -> Result<(), Box<dyn std::err
     let hdr = exposure_hdr(&mut gpu)?;
     gpu.set_display_options(0.0, 0.5, 0.0, 0.95)?;
     gpu.invalidate()?;
+    gpu.test_restart_sample_sequence(0)?;
     host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
     assert_eq!(hdr, exposure_hdr(&mut gpu)?);
     assert_ne!(first, image.download(&mut gpu.context)?);
@@ -1683,6 +1685,7 @@ fn hardware_pt_auto_exposure_manual_ev_is_display_only() -> Result<(), Box<dyn s
     let initial_hdr = exposure_hdr(&mut gpu)?;
     let initial_state = exposure_state(&mut gpu)?;
     gpu.invalidate()?;
+    gpu.test_restart_sample_sequence(0)?;
     let environment = Environment {
         exposure_ev: 2.0,
         ..Environment::default()
@@ -2150,8 +2153,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
             Binding::StorageBuffer(view.display.parameters()),
         ],
     )?;
-    let fallback = view
-        .rr_fallback
+    let fallback = view.rr_fallback[usize::from(gpu.display_timeline.enabled())]
         .rebind(&mut gpu.context, fallback_bindings)?;
     let mut commands = Commands::new(&gpu.context)?;
     commands.barrier();

@@ -32,10 +32,10 @@ StructuredBuffer<display::ExposureState> exposure_state;
 [[vk::binding(10, 0)]]
 StructuredBuffer<uint4> exposure_parameters;
 
-display::PrimeDrtParameters display_parameters()
+func display_parameters<let Automatic : bool>()->display::PrimeDrtParameters
 {
     display::PrimeDrtParameters drt = parameters[0].drt;
-    if (asfloat(exposure_parameters[1].y) > 0)
+    if (Automatic)
         drt.exposure_multiplier *= exp2(exposure_state[0].exposure_ev);
     return drt;
 }
@@ -69,9 +69,7 @@ void pack_main(uint3 id: SV_DispatchThreadID)
     noisy[id.xy] = pt::reconstruction_input(hdr.xyz);
 }
 
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void present_main(uint3 id: SV_DispatchThreadID)
+func present_pixel<let Automatic : bool>(id: uint3)->void
 {
     Params p = parameters[0];
     if (any(id.xy >= p.output_size.xy))
@@ -81,13 +79,11 @@ void present_main(uint3 id: SV_DispatchThreadID)
     bool invalid = pixels[source.y * p.image.x + source.x].w < 0;
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =
         invalid ? float4(1, 0, 1, 1)
-                : float4(display::prime_drt_bt709(hdr, display_parameters()), 1);
+                : float4(display::prime_drt_bt709(hdr, display_parameters<Automatic>()), 1);
 }
 
 /// 本帧求值安全失败时以已有输入和 guides 执行边界保护空间重建，再作显示变换。
-[shader("compute")]
-[numthreads(8, 8, 1)]
-void fallback_main(uint3 id: SV_DispatchThreadID)
+func fallback_pixel<let Automatic : bool>(id: uint3)->void
 {
     Params p = parameters[0];
     if (any(id.xy >= p.output_size.xy))
@@ -97,5 +93,53 @@ void fallback_main(uint3 id: SV_DispatchThreadID)
     float3 hdr = pt::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =
         !valid ? float4(1, 0, 1, 1)
-               : float4(display::prime_drt_bt709(hdr, display_parameters()), 1);
+               : float4(display::prime_drt_bt709(hdr, display_parameters<Automatic>()), 1);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func present_manual(uint3 id: SV_DispatchThreadID)->void
+{
+    present_pixel<false>(id);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func present_automatic(uint3 id: SV_DispatchThreadID)->void
+{
+    present_pixel<true>(id);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func present_main(uint3 id: SV_DispatchThreadID)->void
+{
+    if (asfloat(exposure_parameters[1].y) > 0)
+        present_pixel<true>(id);
+    else
+        present_pixel<false>(id);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func fallback_manual(uint3 id: SV_DispatchThreadID)->void
+{
+    fallback_pixel<false>(id);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func fallback_automatic(uint3 id: SV_DispatchThreadID)->void
+{
+    fallback_pixel<true>(id);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func fallback_main(uint3 id: SV_DispatchThreadID)->void
+{
+    if (asfloat(exposure_parameters[1].y) > 0)
+        fallback_pixel<true>(id);
+    else
+        fallback_pixel<false>(id);
 }

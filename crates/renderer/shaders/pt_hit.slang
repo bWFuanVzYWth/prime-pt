@@ -7,6 +7,9 @@ module pt_hit;
 #ifndef PRIMEPT_RECONSTRUCTION
 #define PRIMEPT_RECONSTRUCTION 1
 #endif
+#ifndef PRIMEPT_REFERENCE_FILM
+#define PRIMEPT_REFERENCE_FILM 0
+#endif
 import pt.hit_transport;
 import pt.pixel_transport;
 import pt.material_vertex;
@@ -128,17 +131,13 @@ void shade_hit(inout pt::MaterialCall call, BuiltInTriangleIntersectionAttribute
         ModScene(), call, hit, material, WorldRayDirection(), settings(parameters[0]));
 }
 // 只执行相机射线和覆盖测试，不解码材质或生成光路状态。
-[shader("raygeneration")]
-void primary_main()
+func cache_primary<let FrameFilm : bool>()->void
 {
-#if PRIMEPT_OMM
-    ENGINE_OPACITY_MICROMAP(primary_main)
-#endif
     Params p = parameters[0];
     uint2 coordinate = DispatchRaysIndex().xy;
     uint pixel = primary_pixel();
     pt::PathSampler sampler = pt::path_sampler(coordinate, p.rr_sample, p.options.z, p.options.x);
-    float2 offset = p.reconstruction.w > 0 ? 0.5 + p.reconstruction.xy : sampler.film();
+    float2 offset = FrameFilm ? 0.5 + p.reconstruction.xy : sampler.film();
     float2 film = (float2(coordinate) + offset) / float2(p.image.xy);
     float3 direction =
         geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
@@ -160,117 +159,253 @@ void primary_main()
 }
 
 [shader("raygeneration")]
+func primary_random()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(primary_random)
+#endif
+    cache_primary<false>();
+}
+
+[shader("raygeneration")]
+func primary_jittered()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(primary_jittered)
+#endif
+    cache_primary<true>();
+}
+
+// 测试和发行夹具保留可显式选择的原film参考入口。
+[shader("raygeneration")]
+func primary_main()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(primary_main)
+#endif
+    if (parameters[0].reconstruction.w > 0)
+        cache_primary<true>();
+    else
+        cache_primary<false>();
+}
+
+[shader("raygeneration")]
 void prefix_empty() {
 #if PRIMEPT_OMM
     ENGINE_OPACITY_MICROMAP(prefix_empty)
 #endif
 }
-#ifndef PRIMEPT_TRANSPORT_LANE
-#define PRIMEPT_TRANSPORT_LANE -1
-#endif
 
-public struct PixelAdapter : pt::IPixelTransport
+func trace_path(coordinate: uint2, film: float2, inout data: pt::TransportCall)
+    ->float
 {
-    public uint2 coordinate;
-    public uint pixel;
-    public uint sample_index(uint lane, bool realtime)
+#if PRIMEPT_RECONSTRUCTION
+    let p = parameters[0];
+    let current = geometry::camera_from_scaled(p.origin.xyz, p.forward.xyz, p.right.xyz, p.up.xyz);
+    let previous : pt::DenoiseCamera = { p.previous_position, p.previous_forward, p.previous_right,
+                                         p.previous_up };
+    let guides : Guides = { coordinate, film, current, previous };
+    if (p.reconstruction.w == 2)
+        return pt::trace_hit_path<HitScene, Guides, HitReorder>(HitScene(), guides, data);
+#endif
+    return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, HitReorder>(HitScene(),
+                                                                        pt::NoPrefixGuides(), data);
+}
+
+public struct RealtimePixelAdapter : pt::IPixelTransport
+{
+    public var coordinate : uint2;
+    public var pixel : uint;
+    public func sample_index(lane: uint)->uint
     {
-        Params params = parameters[0];
-        uint count = realtime ? 0u : sample_counts[pixel];
-        return pt::pixel_sample_index(params.rr_sample, lane, realtime, count, params.image.z);
+        return parameters[0].rr_sample + lane;
     }
-    public float3 origin()
+    public func origin()->float3
     {
         return parameters[0].origin.xyz;
     }
-    public float4 initial_medium()
+    public func initial_medium()->float4
     {
         return parameters[0].initial_medium;
     }
-    public float2 start_path(inout pt::TransportCall data, uint lane, bool realtime)
+    public func start_path(inout data: pt::TransportCall, lane: uint)->float2
     {
-        Params params = parameters[0];
-        float2 film = 0;
-        if (realtime)
-        {
-            data.path.direction = primary_ray[pixel].xyz;
-            uint primitive = primary_identity[pixel].x;
-            if (primitive == 0xffffffffu)
-                pt::escape(HitScene(), data.path);
-            else
-            {
-                uint program = material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
-                pt::MaterialCall call =
-                    pt::MaterialCall::primaryInput(data.sample, lane, data.path.radiance);
-                if (HitReorder)
-                    ReorderThread(program, 32u);
-                CallShader(program, call);
-                data.path = call.result();
-            }
-        }
+        data.path.direction = primary_ray[pixel].xyz;
+        let primitive = primary_identity[pixel].x;
+        if (primitive == 0xffffffffu)
+            pt::escape(HitScene(), data.path);
         else
         {
-            pt::PathSampler sampler =
-                pt::path_sampler(coordinate, data.sample, params.options.z, params.options.x);
-            film =
-                (float2(coordinate) +
-                 (params.reconstruction.w > 0 ? 0.5 + params.reconstruction.xy : sampler.film())) /
-                float2(params.image.xy);
-            data.path.direction = geometry::camera_scaled_direction(
-                params.forward.xyz, params.right.xyz, params.up.xyz, film);
+            let program = material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
+            var call = pt::MaterialCall::primaryInput(data.sample, lane, data.path.radiance);
+            if (HitReorder)
+                ReorderThread(program, 32u);
+            CallShader(program, call);
+            data.path = call.result();
         }
-        return film;
+        return 0;
     }
-    public float trace(inout pt::TransportCall data, float2 film)
+    public func trace(inout data: pt::TransportCall, film: float2)->float
     {
-        Params params = parameters[0];
-#if PRIMEPT_RECONSTRUCTION
-        pt::DenoiseCamera current = geometry::camera_from_scaled(
-            params.origin.xyz, params.forward.xyz, params.right.xyz, params.up.xyz);
-        pt::DenoiseCamera previous = { params.previous_position, params.previous_forward,
-                                       params.previous_right, params.previous_up };
-        Guides guides = { coordinate, film, current, previous };
-        if (params.reconstruction.w == 2)
-            return pt::trace_hit_path<HitScene, Guides, HitReorder>(HitScene(), guides, data);
-        else
-            return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, HitReorder>(
-                HitScene(), pt::NoPrefixGuides(), data);
-#else
-        return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, HitReorder>(
-            HitScene(), pt::NoPrefixGuides(), data);
-#endif
+        return trace_path(coordinate, film, data);
     }
 };
 
-[shader("raygeneration")]
-void render_fused()
+public struct OfflinePixelAdapter : pt::IPixelTransport
 {
-#if PRIMEPT_OMM
-    ENGINE_OPACITY_MICROMAP(render_fused)
+    public var coordinate : uint2;
+    public var pixel : uint;
+    public func sample_index(lane: uint)->uint
+    {
+        let p = parameters[0];
+        return pt::pixel_sample_index(p.rr_sample, lane, false, sample_counts[pixel], p.image.z);
+    }
+    public func origin()->float3
+    {
+        return parameters[0].origin.xyz;
+    }
+    public func initial_medium()->float4
+    {
+        return parameters[0].initial_medium;
+    }
+    public func start_path(inout data: pt::TransportCall, lane: uint)->float2
+    {
+        let p = parameters[0];
+        let sampler = pt::path_sampler(coordinate, data.sample, p.options.z, p.options.x);
+        var offset = sampler.film();
+#if PRIMEPT_REFERENCE_FILM
+        // 居中film仅供独立正确性/质量对照；生产离线不启用RR。
+        if (p.reconstruction.w > 0)
+            offset = 0.5 + p.reconstruction.xy;
 #endif
+        let film = (float2(coordinate) + offset) / float2(p.image.xy);
+        data.path.direction =
+            geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
+        return film;
+    }
+    public func trace(inout data: pt::TransportCall, film: float2)->float
+    {
+        return trace_path(coordinate, film, data);
+    }
+};
 
-    Params params = parameters[0];
-    uint2 coordinate = DispatchRaysIndex().xy;
-    uint pixel = coordinate.y * params.image.x + coordinate.x;
-    bool diagnostic = (params.output_size.z & 1u) != 0;
-    if (!diagnostic && accumulation[pixel].w < 0)
+func render_pixel<A : pt::IPixelTransport, let Realtime : bool, let Samples : uint, let Lane : int,
+                  let IgnoreFailure : bool>(adapter: A, pixel: uint, coordinate: uint2)
+    ->void
+{
+    if (!IgnoreFailure && accumulation[pixel].w < 0)
     {
         output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);
         return;
     }
-    bool realtime = PRIMEPT_TRANSPORT_LANE >= 0 || realtime_pt();
-    pt::PixelTransportInput input = { coordinate, params.image.w, realtime };
-    float4 previous = 0;
-#if PRIMEPT_TRANSPORT_LANE == 1
-    previous = output_image[pixel];
-#endif
-    PixelAdapter adapter = { coordinate, pixel };
-    pt::PixelTransportResult result =
-        pt::integrate_pixel<PixelAdapter, PRIMEPT_TRANSPORT_LANE>(adapter, input, previous);
-#if PRIMEPT_TRANSPORT_LANE != 1
-    float distance =
-        input.realtime || PRIMEPT_TRANSPORT_LANE >= 0 ? primary_ray[pixel].w : result.distance;
-    prefix_image[pixel] = float4(0, 0, 0, distance);
-#endif
+    let input : pt::PixelTransportInput = { coordinate };
+    var previous = float4(0);
+    if (Lane == 1)
+        previous = output_image[pixel];
+    let result = pt::integrate_pixel<A, Realtime, Samples, Lane>(adapter, input, previous);
+    if (Lane != 1)
+        prefix_image[pixel] = float4(0, 0, 0, Realtime ? primary_ray[pixel].w : result.distance);
     output_image[pixel] = result.radiance;
+}
+
+[shader("raygeneration")]
+func render_rt1()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_rt1)
+#endif
+    let coordinate = DispatchRaysIndex().xy;
+    let pixel = primary_pixel();
+    let adapter : RealtimePixelAdapter = { coordinate, pixel };
+    render_pixel<RealtimePixelAdapter, true, 1, -1, false>(adapter, pixel, coordinate);
+}
+
+[shader("raygeneration")]
+func render_rt2_lane0()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_rt2_lane0)
+#endif
+    let coordinate = DispatchRaysIndex().xy;
+    let pixel = primary_pixel();
+    let adapter : RealtimePixelAdapter = { coordinate, pixel };
+    render_pixel<RealtimePixelAdapter, true, 2, 0, false>(adapter, pixel, coordinate);
+}
+
+[shader("raygeneration")]
+func render_rt2_lane1()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_rt2_lane1)
+#endif
+    let coordinate = DispatchRaysIndex().xy;
+    let pixel = primary_pixel();
+    let adapter : RealtimePixelAdapter = { coordinate, pixel };
+    render_pixel<RealtimePixelAdapter, true, 2, 1, false>(adapter, pixel, coordinate);
+}
+
+[shader("raygeneration")]
+func render_offline()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_offline)
+#endif
+    let coordinate = DispatchRaysIndex().xy;
+    let pixel = primary_pixel();
+    let adapter : OfflinePixelAdapter = { coordinate, pixel };
+    render_pixel<OfflinePixelAdapter, false, 1, -1, false>(adapter, pixel, coordinate);
+}
+
+[shader("raygeneration")]
+func render_rt2_merged()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_rt2_merged)
+#endif
+    let coordinate = DispatchRaysIndex().xy;
+    let pixel = primary_pixel();
+    let adapter : RealtimePixelAdapter = { coordinate, pixel };
+    render_pixel<RealtimePixelAdapter, true, 2, -1, false>(adapter, pixel, coordinate);
+}
+
+// 原混合入口只供显式参考/诊断；生产链接到上面的固定执行计划。
+[shader("raygeneration")]
+func render_fused()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_fused)
+#endif
+    let coordinate = DispatchRaysIndex().xy;
+    let pixel = primary_pixel();
+    if ((parameters[0].output_size.z & 1u) != 0)
+    {
+        let adapter : OfflinePixelAdapter = { coordinate, pixel };
+        render_pixel<OfflinePixelAdapter, false, 1, -1, true>(adapter, pixel, coordinate);
+    }
+    else if (realtime_pt())
+    {
+        let adapter : RealtimePixelAdapter = { coordinate, pixel };
+        if (parameters[0].image.w == 2)
+            render_pixel<RealtimePixelAdapter, true, 2, -1, false>(adapter, pixel, coordinate);
+        else
+            render_pixel<RealtimePixelAdapter, true, 1, -1, false>(adapter, pixel, coordinate);
+    }
+    else
+    {
+        let adapter : OfflinePixelAdapter = { coordinate, pixel };
+        render_pixel<OfflinePixelAdapter, false, 1, -1, false>(adapter, pixel, coordinate);
+    }
+}
+
+// 完整PT诊断参考仍着色真实材质；仅测试配置准备，不链接到生产计划。
+[shader("raygeneration")]
+func render_diagnostic()->void
+{
+#if PRIMEPT_OMM
+    ENGINE_OPACITY_MICROMAP(render_diagnostic)
+#endif
+    let coordinate = DispatchRaysIndex().xy;
+    let pixel = primary_pixel();
+    let adapter : OfflinePixelAdapter = { coordinate, pixel };
+    render_pixel<OfflinePixelAdapter, false, 1, -1, true>(adapter, pixel, coordinate);
 }

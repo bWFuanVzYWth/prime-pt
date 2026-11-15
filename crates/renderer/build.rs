@@ -169,6 +169,90 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args: &[],
         });
     }
+    // 有限阶段策略在资源使用前编译，录制期间只选取已准备的程序。
+    for (source, entry, output) in [
+        ("shaders/post.slang", "post_plain_1", "post_plain_1.spv"),
+        ("shaders/post.slang", "post_plain_2", "post_plain_2.spv"),
+        (
+            "shaders/post.slang",
+            "post_clear_random_1",
+            "post_clear_random_1.spv",
+        ),
+        (
+            "shaders/post.slang",
+            "post_clear_random_2",
+            "post_clear_random_2.spv",
+        ),
+        (
+            "shaders/post.slang",
+            "post_clear_jittered_1",
+            "post_clear_jittered_1.spv",
+        ),
+        (
+            "shaders/post.slang",
+            "post_clear_jittered_2",
+            "post_clear_jittered_2.spv",
+        ),
+        (
+            "shaders/post.slang",
+            "post_shadowed_random_1",
+            "post_shadowed_random_1.spv",
+        ),
+        (
+            "shaders/post.slang",
+            "post_shadowed_random_2",
+            "post_shadowed_random_2.spv",
+        ),
+        (
+            "shaders/post.slang",
+            "post_shadowed_jittered_1",
+            "post_shadowed_jittered_1.spv",
+        ),
+        (
+            "shaders/post.slang",
+            "post_shadowed_jittered_2",
+            "post_shadowed_jittered_2.spv",
+        ),
+        (
+            "shaders/present.slang",
+            "present_manual",
+            "present_present_manual.spv",
+        ),
+        (
+            "shaders/present.slang",
+            "present_automatic",
+            "present_present_automatic.spv",
+        ),
+        (
+            "shaders/rr.slang",
+            "present_manual",
+            "rr_present_manual.spv",
+        ),
+        (
+            "shaders/rr.slang",
+            "present_automatic",
+            "rr_present_automatic.spv",
+        ),
+        (
+            "shaders/rr.slang",
+            "fallback_manual",
+            "rr_fallback_manual.spv",
+        ),
+        (
+            "shaders/rr.slang",
+            "fallback_automatic",
+            "rr_fallback_automatic.spv",
+        ),
+    ] {
+        recipes.push(Recipe {
+            source,
+            entry,
+            stage: "compute",
+            output,
+            target: Target::Spirv("spirv_1_4"),
+            args: &["-fp-mode", "precise"],
+        });
+    }
     build(&recipes, &["shaders", shader_library::root()], &["src"])?;
     Ok(())
 }

@@ -8,8 +8,7 @@ import geometry.camera;
 import params;
 import primary_cache;
 
-[shader("raygeneration")]
-void guide_main()
+func write_guides<let Cached : bool>()->void
 {
     Params p = parameters[0];
     uint2 pixel = DispatchRaysIndex().xy;
@@ -19,7 +18,7 @@ void guide_main()
     GuideTrace trace;
     pt::KeyGuideVertex first;
     bool found;
-    if (realtime_pt())
+    if (Cached)
     {
         uint index = primary_pixel();
         uint primitive = primary_identity[index].x;
@@ -46,7 +45,21 @@ void guide_main()
                                    p.previous_up };
     Guides guides = { pixel, film, current, previous };
     if (found)
-        guides.write_key(trace, first, p.origin.xyz, direction, p.initial_medium, realtime_pt());
+        guides.write_key(trace, first, p.origin.xyz, direction, p.initial_medium, Cached);
     else
         guides.sky(direction);
+}
+
+// 生产独立导引总在已完成的共享首视线之后运行。
+[shader("raygeneration")]
+func guide_main()->void
+{
+    write_guides<true>();
+}
+
+// 独立求交参考不混入缓存首面入口的可达图。
+[shader("raygeneration")]
+func guide_reference()->void
+{
+    write_guides<false>();
 }

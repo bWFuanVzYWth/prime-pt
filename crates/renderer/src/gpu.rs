@@ -16,6 +16,8 @@
 //! 是否实际执行SER由设置选择。未启用该能力时保留Flow callable兼容路径，其作者法线预解码
 //! 与旧导引仍是通用实现，不属于完整Hit Group路径的逐阶段材质裁剪保证。实时PT先缓存首视线，再独立运行delta导引
 //! 和随机输运；Guide与输运从同一首面重启，不共用后缀。离线仍追踪完整路径且不生成导引。
+//! 实时1／2样本与离线采用独立入口及最小链接集；有限film、合成和显示程序在准备阶段建立，
+//! FramePlan统一选择录制与参数，帧内只重绑和选择已有程序。
 
 use crate::scene::{Camera, Environment, Mesh};
 use prime_scene::MaterialDefinition;
@@ -50,7 +52,10 @@ mod exposure;
 #[path = "history.rs"]
 mod history;
 pub use history::GlobalReset;
-use simple_engine::pt::gpu::{Programs, Renderer};
+use simple_engine::pt::gpu::{Programs, RealtimeFrame, RealtimePrograms, Renderer};
+#[path = "frame_plan.rs"]
+mod frame_plan;
+use frame_plan::{Composite, FramePlan};
 use simple_engine::vulkan::{
     AccelerationStructure, TriangleInstance,
     interop::RayShader,
@@ -400,13 +405,13 @@ struct View {
     prefix: Buffer,
     progress: history::Accumulation,
     jitter: [f32; 2],
-    present: ComputePipeline,
+    present: [ComputePipeline; 2],
     rr_enabled: bool,
     quality: streamline::Quality,
     rr: RrImages,
     pack: ComputePipeline,
-    rr_present: ComputePipeline,
-    rr_fallback: ComputePipeline,
+    rr_present: [ComputePipeline; 2],
+    rr_fallback: [ComputePipeline; 2],
     display: exposure::Display,
 }
 
@@ -481,11 +486,15 @@ impl View {
             self.accumulation.into(),
             self.counts.into(),
             self.prefix.into(),
-            self.present.into(),
             self.pack.into(),
-            self.rr_present.into(),
-            self.rr_fallback.into(),
         ];
+        roots.extend(
+            self.present
+                .into_iter()
+                .chain(self.rr_present)
+                .chain(self.rr_fallback)
+                .map(vulkan::native::Resource::from),
+        );
         roots.extend(
             self.landing
                 .iter()
@@ -566,18 +575,21 @@ impl View {
                 Binding::StorageBuffer(display.parameters()),
             ],
         )?;
-        let present = if let Some(templates) = templates {
-            templates.present.rebind(context, present_bindings)?
-        } else {
-            ComputePipeline::new(
-                context,
-                present_bindings,
+        let present = display_variants(
+            context,
+            present_bindings,
+            templates.map(|t| t.present),
+            [
                 shader(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/present.spv")),
-                    c"present_main",
+                    include_bytes!(concat!(env!("OUT_DIR"), "/present_present_manual.spv")),
+                    c"present_manual",
                 ),
-            )?
-        };
+                shader(
+                    include_bytes!(concat!(env!("OUT_DIR"), "/present_present_automatic.spv")),
+                    c"present_automatic",
+                ),
+            ],
+        )?;
         let bindings = Bindings::new(
             context,
             &[
@@ -614,30 +626,36 @@ impl View {
                 ),
             )?
         };
-        let rr_present = if let Some(templates) = templates {
-            templates.rr_present.rebind(context, bindings)?
-        } else {
-            ComputePipeline::new(
-                context,
-                bindings,
+        let rr_present = display_variants(
+            context,
+            bindings,
+            templates.map(|t| t.rr_present),
+            [
                 shader(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_present.spv")),
-                    c"present_main",
+                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_present_manual.spv")),
+                    c"present_manual",
                 ),
-            )?
-        };
-        let rr_fallback = if let Some(templates) = templates {
-            templates.rr_fallback.rebind(context, bindings)?
-        } else {
-            ComputePipeline::new(
-                context,
-                bindings,
                 shader(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_fallback.spv")),
-                    c"fallback_main",
+                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_present_automatic.spv")),
+                    c"present_automatic",
                 ),
-            )?
-        };
+            ],
+        )?;
+        let rr_fallback = display_variants(
+            context,
+            bindings,
+            templates.map(|t| t.rr_fallback),
+            [
+                shader(
+                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_fallback_manual.spv")),
+                    c"fallback_manual",
+                ),
+                shader(
+                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_fallback_automatic.spv")),
+                    c"fallback_automatic",
+                ),
+            ],
+        )?;
         Ok(Self {
             extent,
             output_extent,
@@ -661,9 +679,65 @@ impl View {
     }
 }
 
-fn shader(spirv: &'static [u8], entry: &'static std::ffi::CStr) -> RayShader<'static> {
+fn display_variants(
+    context: &mut Context,
+    bindings: Bindings,
+    templates: Option<[ComputePipeline; 2]>,
+    shaders: [RayShader<'static>; 2],
+) -> Result<[ComputePipeline; 2], Error> {
+    let mut create = |index: usize| match templates {
+        Some(previous) => previous[index].rebind(context, bindings),
+        None => ComputePipeline::new(context, bindings, shaders[index]),
+    };
+    Ok([create(0)?, create(1)?])
+}
+
+const fn shader(spirv: &'static [u8], entry: &'static std::ffi::CStr) -> RayShader<'static> {
     RayShader { spirv, entry }
 }
+
+const POST_PROGRAMS: [RayShader<'static>; 10] = [
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_plain_1.spv")),
+        c"post_plain_1",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_plain_2.spv")),
+        c"post_plain_2",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_clear_random_1.spv")),
+        c"post_clear_random_1",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_clear_random_2.spv")),
+        c"post_clear_random_2",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_clear_jittered_1.spv")),
+        c"post_clear_jittered_1",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_clear_jittered_2.spv")),
+        c"post_clear_jittered_2",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_shadowed_random_1.spv")),
+        c"post_shadowed_random_1",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_shadowed_random_2.spv")),
+        c"post_shadowed_random_2",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_shadowed_jittered_1.spv")),
+        c"post_shadowed_jittered_1",
+    ),
+    shader(
+        include_bytes!(concat!(env!("OUT_DIR"), "/post_shadowed_jittered_2.spv")),
+        c"post_shadowed_jittered_2",
+    ),
+];
 
 fn programs<'a>(
     callables: &'a [RayShader<'a>],
@@ -671,8 +745,8 @@ fn programs<'a>(
     hit: materials::HitFeatures,
 ) -> Programs<'a> {
     Programs {
-        primary: None,
-        transport_pair: None,
+        realtime: None,
+        diagnostic: None,
         prefix: Some(shader(
             include_bytes!(concat!(env!("OUT_DIR"), "/prefix.spv")),
             c"prefix_main",
@@ -713,10 +787,7 @@ fn programs<'a>(
         }),
         material_hits: &[],
         callables,
-        post: shader(
-            include_bytes!(concat!(env!("OUT_DIR"), "/post.spv")),
-            c"post_main",
-        ),
+        posts: &POST_PROGRAMS,
     }
 }
 
@@ -740,13 +811,24 @@ struct MaterialGeneration {
     code: [blake3::Hash; 2],
     regular: Renderer,
     reordered: Option<Renderer>,
+    reference_regular: Option<Renderer>,
+    reference_reordered: Option<Renderer>,
     // Guide独立于PT照明管线；资源期准备两种SER设置，帧间仅重绑。
     guide_regular: Option<RayTracingPipeline>,
     guide_reordered: Option<RayTracingPipeline>,
 }
 
 impl MaterialGeneration {
-    fn pt_program(&self, reordered: bool) -> &Renderer {
+    fn pt_program(&self, reordered: bool, reference: bool) -> &Renderer {
+        if reference
+            && let Some(program) = if reordered {
+                self.reference_reordered.as_ref()
+            } else {
+                self.reference_regular.as_ref()
+            }
+        {
+            return program;
+        }
         if reordered {
             self.reordered.as_ref().expect("资源期已准备SER程序")
         } else {
@@ -758,6 +840,8 @@ impl MaterialGeneration {
         self.regular
             .roots()
             .chain(self.reordered.iter().flat_map(Renderer::roots))
+            .chain(self.reference_regular.iter().flat_map(Renderer::roots))
+            .chain(self.reference_reordered.iter().flat_map(Renderer::roots))
             .chain(self.guide_regular.map(vulkan::native::Resource::from))
             .chain(self.guide_reordered.map(vulkan::native::Resource::from))
     }
@@ -922,6 +1006,7 @@ impl Gpu {
     pub fn set_render_tuning(&mut self, tuning: prime_scene::RenderTuning) -> Result<(), Error> {
         if self.tuning.diagnostic() != tuning.diagnostic() && !self.offline {
             self.complete_previous()?;
+            self.renderer = None;
             self.transition_history(history::Event::Accumulation(
                 history::AccumulationEvent::OutputModeChanged,
             ))?;
@@ -1928,6 +2013,7 @@ impl Gpu {
             .iter()
             .copied()
             .chain((dispatch == 8).then_some("-DPRIMEPT_RECONSTRUCTION=0"))
+            .chain(cfg!(test).then_some("-DPRIMEPT_REFERENCE_FILM=1"))
             .collect();
         let guided_args: Vec<_> = args
             .iter()
@@ -1949,25 +2035,34 @@ impl Gpu {
                 compile_stage(
                     &mut batch,
                     program_source,
-                    "render_fused",
+                    if dispatch == 8 {
+                        "render_offline"
+                    } else {
+                        "render_fused"
+                    },
                     "raygeneration",
                     "render-fused.spv",
                     &native_args,
                 )
             })
             .transpose()?;
-        let primary = (dispatch == 8)
-            .then(|| {
-                compile_stage(
-                    &mut batch,
-                    program_source,
-                    "primary_main",
-                    "raygeneration",
-                    "primary.spv",
-                    &native_args,
-                )
-            })
-            .transpose()?;
+        let primary = if dispatch == 8 {
+            ["primary_random", "primary_jittered"]
+                .into_iter()
+                .map(|entry| {
+                    compile_stage(
+                        &mut batch,
+                        program_source,
+                        entry,
+                        "raygeneration",
+                        "primary.spv",
+                        &native_args,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let guide_rg = self.shader_source.with_file_name("guides.slang");
         let guided = (dispatch == 8)
             .then(|| {
@@ -1998,7 +2093,11 @@ impl Gpu {
                 compile_stage(
                     &mut batch,
                     program_source,
-                    "render_fused",
+                    if dispatch == 8 {
+                        "render_offline"
+                    } else {
+                        "render_fused"
+                    },
                     "raygeneration",
                     "render-fused.spv",
                     &ser_args,
@@ -2006,22 +2105,34 @@ impl Gpu {
             })
             .transpose()?;
         let guide_source = self.shader_source.with_file_name("guide_material.slang");
-        let mut transport_pair = Vec::new();
+        let mut realtime_graphs = Vec::new();
+        let mut reference_graphs = Vec::new();
         if dispatch == 8 {
             for (reordered, args) in [(false, &native_args), (true, &ser_args)] {
                 if reordered && !self.context.capabilities().invocation_reorder {
                     continue;
                 }
-                for lane in 0..2 {
-                    let lane_arg = format!("-DPRIMEPT_TRANSPORT_LANE={lane}");
-                    let args: Vec<_> = args.iter().copied().chain([lane_arg.as_str()]).collect();
-                    transport_pair.push(compile_stage(
+                for entry in ["render_rt1", "render_rt2_lane0", "render_rt2_lane1"]
+                    .into_iter()
+                    .chain(cfg!(test).then_some("render_rt2_merged"))
+                {
+                    realtime_graphs.push(compile_stage(
                         &mut batch,
                         program_source,
-                        "render_fused",
+                        entry,
                         "raygeneration",
-                        "render-pair.spv",
-                        &args,
+                        "render-realtime.spv",
+                        args,
+                    )?);
+                }
+                if cfg!(test) {
+                    reference_graphs.push(compile_stage(
+                        &mut batch,
+                        program_source,
+                        "render_diagnostic",
+                        "raygeneration",
+                        "render-reference.spv",
+                        args,
                     )?);
                 }
             }
@@ -2094,10 +2205,17 @@ impl Gpu {
             .map(|set| set.finish(&mut compiled))
             .transpose()?;
         let mut take = |ticket| compiled.take(ticket);
-        let primary = primary.map(&mut take).transpose()?;
+        let primary = primary
+            .into_iter()
+            .map(&mut take)
+            .collect::<Result<Vec<_>, _>>()?;
         let fused = fused.map(&mut take).transpose()?;
         let fused_ser = fused_ser.map(&mut take).transpose()?;
-        let transport_pair: Vec<_> = transport_pair
+        let realtime_graphs: Vec<_> = realtime_graphs
+            .into_iter()
+            .map(&mut take)
+            .collect::<Result<_, _>>()?;
+        let reference_graphs: Vec<_> = reference_graphs
             .into_iter()
             .map(&mut take)
             .collect::<Result<_, _>>()?;
@@ -2164,7 +2282,8 @@ impl Gpu {
                     .chain(primary.iter())
                     .chain(fused.iter())
                     .chain(fused_ser.iter())
-                    .chain(transport_pair.iter())
+                    .chain(realtime_graphs.iter())
+                    .chain(reference_graphs.iter())
                     .chain(guide_hits.artifacts().iter().filter(|_| dispatch != 8)),
             ),
             program_identity(
@@ -2208,35 +2327,64 @@ impl Gpu {
                 entry: c"guide_primary",
             })
             .collect();
-        let configured = |reordered| {
+        let primary_shaders: Vec<_> = primary
+            .iter()
+            .zip([c"primary_random", c"primary_jittered"])
+            .map(|(a, entry)| RayShader {
+                spirv: a.bytes(),
+                entry,
+            })
+            .collect();
+        let configured = |reordered, reference| {
             let mut result = self::programs(&callables, reordered, hit);
             if dispatch != 0 {
                 result.prefix = None;
-                let code = if reordered {
-                    fused_ser.as_ref()
+                let code = if reference {
+                    &reference_graphs[usize::from(reordered)]
+                } else if reordered {
+                    fused_ser.as_ref().expect("SER完整图")
                 } else {
-                    fused.as_ref()
-                }
-                .expect("完整实验程序");
+                    fused.as_ref().expect("完整图")
+                };
                 result.transport = RayShader {
                     spirv: code.bytes(),
-                    entry: c"render_fused",
+                    entry: if reference {
+                        c"render_diagnostic"
+                    } else if dispatch == 8 {
+                        c"render_offline"
+                    } else {
+                        c"render_fused"
+                    },
                 };
                 result.material_hits = &hit_shaders;
                 if dispatch >= 2 {
                     result.callables = &[];
                 }
             }
-            if dispatch == 8 {
-                result.transport_pair = Some(std::array::from_fn(|lane| RayShader {
-                    spirv: transport_pair[usize::from(reordered) * 2 + lane].bytes(),
-                    entry: c"render_fused",
-                }));
-                result.primary = primary.as_ref().map(|a| RayShader {
-                    spirv: a.bytes(),
-                    entry: c"primary_main",
+            if dispatch == 8 && !reference {
+                let base = usize::from(reordered) * if cfg!(test) { 4 } else { 3 };
+                result.realtime = Some(RealtimePrograms {
+                    primary: &primary_shaders,
+                    transport: RayShader {
+                        spirv: realtime_graphs[base].bytes(),
+                        entry: c"render_rt1",
+                    },
+                    transport_pair: Some([
+                        RayShader {
+                            spirv: realtime_graphs[base + 1].bytes(),
+                            entry: c"render_rt2_lane0",
+                        },
+                        RayShader {
+                            spirv: realtime_graphs[base + 2].bytes(),
+                            entry: c"render_rt2_lane1",
+                        },
+                    ]),
+                    merged: cfg!(test).then(|| RayShader {
+                        spirv: realtime_graphs[base + 3].bytes(),
+                        entry: c"render_rt2_merged",
+                    }),
+                    callables: &primary_callables,
                 });
-                result.callables = &primary_callables;
             }
             result
         };
@@ -2248,7 +2396,13 @@ impl Gpu {
                 [1, 1],
             )?
         } else {
-            Renderer::new(&mut self.context, configured(false), trace, post, [1, 1])?
+            Renderer::new(
+                &mut self.context,
+                configured(false, false),
+                trace,
+                post,
+                [1, 1],
+            )?
         };
         let reordered = if self.context.capabilities().invocation_reorder {
             Some(
@@ -2258,12 +2412,42 @@ impl Gpu {
                 {
                     previous.rebind(&mut self.context, trace, post, [1, 1])?
                 } else {
-                    Renderer::new(&mut self.context, configured(true), trace, post, [1, 1])?
+                    Renderer::new(
+                        &mut self.context,
+                        configured(true, false),
+                        trace,
+                        post,
+                        [1, 1],
+                    )?
                 },
             )
         } else {
             None
         };
+
+        let reference_regular = if cfg!(test) && dispatch == 8 {
+            Some(Renderer::new(
+                &mut self.context,
+                configured(false, true),
+                trace,
+                post,
+                [1, 1],
+            )?)
+        } else {
+            None
+        };
+        let reference_reordered =
+            if cfg!(test) && dispatch == 8 && self.context.capabilities().invocation_reorder {
+                Some(Renderer::new(
+                    &mut self.context,
+                    configured(true, true),
+                    trace,
+                    post,
+                    [1, 1],
+                )?)
+            } else {
+                None
+            };
 
         let guide_trace = self::programs(
             &[],
@@ -2335,6 +2519,8 @@ impl Gpu {
                 code,
                 regular,
                 reordered,
+                reference_regular,
+                reference_reordered,
                 guide_regular,
                 guide_reordered,
             },
@@ -3607,7 +3793,7 @@ impl Gpu {
         );
         let (trace, post) = self.allocate_bindings(descriptors)?;
         let generation = self.generation.as_ref().unwrap();
-        let program = generation.pt_program(self.invocation_reorder);
+        let program = generation.pt_program(self.invocation_reorder, self.diagnostic());
         Ok(program.rebind(&mut self.context, trace, post, extent)?)
     }
 
@@ -3739,11 +3925,26 @@ impl Gpu {
 
             let realtime_pt =
                 !self.offline && !diagnostic && self.generation.as_ref().unwrap().dispatch == 8;
-            if realtime_pt && !matches!(self.settings.samples, 1 | 2) {
-                return Err(Error::Invalid(
-                    "实时PT只接受性能（1 spp）或质量（2 spp）策略",
-                ));
-            }
+            let composite = if !sky_enabled || self.initial_medium != [1., 0., 0., 0.] {
+                Composite::None
+            } else if self.terrain_light.shadowed() {
+                Composite::Shadowed
+            } else {
+                Composite::Clear
+            };
+            let frame_film = rr_enabled;
+            #[cfg(test)]
+            let frame_film = frame_film || self.test_center_film;
+            let split = self.settings.samples == 2;
+            #[cfg(test)]
+            let split = split && self.test_split_transport;
+            let frame_plan = FramePlan::new(
+                realtime_pt,
+                self.settings.samples,
+                split,
+                frame_film,
+                composite,
+            )?;
             if self.renderer.is_none() {
                 self.renderer = Some(self.create_renderer()?);
             }
@@ -3910,34 +4111,32 @@ impl Gpu {
             }
             {
                 let renderer = self.renderer.as_ref().unwrap();
-                let split_transport = batch.samples() == 2;
                 #[cfg(test)]
-                let split_transport = split_transport && self.test_split_transport;
+                let (queries, guide_queries) =
+                    (self.test_pt_timestamps, self.test_guide_timestamps);
                 #[cfg(not(test))]
-                let recorded = if realtime_pt {
+                let (queries, guide_queries) = (None, None);
+                let recorded = if let Some(schedule) = frame_plan.realtime {
                     renderer.record_realtime(
                         &mut self.context,
                         self.guide_pipeline.filter(|_| rr_enabled),
-                        split_transport,
-                        None,
-                        None,
+                        RealtimeFrame {
+                            schedule,
+                            primary: frame_plan.primary,
+                            post: frame_plan.post,
+                            queries,
+                            guide_queries,
+                        },
                     )?
-                } else {
-                    renderer.record(&mut self.context, batch.samples())?
-                };
-                #[cfg(test)]
-                let recorded = if realtime_pt {
-                    renderer.record_realtime(
+                } else if let Some(queries) = queries {
+                    renderer.record_with_timestamps(
                         &mut self.context,
-                        self.guide_pipeline.filter(|_| rr_enabled),
-                        split_transport,
-                        self.test_pt_timestamps,
-                        self.test_guide_timestamps,
+                        batch.samples(),
+                        queries,
+                        frame_plan.post,
                     )?
-                } else if let Some(queries) = self.test_pt_timestamps {
-                    renderer.record_with_timestamps(&mut self.context, batch.samples(), queries)?
                 } else {
-                    renderer.record(&mut self.context, batch.samples())?
+                    renderer.record(&mut self.context, batch.samples(), frame_plan.post)?
                 };
                 result.push(recorded);
             }
@@ -3960,7 +4159,8 @@ impl Gpu {
                     Binding::StorageBuffer(view.display.parameters()),
                 ],
             )?;
-            let pipeline = view.present.rebind(&mut self.context, bindings)?;
+            let pipeline = view.present[usize::from(self.display_timeline.enabled())]
+                .rebind(&mut self.context, bindings)?;
             let frame = if self.offline {
                 simple_engine::display::exposure::Frame::new(
                     extent,
@@ -4218,9 +4418,11 @@ impl Gpu {
                     ],
                 )?;
                 let pipeline = if evaluated {
-                    view.rr_present.rebind(&mut self.context, bindings)?
+                    view.rr_present[usize::from(self.display_timeline.enabled())]
+                        .rebind(&mut self.context, bindings)?
                 } else {
-                    view.rr_fallback.rebind(&mut self.context, bindings)?
+                    view.rr_fallback[usize::from(self.display_timeline.enabled())]
+                        .rebind(&mut self.context, bindings)?
                 };
                 let measurement_extent = if evaluated {
                     view.output_extent
