@@ -22,7 +22,7 @@ public struct HitColor : IDecodeColor
     }
     public static float3 tint(pt::Hit hit, float3 color)
     {
-        return color * quad_tint(hit.identity.x, asfloat(hit.identity.yz));
+        return color * quad_tint(hit.identity.x);
     }
 };
 struct NoColor : IDecodeColor
@@ -55,7 +55,7 @@ public struct AtlasColor : IDecodeColor
         float2 bary = asfloat(hit.identity.yz);
         return atlas.Load(sprite_address(material_uv(hit.identity.x, bary), material_bounds(start)))
                    .rgb *
-               quad_tint(hit.identity.x, bary);
+               quad_tint(hit.identity.x);
     }
 };
 public interface IDecodeAux
@@ -309,7 +309,7 @@ struct MappedIor : IAuxResponse
     }
     static float ior(uint start, float4 auxiliary)
     {
-        return 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) / 255.0);
+        return 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) * (1.0 / 255.0));
     }
     static float medium_ior(uint start, float4 auxiliary)
     {

@@ -27,6 +27,7 @@ public bool reads_scattering_color(uint flow, uint variant)
 }
 
 [[vk::binding(1, 0)]]
+// 每quad三行：UV32B与共享FP32线性tint/material16B；CPU源quad仍为sRGB。
 public StructuredBuffer<uint4> quads;
 [[vk::binding(2, 0)]]
 public Texture2D<float4> atlas;
@@ -74,10 +75,6 @@ public uint material_id(uint primitive)
 {
     return quads[(primitive >> 1) * 3u + 2u].w;
 }
-public float3 material_linear(float3 value)
-{
-    return select(value <= 0.04045, value / 12.92, pow((value + 0.055) / 1.055, 2.4));
-}
 public float2 material_uv(uint primitive, float2 barycentrics)
 {
     return prime_coverage::material_uv(quads, primitive, barycentrics);
@@ -95,23 +92,17 @@ public float4 material_aux<let Variant : uint = ~0u>(uint primitive, float2 bary
     return aux_atlas.Load(sprite_address(material_uv(primitive, bary), bounds));
 }
 
-public float3 quad_tint(uint primitive, float2 barycentrics)
+public func quad_tint(primitive: uint)->float3
 {
-    float3 bary = float3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
-    float3 shared_tint = asfloat(quads[(primitive >> 1) * 3u + 2u].xyz);
-    float3 tint = 0;
-    tint += shared_tint * bary.x;
-    tint += shared_tint * bary.y;
-    tint += shared_tint * bary.z;
-    return material_linear(saturate(tint));
+    return asfloat(quads[(primitive >> 1) * 3u + 2u].xyz);
 }
 float4 sample_tinted_texel(uint primitive, float2 barycentrics, float2 uv)
 {
     float4 value = atlas.Load(
         sprite_address(uv, asfloat(material_words.Load4(material_id(primitive) * 112u + 80u))));
-    return float4(value.xyz * quad_tint(primitive, barycentrics), value.w);
+    return float4(value.xyz * quad_tint(primitive), value.w);
 }
-/// 保留旧共享tint的FP32插值顺序；覆盖alpha不乘tint。
+/// 共享tint已在GPU属性发布时解码；覆盖alpha不乘tint。
 public float4 material_texel(uint primitive, float2 barycentrics)
 {
     return sample_tinted_texel(primitive, barycentrics, material_uv(primitive, barycentrics));
@@ -179,7 +170,7 @@ public float3 sampled_material_emission(uint primitive, float2 bary, float scale
     if (!EmitterCoverage.accepts(start, texel.a))
         return 0;
     float4 emission = asfloat(material_words.Load4(start + 48u));
-    return emission.xyz * emission.w * (texel.rgb * quad_tint(primitive, bary)) *
+    return emission.xyz * emission.w * (texel.rgb * quad_tint(primitive)) *
            EmissionWeight.read(start, address) * scale;
 }
 bool emits_on_side(ModMaterial material, bool front)
@@ -248,11 +239,12 @@ public uint map_normal_xy(uint primitive, float2 encoded, float3 local_e1, float
     if (!(length_squared > 0) || !isfinite(length_squared))
         return encode_shading_normal(normal);
     tangent *= rsqrt(length_squared);
-    bitangent = cross(normal, tangent) * (dot(cross(normal, tangent), bitangent) < 0 ? -1.0 : 1.0);
-    float2 xy = (encoded * 255.0 - 128.0) / 127.0;
-    float3 local = normalize(float3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy)))));
-    return encode_shading_normal(
-        normalize(tangent * local.x + bitangent * local.y + normal * local.z));
+    let perpendicular = cross(normal, tangent);
+    bitangent = perpendicular * (dot(perpendicular, bitangent) < 0 ? -1.0 : 1.0);
+    let xy = fma(encoded, 255.0 / 127.0, -128.0 / 127.0);
+    let local = float3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
+    // oct编码消去正比例缩放；local和world的L2单位化均由最终L1归一化吸收。
+    return encode_shading_normal(tangent * local.x + bitangent * local.y + normal * local.z);
 }
 public uint mapped_shading_normal_known(uint primitive, float2 bary, float3 local_e1,
                                         float3 local_e2, float3x3 object_to_world, float3 normal)
@@ -304,8 +296,7 @@ public pt::SurfaceMaterial resolve_material<let HasAux : bool = false,
         uv = material_uv(primitive, asfloat(hit.identity.yz));
     float4 bounds = material.uv_bounds;
     if (readBase)
-        hit.texel.xyz = atlas.Load(sprite_address(uv, bounds)).rgb *
-                        quad_tint(primitive, asfloat(hit.identity.yz));
+        hit.texel.xyz = atlas.Load(sprite_address(uv, bounds)).rgb * quad_tint(primitive);
     float3 base_color = hit.texel.xyz;
     bool reads_mers = (mask & 1u) != 0;
     if (overlay)
@@ -316,7 +307,7 @@ public pt::SurfaceMaterial resolve_material<let HasAux : bool = false,
         float4 top = atlas.Load(sprite_address(top_uv, material.overlay_bounds));
         if (top.a >= 0.5)
         {
-            base_color = top.rgb * quad_tint(primitive, asfloat(hit.identity.yz));
+            base_color = top.rgb * quad_tint(primitive);
             reads_mers = (mask & VARIANT_OVERLAY_MERS) != 0;
             uv = top_uv;
             bounds = material.overlay_bounds;
@@ -341,7 +332,7 @@ public pt::SurfaceMaterial resolve_material<let HasAux : bool = false,
     if ((mask & 2u) != 0)
     {
         float4 auxiliary = HasAux ? sampledAux : aux_atlas.Load(sprite_address(uv, bounds));
-        float ior = 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) / 255.0);
+        float ior = 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) * (1.0 / 255.0));
         result.pbr.surface.x = ior;
         medium.x = ior;
         if ((mask & 8u) != 0)

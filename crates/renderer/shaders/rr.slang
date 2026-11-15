@@ -88,7 +88,7 @@ func fallback_pixel<let Automatic : bool>(id: uint3)->void
     Params p = parameters[0];
     if (any(id.xy >= p.output_size.xy))
         return;
-    float2 source = (float2(id.xy) + 0.5) * float2(p.image.xy) / float2(p.output_size.xy) - 0.5;
+    let source = fma(float2(id.xy) + 0.5, asfloat(p.programs.xy), -0.5);
     bool valid;
     float3 hdr = pt::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =

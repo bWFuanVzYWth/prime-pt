@@ -149,7 +149,7 @@ void prefix_main()
     pt::PathSampler sampler =
         pt::path_sampler(coordinate, data.sample, params.options.z, params.options.x);
     float2 offset = params.reconstruction.w > 0 ? 0.5 + params.reconstruction.xy : sampler.film();
-    float2 film = (float2(coordinate) + offset) / float2(params.image.xy);
+    let film = geometry::camera_sample_uv_offset(coordinate, params.inverse_extent, offset);
     data.path.origin = params.origin.xyz;
     data.path.direction = geometry::camera_scaled_direction(params.forward.xyz, params.right.xyz,
                                                             params.up.xyz, film);
@@ -162,8 +162,7 @@ void prefix_main()
     {
         pt::DenoiseCamera previous = { params.previous_position, params.previous_forward,
                                        params.previous_right, params.previous_up };
-        pt::DenoiseCamera current = geometry::camera_from_scaled(
-            params.origin.xyz, params.forward.xyz, params.right.xyz, params.up.xyz);
+        let current = params.current_camera;
         Guides guides = { coordinate, film, current, previous };
         pt::trace_prefix(provider, data, settings(params), distance, guides);
     }
@@ -309,7 +308,7 @@ void render_fused()
     pt::PathSampler sampler =
         pt::path_sampler(coordinate, data.sample, params.options.z, params.options.x);
     float2 offset = params.reconstruction.w > 0 ? 0.5 + params.reconstruction.xy : sampler.film();
-    float2 film = (float2(coordinate) + offset) / float2(params.image.xy);
+    let film = geometry::camera_sample_uv_offset(coordinate, params.inverse_extent, offset);
     data.path.origin = params.origin.xyz;
     data.path.direction = geometry::camera_scaled_direction(params.forward.xyz, params.right.xyz,
                                                             params.up.xyz, film);

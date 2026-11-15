@@ -3,6 +3,7 @@ module params;
 import pt.scene;
 import display.prime_drt;
 import atmosphere.parameters;
+import geometry.camera;
 
 public struct Params
 {
@@ -26,7 +27,8 @@ public struct Params
     public uint rr_sample;
     /// 方块发光的场景线性倍率，命中和直接光估计使用同一个值。
     public float block_emission_scale;
-    public uint2 temporal_reserved;
+    /// 正有限的倒输入尺寸，由宿主按本帧实际追踪尺寸准备。
+    public float2 inverse_extent;
     public float4 previous_position;
     public float4 previous_forward;
     public float4 previous_right;
@@ -37,8 +39,10 @@ public struct Params
     public int4 anchor_region;
     /// 宿主实际相机介质的IOR和RGB extinction。
     public float4 initial_medium;
-    /// z 为照明 hit/callable 数量，用于兼容管线的导引段偏移，其余保留为零。
+    /// xy为输入/输出尺寸比例bits，z为兼容导引偏移，w为同源太阳半角的弦长平方bits。
     public uint4 programs;
+    /// 当前规范相机，源自与previous相同的CPU CameraFrame编码，不含jitter。
+    public geometry::Camera current_camera;
 };
 
 public pt::Settings settings(Params params)

@@ -1509,7 +1509,11 @@ impl Gpu {
         } else {
             let mut encoder = scene_cache::QuadEncoder::with_capacity(mesh.quads.len())?;
             for q in &mesh.quads {
-                encoder.push(q.positions(), 0, q.attributes())?;
+                encoder.push(
+                    q.positions(),
+                    0,
+                    attribute_update::linear_attributes(q.attributes()),
+                )?;
             }
             let owner = scene_cache::Cache::<()>::new()?;
             let mut update = owner.begin(0)?;
@@ -2843,7 +2847,11 @@ impl Gpu {
                         return Err(Error::Invalid("构建AS前quad记录或材质身份无效"));
                     }
                     opaque &= !coverage;
-                    encoder.push(quad.positions(), 0, attributes)?;
+                    encoder.push(
+                        quad.positions(),
+                        0,
+                        attribute_update::linear_attributes(attributes),
+                    )?;
                     if self.opacity.map.is_some() {
                         let pair = self.opacity.indices(quad.material_id().index(), quad.uv());
                         opacity_indices.extend(pair);
@@ -4040,8 +4048,8 @@ impl Gpu {
             words.extend([
                 self.absolute_sample,
                 block_emission_scale.to_bits(),
-                self.absolute_sample,
-                0,
+                (1.0 / extent[0] as f32).to_bits(),
+                (1.0 / extent[1] as f32).to_bits(),
             ]);
             words.extend(
                 previous_camera
@@ -4066,8 +4074,8 @@ impl Gpu {
             words.push(0);
             words.extend(self.initial_medium.map(f32::to_bits));
             words.extend([
-                0,
-                0,
+                (extent[0] as f32 / view.output_extent[0] as f32).to_bits(),
+                (extent[1] as f32 / view.output_extent[1] as f32).to_bits(),
                 self.generation
                     .as_ref()
                     .unwrap()
@@ -4075,8 +4083,12 @@ impl Gpu {
                     .plan()
                     .keys()
                     .len() as u32,
-                0,
+                simple_engine::light_sampling::cone_chord_squared(
+                    self.atmosphere.parameters().sun_angular_radius(),
+                )
+                .to_bits(),
             ]);
+            words.extend(current.camera_words(self.anchor)?.map(f32::to_bits));
 
             view.params
                 .write(&mut self.context, 0, bytemuck::cast_slice(&words))?;

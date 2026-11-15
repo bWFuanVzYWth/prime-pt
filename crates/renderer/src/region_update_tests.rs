@@ -182,7 +182,11 @@ fn hardware_pt_rr_stationary_partial_updates() -> Result<(), Box<dyn std::error:
             u64::from(entry.range.start) * 48,
             &mut actual,
         )?;
-        let expected: Vec<_> = parts.view().attributes().collect();
+        let expected: Vec<_> = parts
+            .view()
+            .attributes()
+            .map(super::attribute_update::linear_attributes)
+            .collect();
         assert_eq!(
             actual,
             bytemuck::cast_slice::<_, u8>(&expected),

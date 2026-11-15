@@ -10,8 +10,8 @@ geometry::Ray probe(uint index)
 {
     uint lane = index % 16;
     bool front = lane >= 8;
-    return { float3(float(index / 16) * 3.0 - 0.75 + float(lane % 4) * 0.5,
-                    (lane / 4) % 2 == 0 ? -0.6 : 0.6, front ? 2.0 : 0.0),
+    return { float3(float(index >> 4) * 3.0 - 0.75 + float(lane % 4) * 0.5,
+                    ((lane >> 2) % 2) == 0 ? -0.6 : 0.6, front ? 2.0 : 0.0),
              0, float3(0, 0, front ? -1.0 : 1.0), 1.5 };
 }
 [shader("raygeneration")]

@@ -49,7 +49,8 @@ void light_probe_main(uint3 id: SV_DispatchThreadID)
     geometry::SurfacePoint point = { float3(2, 0, 4), float3(0, 0, -1), 1.0e-5 };
     // 固定开区间格点覆盖alias列与片内warp，不读取帧随机状态。
     float lane = float(id.x) + 0.5;
-    float3 random = float3(lane / 32.0, frac(lane * 0.61803398875), frac(lane * 0.75487766625));
+    float3 random =
+        float3(lane * (1.0 / 32.0), frac(lane * 0.61803398875), frac(lane * 0.75487766625));
     Params p = parameters[0];
     pt::LightSample sample = sample_quad_light(point, random, p);
     if (!(sample.pdf > 0))

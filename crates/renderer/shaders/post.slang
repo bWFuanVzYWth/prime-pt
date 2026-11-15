@@ -6,6 +6,7 @@ import pt.scene;
 import pt.path_sampler;
 import atmosphere.terrain_composite;
 import atmosphere.terrain_frame;
+import geometry.camera;
 
 [[vk::binding(0, 0)]]
 StructuredBuffer<Params> parameters;
@@ -47,7 +48,7 @@ func post_pixel<let Paths : uint, let Composite : uint, let FrameFilm : bool>(id
             id.xy, params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u),
             params.options.z, params.options.x);
         float2 offset = FrameFilm ? 0.5 + params.reconstruction.xy : sampler.film();
-        float2 film = (float2(id.xy) + offset) / float2(params.image.xy);
+        let film = geometry::camera_sample_uv_offset(id.xy, params.inverse_extent, offset);
         if (Composite == 1)
             radiance = atmosphere::composite_clear_aerial_bt709(
                 aerial_light, aerial_transmittance, linear_sampler, film, prefix.w,

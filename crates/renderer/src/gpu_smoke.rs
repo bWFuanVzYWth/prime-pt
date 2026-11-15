@@ -775,7 +775,7 @@ fn hardware_sampling_strategy_roulette_scope() -> Result<(), Box<dyn std::error:
                 Options::new(false, streamline::Quality::Dlaa, samples, 8)?,
             )?;
             let view = gpu.view.as_ref().unwrap();
-            // 按Params字段定位output_size.w；缓冲容量还含未使用的预留空间。
+            // 按Params字段定位output_size.w。
             let policy_offset = (16
                 + 4
                 + 4
@@ -1143,12 +1143,14 @@ fn hardware_pt_linear_tint() -> Result<(), Box<dyn std::error::Error>> {
     add_quad(&mut mesh, 1., [0.5; 2], [1.; 3], 2.);
     gpu.set_atlas(1, 1, &[128, 192, 64, 255])?;
     gpu.set_scene(&mesh)?;
+    let sample_checkpoint = gpu.absolute_sample;
     let texture = host.render(&mut gpu, &image, &camera())?;
     gpu.set_atlas(1, 1, &[255; 4])?;
     for quad in &mut mesh.quads {
         quad.set_tint([128. / 255., 192. / 255., 64. / 255.]);
     }
     gpu.set_scene(&mesh)?;
+    gpu.test_restart_sample_sequence(sample_checkpoint)?;
     let tint = host.render(&mut gpu, &image, &camera())?;
     assert!(
         center(&texture)

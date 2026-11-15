@@ -3,6 +3,17 @@ use super::{Error, Gpu, SceneUpdateTiming, elapsed_ns};
 use prime_scene::RenderChange;
 use simple_engine::{scene_cache, vulkan};
 
+/// CPU源保持sRGB；只在派生GPU属性的边界解码共享tint，三个通道仍各占一个FP32槽。
+pub(super) fn linear_attributes(mut value: [[u32; 4]; 3]) -> [[u32; 4]; 3] {
+    let rgb: [f32; 3] = std::array::from_fn(|i| f32::from_bits(value[2][i]).clamp(0.0, 1.0));
+    let linear = simple_engine::color::SrgbRgba::new(rgb[0], rgb[1], rgb[2], 1.0)
+        .to_linear_srgb()
+        .to_array()
+        .map(f32::to_bits);
+    value[2][..3].copy_from_slice(&linear[..3]);
+    value
+}
+
 /// 将区域内连续的源 quad 属性写入同序 GPU 槽，相邻的写入合为一个范围。
 pub(super) fn pack_patch(
     slots: &std::ops::Range<u32>,
@@ -30,7 +41,7 @@ pub(super) fn pack_patch(
         ranges.try_reserve(1).map_err(scene_cache::Error::from)?;
         ranges.push((dest, start..start + count));
     }
-    out.extend(values);
+    out.extend(values.map(linear_attributes));
     Ok(())
 }
 
@@ -195,5 +206,24 @@ impl Gpu {
         metrics.resources_ns += metrics.publish_ns;
         self.scene_update = Some(metrics);
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn derived_tint_preserves_sub_byte_precision() {
+        let tint = [0.001_f32, 0.003, 0.004];
+        let mut source = [[0; 4]; 3];
+        source[2][..3].copy_from_slice(&tint.map(f32::to_bits));
+        let derived = super::linear_attributes(source);
+        let linear: [f32; 3] = std::array::from_fn(|i| f32::from_bits(derived[2][i]));
+        let restored =
+            simple_engine::color::LinearSrgbRgba::new(linear[0], linear[1], linear[2], 1.0)
+                .to_srgb()
+                .to_array();
+        for i in 0..3 {
+            assert!((restored[i] - tint[i]).abs() < 1e-7);
+        }
     }
 }

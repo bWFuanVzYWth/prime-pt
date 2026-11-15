@@ -28,6 +28,7 @@ pub(super) struct History {
     pub maps: Vec<(u32, [u32; 2])>,
 }
 pub(super) struct Page {
+    /// 尚未派生的CPU源属性；只在pack_patch或QuadEncoder/rebind时解码tint。
     pub attrs: Vec<[[u32; 4]; 3]>,
     pub lamps: Vec<Record>,
     pub geometry: PackedQuads,
@@ -85,7 +86,11 @@ pub(super) fn encode(
             lamps.push(record);
         }
         if !checked {
-            encoder.push(q.positions(), 0, q.attributes())?;
+            encoder.push(
+                q.positions(),
+                0,
+                super::attribute_update::linear_attributes(q.attributes()),
+            )?;
         }
         if coverage
             && !tables.maps.is_empty()
@@ -222,7 +227,11 @@ impl Build {
                 };
                 let mut encoder = QuadEncoder::with_capacity(page.attrs.len())?;
                 for (i, attr) in page.attrs.drain(..).enumerate() {
-                    encoder.rebind(&old.resident, first + i, attr)?;
+                    encoder.rebind(
+                        &old.resident,
+                        first + i,
+                        super::attribute_update::linear_attributes(attr),
+                    )?;
                 }
                 page.geometry = encoder.finish();
             }

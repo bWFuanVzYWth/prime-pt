@@ -98,7 +98,10 @@ fn streamed_large_tint_only_touches_the_requested_faces() -> Result<(), Box<dyn 
     )?;
     assert_eq!(
         &rows[1][8..11],
-        &[128, 64, 32].map(|v| (v as f32 / 255.).to_bits())
+        &simple_engine::color::Srgb8Rgba::new(128, 64, 32, 255)
+            .to_linear_srgb()
+            .to_array()
+            .map(f32::to_bits)[..3]
     );
     assert_ne!(rows[0][8], rows[1][8]);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
@@ -1052,7 +1055,10 @@ fn hardware_pt_sparse_tint_publication_keeps_geometry_and_writes_only_the_patch(
     let words: &[[[u32; 4]; 3]] = bytemuck::cast_slice(&after[offset..offset + 48]);
     assert_eq!(
         words[0][2][..3],
-        [0x12, 0x34, 0x56].map(|v| (v as f32 / 255.).to_bits())
+        simple_engine::color::Srgb8Rgba::new(0x12, 0x34, 0x56, 255)
+            .to_linear_srgb()
+            .to_array()
+            .map(f32::to_bits)[..3]
     );
     let _retired = candidate.finish(&mut parts);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);

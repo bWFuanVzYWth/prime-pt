@@ -41,7 +41,7 @@ void measure(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint lane: 
     }
     if (lane == 0)
     {
-        uint2 tiles = (extent + 15u) / 16u;
+        uint2 tiles = (extent + 15u) >> 4u;
         uint2 size = min(uint2(16), extent - group.xy * 16u);
         blocks[((frame % 32u) * tiles.y + group.y) * tiles.x + group.x] =
             float4(reduced[0].xyz / float(size.x * size.y), reduced[0].w);

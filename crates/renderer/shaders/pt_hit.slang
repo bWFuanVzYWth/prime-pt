@@ -138,7 +138,7 @@ func cache_primary<let FrameFilm : bool>()->void
     uint pixel = primary_pixel();
     pt::PathSampler sampler = pt::path_sampler(coordinate, p.rr_sample, p.options.z, p.options.x);
     float2 offset = FrameFilm ? 0.5 + p.reconstruction.xy : sampler.film();
-    float2 film = (float2(coordinate) + offset) / float2(p.image.xy);
+    let film = geometry::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
     float3 direction =
         geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
     RayDesc ray = { p.origin.xyz, 0, direction, pt::FAR };
@@ -201,7 +201,7 @@ func trace_path(coordinate: uint2, film: float2, inout data: pt::TransportCall)
 {
 #if PRIMEPT_RECONSTRUCTION
     let p = parameters[0];
-    let current = geometry::camera_from_scaled(p.origin.xyz, p.forward.xyz, p.right.xyz, p.up.xyz);
+    let current = p.current_camera;
     let previous : pt::DenoiseCamera = { p.previous_position, p.previous_forward, p.previous_right,
                                          p.previous_up };
     let guides : Guides = { coordinate, film, current, previous };
@@ -278,7 +278,7 @@ public struct OfflinePixelAdapter : pt::IPixelTransport
         if (p.reconstruction.w > 0)
             offset = 0.5 + p.reconstruction.xy;
 #endif
-        let film = (float2(coordinate) + offset) / float2(p.image.xy);
+        let film = geometry::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
         data.path.direction =
             geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
         return film;

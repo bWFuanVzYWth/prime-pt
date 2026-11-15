@@ -12,7 +12,8 @@ func write_guides<let Cached : bool>()->void
 {
     Params p = parameters[0];
     uint2 pixel = DispatchRaysIndex().xy;
-    float2 film = (float2(pixel) + 0.5 + p.reconstruction.xy) / float2(p.image.xy);
+    let film =
+        geometry::camera_sample_uv_offset(pixel, p.inverse_extent, 0.5 + p.reconstruction.xy);
     float3 direction =
         geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
     GuideTrace trace;
@@ -39,8 +40,7 @@ func write_guides<let Cached : bool>()->void
     }
     else
         found = trace.intersect_guide(p.origin.xyz, direction, p.initial_medium, first);
-    pt::DenoiseCamera current =
-        geometry::camera_from_scaled(p.origin.xyz, p.forward.xyz, p.right.xyz, p.up.xyz);
+    let current = p.current_camera;
     pt::DenoiseCamera previous = { p.previous_position, p.previous_forward, p.previous_right,
                                    p.previous_up };
     Guides guides = { pixel, film, current, previous };

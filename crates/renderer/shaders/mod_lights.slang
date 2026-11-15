@@ -117,7 +117,7 @@ public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sa
     pt::LightBvhSample selected = proposal.sample(receiver, sample.z);
     if (selected.pmf <= 0)
         return result;
-    uint index = light_alias[2u + selected.light / 4u][selected.light & 3u];
+    uint index = light_alias[2u + (selected.light >> 2u)][selected.light & 3u];
     uint4 meta = light_meta[index];
     uint primitive = meta.w * 2u;
     uint alias_offset = PublishedArea.alias_offset(primitive);

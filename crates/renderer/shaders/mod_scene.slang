@@ -61,13 +61,13 @@ public uint region_primitive(uint instance, uint local_primitive)
 
 public bool sun_contains(float3 direction)
 {
-    return geometry::cone_contains(parameters[0].lighting.xyz, parameters[0].atmosphere.sun.z,
-                                   direction);
+    return geometry::cone_contains_chord(parameters[0].lighting.xyz,
+                                         asfloat(parameters[0].programs.w), direction);
 }
 
 public float sun_pdf()
 {
-    return geometry::uniform_cone_pdf(parameters[0].atmosphere.sun.z);
+    return geometry::uniform_cone_pdf_chord(asfloat(parameters[0].programs.w));
 }
 
 float altitude(float world_y)
@@ -211,8 +211,8 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         pt::LightSample result = (pt::LightSample)0;
         if (parameters[0].lighting.w <= 0)
             return result;
-        result.direction = geometry::sample_uniform_cone(parameters[0].lighting.xyz,
-                                                         parameters[0].atmosphere.sun.z, sample);
+        result.direction = geometry::sample_uniform_cone_chord(
+            parameters[0].lighting.xyz, asfloat(parameters[0].programs.w), sample);
         result.pdf = sun_pdf();
         result.distance = pt::FAR;
         result.visibility = { geometry::offset_origin(point, result.direction), 0, result.direction,
