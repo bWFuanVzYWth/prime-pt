@@ -54,7 +54,7 @@ final class BundledRuntimeFixture {
             }
             if (stage[4].equals("raygeneration")) {
                 builder.command().addAll(java.util.List.of("-capability", "spvShaderInvocationReorderEXT",
-                        "-capability", "spvRayTracingPositionFetchKHR", "-DPT_HIT_SER=1", "-DPRIMEPT_SER=1"));
+                        "-capability", "spvRayTracingPositionFetchKHR", "-DPRIMEPT_SER=1"));
             }
             builder.directory(cache.toFile());
             builder.environment().remove("SLANGC");

@@ -4,9 +4,6 @@ module pt_hit;
 #ifndef PRIMEPT_OMM
 #define PRIMEPT_OMM 0
 #endif
-#ifndef PT_HIT_SER
-#define PT_HIT_SER 0
-#endif
 #ifndef PRIMEPT_RECONSTRUCTION
 #define PRIMEPT_RECONSTRUCTION 1
 #endif
@@ -36,6 +33,11 @@ import primary_cache;
 #endif
 #ifndef PRIMEPT_LIGHT_MASK
 #define PRIMEPT_LIGHT_MASK 3
+#endif
+#ifdef PRIMEPT_SER
+static const let HitReorder = true;
+#else
+static const let HitReorder = false;
 #endif
 #ifndef PRIMEPT_RECONSTRUCTION
 #define PRIMEPT_RECONSTRUCTION 1
@@ -163,8 +165,8 @@ void prefix_empty() {
     ENGINE_OPACITY_MICROMAP(prefix_empty)
 #endif
 }
-#ifndef PT_TRANSPORT_LANE
-#define PT_TRANSPORT_LANE -1
+#ifndef PRIMEPT_TRANSPORT_LANE
+#define PRIMEPT_TRANSPORT_LANE -1
 #endif
 
 public struct PixelAdapter : pt::IPixelTransport
@@ -200,9 +202,8 @@ public struct PixelAdapter : pt::IPixelTransport
                 uint program = material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
                 pt::MaterialCall call =
                     pt::MaterialCall::primaryInput(data.sample, lane, data.path.radiance);
-#if PT_HIT_SER
-                ReorderThread(program, 32u);
-#endif
+                if (HitReorder)
+                    ReorderThread(program, 32u);
                 CallShader(program, call);
                 data.path = call.result();
             }
@@ -230,11 +231,13 @@ public struct PixelAdapter : pt::IPixelTransport
                                        params.previous_right, params.previous_up };
         Guides guides = { coordinate, film, current, previous };
         if (params.reconstruction.w == 2)
-            return pt::trace_hit_path(HitScene(), guides, data);
+            return pt::trace_hit_path<HitScene, Guides, HitReorder>(HitScene(), guides, data);
         else
-            return pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
+            return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, HitReorder>(
+                HitScene(), pt::NoPrefixGuides(), data);
 #else
-        return pt::trace_hit_path(HitScene(), pt::NoPrefixGuides(), data);
+        return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, HitReorder>(
+            HitScene(), pt::NoPrefixGuides(), data);
 #endif
     }
 };
@@ -255,17 +258,18 @@ void render_fused()
         output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);
         return;
     }
-    bool realtime = PT_TRANSPORT_LANE >= 0 || realtime_pt();
+    bool realtime = PRIMEPT_TRANSPORT_LANE >= 0 || realtime_pt();
     pt::PixelTransportInput input = { coordinate, params.image.w, realtime };
     float4 previous = 0;
-#if PT_TRANSPORT_LANE == 1
+#if PRIMEPT_TRANSPORT_LANE == 1
     previous = output_image[pixel];
 #endif
     PixelAdapter adapter = { coordinate, pixel };
-    pt::PixelTransportResult result = pt::integrate_pixel(adapter, input, previous);
-#if PT_TRANSPORT_LANE != 1
+    pt::PixelTransportResult result =
+        pt::integrate_pixel<PixelAdapter, PRIMEPT_TRANSPORT_LANE>(adapter, input, previous);
+#if PRIMEPT_TRANSPORT_LANE != 1
     float distance =
-        input.realtime || PT_TRANSPORT_LANE >= 0 ? primary_ray[pixel].w : result.distance;
+        input.realtime || PRIMEPT_TRANSPORT_LANE >= 0 ? primary_ray[pixel].w : result.distance;
     prefix_image[pixel] = float4(0, 0, 0, distance);
 #endif
     output_image[pixel] = result.radiance;

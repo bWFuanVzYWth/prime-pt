@@ -24,7 +24,11 @@ fn programs(texture: bool) -> Programs<'static> {
             } else {
                 include_bytes!(concat!(env!("OUT_DIR"), "/exposure.buffer.spv"))
             },
-            entry: c"histogram_main",
+            entry: if texture {
+                c"histogram_texture_main"
+            } else {
+                c"histogram_main"
+            },
         },
         update: RayShader {
             spirv: include_bytes!(concat!(env!("OUT_DIR"), "/exposure.update.spv")),

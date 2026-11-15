@@ -155,18 +155,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         target: Target::Spirv("spirv_1_4"),
         args: &["-fp-mode", "precise"],
     });
-    for (entry, output, args) in [
-        (
-            "histogram_main",
-            "exposure.buffer.spv",
-            &["-DEXPOSURE_TEXTURE=0"][..],
-        ),
-        (
-            "histogram_main",
-            "exposure.texture.spv",
-            &["-DEXPOSURE_TEXTURE=1"][..],
-        ),
-        ("update_main", "exposure.update.spv", &[][..]),
+    for (entry, output) in [
+        ("histogram_main", "exposure.buffer.spv"),
+        ("histogram_texture_main", "exposure.texture.spv"),
+        ("update_main", "exposure.update.spv"),
     ] {
         recipes.push(Recipe {
             source: &exposure_source,
@@ -174,7 +166,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stage: "compute",
             output,
             target: Target::Spirv("spirv_1_4"),
-            args,
+            args: &[],
         });
     }
     build(&recipes, &["shaders", shader_library::root()], &["src"])?;

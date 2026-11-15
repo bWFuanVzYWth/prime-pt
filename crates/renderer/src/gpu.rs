@@ -1937,12 +1937,12 @@ impl Gpu {
         let ser_args: Vec<_> = native_args
             .iter()
             .copied()
-            .chain(["-DPRIMEPT_SER=1", "-DPT_HIT_SER=1"])
+            .chain(["-DPRIMEPT_SER=1"])
             .collect();
         let guided_ser_args: Vec<_> = guided_args
             .iter()
             .copied()
-            .chain(["-DPRIMEPT_SER=1", "-DPT_HIT_SER=1"])
+            .chain(["-DPRIMEPT_SER=1"])
             .collect();
         let fused = (dispatch != 0)
             .then(|| {
@@ -2013,7 +2013,7 @@ impl Gpu {
                     continue;
                 }
                 for lane in 0..2 {
-                    let lane_arg = format!("-DPT_TRANSPORT_LANE={lane}");
+                    let lane_arg = format!("-DPRIMEPT_TRANSPORT_LANE={lane}");
                     let args: Vec<_> = args.iter().copied().chain([lane_arg.as_str()]).collect();
                     transport_pair.push(compile_stage(
                         &mut batch,
