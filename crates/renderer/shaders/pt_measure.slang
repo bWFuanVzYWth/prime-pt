@@ -2,27 +2,28 @@
 module spatial_measure;
 
 [[vk::binding(0, 0)]]
-StructuredBuffer<float4> source;
+var source : StructuredBuffer<float4>;
 [[vk::binding(1, 0)]]
-RWStructuredBuffer<float4> sums;
+var sums : RWStructuredBuffer<float4>;
 [[vk::binding(2, 0)]]
-RWStructuredBuffer<float4> blocks;
+var blocks : RWStructuredBuffer<float4>;
 /// xy尺寸，z从零开始的帧号；blocks保留最近32帧。
 [[vk::binding(3, 0)]]
-StructuredBuffer<uint4> config;
+var config : StructuredBuffer<uint4>;
 
-groupshared float4 reduced[256];
+groupshared var reduced : float4[256];
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void measure(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint lane: SV_GroupIndex)
+func measure(id: uint3: SV_DispatchThreadID, group: uint3: SV_GroupID, lane: uint: SV_GroupIndex)
+    ->void
 {
-    uint2 extent = config[0].xy;
-    uint frame = config[0].z;
-    float4 value = float4(0);
+    let extent : uint2 = config[0].xy;
+    let frame : uint = config[0].z;
+    var value = float4(0);
     if (all(id.xy < extent))
     {
-        uint index = id.y * extent.x + id.x;
+        let index : uint = id.y * extent.x + id.x;
         value = source[index];
         sums[index] = (frame == 0 ? float4(0) : sums[index]) + value;
     }
@@ -30,7 +31,7 @@ void measure(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint lane: 
                                           ? max(abs(value.x), max(abs(value.y), abs(value.z)))
                                           : asfloat(0x7f800000u));
     GroupMemoryBarrierWithGroupSync();
-    for (uint stride = 128; stride > 0; stride >>= 1)
+    for (var stride: uint = 128; stride > 0; stride >>= 1)
     {
         if (lane < stride)
         {
@@ -41,8 +42,8 @@ void measure(uint3 id: SV_DispatchThreadID, uint3 group: SV_GroupID, uint lane: 
     }
     if (lane == 0)
     {
-        uint2 tiles = (extent + 15u) >> 4u;
-        uint2 size = min(uint2(16), extent - group.xy * 16u);
+        let tiles : uint2 = (extent + 15u) >> 4u;
+        let size : uint2 = min(uint2(16), extent - group.xy * 16u);
         blocks[((frame % 32u) * tiles.y + group.y) * tiles.x + group.x] =
             float4(reduced[0].xyz / float(size.x * size.y), reduced[0].w);
     }

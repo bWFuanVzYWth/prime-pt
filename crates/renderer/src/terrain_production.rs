@@ -33,7 +33,7 @@ struct SourcePage {
 }
 enum PageInput {
     Quads(Vec<Quad>),
-    Tint(Vec<[[u32; 4]; 3]>),
+    Tint(Vec<scene_cache::QuadAttributes>),
 }
 enum Entry {
     Reuse(usize),
@@ -201,7 +201,7 @@ impl Feed {
                         a[2][..3].copy_from_slice(&rgb);
                         a
                     }));
-                    copied += attrs.len() * 48;
+                    copied += attrs.len() * scene_cache::QUAD_ATTRIBUTE_BYTES;
                     PageInput::Tint(attrs)
                 } else {
                     let mut quads = self.recycle.try_recv().unwrap_or_default();

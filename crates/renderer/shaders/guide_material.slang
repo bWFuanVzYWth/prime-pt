@@ -12,26 +12,29 @@ import primary_cache;
 #error OPENPBR_FLOW must come from resource preparation
 #endif
 
-pt::KeyGuideVertex guide_value(pt::Hit hit, float3 incoming, float4 incident, float4 auxiliary)
+func guide_value(hit: pt::Hit, incoming: float3, incident: float4, auxiliary: float4)
+    ->pt::KeyGuideVertex
 {
-    ModScene provider;
-    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
-        hit, parameters[0].block_emission_scale, { auxiliary });
+    var provider : ModScene;
+    let material : pt::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
+                       hit, parameters[0].block_emission_scale, { auxiliary });
     return pt::make_key_guide<OPENPBR_FLOW>(hit, material, provider.energy(),
                                             provider.guide_pose(hit), incoming, incident);
 }
 
 [shader("closesthit")]
-void guide_hit(inout pt::KeyGuideCall call, BuiltInTriangleIntersectionAttributes attributes)
+func guide_hit(inout call: pt::KeyGuideCall, attributes: BuiltInTriangleIntersectionAttributes)
+    ->void
 {
-    float3 a = HitTriangleVertexPosition(0), b = HitTriangleVertexPosition(1),
-           c = HitTriangleVertexPosition(2);
-    pt::Hit hit = {};
+    let a : float3 = HitTriangleVertexPosition(0);
+    let b : float3 = HitTriangleVertexPosition(1);
+    let c : float3 = HitTriangleVertexPosition(2);
+    var hit : pt::Hit = {};
     hit.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
                                            WorldToObject3x4());
-    uint primitive = region_primitive(InstanceID(), PrimitiveIndex());
-    float4 auxiliary = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
-    uint normal = 0;
+    let primitive : uint = region_primitive(InstanceID(), PrimitiveIndex());
+    let auxiliary : float4 = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
+    var normal : uint = 0;
     if ((OPENPBR_VARIANT & 8u) != 0)
         normal = map_normal_xy(primitive, auxiliary.xy, b - a, c - a, (float3x3)ObjectToWorld3x4(),
                                hit.surface.normal);
@@ -43,14 +46,15 @@ void guide_hit(inout pt::KeyGuideCall call, BuiltInTriangleIntersectionAttribute
 
 // 首命中来自第一阶段，不再追相机射线；delta后缀仍独立重追。
 [shader("callable")]
-void guide_primary(inout pt::KeyGuideCall call)
+func guide_primary(inout call: pt::KeyGuideCall)->void
 {
-    uint pixel = primary_pixel();
-    pt::Hit hit = {};
+    let pixel : uint = primary_pixel();
+    var hit : pt::Hit = {};
     hit.identity = primary_identity[pixel];
     hit.surface = geometry::surface_point(known_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
-    float4 ray = primary_ray[pixel];
-    float4 auxiliary = material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
+    let ray : float4 = primary_ray[pixel];
+    let auxiliary : float4 =
+                        material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
     hit.identity.w =
         known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
     hit.front = dot(ray.xyz, hit.surface.normal) < 0;

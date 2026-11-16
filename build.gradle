@@ -164,7 +164,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
     }
     from('../../shaders') {
         include 'atmosphere/*.slang', 'bsdf/openpbr/**/*.slang', 'color/*.slang',
-                'display/prime_drt.slang', 'geometry/*.slang', 'pt/*.slang'
+                'display/prime_drt.slang', 'geometry/*.slang', 'math/*.slang', 'pt/*.slang'
         into 'shaders/engine'
     }
     doLast {
@@ -175,6 +175,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
                  'shaders/prime/known_geometry.slang',
                  'shaders/engine/pt/scene.slang', 'shaders/engine/pt/hit_transport.slang',
                  'shaders/engine/pt/key_guides.slang',
+                 'shaders/engine/pt/sobol_bits.slang', 'shaders/engine/math/constants.slang',
                  'shaders/engine/geometry/identity.slang']
         for (def path : required) {
             def file = new File(directory, path)

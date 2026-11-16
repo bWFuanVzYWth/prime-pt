@@ -5,23 +5,23 @@ import pt.scene;
 import geometry.ray;
 
 [[vk::binding(4, 0)]]
-RWStructuredBuffer<uint> result;
+var result : RWStructuredBuffer<uint>;
 
 [shader("raygeneration")]
-void reference_main()
+func reference_main()->void
 {
-    uint index = DispatchRaysIndex().x;
-    ModScene provider;
-    pt::Hit hit;
-    bool found = provider.intersect(float3(0), float3(0, 0, 1), hit);
+    let index : uint = DispatchRaysIndex().x;
+    var provider : ModScene;
+    var hit : pt::Hit;
+    let found : bool = provider.intersect(float3(0), float3(0, 0, 1), hit);
     result[index] = uint(found && hit.distance < (index == 0 ? 1.5 : 3.0));
 }
 
 [shader("compute")]
 [numthreads(2, 1, 1)]
-void visibility_main(uint3 id: SV_DispatchThreadID)
+func visibility_main(id: uint3: SV_DispatchThreadID)->void
 {
-    geometry::Ray ray = { float3(0), 0, float3(0, 0, 1), id.x == 0 ? 1.5 : 3.0 };
-    ModScene provider;
+    let ray : geometry::Ray = { float3(0), 0, float3(0, 0, 1), id.x == 0 ? 1.5 : 3.0 };
+    var provider : ModScene;
     result[2 + id.x] = uint(provider.occluded(ray));
 }

@@ -4,7 +4,9 @@ use prime_scene::RenderChange;
 use simple_engine::{scene_cache, vulkan};
 
 /// CPU源保持sRGB；只在派生GPU属性的边界解码共享tint，三个通道仍各占一个FP32槽。
-pub(super) fn linear_attributes(mut value: [[u32; 4]; 3]) -> [[u32; 4]; 3] {
+pub(super) fn linear_attributes(
+    mut value: scene_cache::QuadAttributes,
+) -> scene_cache::QuadAttributes {
     let rgb: [f32; 3] = std::array::from_fn(|i| f32::from_bits(value[2][i]).clamp(0.0, 1.0));
     let linear = simple_engine::color::SrgbRgba::new(rgb[0], rgb[1], rgb[2], 1.0)
         .to_linear_srgb()
@@ -18,8 +20,8 @@ pub(super) fn linear_attributes(mut value: [[u32; 4]; 3]) -> [[u32; 4]; 3] {
 pub(super) fn pack_patch(
     slots: &std::ops::Range<u32>,
     first: usize,
-    values: impl ExactSizeIterator<Item = [[u32; 4]; 3]>,
-    out: &mut Vec<[[u32; 4]; 3]>,
+    values: impl ExactSizeIterator<Item = scene_cache::QuadAttributes>,
+    out: &mut Vec<scene_cache::QuadAttributes>,
     ranges: &mut Vec<(usize, std::ops::Range<usize>)>,
 ) -> Result<(), Error> {
     let count = values.len();
@@ -30,10 +32,10 @@ pub(super) fn pack_patch(
         return Ok(());
     }
     out.try_reserve(count).map_err(scene_cache::Error::from)?;
-    let dest = (slots.start as usize + first) * size_of::<[[u32; 4]; 3]>();
+    let dest = (slots.start as usize + first) * size_of::<scene_cache::QuadAttributes>();
     let start = out.len();
     if let Some((old, range)) = ranges.last_mut()
-        && *old + range.len() * size_of::<[[u32; 4]; 3]>() == dest
+        && *old + range.len() * size_of::<scene_cache::QuadAttributes>() == dest
         && range.end == start
     {
         range.end += count;
@@ -87,11 +89,20 @@ impl Gpu {
             if !r.mesh.attribute_only() {
                 return None;
             }
-            r.mesh
-                .attribute_ranges()
-                .try_fold(n, |n, p| n.checked_add(p.quads.len().checked_mul(48)?))
+            r.mesh.attribute_ranges().try_fold(n, |n, p| {
+                n.checked_add(
+                    p.quads
+                        .len()
+                        .checked_mul(scene_cache::QUAD_ATTRIBUTE_BYTES)?,
+                )
+            })
         });
-        if bytes.is_none_or(|v| v > self.terrain_uploads.limit().min(256 * 48)) {
+        if bytes.is_none_or(|v| {
+            v > self
+                .terrain_uploads
+                .limit()
+                .min(256 * scene_cache::QUAD_ATTRIBUTE_BYTES)
+        }) {
             return Ok(false);
         }
         let started = std::time::Instant::now();
@@ -168,13 +179,16 @@ impl Gpu {
         metrics.attribute_pack_ns = elapsed_ns(started);
         metrics.geometry_ns = metrics.attribute_pack_ns;
         metrics.attribute_capacity_bytes =
-            (attributes.capacity() * size_of::<[[u32; 4]; 3]>()) as u64;
+            (attributes.capacity() * size_of::<scene_cache::QuadAttributes>()) as u64;
         let writes: Vec<_> = ranges
             .iter()
             .map(|(offset, range)| (*offset, bytemuck::cast_slice(&attributes[range.clone()])))
             .collect();
         if self.terrain_uploads.pending()
-            || attributes.len().saturating_mul(48) > self.terrain_uploads.limit()
+            || attributes
+                .len()
+                .saturating_mul(scene_cache::QUAD_ATTRIBUTE_BYTES)
+                > self.terrain_uploads.limit()
         {
             return Ok(false);
         }
@@ -187,7 +201,8 @@ impl Gpu {
                 &[(&self.scene.quads, &writes)],
             )?;
             metrics.attribute_upload_ns = elapsed_ns(started);
-            metrics.attribute_upload_bytes = (attributes.len() * 48) as u64;
+            metrics.attribute_upload_bytes =
+                (attributes.len() * scene_cache::QUAD_ATTRIBUTE_BYTES) as u64;
             metrics.terrain_upload_bytes = metrics.attribute_upload_bytes;
             metrics.resources_ns = metrics.attribute_upload_ns;
         }

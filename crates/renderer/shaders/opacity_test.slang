@@ -5,27 +5,27 @@ import pt.scene;
 import geometry.ray;
 #include "geometry/opacity.slang"
 [[vk::binding(4, 0)]]
-RWStructuredBuffer<uint> result;
-geometry::Ray probe(uint index)
+var result : RWStructuredBuffer<uint>;
+func probe(index: uint)->geometry::Ray
 {
-    uint lane = index % 16;
-    bool front = lane >= 8;
+    let lane : uint = index % 16;
+    let front : bool = lane >= 8;
     return { float3(float(index >> 4) * 3.0 - 0.75 + float(lane % 4) * 0.5,
                     ((lane >> 2) % 2) == 0 ? -0.6 : 0.6, front ? 2.0 : 0.0),
              0, float3(0, 0, front ? -1.0 : 1.0), 1.5 };
 }
 [shader("raygeneration")]
-void trace_main()
+func trace_main()->void
 {
-    uint index = DispatchRaysIndex().x;
-    geometry::Ray ray = probe(index);
-    pt::Hit hit;
+    let index : uint = DispatchRaysIndex().x;
+    let ray : geometry::Ray = probe(index);
+    var hit : pt::Hit;
     result[index] =
         uint(ModScene().intersect(ray.origin, ray.direction, hit) && hit.distance < ray.t_max);
 }
 [shader("compute")]
 [numthreads(64, 1, 1)]
-void query_main(uint3 id: SV_DispatchThreadID)
+func query_main(id: uint3: SV_DispatchThreadID)->void
 {
     ENGINE_OPACITY_MICROMAP(query_main)
     result[64 + id.x] = uint(ModScene().occluded(probe(id.x)));

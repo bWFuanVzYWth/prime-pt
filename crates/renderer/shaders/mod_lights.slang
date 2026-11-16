@@ -13,55 +13,56 @@ import mod_materials;
 /// 首行[count,treeBase,0,0]，随后region anchor和紧凑活动槽，再存位置BVH。
 /// BVH按几何发布事务更新；纹理alias仍仅在资源准备阶段构建。
 [[vk::binding(30, 0)]]
-StructuredBuffer<uint4> light_alias;
+var light_selection : StructuredBuffer<uint4>;
 [[vk::binding(38, 0)]]
-StructuredBuffer<uint4> light_tree;
+var light_tree : StructuredBuffer<uint4>;
 /// 每灯[split,rho0,rho1,globalQuadSlot]。
 [[vk::binding(31, 0)]]
-public StructuredBuffer<uint4> light_meta;
+public var light_meta : StructuredBuffer<uint4>;
 /// 与 BLAS 共读的四顶点列，发光目录只保存其 quad 槽。
 [[vk::binding(32, 0)]]
-public StructuredBuffer<float4> light_vertices;
+public var light_vertices : StructuredBuffer<float4>;
 /// 首行[count,mask,1,0]，后续每桶[key=globalQuadSlot+1,dataSlot+1,0,0]。
 [[vk::binding(33, 0)]]
-StructuredBuffer<uint4> light_inverse;
+var light_inverse : StructuredBuffer<uint4>;
 /// regionKey.xyz与(activeRank<<2)|sideMask；平移在shader按当前anchor计算。
 [[vk::binding(34, 0)]]
-public StructuredBuffer<int4> light_regions;
+public var light_regions : StructuredBuffer<int4>;
 /// 每资源世代唯一的静态纹理内alias，control.w>>1给出header word偏移。
 [[vk::binding(35, 0)]]
-ByteAddressBuffer emission_alias_words;
+var emission_alias_words : ByteAddressBuffer;
 
-public pt::LightQuadVertices emitter_vertices(uint index)
+public func emitter_vertices(index: uint)->pt::LightQuadVertices
 {
-    uint at = light_meta[index].w * 4u;
+    let at : uint = light_meta[index].w * 4u;
     return { light_vertices[at].xyz, light_vertices[at + 1u].xyz, light_vertices[at + 2u].xyz,
              light_vertices[at + 3u].xyz };
 }
 /// 本帧已发布的活动灯数；策略权重不依赖单次面积proposal的接受结果。
-public uint light_count()
+public func light_count()->uint
 {
-    return light_alias[0].x;
+    return light_selection[0].x;
 }
 
-uint light_hash(uint key)
+func light_hash(input_key: uint)->uint
 {
+    var key = input_key;
     key ^= key >> 16u;
     key *= 0x7feb352du;
     key ^= key >> 15u;
     key *= 0x846ca68bu;
     return key ^ (key >> 16u);
 }
-uint light_index(uint quad)
+func light_index(quad: uint)->uint
 {
-    uint4 header = light_inverse[0];
+    let header : uint4 = light_inverse[0];
     if (header.x == 0)
         return 0xffffffffu;
-    uint key = quad + 1u;
-    uint slot = light_hash(key) & header.y;
-    for (uint probe = 0; probe <= header.y; ++probe)
+    let key : uint = quad + 1u;
+    var slot : uint = light_hash(key) & header.y;
+    for (var probe: uint = 0; probe <= header.y; ++probe)
     {
-        uint2 item = light_inverse[header.z + slot].xy;
+        let item : uint2 = light_inverse[header.z + slot].xy;
         if (item.x == key)
             return item.y - 1u;
         if (item.x == 0u)
@@ -72,18 +73,18 @@ uint light_index(uint quad)
 }
 public interface IEmitterArea
 {
-    static uint alias_offset(uint primitive);
+    static func alias_offset(primitive: uint)->uint;
 };
 public struct UniformArea : IEmitterArea
 {
-    public static uint alias_offset(uint primitive)
+    public static func alias_offset(primitive: uint)->uint
     {
         return 0;
     }
 };
 public struct ResourceArea : IEmitterArea
 {
-    public static uint alias_offset(uint primitive)
+    public static func alias_offset(primitive: uint)->uint
     {
         return material_words.Load(material_id(primitive) * 112u + 76u) >> 1u;
     }
@@ -105,66 +106,71 @@ public typedef UniformArea SelectedEmitterArea;
 public typedef PublishedArea SelectedEmitterArea;
 #endif
 
-public pt::LightSample sample_quad_light(geometry::SurfacePoint point, float3 sample, Params params)
+public func sample_quad_light(surface_point: geometry::SurfacePoint, random_sample: float3,
+                              params: Params)
+    ->pt::LightSample
 {
-    pt::LightSample result = {};
-    uint4 header = light_alias[0];
+    var result : pt::LightSample = {};
+    let header : uint4 = light_selection[0];
     if (header.x == 0u)
         return result;
-    int3 anchor = asint(light_alias[1].xyz);
-    float3 receiver = point.position + float3(params.anchor_region.xyz - anchor) * 64.0;
-    pt::LightBvhProposal proposal = { light_tree, 0, header.x };
-    pt::LightBvhSample selected = proposal.sample(receiver, sample.z);
+    let anchor : int3 = asint(light_selection[1].xyz);
+    let receiver : float3 =
+                       surface_point.position + float3(params.anchor_region.xyz - anchor) * 64.0;
+    var proposal : pt::LightBvhProposal = { light_tree, 0, header.x };
+    let selected : pt::LightBvhSample = proposal.sample(receiver, random_sample.z);
     if (selected.pmf <= 0)
         return result;
-    uint index = light_alias[2u + (selected.light >> 2u)][selected.light & 3u];
-    uint4 meta = light_meta[index];
-    uint primitive = meta.w * 2u;
-    uint alias_offset = PublishedArea.alias_offset(primitive);
-    pt::LightQuadVertices vertices = emitter_vertices(index);
+    let index : uint = light_selection[2u + (selected.light >> 2u)][selected.light & 3u];
+    var meta : uint4 = light_meta[index];
+    let primitive : uint = meta.w * 2u;
+    let alias_offset : uint = PublishedArea.alias_offset(primitive);
+    let vertices : pt::LightQuadVertices = emitter_vertices(index);
     if (meta.x == 0xffffffffu)
         meta = pt::dynamic_quad_area(vertices);
     if (asfloat(meta.y) <= 0 && asfloat(meta.z) <= 0)
         return result;
-    pt::LightSurfaceProposal emitter = { meta, alias_offset };
-    pt::TexturedEmitterAlias distribution = { emission_alias_words };
-    pt::QuadAreaSample area;
-    float3 translation = float3(light_regions[index].xyz - params.anchor_region.xyz) * 64.0;
-    float3x4 transform =
+    let emitter : pt::LightSurfaceProposal = { meta, alias_offset };
+    let distribution : pt::TexturedEmitterAlias = { emission_alias_words };
+    var area : pt::QuadAreaSample;
+    let translation = float3(light_regions[index].xyz - params.anchor_region.xyz) * 64.0;
+    var transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);
-    float3x4 inverse =
+    let inverse =
         float3x4(1, 0, 0, -translation.x, 0, 1, 0, -translation.y, 0, 0, 1, -translation.z);
-    result =
-        pt::sample_quad_emitter(distribution, emitter, vertices, point, sample.xy, selected.pmf,
-                                uint(light_regions[index].w) & 3u, transform, inverse, area);
+    result = pt::sample_quad_emitter(distribution, emitter, vertices, surface_point,
+                                     random_sample.xy, selected.pmf,
+                                     uint(light_regions[index].w) & 3u, transform, inverse, area);
     // 遮挡确认后才按实际 bary 读取发光纹理。
     result.emission = float3(area.bary, asfloat(area.half));
     result.emission_reference = index;
     return result;
 }
 /// 只接受当前已发布灯提案返回且pdf>0的样本；源sideMask已完成发光侧准入。
-public float3 quad_light_emission(pt::LightSample sample, float block_emission_scale)
+public func quad_light_emission(light_sample: pt::LightSample, block_emission_scale: float)->float3
 {
-    uint flags = asuint(sample.emission.z);
-    uint primitive = light_meta[sample.emission_reference].w * 2u + (flags & 1u);
-    return sampled_material_emission(primitive, sample.emission.xy, block_emission_scale);
+    let flags : uint = asuint(light_sample.emission.z);
+    let primitive : uint = light_meta[light_sample.emission_reference].w * 2u + (flags & 1u);
+    return sampled_material_emission(primitive, light_sample.emission.xy, block_emission_scale);
 }
-public float quad_emission_pdf<Area : IEmitterArea>(pt::Hit hit, float3 previous,
-                                                    int3 anchor_region)
+public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float3,
+                                                   anchor_region: int3)
+    ->float
 {
-    uint index = light_index(hit.identity.x >> 1u);
+    let index : uint = light_index(hit.identity.x >> 1u);
     if (index == 0xffffffffu)
         return 0;
-    uint4 header = light_alias[0];
-    int3 anchor = asint(light_alias[1].xyz);
-    float3 receiver = previous + float3(anchor_region - anchor) * 64.0;
-    pt::LightBvhProposal proposal = { light_tree, 0, header.x };
-    uint4 meta = light_meta[index];
-    uint alias_offset = Area.alias_offset(hit.identity.x);
-    float2 uv = 0;
+    let header : uint4 = light_selection[0];
+    let anchor : int3 = asint(light_selection[1].xyz);
+    let receiver : float3 = previous + float3(anchor_region - anchor) * 64.0;
+    let proposal : pt::LightBvhProposal = { light_tree, 0, header.x };
+    var meta : uint4 = light_meta[index];
+    let alias_offset : uint = Area.alias_offset(hit.identity.x);
+    var uv : float2 = 0;
     if (alias_offset != 0u)
     {
-        float4 bounds = asfloat(material_words.Load4(material_id(hit.identity.x) * 112u + 80u));
+        let bounds : float4 =
+                         asfloat(material_words.Load4(material_id(hit.identity.x) * 112u + 80u));
         uv = (material_uv(hit.identity.x, asfloat(hit.identity.yz)) - bounds.xy) /
              (bounds.zw - bounds.xy);
     }
@@ -175,8 +181,8 @@ public float quad_emission_pdf<Area : IEmitterArea>(pt::Hit hit, float3 previous
             meta = pt::dynamic_quad_area(emitter_vertices(index));
         }
     }
-    pt::LightSurfaceProposal emitter = { meta, alias_offset };
-    pt::TexturedEmitterAlias distribution = { emission_alias_words };
+    let emitter : pt::LightSurfaceProposal = { meta, alias_offset };
+    let distribution : pt::TexturedEmitterAlias = { emission_alias_words };
     return pt::quad_emitter_pdf(distribution, emitter, proposal, receiver,
                                 uint(light_regions[index].w) >> 2u, previous, hit.surface.position,
                                 hit.surface.normal, hit.identity.x & 1u, uv,

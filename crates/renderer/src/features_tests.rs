@@ -1495,8 +1495,8 @@ fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
     mesh.quads.push(quad);
     publish(&mut gpu, &mesh, 2, 3, [0.; 3])?;
     assert_eq!(gpu.lighting_gpu.roots()[1..], lighting.roots()[1..]);
-    let mut bytes = vec![0; lighting.alias.len() as usize];
-    lighting.alias.read(&mut gpu.context, 0, &mut bytes)?;
+    let mut bytes = vec![0; lighting.selection.len() as usize];
+    lighting.selection.read(&mut gpu.context, 0, &mut bytes)?;
     let selectors: Vec<u32> = bytes
         .as_chunks::<4>()
         .0

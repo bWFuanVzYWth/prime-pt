@@ -8,28 +8,28 @@ import geometry.camera;
 import params;
 import primary_cache;
 
-func write_guides<let Cached : bool>()->void
+func write_guides<let cached : bool>()->void
 {
-    Params p = parameters[0];
-    uint2 pixel = DispatchRaysIndex().xy;
+    let p : Params = parameters[0];
+    let pixel : uint2 = DispatchRaysIndex().xy;
     let film =
         geometry::camera_sample_uv_offset(pixel, p.inverse_extent, 0.5 + p.reconstruction.xy);
-    float3 direction =
-        geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
-    GuideTrace trace;
-    pt::KeyGuideVertex first;
-    bool found;
-    if (Cached)
+    var direction
+        : float3 = geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
+    var trace : GuideTrace;
+    var first : pt::KeyGuideVertex;
+    var found : bool;
+    if (cached)
     {
-        uint index = primary_pixel();
-        uint primitive = primary_identity[index].x;
+        let index : uint = primary_pixel();
+        let primitive : uint = primary_identity[index].x;
         direction = primary_ray[index].xyz;
         found = primitive != 0xffffffffu;
         first = {};
         if (found)
         {
-            uint program = guide_slot(primitive);
-            pt::KeyGuideCall call = {};
+            let program : uint = guide_slot(primitive);
+            var call : pt::KeyGuideCall = {};
             call.value.medium = p.initial_medium;
 #ifdef PRIMEPT_SER
             ReorderThread(program, 32u);
@@ -41,11 +41,11 @@ func write_guides<let Cached : bool>()->void
     else
         found = trace.intersect_guide(p.origin.xyz, direction, p.initial_medium, first);
     let current = p.current_camera;
-    pt::DenoiseCamera previous = { p.previous_position, p.previous_forward, p.previous_right,
-                                   p.previous_up };
-    Guides guides = { pixel, film, current, previous };
+    let previous : pt::DenoiseCamera = { p.previous_position, p.previous_forward, p.previous_right,
+                                         p.previous_up };
+    var guides : Guides = { pixel, film, current, previous };
     if (found)
-        guides.write_key(trace, first, p.origin.xyz, direction, p.initial_medium, Cached);
+        guides.write_key(trace, first, p.origin.xyz, direction, p.initial_medium, cached);
     else
         guides.sky(direction);
 }

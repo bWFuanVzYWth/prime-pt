@@ -2,25 +2,25 @@ import atmosphere.shadow_resolve;
 import atmosphere.terrain_frame;
 using namespace atmosphere;
 [[vk::binding(0, 0)]]
-StructuredBuffer<TerrainFrame> frames;
+var frames : StructuredBuffer<TerrainFrame>;
 [[vk::binding(1, 0)]]
-RWStructuredBuffer<uint4> cells;
+var cells : RWStructuredBuffer<uint4>;
 [[vk::binding(2, 0)]]
-RaytracingAccelerationStructure world;
+var world : RaytracingAccelerationStructure;
 [[vk::binding(3, 0)]]
-RWStructuredBuffer<uint> first_hits;
+var first_hits : RWStructuredBuffer<uint>;
 [[vk::binding(4, 0)]]
-StructuredBuffer<uint4> columns;
+var columns : StructuredBuffer<uint4>;
 import mod_coverage;
 [[vk::binding(5, 0)]]
-StructuredBuffer<uint> bases;
+var bases : StructuredBuffer<uint>;
 [[vk::binding(6, 0)]]
-Texture2D<float4> atlas;
+var atlas : Texture2D<float4>;
 [[vk::binding(7, 0)]]
-ByteAddressBuffer materials;
+var materials : ByteAddressBuffer;
 struct Coverage : IBlockerCoverage
 {
-    static bool accepts(uint instance, uint primitive, float2 bary, bool front)
+    static func accepts(instance: uint, primitive: uint, bary: float2, front: bool)->bool
     {
         return prime_coverage::accepts<40>(columns, atlas, materials,
                                            bases[instance] * 2 + primitive, bary, front);
@@ -28,7 +28,7 @@ struct Coverage : IBlockerCoverage
 };
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void shadow_columns(uint3 id: SV_DispatchThreadID)
+func shadow_columns(id: uint3: SV_DispatchThreadID)->void
 {
     resolve_shadow_column<Coverage>(id, frames[0], cells, world, first_hits);
 }

@@ -6,23 +6,23 @@ import bsdf.openpbr.flow;
 
 public struct ModTransportCall
 {
-    public geometry::SurfacePoint point;
-    public uint4 identity;
-    public uint state;
-    public float3 direction;
-    public float3 throughput;
-    public float3 radiance;
-    public float4 medium;
-    public float3 previous;
-    public float previous_pdf;
-    public float eta_scale;
-    public uint2 pixel;
-    public uint sample;
+    public var surface_point : geometry::SurfacePoint;
+    public var identity : uint4;
+    public var state : uint;
+    public var direction : float3;
+    public var throughput : float3;
+    public var radiance : float3;
+    public var medium : float4;
+    public var previous : float3;
+    public var previous_pdf : float;
+    public var eta_scale : float;
+    public var pixel : uint2;
+    public var sample : uint;
 
-    public static ModTransportCall input(pt::TransportCall data)
+    public static func input(data: pt::TransportCall)->ModTransportCall
     {
-        ModTransportCall call;
-        call.point = data.hit.surface;
+        var call : ModTransportCall;
+        call.surface_point = data.hit.surface;
         call.identity = data.hit.identity;
         call.state =
             uint(data.hit.front) | (data.path.depth << 1) | (data.path.dielectric_events << 8);
@@ -38,10 +38,10 @@ public struct ModTransportCall
         return call;
     }
 
-    public pt::TransportCall unpack()
+    public func unpack()->pt::TransportCall
     {
-        pt::TransportCall data = {};
-        data.hit.surface = point;
+        var data : pt::TransportCall = {};
+        data.hit.surface = surface_point;
         data.hit.identity = identity;
         data.hit.front = (state & 1u) != 0;
         data.path = result();
@@ -54,10 +54,10 @@ public struct ModTransportCall
         return data;
     }
 
-    public pt::PathState result()
+    public func result()->pt::PathState
     {
-        pt::PathState path;
-        path.origin = point.position;
+        var path : pt::PathState;
+        path.origin = surface_point.position;
         path.direction = direction;
         path.throughput = throughput;
         path.radiance = radiance;
@@ -72,16 +72,16 @@ public struct ModTransportCall
     }
 
     [mutating]
-    public void store<let Flow : uint>(pt::PathState path)
+    public func store<let flow : uint>(path: pt::PathState)->void
     {
-        point.position = path.origin;
+        surface_point.position = path.origin;
         state = path.status | (path.depth << 2) | (path.dielectric_events << 9);
         direction = path.direction;
         throughput = path.throughput;
-        if (openpbr::flow_continuous<Flow>() || (Flow & openpbr::FLOW_EMISSION) != 0)
+        if (openpbr::flow_continuous<flow>() || (flow & openpbr::FLOW_EMISSION) != 0)
             radiance = path.radiance;
         // 不变字段留在交接内存中，避免叶子为回写而读取并保活它们。
-        if ((Flow & openpbr::FLOW_SOLID_TRANSMISSION) != 0)
+        if ((flow & openpbr::FLOW_SOLID_TRANSMISSION) != 0)
         {
             medium = path.medium;
             eta_scale = path.eta_scale;

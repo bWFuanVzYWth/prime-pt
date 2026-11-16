@@ -9,51 +9,51 @@ import atmosphere.terrain_frame;
 import geometry.camera;
 
 [[vk::binding(0, 0)]]
-StructuredBuffer<Params> parameters;
+var parameters : StructuredBuffer<Params>;
 [[vk::binding(1, 0)]]
-RWStructuredBuffer<float4> output_image;
+var output_image : RWStructuredBuffer<float4>;
 [[vk::binding(2, 0)]]
-RWStructuredBuffer<float4> accumulation;
+var accumulation : RWStructuredBuffer<float4>;
 [[vk::binding(3, 0)]]
-RWStructuredBuffer<uint> sample_counts;
+var sample_counts : RWStructuredBuffer<uint>;
 [[vk::binding(4, 0)]]
-StructuredBuffer<float4> prefix_image;
+var prefix_image : StructuredBuffer<float4>;
 [[vk::binding(5, 0)]]
-Texture3D<float4> aerial_light;
+var aerial_light : Texture3D<float4>;
 [[vk::binding(6, 0)]]
-Texture3D<float4> aerial_transmittance;
+var aerial_transmittance : Texture3D<float4>;
 [[vk::binding(7, 0)]]
-SamplerState linear_sampler;
+var linear_sampler : SamplerState;
 [[vk::binding(8, 0)]]
-StructuredBuffer<atmosphere::TerrainFrame> terrain_frames;
+var terrain_frames : StructuredBuffer<atmosphere::TerrainFrame>;
 [[vk::binding(9, 0)]]
-Texture3D<float4> terrain_radiance;
+var terrain_radiance : Texture3D<float4>;
 [[vk::binding(10, 0)]]
-StructuredBuffer<uint> first_hits;
+var first_hits : StructuredBuffer<uint>;
 
-func post_pixel<let Paths : uint, let Composite : uint, let FrameFilm : bool>(id: uint3)->void
+func post_pixel<let paths : uint, let composite : uint, let frame_film : bool>(id: uint3)->void
 {
-    Params params = parameters[0];
+    let params : Params = parameters[0];
     if (any(id.xy >= params.image.xy))
         return;
-    uint pixel = id.y * params.image.x + id.x;
-    float4 sum = accumulation[pixel];
-    float4 tail = output_image[pixel];
-    uint count = sample_counts[pixel];
-    float4 prefix = prefix_image[pixel];
-    float3 radiance = prefix.xyz + tail.xyz;
-    if (Composite != 0 && tail.w >= 0)
+    let pixel : uint = id.y * params.image.x + id.x;
+    var sum : float4 = accumulation[pixel];
+    let tail : float4 = output_image[pixel];
+    var count : uint = sample_counts[pixel];
+    let prefix : float4 = prefix_image[pixel];
+    var radiance : float3 = prefix.xyz + tail.xyz;
+    if (composite != 0 && tail.w >= 0)
     {
-        pt::PathSampler sampler = pt::path_sampler(
+        let sampler = pt::path_sampler(
             id.xy, params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u),
             params.options.z, params.options.x);
-        float2 offset = FrameFilm ? 0.5 + params.reconstruction.xy : sampler.film();
+        let offset : float2 = frame_film ? 0.5 + params.reconstruction.xy : sampler.film();
         let film = geometry::camera_sample_uv_offset(id.xy, params.inverse_extent, offset);
-        if (Composite == 1)
+        if (composite == 1)
             radiance = atmosphere::composite_clear_aerial_bt709(
                 aerial_light, aerial_transmittance, linear_sampler, film, prefix.w,
                 params.atmosphere_settings.w, prefix.w < pt::FAR, radiance);
-        else if (Composite == 2)
+        else if (composite == 2)
             radiance = atmosphere::composite_shadowed_terrain_bt709(
                 aerial_light, aerial_transmittance, terrain_radiance, first_hits, linear_sampler,
                 terrain_frames[0], film, prefix.w, params.atmosphere_settings.w, prefix.w < pt::FAR,
@@ -66,7 +66,7 @@ func post_pixel<let Paths : uint, let Composite : uint, let FrameFilm : bool>(id
         radiance = max(radiance, 0);
     }
     // 本次均值代表1或2条输运路径，累积计数仍按实际路径计。
-    for (uint lane = 0; lane < Paths; lane++)
+    for (var lane: uint = 0; lane < paths; lane++)
         pt::accumulate_sample(sum, count, radiance, tail.w);
     accumulation[pixel] = sum;
     sample_counts[pixel] = count;
@@ -76,70 +76,70 @@ func post_pixel<let Paths : uint, let Composite : uint, let FrameFilm : bool>(id
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_plain_1(uint3 id: SV_DispatchThreadID)->void
+func post_plain_1(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<1, 0, false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_plain_2(uint3 id: SV_DispatchThreadID)->void
+func post_plain_2(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<2, 0, false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_clear_random_1(uint3 id: SV_DispatchThreadID)->void
+func post_clear_random_1(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<1, 1, false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_clear_random_2(uint3 id: SV_DispatchThreadID)->void
+func post_clear_random_2(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<2, 1, false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_clear_jittered_1(uint3 id: SV_DispatchThreadID)->void
+func post_clear_jittered_1(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<1, 1, true>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_clear_jittered_2(uint3 id: SV_DispatchThreadID)->void
+func post_clear_jittered_2(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<2, 1, true>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_shadowed_random_1(uint3 id: SV_DispatchThreadID)->void
+func post_shadowed_random_1(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<1, 2, false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_shadowed_random_2(uint3 id: SV_DispatchThreadID)->void
+func post_shadowed_random_2(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<2, 2, false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_shadowed_jittered_1(uint3 id: SV_DispatchThreadID)->void
+func post_shadowed_jittered_1(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<1, 2, true>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_shadowed_jittered_2(uint3 id: SV_DispatchThreadID)->void
+func post_shadowed_jittered_2(id: uint3: SV_DispatchThreadID)->void
 {
     post_pixel<2, 2, true>(id);
 }
@@ -147,11 +147,11 @@ func post_shadowed_jittered_2(uint3 id: SV_DispatchThreadID)->void
 // 显式参考入口；生产按FramePlan选择上面的固定叶子。
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func post_main(uint3 id: SV_DispatchThreadID)->void
+func post_main(id: uint3: SV_DispatchThreadID)->void
 {
     let p = parameters[0];
     let composite = p.lighting.w > 0 && all(p.initial_medium == float4(1, 0, 0, 0));
-    let frameFilm = p.reconstruction.w > 0;
+    let frame_film = p.reconstruction.w > 0;
     let paths = (p.output_size.z & 32u) != 0 ? p.image.w : 1u;
     if (!composite)
     {
@@ -160,7 +160,7 @@ func post_main(uint3 id: SV_DispatchThreadID)->void
         else
             post_pixel<1, 0, false>(id);
     }
-    else if (frameFilm)
+    else if (frame_film)
     {
         if (paths == 2)
             post_pixel<2, 3, true>(id);

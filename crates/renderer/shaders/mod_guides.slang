@@ -12,46 +12,48 @@ import geometry.camera;
 
 [[vk::binding(19, 0)]]
 [[vk::image_format("r32f")]]
-RWTexture2D<float> guide_depth;
+var guide_depth : RWTexture2D<float>;
 [[vk::binding(20, 0)]]
 [[vk::image_format("rg16f")]]
-RWTexture2D<float2> guide_motion;
+var guide_motion : RWTexture2D<float2>;
 [[vk::binding(21, 0)]]
 [[vk::image_format("rgba16f")]]
-RWTexture2D<float4> guide_normal;
+var guide_normal : RWTexture2D<float4>;
 [[vk::binding(22, 0)]]
 [[vk::image_format("rgba16f")]]
-RWTexture2D<float4> guide_diffuse;
+var guide_diffuse : RWTexture2D<float4>;
 [[vk::binding(23, 0)]]
 [[vk::image_format("rgba16f")]]
-RWTexture2D<float4> guide_specular;
+var guide_specular : RWTexture2D<float4>;
 [[vk::binding(24, 0)]]
 [[vk::image_format("r32f")]]
-RWTexture2D<float> guide_distance;
+var guide_distance : RWTexture2D<float>;
 [[vk::binding(25, 0)]]
 [[vk::image_format("rg16f")]]
-RWTexture2D<float2> guide_specular_motion;
+var guide_specular_motion : RWTexture2D<float2>;
 
 public struct GuideTrace : pt::IKeyGuideTrace
 {
 
-    public bool intersect_guide(float3 origin, float3 direction, float4 incident,
-                                out pt::KeyGuideVertex value)
+    public func intersect_guide(origin: float3, direction: float3, incident: float4,
+                                out value: pt::KeyGuideVertex)
+        ->bool
     {
         value = {};
-        RayDesc ray = { origin, 0, direction, pt::FAR };
-        uint unused = 0;
-        HitObject found = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+        let ray : RayDesc = { origin, 0, direction, pt::FAR };
+        var unused : uint = 0;
+        var found : HitObject =
+                        HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
         if (!found.IsHit())
             return false;
-        uint primitive = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
+        let primitive : uint = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
 #ifdef PRIMEPT_SEPARATE_GUIDES
-        uint program = guide_slot(primitive);
+        var program : uint = guide_slot(primitive);
 #else
-        uint program = guide_slot(primitive) + parameters[0].programs.z;
+        let program : uint = guide_slot(primitive) + parameters[0].programs.z;
 #endif
         found.SetShaderTableIndex(program + 1u);
-        pt::KeyGuideCall call = {};
+        var call : pt::KeyGuideCall = {};
         call.value.medium = incident;
 #ifdef PRIMEPT_SER
         ReorderThread(found);
@@ -64,57 +66,58 @@ public struct GuideTrace : pt::IKeyGuideTrace
 
 public struct Guides : pt::IPrefixGuides, pt::IHitGuides
 {
-    public uint2 coordinate;
-    public float2 film;
-    public pt::DenoiseCamera current;
-    public pt::DenoiseCamera previous;
+    public var coordinate : uint2;
+    public var film : float2;
+    public var current : pt::DenoiseCamera;
+    public var previous : pt::DenoiseCamera;
 
-    pt::GuideImages images()
+    func images()->pt::GuideImages
     {
         return { guide_depth,    guide_motion,   guide_normal,         guide_diffuse,
                  guide_specular, guide_distance, guide_specular_motion };
     }
-    pt::GuideFrame frame()
+    func frame()->pt::GuideFrame
     {
-        Params p = parameters[0];
+        let p : Params = parameters[0];
         return { current, previous, p.image.xy, p.options.y, p.reconstruction.z > 0 };
     }
 
-    public void write_key<Trace : pt::IKeyGuideTrace>(Trace provider, pt::KeyGuideVertex first,
-                                                      float3 origin, float3 direction,
-                                                      float4 incident, bool deltaOnly = false)
+    public func write_key<Trace : pt::IKeyGuideTrace>(provider: Trace, first: pt::KeyGuideVertex,
+                                                      origin: float3, direction: float3,
+                                                      incident: float4, delta_only: bool = false)
+        ->void
     {
         pt::write_key_guides(provider, images(), frame(), coordinate, film, first, origin,
-                             direction, incident, deltaOnly);
+                             direction, incident, delta_only);
     }
 
-    public void surface_hit(HitObject found, pt::TransportCall data)
+    public func surface_hit(found: HitObject, data: pt::TransportCall)->void
     {
-        uint primitive = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
-        uint program = guide_slot(primitive) + parameters[0].programs.z;
+        let primitive : uint = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
+        let program : uint = guide_slot(primitive) + parameters[0].programs.z;
         found.SetShaderTableIndex(program + 1u);
-        pt::KeyGuideCall call = {};
+        var call : pt::KeyGuideCall = {};
         call.value.medium = data.path.medium;
 #ifdef PRIMEPT_SER
         ReorderThread(found);
 #endif
         HitObject::Invoke(found, call);
-        GuideTrace provider;
+        var provider : GuideTrace;
         write_key(provider, call.value, data.path.origin, data.path.direction, data.path.medium);
     }
 
     // mode0参考与未启用EXT的兼容PT保留旧导引；HG/PT不经此通用翻译路径。
-    public void surface(pt::TransportCall data)
+    public func surface(data: pt::TransportCall)->void
     {
         pt::write_surface_guides(ModScene(), images(), frame(), coordinate, film, data);
     }
 
-    public void environment(pt::TransportCall data)
+    public func environment(data: pt::TransportCall)->void
     {
         sky(data.path.direction);
     }
 
-    public void sky(float3 direction)
+    public func sky(direction: float3)->void
     {
         pt::write_sky_guide(images(), frame(), coordinate, film, direction, 0);
     }

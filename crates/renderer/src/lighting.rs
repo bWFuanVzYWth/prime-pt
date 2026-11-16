@@ -528,7 +528,7 @@ mod tests {
     }
 
     fn empty(patches: &TablePatches) -> bool {
-        patches.alias.is_empty()
+        patches.selection.is_empty()
             && patches.meta.is_empty()
             && patches.vertices.is_empty()
             && patches.inverse.is_empty()
@@ -575,11 +575,16 @@ mod tests {
         assert!(prep.patches.meta.is_empty());
         assert!(
             prep.patches
-                .alias
+                .selection
                 .iter()
                 .all(|(row, _)| *row == 0 || *row >= tree_base)
         );
-        assert!(prep.patches.alias.iter().any(|(row, _)| *row >= tree_base));
+        assert!(
+            prep.patches
+                .selection
+                .iter()
+                .any(|(row, _)| *row >= tree_base)
+        );
         assert!(
             prep.patches
                 .vertices
@@ -619,7 +624,7 @@ mod tests {
         let changed = lighting
             .prepare(view(&regions), &[0], emitters(&[1., 16.]), true, 2)
             .unwrap();
-        assert!(!changed.patches.alias.is_empty());
+        assert!(!changed.patches.selection.is_empty());
         assert!(changed.patches.vertices.is_empty());
         assert!(changed.patches.meta.is_empty());
         assert!(changed.patches.regions.is_empty());

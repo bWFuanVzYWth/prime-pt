@@ -29,56 +29,56 @@ import color.primaries;
 #endif
 
 [[vk::binding(0, 0)]]
-public RaytracingAccelerationStructure scene;
+public var scene : RaytracingAccelerationStructure;
 [[vk::binding(4, 0)]]
-public StructuredBuffer<Params> parameters;
+public var parameters : StructuredBuffer<Params>;
 [[vk::binding(5, 0)]]
-Texture3D<float4> energy_texture;
+var energy_texture : Texture3D<float4>;
 [[vk::binding(6, 0)]]
-SamplerState linear_sampler;
+var linear_sampler : SamplerState;
 [[vk::binding(16, 0)]]
-StructuredBuffer<float4> sky_mapping;
+var sky_mapping : StructuredBuffer<float4>;
 [[vk::binding(17, 0)]]
-Texture2D<float4> sky_texture;
+var sky_texture : Texture2D<float4>;
 [[vk::binding(18, 0)]]
-Texture2D<float4> optical_depth;
+var optical_depth : Texture2D<float4>;
 [[vk::binding(36, 0)]]
-StructuredBuffer<uint> instance_quad_bases;
+var instance_quad_bases : StructuredBuffer<uint>;
 [[vk::binding(37, 0)]]
-StructuredBuffer<uint2> resident_quad_tokens;
+var resident_quad_tokens : StructuredBuffer<uint2>;
 
 /// 当前驻留 quad 的 64 位身份与其有向半面；各帧的 primitive 槽可不同。
-public uint3 stable_triangle(uint primitive)
+public func stable_triangle(primitive: uint)->uint3
 {
     return uint3(resident_quad_tokens[primitive >> 1u], primitive & 1u);
 }
 
 /// 实例自定义索引只选择对应区块的属性起点。每个 quad 在 BLAS 中占两个三角形。
-public uint region_primitive(uint instance, uint local_primitive)
+public func region_primitive(instance: uint, local_primitive: uint)->uint
 {
     return instance_quad_bases[instance] * 2u + local_primitive;
 }
 
-public bool sun_contains(float3 direction)
+public func sun_contains(direction: float3)->bool
 {
     return geometry::cone_contains_chord(parameters[0].lighting.xyz,
                                          asfloat(parameters[0].programs.w), direction);
 }
 
-public float sun_pdf()
+public func sun_pdf()->float
 {
     return geometry::uniform_cone_pdf_chord(asfloat(parameters[0].programs.w));
 }
 
-float altitude(float world_y)
+func altitude(world_y: float)->float
 {
     return clamp(0.5 + (world_y - parameters[0].origin.w) * 0.001, 0.0, 36000.0);
 }
 
-float3 solar_radiance(float3 direction, float altitude_km)
+func solar_radiance(direction: float3, altitude_km: float)->float3
 {
-    atmosphere::Params p = parameters[0].atmosphere;
-    p.view.w = altitude_km;
+    var p : atmosphere::Params = parameters[0].atmosphere;
+    p.observer_height_km = altitude_km;
     return max(
         color::rec2020_to_bt709(atmosphere::solar_radiance(
             p, optical_depth, linear_sampler, direction, parameters[0].atmosphere_settings.xyz)),
@@ -88,33 +88,35 @@ float3 solar_radiance(float3 direction, float altitude_km)
 /// 主查询只交接硬件命中引用；OpenPBR 翻译在消费交点时执行。
 public struct TracePayload
 {
-    public uint primitive;
-    public float2 bary;
-    public float distance;
-    public geometry::SurfacePoint surface;
-    public uint shading_normal;
+    public var primitive : uint;
+    public var bary : float2;
+    public var distance : float;
+    public var surface : geometry::SurfacePoint;
+    public var shading_normal : uint;
 };
 
 /// 原有公开texel入口保留，材质、覆盖和光源复用同一UV/tint翻译。
-public float4 texel(uint primitive, float2 barycentrics)
+public func texel(primitive: uint, barycentrics: float2)->float4
 {
     return material_texel(primitive, barycentrics);
 }
 
-public void finish_vertex(inout pt::TransportCall data)
+public func finish_vertex(inout data: pt::TransportCall)->void
 {
     // 与材质键无关的收尾不扩大每个callable；采样身份无需跨call复制临时随机状态。
-    uint status = data.path.status;
+    var status : uint = data.path.status;
     if (status == pt::PATH_ACTIVE)
     {
         if (max(data.path.throughput.x, max(data.path.throughput.y, data.path.throughput.z)) <= 0)
             status = pt::PATH_DONE;
         else if (data.path.depth + 1 >= 2)
         {
-            float survival = pt::roulette_probability(data.path.throughput, data.path.eta_scale,
-                                                      parameters[0].output_size.w != 0);
-            pt::PathSampler sampler = pt::path_sampler(
-                data.pixel, data.sample, parameters[0].options.z, parameters[0].options.x);
+            let survival : float =
+                               pt::roulette_probability(data.path.throughput, data.path.eta_scale,
+                                                        parameters[0].output_size.w != 0);
+            let sampler : pt::PathSampler =
+                              pt::path_sampler(data.pixel, data.sample, parameters[0].options.z,
+                                               parameters[0].options.x);
             if (survival == 0 || (survival < 1 && sampler.roulette(data.path.depth) >= survival))
                 status = pt::PATH_DONE;
             else if (survival < 1)
@@ -127,71 +129,75 @@ public void finish_vertex(inout pt::TransportCall data)
 /// 资源世代的完整材质在消费交点时翻译；几何误差与着色法线独立。
 public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 {
-    public pt::GuidePose guide_pose(pt::Hit hit)
+    public func guide_pose(hit: pt::Hit)->pt::GuidePose
     {
         // 捕获网格没有跨帧实例/顶点对应；保留相机代理，不猜测物体静止。
         return { hit.surface.position, false, false };
     }
 
-    public pt::SurfaceMaterial guide_material(pt::Hit hit, float4 incident)
+    public func guide_material(input_hit: pt::Hit, incident: float4)->pt::SurfaceMaterial
     {
+        var hit = input_hit;
         hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
         return resolve_material(hit, ~openpbr::FLOW_EMISSION, ~0u, 1.0);
     }
 
-    public bool intersect(float3 origin, float3 direction, out pt::Hit hit)
+    public func intersect(origin: float3, direction: float3, out hit: pt::Hit)->bool
     {
         hit = (pt::Hit)0;
-        RayDesc ray = { origin, 0, direction, pt::FAR };
-        TracePayload payload = (TracePayload)0;
-        payload.primitive = 0xffffffffu;
-        TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, payload);
-        if (payload.primitive == 0xffffffffu)
+        let ray : RayDesc = { origin, 0, direction, pt::FAR };
+        var ray_payload : TracePayload = (TracePayload)0;
+        ray_payload.primitive = 0xffffffffu;
+        TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, ray_payload);
+        if (ray_payload.primitive == 0xffffffffu)
             return false;
-        hit.surface = payload.surface;
-        hit.identity = uint4(payload.primitive, asuint(payload.bary), payload.shading_normal);
+        hit.surface = ray_payload.surface;
+        hit.identity =
+            uint4(ray_payload.primitive, asuint(ray_payload.bary), ray_payload.shading_normal);
         hit.capability = 0;
-        hit.distance = payload.distance;
+        hit.distance = ray_payload.distance;
         hit.front = dot(direction, hit.surface.normal) < 0;
         return true;
     }
 
-    public void resolve_hit(inout pt::Hit hit, float4 incident)
+    public func resolve_hit(inout hit: pt::Hit, incident: float4)->void
     {
     }
 
-    public bool prefix(pt::Hit hit)
+    public func prefix(hit: pt::Hit)->bool
     {
         return false;
     }
 
-    public pt::DeltaInterface delta_interface(pt::Hit hit, float4 incident)
+    public func delta_interface(hit: pt::Hit, incident: float4)->pt::DeltaInterface
     {
         // prefix恒为false，所有材质进入已绑定键的CH/callable。
         return {};
     }
 
-    public void shade(inout pt::TransportCall data)
+    public func shade(inout data: pt::TransportCall)->void
     {
         data.path.throughput *= pt::segment_transmittance(data.path.medium.yzw, data.hit.distance);
         // GPU派生表的高30位为资源期按真实Flow去重后的callable槽；不是源OpenPBR flags。
-        uint program = material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2u;
+        let program : uint =
+                          material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2u;
 #ifdef PRIMEPT_SER
         ReorderThread(program, 32u);
 #endif
-        ModTransportCall call = ModTransportCall.input(data);
+        var call : ModTransportCall = ModTransportCall.input(data);
         CallShader(program, call);
         data.path = call.result();
         finish_vertex(data);
     }
 
-    public pt::SurfaceMaterial resolve(pt::Hit hit, uint capability, float4 incident)
+    public func resolve(input_hit: pt::Hit, capability: uint, incident: float4)->pt::SurfaceMaterial
     {
+        var hit = input_hit;
         hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
         return resolve_material(hit, ~0u, ~0u, parameters[0].block_emission_scale);
     }
 
-    public pt::SurfaceMaterial resolve_flow(pt::Hit hit, uint flow, float4 incident)
+    public func resolve_flow(hit: pt::Hit, flow: uint, incident: float4)->pt::SurfaceMaterial
     {
 #if defined(OPENPBR_FLOW) && OPENPBR_VARIANT != 0xffffffffu
         return decode_surface<AtlasColor, FetchAux>(hit, parameters[0].block_emission_scale, {});
@@ -201,55 +207,59 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 #endif
     }
 
-    public openpbr::Energy energy()
+    public func energy()->openpbr::Energy
     {
         return { energy_texture, linear_sampler };
     }
 
-    public pt::LightSample sample_sun(geometry::SurfacePoint point, float2 sample)
+    public func sample_sun(surface_point: geometry::SurfacePoint, random_sample: float2)
+        ->pt::LightSample
     {
-        pt::LightSample result = (pt::LightSample)0;
+        var result : pt::LightSample = (pt::LightSample)0;
         if (parameters[0].lighting.w <= 0)
             return result;
         result.direction = geometry::sample_uniform_cone_chord(
-            parameters[0].lighting.xyz, asfloat(parameters[0].programs.w), sample);
+            parameters[0].lighting.xyz, asfloat(parameters[0].programs.w), random_sample);
         result.pdf = sun_pdf();
         result.distance = pt::FAR;
-        result.visibility = { geometry::offset_origin(point, result.direction), 0, result.direction,
-                              pt::FAR };
+        result.visibility = { geometry::offset_origin(surface_point, result.direction), 0,
+                              result.direction, pt::FAR };
         return result;
     }
 
-    public pt::LightSample sample_light(geometry::SurfacePoint point, float3 sample)
+    public func sample_light(surface_point: geometry::SurfacePoint, random_sample: float3)
+        ->pt::LightSample
     {
-        return sample_quad_light(point, sample, parameters[0]);
+        return sample_quad_light(surface_point, random_sample, parameters[0]);
     }
 
-    public float3 light_emission(geometry::SurfacePoint point, pt::LightSample sample, bool solar)
+    public func light_emission(surface_point: geometry::SurfacePoint, light_sample: pt::LightSample,
+                               solar: bool)
+        ->float3
     {
-        return solar ? solar_radiance(sample.direction, altitude(point.position.y))
-                     : quad_light_emission(sample, parameters[0].block_emission_scale);
+        return solar ? solar_radiance(light_sample.direction, altitude(surface_point.position.y))
+                     : quad_light_emission(light_sample, parameters[0].block_emission_scale);
     }
 
-    public float emission_pdf(pt::Hit hit, float3 previous)
+    public func emission_pdf(hit: pt::Hit, previous: float3)->float
     {
         return quad_emission_pdf<SelectedEmitterArea>(hit, previous,
                                                       parameters[0].anchor_region.xyz);
     }
 
-    public bool occluded(geometry::Ray connection)
+    public func occluded(connection: geometry::Ray)->bool
     {
-        RayDesc ray = { connection.origin, connection.t_min, connection.direction,
-                        connection.t_max };
+        let ray : RayDesc = { connection.origin, connection.t_min, connection.direction,
+                              connection.t_max };
 #if PRIMEPT_COVERAGE_MASK == 0
         {
-            RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE> opaque;
+            var opaque : RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE>;
             opaque.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
             opaque.Proceed();
             return opaque.CommittedStatus() != COMMITTED_NOTHING;
         }
 #else
-        RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+        var query : RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH>;
         query.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
         while (query.Proceed())
         {
@@ -264,18 +274,19 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 #endif
     }
 
-    public pt::Environment environment(float3 direction, float3 previous, uint depth)
+    public func environment(direction: float3, previous: float3, depth: uint)->pt::Environment
     {
-        pt::Environment result = (pt::Environment)0;
-        Params p = parameters[0];
+        var result : pt::Environment = (pt::Environment)0;
+        let p : Params = parameters[0];
         if (p.lighting.w <= 0)
             return result;
-        float3 rgb = atmosphere::sky_radiance(p.atmosphere, sky_mapping, sky_texture, direction);
+        let rgb : float3 =
+                      atmosphere::sky_radiance(p.atmosphere, sky_mapping, sky_texture, direction);
         result.sky = max(color::rec2020_to_bt709(rgb * p.atmosphere_settings.xyz), 0);
         if (sun_contains(direction))
         {
-            result.sun =
-                solar_radiance(direction, depth == 0 ? p.atmosphere.view.w : altitude(previous.y));
+            result.sun = solar_radiance(direction, depth == 0 ? p.atmosphere.observer_height_km
+                                                              : altitude(previous.y));
             result.sun_pdf = sun_pdf();
         }
         return result;

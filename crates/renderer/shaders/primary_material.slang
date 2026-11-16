@@ -14,24 +14,25 @@ import geometry.ray;
 import params;
 
 [shader("callable")]
-void shade_primary(inout pt::MaterialCall call)
+func shade_primary(inout call: pt::MaterialCall)->void
 {
 #if PRIMEPT_OMM
     ENGINE_OPACITY_MICROMAP(shade_primary)
 #endif
-    call.initializePrimary(parameters[0].initial_medium);
-    uint pixel = primary_pixel();
-    pt::Hit hit = {};
+    call.initialize_primary(parameters[0].initial_medium);
+    let pixel : uint = primary_pixel();
+    var hit : pt::Hit = {};
     hit.identity = primary_identity[pixel];
     hit.surface = geometry::surface_point(known_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
-    float4 ray = primary_ray[pixel];
+    let ray : float4 = primary_ray[pixel];
     hit.distance = ray.w;
     hit.front = dot(ray.xyz, hit.surface.normal) < 0;
-    float4 auxiliary = material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
+    let auxiliary : float4 =
+                        material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
     hit.identity.w =
         known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
-    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
-        hit, parameters[0].block_emission_scale, { auxiliary });
+    let material : pt::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
+                       hit, parameters[0].block_emission_scale, { auxiliary });
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true>(
         ModScene(), call, hit, material, ray.xyz, settings(parameters[0]), parameters[0].image.w,
         asuint(call.origin_pixel.y));

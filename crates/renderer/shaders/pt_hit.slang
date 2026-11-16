@@ -38,118 +38,121 @@ import primary_cache;
 #define PRIMEPT_LIGHT_MASK 3
 #endif
 #ifdef PRIMEPT_SER
-static const let HitReorder = true;
+static const let hit_reorder = true;
 #else
-static const let HitReorder = false;
+static const let hit_reorder = false;
 #endif
 #ifndef PRIMEPT_RECONSTRUCTION
 #define PRIMEPT_RECONSTRUCTION 1
 #endif
 [[vk::binding(7, 0)]]
-RWStructuredBuffer<float4> output_image;
+var output_image : RWStructuredBuffer<float4>;
 [[vk::binding(8, 0)]]
-RWStructuredBuffer<float4> accumulation;
+var accumulation : RWStructuredBuffer<float4>;
 [[vk::binding(9, 0)]]
-RWStructuredBuffer<uint> sample_counts;
+var sample_counts : RWStructuredBuffer<uint>;
 [[vk::binding(15, 0)]]
-RWStructuredBuffer<float4> prefix_image;
+var prefix_image : RWStructuredBuffer<float4>;
 public struct HitScene : pt::IHitScene
 {
-    public bool guides_enabled()
+    public func guides_enabled()->bool
     {
         return PRIMEPT_RECONSTRUCTION != 0 && parameters[0].reconstruction.w == 2;
     }
-    public uint program(HitObject object, float4 incident)
+    public func program(object: HitObject, incident: float4)->uint
     {
-        uint primitive = region_primitive(object.GetInstanceID(), object.GetPrimitiveIndex());
+        let primitive : uint = region_primitive(object.GetInstanceID(), object.GetPrimitiveIndex());
         return material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
     }
-    public pt::SurfaceMaterial resolve(pt::Hit hit, uint cap, float4 incident)
+    public func resolve(hit: pt::Hit, cap: uint, incident: float4)->pt::SurfaceMaterial
     {
         return ModScene().resolve(hit, cap, incident);
     }
-    public pt::SurfaceMaterial resolve_flow(pt::Hit hit, uint flow, float4 incident)
+    public func resolve_flow(hit: pt::Hit, flow: uint, incident: float4)->pt::SurfaceMaterial
     {
         return ModScene().resolve_flow(hit, flow, incident);
     }
-    public openpbr::Energy energy()
+    public func energy()->openpbr::Energy
     {
         return ModScene().energy();
     }
-    public pt::LightSample sample_sun(geometry::SurfacePoint p, float2 u)
+    public func sample_sun(p: geometry::SurfacePoint, u: float2)->pt::LightSample
     {
         return ModScene().sample_sun(p, u);
     }
-    public pt::LightSample sample_light(geometry::SurfacePoint p, float3 u)
+    public func sample_light(p: geometry::SurfacePoint, u: float3)->pt::LightSample
     {
         return ModScene().sample_light(p, u);
     }
-    public float3 light_emission(geometry::SurfacePoint p, pt::LightSample s, bool solar)
+    public func light_emission(p: geometry::SurfacePoint, s: pt::LightSample, solar: bool)->float3
     {
         return ModScene().light_emission(p, s, solar);
     }
-    public float emission_pdf(pt::Hit hit, float3 previous)
+    public func emission_pdf(hit: pt::Hit, previous: float3)->float
     {
         return ModScene().emission_pdf(hit, previous);
     }
-    public bool occluded(geometry::Ray ray)
+    public func occluded(ray: geometry::Ray)->bool
     {
         return ModScene().occluded(ray);
     }
-    public pt::Environment environment(float3 d, float3 p, uint depth)
+    public func environment(d: float3, p: float3, depth: uint)->pt::Environment
     {
         return ModScene().environment(d, p, depth);
     }
-    public RaytracingAccelerationStructure acceleration()
+    public func acceleration()->RaytracingAccelerationStructure
     {
         return scene;
     }
 };
 [shader("closesthit")]
-void shade_hit(inout pt::MaterialCall call, BuiltInTriangleIntersectionAttributes attributes)
+func shade_hit(inout call: pt::MaterialCall, attributes: BuiltInTriangleIntersectionAttributes)
+    ->void
 {
 #if PRIMEPT_OMM
     ENGINE_OPACITY_MICROMAP(shade_hit)
 #endif
-    float3 a = HitTriangleVertexPosition(0), b = HitTriangleVertexPosition(1),
-           c = HitTriangleVertexPosition(2);
-    pt::Hit hit = {};
+    let a : float3 = HitTriangleVertexPosition(0);
+    let b : float3 = HitTriangleVertexPosition(1);
+    let c : float3 = HitTriangleVertexPosition(2);
+    var hit : pt::Hit = {};
     hit.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
                                            WorldToObject3x4());
-    uint primitive = region_primitive(InstanceID(), PrimitiveIndex());
-    float4 auxiliary = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
-    uint normal = 0;
+    let primitive : uint = region_primitive(InstanceID(), PrimitiveIndex());
+    let auxiliary : float4 = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
+    var normal : uint = 0;
     if ((OPENPBR_VARIANT & 8u) != 0)
         normal = map_normal_xy(primitive, auxiliary.xy, b - a, c - a, (float3x3)ObjectToWorld3x4(),
                                hit.surface.normal);
     hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
     hit.distance = RayTCurrent();
     hit.front = dot(WorldRayDirection(), hit.surface.normal) < 0;
-    pt::SurfaceMaterial material = decode_surface<AtlasColor, CachedAux>(
-        hit, parameters[0].block_emission_scale, { auxiliary });
+    let material : pt::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
+                       hit, parameters[0].block_emission_scale, { auxiliary });
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(
         ModScene(), call, hit, material, WorldRayDirection(), settings(parameters[0]));
 }
 // 只执行相机射线和覆盖测试，不解码材质或生成光路状态。
-func cache_primary<let FrameFilm : bool>()->void
+func cache_primary<let frame_film : bool>()->void
 {
-    Params p = parameters[0];
-    uint2 coordinate = DispatchRaysIndex().xy;
-    uint pixel = primary_pixel();
-    pt::PathSampler sampler = pt::path_sampler(coordinate, p.rr_sample, p.options.z, p.options.x);
-    float2 offset = FrameFilm ? 0.5 + p.reconstruction.xy : sampler.film();
+    let p : Params = parameters[0];
+    let coordinate : uint2 = DispatchRaysIndex().xy;
+    let pixel : uint = primary_pixel();
+    let sampler : pt::PathSampler =
+                      pt::path_sampler(coordinate, p.rr_sample, p.options.z, p.options.x);
+    let offset : float2 = frame_film ? 0.5 + p.reconstruction.xy : sampler.film();
     let film = geometry::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
-    float3 direction =
-        geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
-    RayDesc ray = { p.origin.xyz, 0, direction, pt::FAR };
-    uint unused = 0;
-    HitObject found = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
-    uint4 identity = uint4(0xffffffffu, 0, 0, 0);
-    float distance = pt::FAR;
+    let direction
+        : float3 = geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
+    let ray : RayDesc = { p.origin.xyz, 0, direction, pt::FAR };
+    var unused : uint = 0;
+    var found : HitObject = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+    var identity = uint4(0xffffffffu, 0, 0, 0);
+    var distance : float = pt::FAR;
     if (found.IsHit())
     {
-        BuiltInTriangleIntersectionAttributes attributes =
-            found.GetAttributes<BuiltInTriangleIntersectionAttributes>();
+        let attributes : BuiltInTriangleIntersectionAttributes =
+                             found.GetAttributes<BuiltInTriangleIntersectionAttributes>();
         identity = uint4(region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex()),
                          asuint(attributes.barycentrics), 0);
         distance = found.GetRayDesc().TMax;
@@ -190,11 +193,12 @@ func primary_main()->void
 }
 
 [shader("raygeneration")]
-void prefix_empty() {
+func prefix_empty()
+    ->void {
 #if PRIMEPT_OMM
-    ENGINE_OPACITY_MICROMAP(prefix_empty)
+        ENGINE_OPACITY_MICROMAP(prefix_empty)
 #endif
-}
+    }
 
 func trace_path(coordinate: uint2, film: float2, inout data: pt::TransportCall)
     ->float
@@ -206,10 +210,10 @@ func trace_path(coordinate: uint2, film: float2, inout data: pt::TransportCall)
                                          p.previous_up };
     let guides : Guides = { coordinate, film, current, previous };
     if (p.reconstruction.w == 2)
-        return pt::trace_hit_path<HitScene, Guides, HitReorder>(HitScene(), guides, data);
+        return pt::trace_hit_path<HitScene, Guides, hit_reorder>(HitScene(), guides, data);
 #endif
-    return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, HitReorder>(HitScene(),
-                                                                        pt::NoPrefixGuides(), data);
+    return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, hit_reorder>(
+        HitScene(), pt::NoPrefixGuides(), data);
 }
 
 public struct RealtimePixelAdapter : pt::IPixelTransport
@@ -237,8 +241,8 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
         else
         {
             let program = material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
-            var call = pt::MaterialCall::primaryInput(data.sample, lane, data.path.radiance);
-            if (HitReorder)
+            var call = pt::MaterialCall::primary_input(data.sample, lane, data.path.radiance);
+            if (hit_reorder)
                 ReorderThread(program, 32u);
             CallShader(program, call);
             data.path = call.result();
@@ -289,22 +293,21 @@ public struct OfflinePixelAdapter : pt::IPixelTransport
     }
 };
 
-func render_pixel<A : pt::IPixelTransport, let Realtime : bool, let Samples : uint, let Lane : int,
-                  let IgnoreFailure : bool>(adapter: A, pixel: uint, coordinate: uint2)
+func render_pixel<A : pt::IPixelTransport, let realtime : bool, let samples : uint, let lane : int,
+                  let ignore_failure : bool>(adapter: A, pixel: uint, coordinate: uint2)
     ->void
 {
-    if (!IgnoreFailure && accumulation[pixel].w < 0)
+    if (!ignore_failure && accumulation[pixel].w < 0)
     {
         output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);
         return;
     }
-    let input : pt::PixelTransportInput = { coordinate };
     var previous = float4(0);
-    if (Lane == 1)
+    if (lane == 1)
         previous = output_image[pixel];
-    let result = pt::integrate_pixel<A, Realtime, Samples, Lane>(adapter, input, previous);
-    if (Lane != 1)
-        prefix_image[pixel] = float4(0, 0, 0, Realtime ? primary_ray[pixel].w : result.distance);
+    let result = pt::integrate_pixel<A, realtime, samples, lane>(adapter, coordinate, previous);
+    if (lane != 1)
+        prefix_image[pixel] = float4(0, 0, 0, realtime ? primary_ray[pixel].w : result.distance);
     output_image[pixel] = result.radiance;
 }
 

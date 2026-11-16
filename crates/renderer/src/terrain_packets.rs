@@ -29,7 +29,7 @@ pub(super) struct History {
 }
 pub(super) struct Page {
     /// 尚未派生的CPU源属性；只在pack_patch或QuadEncoder/rebind时解码tint。
-    pub attrs: Vec<[[u32; 4]; 3]>,
+    pub attrs: Vec<scene_cache::QuadAttributes>,
     pub lamps: Vec<Record>,
     pub geometry: PackedQuads,
     pub maps: Vec<(u32, [u32; 2])>,
@@ -142,7 +142,7 @@ pub(super) struct Check {
     pub tint: bool,
 }
 pub(super) struct AttributeRows {
-    pub attributes: Vec<[[u32; 4]; 3]>,
+    pub attributes: Vec<scene_cache::QuadAttributes>,
     pub ranges: Vec<(usize, Range<usize>)>,
     pub lamps: Option<Vec<Record>>,
 }

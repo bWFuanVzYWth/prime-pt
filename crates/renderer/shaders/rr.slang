@@ -8,46 +8,46 @@ import pt.denoise;
 import pt.guide_output;
 
 [[vk::binding(0, 0)]]
-StructuredBuffer<Params> parameters;
+var parameters : StructuredBuffer<Params>;
 [[vk::binding(1, 0)]]
-StructuredBuffer<float4> pixels;
+var pixels : StructuredBuffer<float4>;
 [[vk::binding(2, 0)]]
 [[vk::image_format("rgba16f")]]
-RWTexture2D<float4> noisy;
+var noisy : RWTexture2D<float4>;
 [[vk::binding(3, 0)]]
-Texture2D<float4> reconstructed;
+var reconstructed : Texture2D<float4>;
 [[vk::binding(4, 0)]]
 [[vk::image_format("rgba8")]]
-RWTexture2D<float4> target;
+var target : RWTexture2D<float4>;
 [[vk::binding(5, 0)]]
-Texture2D<float> guide_depth;
+var guide_depth : Texture2D<float>;
 [[vk::binding(6, 0)]]
-Texture2D<float4> guide_normal;
+var guide_normal : Texture2D<float4>;
 [[vk::binding(7, 0)]]
-Texture2D<float4> guide_diffuse;
+var guide_diffuse : Texture2D<float4>;
 [[vk::binding(8, 0)]]
-Texture2D<float4> guide_specular;
+var guide_specular : Texture2D<float4>;
 [[vk::binding(9, 0)]]
-StructuredBuffer<display::ExposureState> exposure_state;
+var exposure_state : StructuredBuffer<display::ExposureState>;
 [[vk::binding(10, 0)]]
-StructuredBuffer<uint4> exposure_parameters;
+var exposure_parameters : StructuredBuffer<uint4>;
 
-func display_parameters<let Automatic : bool>()->display::PrimeDrtParameters
+func display_parameters<let automatic : bool>()->display::PrimeDrtParameters
 {
-    display::PrimeDrtParameters drt = parameters[0].drt;
-    if (Automatic)
+    var drt : display::PrimeDrtParameters = parameters[0].drt;
+    if (automatic)
         drt.exposure_multiplier *= exp2(exposure_state[0].exposure_ev);
     return drt;
 }
 
 public struct SpatialInput : pt::ISpatialImage
 {
-    public pt::SpatialSample load(uint2 pixel)
+    public func load(pixel: uint2)->pt::SpatialSample
     {
-        float4 hdr = pixels[pixel.y * parameters[0].image.x + pixel.x];
-        float depth = guide_depth.Load(int3(pixel, 0));
-        float4 albedo = guide_diffuse.Load(int3(pixel, 0));
-        uint flags = uint(round(albedo.w * 255));
+        let hdr : float4 = pixels[pixel.y * parameters[0].image.x + pixel.x];
+        let depth : float = guide_depth.Load(int3(pixel, 0));
+        let albedo : float4 = guide_diffuse.Load(int3(pixel, 0));
+        let flags = uint(round(albedo.w * 255));
         return { hdr.xyz,
                  depth,
                  guide_normal.Load(int3(pixel, 0)),
@@ -60,59 +60,59 @@ public struct SpatialInput : pt::ISpatialImage
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void pack_main(uint3 id: SV_DispatchThreadID)
+func pack_main(id: uint3: SV_DispatchThreadID)->void
 {
-    Params p = parameters[0];
+    let p : Params = parameters[0];
     if (any(id.xy >= p.image.xy))
         return;
-    float4 hdr = pixels[id.y * p.image.x + id.x];
+    let hdr : float4 = pixels[id.y * p.image.x + id.x];
     noisy[id.xy] = pt::reconstruction_input(hdr.xyz);
 }
 
-func present_pixel<let Automatic : bool>(id: uint3)->void
+func present_pixel<let automatic : bool>(id: uint3)->void
 {
-    Params p = parameters[0];
+    let p : Params = parameters[0];
     if (any(id.xy >= p.output_size.xy))
         return;
-    float3 hdr = reconstructed.Load(int3(id.xy, 0)).xyz;
-    uint2 source = min(id.xy * p.image.xy / p.output_size.xy, p.image.xy - 1);
-    bool invalid = pixels[source.y * p.image.x + source.x].w < 0;
+    let hdr : float3 = reconstructed.Load(int3(id.xy, 0)).xyz;
+    let source : uint2 = min(id.xy * p.image.xy / p.output_size.xy, p.image.xy - 1);
+    let invalid : bool = pixels[source.y * p.image.x + source.x].w < 0;
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =
         invalid ? float4(1, 0, 1, 1)
-                : float4(display::prime_drt_bt709(hdr, display_parameters<Automatic>()), 1);
+                : float4(display::prime_drt_bt709(hdr, display_parameters<automatic>()), 1);
 }
 
 /// 本帧求值安全失败时以已有输入和 guides 执行边界保护空间重建，再作显示变换。
-func fallback_pixel<let Automatic : bool>(id: uint3)->void
+func fallback_pixel<let automatic : bool>(id: uint3)->void
 {
-    Params p = parameters[0];
+    let p : Params = parameters[0];
     if (any(id.xy >= p.output_size.xy))
         return;
     let source = fma(float2(id.xy) + 0.5, asfloat(p.programs.xy), -0.5);
-    bool valid;
-    float3 hdr = pt::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
+    var valid : bool;
+    let hdr : float3 = pt::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =
         !valid ? float4(1, 0, 1, 1)
-               : float4(display::prime_drt_bt709(hdr, display_parameters<Automatic>()), 1);
+               : float4(display::prime_drt_bt709(hdr, display_parameters<automatic>()), 1);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func present_manual(uint3 id: SV_DispatchThreadID)->void
+func present_manual(id: uint3: SV_DispatchThreadID)->void
 {
     present_pixel<false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func present_automatic(uint3 id: SV_DispatchThreadID)->void
+func present_automatic(id: uint3: SV_DispatchThreadID)->void
 {
     present_pixel<true>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func present_main(uint3 id: SV_DispatchThreadID)->void
+func present_main(id: uint3: SV_DispatchThreadID)->void
 {
     if (asfloat(exposure_parameters[1].y) > 0)
         present_pixel<true>(id);
@@ -122,21 +122,21 @@ func present_main(uint3 id: SV_DispatchThreadID)->void
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func fallback_manual(uint3 id: SV_DispatchThreadID)->void
+func fallback_manual(id: uint3: SV_DispatchThreadID)->void
 {
     fallback_pixel<false>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func fallback_automatic(uint3 id: SV_DispatchThreadID)->void
+func fallback_automatic(id: uint3: SV_DispatchThreadID)->void
 {
     fallback_pixel<true>(id);
 }
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-func fallback_main(uint3 id: SV_DispatchThreadID)->void
+func fallback_main(id: uint3: SV_DispatchThreadID)->void
 {
     if (asfloat(exposure_parameters[1].y) > 0)
         fallback_pixel<true>(id);
