@@ -2,7 +2,7 @@
 module mod_call;
 import pt.scene;
 import geometry.ray;
-import bsdf.openpbr.flow;
+import openpbr.flow;
 
 public struct ModTransportCall
 {

@@ -2,13 +2,12 @@
 module mod_guides;
 import mod_scene;
 import params;
-import pt.denoise;
 import pt.integrator;
 import pt.reconstruction;
 import pt.key_guides;
 import pt.guide_output;
 import pt.hit_transport;
-import geometry.camera;
+import camera.pinhole;
 
 [[vk::binding(19, 0)]]
 [[vk::image_format("r32f")]]
@@ -68,8 +67,8 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
 {
     public var coordinate : uint2;
     public var film : float2;
-    public var current : pt::DenoiseCamera;
-    public var previous : pt::DenoiseCamera;
+    public var current : camera::Camera;
+    public var previous : camera::Camera;
 
     func images()->pt::GuideImages
     {

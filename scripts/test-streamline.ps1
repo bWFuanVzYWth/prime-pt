@@ -9,6 +9,4 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../../..'))
-if (!$SdkRoot) { $SdkRoot = $env:STREAMLINE_SDK }
-if (!$SdkRoot) { $SdkRoot = Join-Path $repository 'target/streamline-sdk' }
-& (Join-Path $repository 'scripts/gpu/test_streamline.ps1') -SdkRoot $SdkRoot -Manual:$Manual -InitializationOnly:$InitializationOnly -ReportOnlyValidation:$ReportOnlyValidation -StandardValidationOnly:$StandardValidationOnly -Output $Output
+& (Join-Path $repository 'crates/vulkan/streamline/test_gpu.ps1') @PSBoundParameters

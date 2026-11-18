@@ -1,6 +1,6 @@
 /// 只负责硬件命中和 K1/K2 交接；路径推进完全使用引擎 pt.integrator。
 module primary;
-#include "geometry/opacity.slang"
+#include "opacity/micromap.inc.slang"
 #ifndef PRIMEPT_OMM
 #define PRIMEPT_OMM 0
 #endif
@@ -9,13 +9,13 @@ import mod_call;
 import mod_guides;
 import params;
 import pt.integrator;
-import pt.transport;
-import pt.denoise;
 import pt.reconstruction;
 import geometry.ray;
-import geometry.camera;
-import bsdf.openpbr.specialized;
-import bsdf.openpbr.flow;
+import camera.pinhole;
+import openpbr.specialized;
+import openpbr.flow;
+import light_sampling.sample;
+import transport.medium;
 
 #ifndef OPENPBR_FLOW
 #define OPENPBR_FLOW 131
@@ -155,10 +155,10 @@ func prefix_main()->void
                       pt::path_sampler(coordinate, data.sample, params.options.z, params.options.x);
     let offset : float2 =
                      params.reconstruction.w > 0 ? 0.5 + params.reconstruction.xy : sampler.film();
-    let film = geometry::camera_sample_uv_offset(coordinate, params.inverse_extent, offset);
+    let film = camera::camera_sample_uv_offset(coordinate, params.inverse_extent, offset);
     data.path.origin = params.origin.xyz;
-    data.path.direction = geometry::camera_scaled_direction(params.forward.xyz, params.right.xyz,
-                                                            params.up.xyz, film);
+    data.path.direction =
+        camera::camera_scaled_direction(params.forward.xyz, params.right.xyz, params.up.xyz, film);
     data.path.throughput = 1;
     data.path.eta_scale = 1;
     data.path.medium = parameters[0].initial_medium;
@@ -166,8 +166,8 @@ func prefix_main()->void
     var provider : ModScene;
     if (params.reconstruction.w > 0)
     {
-        let previous : pt::DenoiseCamera = { params.previous_position, params.previous_forward,
-                                             params.previous_right, params.previous_up };
+        let previous : camera::Camera = { params.previous_position, params.previous_forward,
+                                          params.previous_right, params.previous_up };
         let current = params.current_camera;
         let guides : Guides = { coordinate, film, current, previous };
         pt::trace_prefix(provider, data, settings(params), distance, guides);
@@ -319,10 +319,10 @@ func render_fused()->void
                       pt::path_sampler(coordinate, data.sample, params.options.z, params.options.x);
     let offset : float2 =
                      params.reconstruction.w > 0 ? 0.5 + params.reconstruction.xy : sampler.film();
-    let film = geometry::camera_sample_uv_offset(coordinate, params.inverse_extent, offset);
+    let film = camera::camera_sample_uv_offset(coordinate, params.inverse_extent, offset);
     data.path.origin = params.origin.xyz;
-    data.path.direction = geometry::camera_scaled_direction(params.forward.xyz, params.right.xyz,
-                                                            params.up.xyz, film);
+    data.path.direction =
+        camera::camera_scaled_direction(params.forward.xyz, params.right.xyz, params.up.xyz, film);
     data.path.throughput = 1;
     data.path.eta_scale = 1;
     data.path.medium = params.initial_medium;
@@ -347,7 +347,8 @@ func render_fused()->void
             provider.shade(data);
             continue;
         }
-        data.path.throughput *= pt::segment_transmittance(data.path.medium.yzw, data.hit.distance);
+        data.path.throughput *=
+            transport::segment_transmittance(data.path.medium.yzw, data.hit.distance);
         let program : uint =
                           material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2u;
         found.SetShaderTableIndex(program + 1u);
@@ -357,7 +358,7 @@ func render_fused()->void
         var call : ModTransportCall = ModTransportCall.input(data);
         HitObject::Invoke(found, call);
         // 只保活几何点和采样身份，灯样本不跨SER/材质阶段。
-        var light : pt::LightSample;
+        var light : light_sampling::LightSample;
         var direct : float3 = 0;
         if (any(call.surface_point.normal > 0))
         {

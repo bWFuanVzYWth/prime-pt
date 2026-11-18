@@ -3,7 +3,7 @@ module params;
 import pt.scene;
 import display.prime_drt;
 import atmosphere.parameters;
-import geometry.camera;
+import camera.pinhole;
 
 public struct Params
 {
@@ -42,7 +42,7 @@ public struct Params
     /// xy为输入/输出尺寸比例bits，z为兼容导引偏移，w为同源太阳半角的弦长平方bits。
     public var programs : uint4;
     /// 当前规范相机，源自与previous相同的CPU CameraFrame编码，不含jitter。
-    public var current_camera : geometry::Camera;
+    public var current_camera : camera::Camera;
 };
 
 public func settings(params: Params)->pt::Settings

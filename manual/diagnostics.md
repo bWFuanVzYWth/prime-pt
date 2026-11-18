@@ -44,7 +44,6 @@ SER 默认沿用快照开关；用 `$env:PRIME_PT_REPLAY_SER = '0'` 或 `'1'` �
 
 ```powershell
 Set-Location 'C:\repositories\simple_engine\app\prime_pt'
-$env:STREAMLINE_SDK = 'C:\repositories\simple_engine\target\streamline-sdk'
 New-Item -ItemType Directory -Force 'C:\repositories\simple_engine\temp' | Out-Null
 $env:PT_QUALITY_CONFIG = 'C:\repositories\simple_engine\temp\pt-quality.json'
 @'

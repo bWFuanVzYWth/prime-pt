@@ -7,22 +7,24 @@ module mod_scene;
 
 import pt.scene;
 import pt.integrator;
-import pt.transport;
-import pt.roulette;
+import transport.roulette;
 import mod_call;
 __exported import mod_materials;
 import mod_lights;
 import mod_decode;
 import pt.reconstruction;
 import geometry.ray;
-import geometry.cone;
-import bsdf.openpbr.api;
-import bsdf.openpbr.specialized;
-import bsdf.openpbr.flow;
+import sampling.cone;
+import openpbr.api;
+import openpbr.specialized;
+import openpbr.flow;
 import params;
 import atmosphere.parameters;
 import atmosphere.sampling;
 import color.primaries;
+import light_sampling.sample;
+import transport.surface_material;
+import transport.medium;
 
 #ifndef OPENPBR_VARIANT
 #define OPENPBR_VARIANT 0xffffffffu
@@ -61,13 +63,13 @@ public func region_primitive(instance: uint, local_primitive: uint)->uint
 
 public func sun_contains(direction: float3)->bool
 {
-    return geometry::cone_contains_chord(parameters[0].lighting.xyz,
+    return sampling::cone_contains_chord(parameters[0].lighting.xyz,
                                          asfloat(parameters[0].programs.w), direction);
 }
 
 public func sun_pdf()->float
 {
-    return geometry::uniform_cone_pdf_chord(asfloat(parameters[0].programs.w));
+    return sampling::uniform_cone_pdf_chord(asfloat(parameters[0].programs.w));
 }
 
 func altitude(world_y: float)->float
@@ -111,16 +113,16 @@ public func finish_vertex(inout data: pt::TransportCall)->void
             status = pt::PATH_DONE;
         else if (data.path.depth + 1 >= 2)
         {
-            let survival : float =
-                               pt::roulette_probability(data.path.throughput, data.path.eta_scale,
-                                                        parameters[0].output_size.w != 0);
+            let survival
+                : float = transport::roulette_probability(data.path.throughput, data.path.eta_scale,
+                                                          parameters[0].output_size.w != 0);
             let sampler : pt::PathSampler =
                               pt::path_sampler(data.pixel, data.sample, parameters[0].options.z,
                                                parameters[0].options.x);
             if (survival == 0 || (survival < 1 && sampler.roulette(data.path.depth) >= survival))
                 status = pt::PATH_DONE;
             else if (survival < 1)
-                data.path.throughput = pt::roulette_reweight(data.path.throughput, survival);
+                data.path.throughput = transport::roulette_reweight(data.path.throughput, survival);
         }
     }
     pt::finish(data.path, status);
@@ -135,7 +137,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         return { hit.surface.position, false, false };
     }
 
-    public func guide_material(input_hit: pt::Hit, incident: float4)->pt::SurfaceMaterial
+    public func guide_material(input_hit: pt::Hit, incident: float4)->transport::SurfaceMaterial
     {
         var hit = input_hit;
         hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
@@ -177,7 +179,8 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public func shade(inout data: pt::TransportCall)->void
     {
-        data.path.throughput *= pt::segment_transmittance(data.path.medium.yzw, data.hit.distance);
+        data.path.throughput *=
+            transport::segment_transmittance(data.path.medium.yzw, data.hit.distance);
         // GPU派生表的高30位为资源期按真实Flow去重后的callable槽；不是源OpenPBR flags。
         let program : uint =
                           material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2u;
@@ -190,14 +193,15 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         finish_vertex(data);
     }
 
-    public func resolve(input_hit: pt::Hit, capability: uint, incident: float4)->pt::SurfaceMaterial
+    public func resolve(input_hit: pt::Hit, capability: uint, incident: float4)
+        ->transport::SurfaceMaterial
     {
         var hit = input_hit;
         hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
         return resolve_material(hit, ~0u, ~0u, parameters[0].block_emission_scale);
     }
 
-    public func resolve_flow(hit: pt::Hit, flow: uint, incident: float4)->pt::SurfaceMaterial
+    public func resolve_flow(hit: pt::Hit, flow: uint, incident: float4)->transport::SurfaceMaterial
     {
 #if defined(OPENPBR_FLOW) && OPENPBR_VARIANT != 0xffffffffu
         return decode_surface<AtlasColor, FetchAux>(hit, parameters[0].block_emission_scale, {});
@@ -213,12 +217,12 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
     }
 
     public func sample_sun(surface_point: geometry::SurfacePoint, random_sample: float2)
-        ->pt::LightSample
+        ->light_sampling::LightSample
     {
-        var result : pt::LightSample = (pt::LightSample)0;
+        var result : light_sampling::LightSample = (light_sampling::LightSample)0;
         if (parameters[0].lighting.w <= 0)
             return result;
-        result.direction = geometry::sample_uniform_cone_chord(
+        result.direction = sampling::sample_uniform_cone_chord(
             parameters[0].lighting.xyz, asfloat(parameters[0].programs.w), random_sample);
         result.pdf = sun_pdf();
         result.distance = pt::FAR;
@@ -228,13 +232,13 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
     }
 
     public func sample_light(surface_point: geometry::SurfacePoint, random_sample: float3)
-        ->pt::LightSample
+        ->light_sampling::LightSample
     {
         return sample_quad_light(surface_point, random_sample, parameters[0]);
     }
 
-    public func light_emission(surface_point: geometry::SurfacePoint, light_sample: pt::LightSample,
-                               solar: bool)
+    public func light_emission(surface_point: geometry::SurfacePoint,
+                               light_sample: light_sampling::LightSample, solar: bool)
         ->float3
     {
         return solar ? solar_radiance(light_sample.direction, altitude(surface_point.position.y))

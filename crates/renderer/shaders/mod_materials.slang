@@ -2,8 +2,9 @@
 module mod_materials;
 import pt.scene;
 import mod_coverage;
-import bsdf.openpbr.api;
-import bsdf.openpbr.flow;
+import openpbr.api;
+import openpbr.flow;
+import transport.surface_material;
 
 #ifndef PRIMEPT_COVERAGE_MASK
 #define PRIMEPT_COVERAGE_MASK 40u
@@ -281,13 +282,13 @@ func material_variant(material: ModMaterial)->uint
 public func resolve_material<let has_aux : bool = false, let read_color : bool = false>(
     input_hit: pt::Hit, flow: uint, variant: uint, block_emission_scale: float,
     sampled_aux: float4 = float4(0))
-    ->pt::SurfaceMaterial
+    ->transport::SurfaceMaterial
 {
     var hit = input_hit;
     let primitive : uint = hit.identity.x;
     let material : ModMaterial = material_at(material_id(primitive));
     let mask : uint = variant == ~0u ? material_variant(material) : variant;
-    var result : pt::SurfaceMaterial = {};
+    var result : transport::SurfaceMaterial = {};
     result.pbr.base_roughness.w = material.base_roughness.w;
     result.pbr.surface = material.surface;
     result.pbr.control.x = (mask >> 6u) & 3u;

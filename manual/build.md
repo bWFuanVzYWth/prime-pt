@@ -53,7 +53,7 @@ Java 和 javac 应显示 25，Cargo 与 Gradle 应能打印版本。找不到 ja
 ./scripts/setup-streamline.ps1
 ```
 
-成功时会显示 SDK 校验结果和 `STREAMLINE_SDK` 的位置。安装器默认使用引擎的 `target/streamline-sdk`，已有 SDK 可加 `-VerifyOnly`。后续构建在同一终端执行。校验失败时看[引擎 Streamline 手册](../../../manual/streamline.md)。
+成功时会显示 SDK 校验结果和安装目录。SDK 默认装到引擎的 `local/tools/streamline/`。Gradle 通过 Cargo 构建原生库，由引擎的 Vulkan crate 发现并校验 SDK，新终端也能复用。已有 SDK 可加 `-VerifyOnly` 检查。使用自定义目录时，可用绝对路径 `STREAMLINE_SDK` 覆盖。校验失败时看[引擎 Streamline 手册](../../../manual/streamline.md)。
 
 ## 构建发行包
 
@@ -67,13 +67,17 @@ Java 和 javac 应显示 25，Cargo 与 Gradle 应能打印版本。找不到 ja
 
 ## 运行开发客户端
 
-开发客户端使用项目内的 `run/` 作为游戏目录。确认前面的工具和 SDK 都已准备。直接运行开发客户端时，可先用 `../../scripts/install_slang.ps1` 安装引擎固定的 Slang，然后留在同一 PowerShell 窗口执行：
+开发客户端使用项目内的 `run/` 作为游戏目录。确认前面的工具和 SDK 都已准备。Slang 可用 `../../scripts/install_slang.ps1` 安装，也可用 `SLANGC` 指定编译器。默认位置安装的 Slang 和 Streamline SDK 在新终端也能自动发现。从 Prime PT 根目录的 Windows PowerShell 或 PowerShell 7 运行：
 
 ```powershell
 ./gradlew.bat runClient
 ```
 
-成功时会打开 Minecraft 客户端。开发运行的日志可在 `run/logs/` 查看。常用调试选项如下。
+成功时会打开 Minecraft 客户端。开发运行的日志可在 `run/logs/` 查看。
+
+如果遇到 `CreateProcess error=740`，请通过项目的 `gradlew.bat` 启动。它会从这次构建的环境中去掉 VS Code 继承的 `RUNASADMIN` 兼容性标记，让普通权限的 Gradle 守护进程可以启动 Cargo。
+
+常用调试选项如下。
 
 - `-Prr=false` 跳过早期 SDK 接入，以原始路径追踪启动。之后启用 RR 需要重启。
 - `-Pser=false` 为没有持久化设置的配置提供关闭 SER 的默认值。SER 是设备可以选择的着色器执行重排功能。

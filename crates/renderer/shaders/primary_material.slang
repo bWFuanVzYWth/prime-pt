@@ -1,6 +1,6 @@
 /// 缓存首表面的材质专用输运；EXT不能MakeHit，因而使用callable，后续反弹仍走hit group。
 module primary_material;
-#include "geometry/opacity.slang"
+#include "opacity/micromap.inc.slang"
 #ifndef PRIMEPT_OMM
 #define PRIMEPT_OMM 0
 #endif
@@ -12,6 +12,7 @@ import mod_scene;
 import pt.scene;
 import geometry.ray;
 import params;
+import transport.surface_material;
 
 [shader("callable")]
 func shade_primary(inout call: pt::MaterialCall)->void
@@ -31,7 +32,7 @@ func shade_primary(inout call: pt::MaterialCall)->void
                         material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
     hit.identity.w =
         known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
-    let material : pt::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
+    let material : transport::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
                        hit, parameters[0].block_emission_scale, { auxiliary });
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true>(
         ModScene(), call, hit, material, ray.xyz, settings(parameters[0]), parameters[0].image.w,

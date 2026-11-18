@@ -30,6 +30,9 @@ tasks.withType(JavaCompile).configureEach {
     options.release = 25
     options.encoding = 'UTF-8'
 }
+tasks.withType(JavaExec).configureEach {
+    jvmArgs '-Dstdout.encoding=UTF-8', '-Dstderr.encoding=UTF-8'
+}
 def nativeProfile = providers.gradleProperty('nativeProfile').getOrElse('release-lto')
 if (!(nativeProfile in ['release-lto', 'release'])) {
     throw new GradleException('nativeProfile 须为 release-lto 或 release')
@@ -63,14 +66,14 @@ loom {
         }
     }
 }
-def streamlineSdk = providers.environmentVariable('STREAMLINE_SDK').getOrElse(rootProject.file('../../target/streamline-sdk').absolutePath)
+def streamlineSdkOverride = providers.environmentVariable('STREAMLINE_SDK').orNull
 def buildRoots = [
         'source': rootProject.file('../..'),
         'cargo': providers.environmentVariable('CARGO_HOME').map { rootProject.file(it) }.orNull,
         'rustup': providers.environmentVariable('RUSTUP_HOME').map { rootProject.file(it) }.orNull,
         'target': cargoTargetDir,
         'home': rootProject.file(System.getProperty('user.home')),
-        'sdk': rootProject.file(streamlineSdk),
+        'sdk': streamlineSdkOverride ? rootProject.file(streamlineSdkOverride) : null,
         'slang': slangCompiler.parentFile.parentFile,
 ].findAll { name, file -> file != null }
 def pathSpellings = { File directory ->
@@ -78,14 +81,8 @@ def pathSpellings = { File directory ->
     [path.replace('\\', '/'), path.replace('/', '\\')].unique()
 }
 
-tasks.register('verifyStreamline', Exec) {
-    workingDir rootDir
-    commandLine 'pwsh', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'scripts/setup-streamline.ps1', '-SdkRoot', streamlineSdk, '-VerifyOnly'
-}
 tasks.register('buildNative', Exec) {
-    dependsOn tasks.named('verifyStreamline')
     workingDir rootDir
-    environment 'STREAMLINE_SDK', streamlineSdk
     environment 'CARGO_TARGET_DIR', cargoTargetDir.absolutePath
     if (slangCompiler.isFile()) environment 'SLANGC', slangCompiler.absolutePath
     def args = ['cargo', 'build', '--profile', nativeProfile, '--locked', '--manifest-path', 'native/Cargo.toml']
@@ -163,8 +160,10 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'shaders/prime'
     }
     from('../../shaders') {
-        include 'atmosphere/*.slang', 'bsdf/openpbr/**/*.slang', 'color/*.slang',
-                'display/prime_drt.slang', 'geometry/*.slang', 'math/*.slang', 'pt/*.slang'
+        include 'atmosphere/*.slang', 'camera/*.slang', 'color/*.slang', 'denoise/*.slang',
+                'display/prime_drt.slang', 'geometry/*.slang', 'light_bvh/sample.slang',
+                'light_sampling/*.slang', 'math/*.slang', 'opacity/*.inc.slang', 'openpbr/**/*.slang',
+                'pt/*.slang', 'sampling/*.slang', 'scene_cache/identity.slang', 'transport/*.slang'
         into 'shaders/engine'
     }
     doLast {
@@ -175,8 +174,8 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
                  'shaders/prime/known_geometry.slang',
                  'shaders/engine/pt/scene.slang', 'shaders/engine/pt/hit_transport.slang',
                  'shaders/engine/pt/key_guides.slang',
-                 'shaders/engine/pt/sobol_bits.slang', 'shaders/engine/math/constants.slang',
-                 'shaders/engine/geometry/identity.slang']
+                 'shaders/engine/sampling/sobol_bits.slang', 'shaders/engine/math/constants.slang',
+                 'shaders/engine/scene_cache/identity.slang']
         for (def path : required) {
             def file = new File(directory, path)
             if (!file.isFile() || file.length() == 0) throw new GradleException("发行运行时缺少 ${path}")

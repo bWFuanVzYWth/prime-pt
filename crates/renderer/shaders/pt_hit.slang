@@ -1,6 +1,6 @@
 /// 普通PT生产入口；材质来源单独适配，路径和数值叶子由引擎维护。
 module pt_hit;
-#include "geometry/opacity.slang"
+#include "opacity/micromap.inc.slang"
 #ifndef PRIMEPT_OMM
 #define PRIMEPT_OMM 0
 #endif
@@ -14,20 +14,21 @@ import pt.hit_transport;
 import pt.pixel_transport;
 import pt.material_vertex;
 import pt.scene;
-import pt.denoise;
 import pt.integrator;
 import pt.path_sampler;
 import geometry.ray;
-import bsdf.openpbr.api;
-import bsdf.openpbr.flow;
+import openpbr.api;
+import openpbr.flow;
 import params;
-import geometry.camera;
+import camera.pinhole;
 import mod_scene;
 import mod_decode;
 #if PRIMEPT_RECONSTRUCTION
 import mod_guides;
 #endif
 import primary_cache;
+import light_sampling.sample;
+import transport.surface_material;
 #ifndef OPENPBR_FLOW
 #error OPENPBR_FLOW must come from a material key or an explicit raygen placeholder
 #endif
@@ -64,11 +65,11 @@ public struct HitScene : pt::IHitScene
         let primitive : uint = region_primitive(object.GetInstanceID(), object.GetPrimitiveIndex());
         return material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
     }
-    public func resolve(hit: pt::Hit, cap: uint, incident: float4)->pt::SurfaceMaterial
+    public func resolve(hit: pt::Hit, cap: uint, incident: float4)->transport::SurfaceMaterial
     {
         return ModScene().resolve(hit, cap, incident);
     }
-    public func resolve_flow(hit: pt::Hit, flow: uint, incident: float4)->pt::SurfaceMaterial
+    public func resolve_flow(hit: pt::Hit, flow: uint, incident: float4)->transport::SurfaceMaterial
     {
         return ModScene().resolve_flow(hit, flow, incident);
     }
@@ -76,15 +77,17 @@ public struct HitScene : pt::IHitScene
     {
         return ModScene().energy();
     }
-    public func sample_sun(p: geometry::SurfacePoint, u: float2)->pt::LightSample
+    public func sample_sun(p: geometry::SurfacePoint, u: float2)->light_sampling::LightSample
     {
         return ModScene().sample_sun(p, u);
     }
-    public func sample_light(p: geometry::SurfacePoint, u: float3)->pt::LightSample
+    public func sample_light(p: geometry::SurfacePoint, u: float3)->light_sampling::LightSample
     {
         return ModScene().sample_light(p, u);
     }
-    public func light_emission(p: geometry::SurfacePoint, s: pt::LightSample, solar: bool)->float3
+    public func light_emission(p: geometry::SurfacePoint, s: light_sampling::LightSample,
+                               solar: bool)
+        ->float3
     {
         return ModScene().light_emission(p, s, solar);
     }
@@ -127,7 +130,7 @@ func shade_hit(inout call: pt::MaterialCall, attributes: BuiltInTriangleIntersec
     hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
     hit.distance = RayTCurrent();
     hit.front = dot(WorldRayDirection(), hit.surface.normal) < 0;
-    let material : pt::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
+    let material : transport::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
                        hit, parameters[0].block_emission_scale, { auxiliary });
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK>(
         ModScene(), call, hit, material, WorldRayDirection(), settings(parameters[0]));
@@ -141,9 +144,9 @@ func cache_primary<let frame_film : bool>()->void
     let sampler : pt::PathSampler =
                       pt::path_sampler(coordinate, p.rr_sample, p.options.z, p.options.x);
     let offset : float2 = frame_film ? 0.5 + p.reconstruction.xy : sampler.film();
-    let film = geometry::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
-    let direction
-        : float3 = geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
+    let film = camera::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
+    let direction : float3 =
+                        camera::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
     let ray : RayDesc = { p.origin.xyz, 0, direction, pt::FAR };
     var unused : uint = 0;
     var found : HitObject = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
@@ -206,8 +209,8 @@ func trace_path(coordinate: uint2, film: float2, inout data: pt::TransportCall)
 #if PRIMEPT_RECONSTRUCTION
     let p = parameters[0];
     let current = p.current_camera;
-    let previous : pt::DenoiseCamera = { p.previous_position, p.previous_forward, p.previous_right,
-                                         p.previous_up };
+    let previous : camera::Camera = { p.previous_position, p.previous_forward, p.previous_right,
+                                      p.previous_up };
     let guides : Guides = { coordinate, film, current, previous };
     if (p.reconstruction.w == 2)
         return pt::trace_hit_path<HitScene, Guides, hit_reorder>(HitScene(), guides, data);
@@ -282,9 +285,9 @@ public struct OfflinePixelAdapter : pt::IPixelTransport
         if (p.reconstruction.w > 0)
             offset = 0.5 + p.reconstruction.xy;
 #endif
-        let film = geometry::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
+        let film = camera::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
         data.path.direction =
-            geometry::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
+            camera::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
         return film;
     }
     public func trace(inout data: pt::TransportCall, film: float2)->float

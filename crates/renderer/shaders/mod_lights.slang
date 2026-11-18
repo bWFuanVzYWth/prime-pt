@@ -5,10 +5,13 @@ module mod_lights;
 #define PRIMEPT_EMITTER_CAPABILITIES 7
 #endif
 import pt.scene;
-__exported import pt.light_sampling;
 import geometry.ray;
 import params;
 import mod_materials;
+import light_bvh.sample;
+import light_sampling.area;
+import light_sampling.quad;
+import light_sampling.sample;
 
 /// 首行[count,treeBase,0,0]，随后region anchor和紧凑活动槽，再存位置BVH。
 /// BVH按几何发布事务更新；纹理alias仍仅在资源准备阶段构建。
@@ -32,7 +35,7 @@ public var light_regions : StructuredBuffer<int4>;
 [[vk::binding(35, 0)]]
 var emission_alias_words : ByteAddressBuffer;
 
-public func emitter_vertices(index: uint)->pt::LightQuadVertices
+public func emitter_vertices(index: uint)->light_sampling::LightQuadVertices
 {
     let at : uint = light_meta[index].w * 4u;
     return { light_vertices[at].xyz, light_vertices[at + 1u].xyz, light_vertices[at + 2u].xyz,
@@ -108,46 +111,48 @@ public typedef PublishedArea SelectedEmitterArea;
 
 public func sample_quad_light(surface_point: geometry::SurfacePoint, random_sample: float3,
                               params: Params)
-    ->pt::LightSample
+    ->light_sampling::LightSample
 {
-    var result : pt::LightSample = {};
+    var result : light_sampling::LightSample = {};
     let header : uint4 = light_selection[0];
     if (header.x == 0u)
         return result;
     let anchor : int3 = asint(light_selection[1].xyz);
     let receiver : float3 =
                        surface_point.position + float3(params.anchor_region.xyz - anchor) * 64.0;
-    var proposal : pt::LightBvhProposal = { light_tree, 0, header.x };
-    let selected : pt::LightBvhSample = proposal.sample(receiver, random_sample.z);
+    var proposal : light_bvh::LightBvhProposal = { light_tree, 0, header.x };
+    let selected : light_bvh::LightBvhSample = proposal.sample(receiver, random_sample.z);
     if (selected.pmf <= 0)
         return result;
     let index : uint = light_selection[2u + (selected.light >> 2u)][selected.light & 3u];
     var meta : uint4 = light_meta[index];
     let primitive : uint = meta.w * 2u;
     let alias_offset : uint = PublishedArea.alias_offset(primitive);
-    let vertices : pt::LightQuadVertices = emitter_vertices(index);
+    let vertices : light_sampling::LightQuadVertices = emitter_vertices(index);
     if (meta.x == 0xffffffffu)
-        meta = pt::dynamic_quad_area(vertices);
+        meta = light_sampling::dynamic_quad_area(vertices);
     if (asfloat(meta.y) <= 0 && asfloat(meta.z) <= 0)
         return result;
-    let emitter : pt::LightSurfaceProposal = { meta, alias_offset };
-    let distribution : pt::TexturedEmitterAlias = { emission_alias_words };
-    var area : pt::QuadAreaSample;
+    let emitter : light_sampling::LightSurfaceProposal = { meta, alias_offset };
+    let distribution : light_sampling::TexturedEmitterAlias = { emission_alias_words };
+    var area : light_sampling::QuadAreaSample;
     let translation = float3(light_regions[index].xyz - params.anchor_region.xyz) * 64.0;
     var transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);
     let inverse =
         float3x4(1, 0, 0, -translation.x, 0, 1, 0, -translation.y, 0, 0, 1, -translation.z);
-    result = pt::sample_quad_emitter(distribution, emitter, vertices, surface_point,
-                                     random_sample.xy, selected.pmf,
-                                     uint(light_regions[index].w) & 3u, transform, inverse, area);
+    result = light_sampling::sample_quad_emitter(
+        distribution, emitter, vertices, surface_point, random_sample.xy, selected.pmf,
+        uint(light_regions[index].w) & 3u, transform, inverse, area);
     // 遮挡确认后才按实际 bary 读取发光纹理。
     result.emission = float3(area.bary, asfloat(area.half));
     result.emission_reference = index;
     return result;
 }
 /// 只接受当前已发布灯提案返回且pdf>0的样本；源sideMask已完成发光侧准入。
-public func quad_light_emission(light_sample: pt::LightSample, block_emission_scale: float)->float3
+public func quad_light_emission(light_sample: light_sampling::LightSample,
+                                block_emission_scale: float)
+    ->float3
 {
     let flags : uint = asuint(light_sample.emission.z);
     let primitive : uint = light_meta[light_sample.emission_reference].w * 2u + (flags & 1u);
@@ -163,7 +168,7 @@ public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float
     let header : uint4 = light_selection[0];
     let anchor : int3 = asint(light_selection[1].xyz);
     let receiver : float3 = previous + float3(anchor_region - anchor) * 64.0;
-    let proposal : pt::LightBvhProposal = { light_tree, 0, header.x };
+    let proposal : light_bvh::LightBvhProposal = { light_tree, 0, header.x };
     var meta : uint4 = light_meta[index];
     let alias_offset : uint = Area.alias_offset(hit.identity.x);
     var uv : float2 = 0;
@@ -178,13 +183,14 @@ public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float
     {
         if (meta.x == 0xffffffffu)
         {
-            meta = pt::dynamic_quad_area(emitter_vertices(index));
+            meta = light_sampling::dynamic_quad_area(emitter_vertices(index));
         }
     }
-    let emitter : pt::LightSurfaceProposal = { meta, alias_offset };
-    let distribution : pt::TexturedEmitterAlias = { emission_alias_words };
-    return pt::quad_emitter_pdf(distribution, emitter, proposal, receiver,
-                                uint(light_regions[index].w) >> 2u, previous, hit.surface.position,
-                                hit.surface.normal, hit.identity.x & 1u, uv,
-                                uint(light_regions[index].w) & 3u);
+    let emitter : light_sampling::LightSurfaceProposal = { meta, alias_offset };
+    let distribution : light_sampling::TexturedEmitterAlias = { emission_alias_words };
+    let emitter_flags = uint(light_regions[index].w);
+    let selection_pmf = proposal.pmf(receiver, emitter_flags >> 2u);
+    return light_sampling::quad_emitter_pdf(distribution, emitter, selection_pmf, previous,
+                                            hit.surface.position, hit.surface.normal,
+                                            hit.identity.x & 1u, uv, emitter_flags & 3u);
 }

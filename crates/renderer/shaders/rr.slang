@@ -3,9 +3,8 @@ module rr;
 import params;
 import display.prime_drt;
 import display.exposure;
-import pt.spatial_denoise;
-import pt.denoise;
 import pt.guide_output;
+import denoise.spatial;
 
 [[vk::binding(0, 0)]]
 var parameters : StructuredBuffer<Params>;
@@ -40,9 +39,9 @@ func display_parameters<let automatic : bool>()->display::PrimeDrtParameters
     return drt;
 }
 
-public struct SpatialInput : pt::ISpatialImage
+public struct SpatialInput : denoise::ISpatialImage
 {
-    public func load(pixel: uint2)->pt::SpatialSample
+    public func load(pixel: uint2)->denoise::SpatialSample
     {
         let hdr : float4 = pixels[pixel.y * parameters[0].image.x + pixel.x];
         let depth : float = guide_depth.Load(int3(pixel, 0));
@@ -90,7 +89,7 @@ func fallback_pixel<let automatic : bool>(id: uint3)->void
         return;
     let source = fma(float2(id.xy) + 0.5, asfloat(p.programs.xy), -0.5);
     var valid : bool;
-    let hdr : float3 = pt::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
+    let hdr : float3 = denoise::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
     target[uint2(id.x, p.output_size.y - 1 - id.y)] =
         !valid ? float4(1, 0, 1, 1)
                : float4(display::prime_drt_bt709(hdr, display_parameters<automatic>()), 1);

@@ -3,7 +3,7 @@ module opacity_test;
 import mod_scene;
 import pt.scene;
 import geometry.ray;
-#include "geometry/opacity.slang"
+#include "opacity/micromap.inc.slang"
 [[vk::binding(4, 0)]]
 var result : RWStructuredBuffer<uint>;
 func probe(index: uint)->geometry::Ray

@@ -7,6 +7,7 @@ import mod_decode;
 import known_geometry;
 import geometry.ray;
 import primary_cache;
+import transport.surface_material;
 
 #ifndef OPENPBR_FLOW
 #error OPENPBR_FLOW must come from resource preparation
@@ -16,7 +17,7 @@ func guide_value(hit: pt::Hit, incoming: float3, incident: float4, auxiliary: fl
     ->pt::KeyGuideVertex
 {
     var provider : ModScene;
-    let material : pt::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
+    let material : transport::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
                        hit, parameters[0].block_emission_scale, { auxiliary });
     return pt::make_key_guide<OPENPBR_FLOW>(hit, material, provider.energy(),
                                             provider.guide_pose(hit), incoming, incident);

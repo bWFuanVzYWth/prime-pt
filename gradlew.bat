@@ -25,6 +25,7 @@
 
 @rem Set local scope for the variables, and ensure extensions are enabled
 setlocal EnableExtensions
+if defined __COMPAT_LAYER set "__COMPAT_LAYER=%__COMPAT_LAYER:RUNASADMIN=%"
 
 set DIRNAME=%~dp0
 if "%DIRNAME%"=="" set DIRNAME=.
@@ -69,13 +70,13 @@ echo location of your Java installation. 1>&2
 
 :execute
 @rem Setup the command line
-
-
+set "PRIMEPT_CONSOLE_CODE_PAGE="
+"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -Command "exit ([int]([Console]::IsInputRedirected -and [Console]::IsOutputRedirected -and [Console]::IsErrorRedirected))" 2>NUL
+if "%ERRORLEVEL%"=="0" for /f "tokens=2 delims=:" %%i in ('chcp 2^>NUL') do for /f %%j in ("%%i") do set "PRIMEPT_CONSOLE_CODE_PAGE=%%j"
+if defined PRIMEPT_CONSOLE_CODE_PAGE if not "%PRIMEPT_CONSOLE_CODE_PAGE%"=="65001" set DEFAULT_JVM_OPTS=%DEFAULT_JVM_OPTS% "-Dfile.encoding=CP%PRIMEPT_CONSOLE_CODE_PAGE%"
 
 @rem Execute gradlew
-@rem endlocal doesn't take effect until after the line is parsed and variables are expanded
-@rem which allows us to clear the local environment before executing the java command
-endlocal & "%JAVA_EXE%" %DEFAULT_JVM_OPTS% %JAVA_OPTS% %GRADLE_OPTS% "-Dorg.gradle.appname=%APP_BASE_NAME%" -jar "%APP_HOME%\gradle\wrapper\gradle-wrapper.jar" %* & call :exitWithErrorLevel
+"%JAVA_EXE%" %DEFAULT_JVM_OPTS% %JAVA_OPTS% %GRADLE_OPTS% "-Dorg.gradle.appname=%APP_BASE_NAME%" -jar "%APP_HOME%\gradle\wrapper\gradle-wrapper.jar" %* & call :exitWithErrorLevel
 
 :exitWithErrorLevel
 @rem Use "%COMSPEC%" /c exit to allow operators to work properly in scripts

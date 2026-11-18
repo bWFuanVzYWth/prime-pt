@@ -4,8 +4,9 @@ import mod_scene;
 import mod_lights;
 import params;
 import pt.scene;
-import pt.light_sampling;
 import geometry.ray;
+import light_sampling.area;
+import light_sampling.sample;
 
 /// 每lane输出[forward_pdf,reverse_pdf,真实发光BT.709亮度,有效样本]；仅测试额外binding。
 [[vk::binding(39, 0)]]
@@ -52,7 +53,7 @@ func light_probe_main(id: uint3: SV_DispatchThreadID)->void
     let random =
         float3(lane * (1.0 / 32.0), frac(lane * 0.61803398875), frac(lane * 0.75487766625));
     let p : Params = parameters[0];
-    let light_sample : pt::LightSample = sample_quad_light(surface_point, random, p);
+    let light_sample : light_sampling::LightSample = sample_quad_light(surface_point, random, p);
     if (!(light_sample.pdf > 0))
     {
         probes[id.x] = 0;
@@ -60,15 +61,15 @@ func light_probe_main(id: uint3: SV_DispatchThreadID)->void
     }
     let index : uint = light_sample.emission_reference;
     let flags : uint = asuint(light_sample.emission.z);
-    let area : pt::QuadAreaSample = { flags & 1u, light_sample.emission.xy, 0 };
-    let vertices : pt::LightQuadVertices = emitter_vertices(index);
+    let area : light_sampling::QuadAreaSample = { flags & 1u, light_sample.emission.xy, 0 };
+    let vertices : light_sampling::LightQuadVertices = emitter_vertices(index);
     let translation = float3(light_regions[index].xyz - p.anchor_region.xyz) * 64.0;
     let transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);
     let inverse =
         float3x4(1, 0, 0, -translation.x, 0, 1, 0, -translation.y, 0, 0, 1, -translation.z);
     let endpoint : geometry::TriangleEndpoint =
-                       pt::quad_endpoint(vertices, area, transform, inverse);
+                       light_sampling::quad_endpoint(vertices, area, transform, inverse);
     var hit : pt::Hit = {};
     hit.surface = { endpoint.position, endpoint.normal, endpoint.base_offset };
     hit.identity = uint4(light_meta[index].w * 2u + area.half, asuint(area.bary), 0);

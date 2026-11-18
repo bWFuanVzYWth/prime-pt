@@ -2,6 +2,7 @@
 module mod_decode;
 import mod_materials;
 import pt.scene;
+import transport.surface_material;
 
 public interface IDecodeColor
 {
@@ -406,7 +407,7 @@ typedef UniformSurface AuxResponse;
 
 public func decode_surface<C : IDecodeColor, A : IDecodeAux>(input_hit: pt::Hit,
                                                              emission_scale: float, auxiliary: A)
-    ->pt::SurfaceMaterial
+    ->transport::SurfaceMaterial
 {
     var hit = input_hit;
     let start : uint = material_id(hit.identity.x) * 112u;
@@ -417,7 +418,7 @@ public func decode_surface<C : IDecodeColor, A : IDecodeAux>(input_hit: pt::Hit,
 #endif
     let aux : float4 = AuxResponse.read(hit, start, auxiliary);
     let ior : float = AuxResponse.ior(start, aux);
-    var result : pt::SurfaceMaterial = {};
+    var result : transport::SurfaceMaterial = {};
     result.pbr.base_roughness =
         float4(ColorResponse.read(start, layer.color), AuxResponse.roughness(layer.weights.x, aux));
     result.pbr.surface = float4(ior, layer.weights.yz, Boundary.thickness(start));
@@ -436,7 +437,7 @@ public func decode_surface<C : IDecodeColor, A : IDecodeAux>(input_hit: pt::Hit,
 // raygen也导入叶子声明，但没有材料键；只有探针/通用参考允许执行此入口。
 public func decode_surface<C : IDecodeColor, A : IDecodeAux>(input_hit: pt::Hit,
                                                              emission_scale: float, auxiliary: A)
-    ->pt::SurfaceMaterial
+    ->transport::SurfaceMaterial
 {
     var hit = input_hit;
     let start : uint = material_id(hit.identity.x) * 112u;

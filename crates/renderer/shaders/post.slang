@@ -1,12 +1,12 @@
 /// K3 复用引擎线性累积；宿主编码与上下翻转在独立呈现阶段处理。
 module post;
 import params;
-import pt.post;
+import pt.accumulation;
 import pt.scene;
 import pt.path_sampler;
 import atmosphere.terrain_composite;
 import atmosphere.terrain_frame;
-import geometry.camera;
+import camera.pinhole;
 
 [[vk::binding(0, 0)]]
 var parameters : StructuredBuffer<Params>;
@@ -48,7 +48,7 @@ func post_pixel<let paths : uint, let composite : uint, let frame_film : bool>(i
             id.xy, params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u),
             params.options.z, params.options.x);
         let offset : float2 = frame_film ? 0.5 + params.reconstruction.xy : sampler.film();
-        let film = geometry::camera_sample_uv_offset(id.xy, params.inverse_extent, offset);
+        let film = camera::camera_sample_uv_offset(id.xy, params.inverse_extent, offset);
         if (composite == 1)
             radiance = atmosphere::composite_clear_aerial_bt709(
                 aerial_light, aerial_transmittance, linear_sampler, film, prefix.w,
