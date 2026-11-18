@@ -9,16 +9,14 @@ import geometry.ray;
 import params;
 import mod_materials;
 import light_bvh.sample;
+import light_bvh.world;
 import light_sampling.area;
 import light_sampling.quad;
 import light_sampling.sample;
 
-/// 首行[count,treeBase,0,0]，随后region anchor和紧凑活动槽，再存位置BVH。
-/// BVH按几何发布事务更新；纹理alias仍仅在资源准备阶段构建。
-[[vk::binding(30, 0)]]
-var light_selection : StructuredBuffer<uint4>;
+/// 世界树引用可独立复用的区块子树。区块叶使用稳定灯槽；纹理 alias 属于资源世代。
 [[vk::binding(38, 0)]]
-var light_tree : StructuredBuffer<uint4>;
+var light_tree : StructuredBuffer<light_bvh::LightWorld>;
 /// 每灯[split,rho0,rho1,globalQuadSlot]。
 [[vk::binding(31, 0)]]
 public var light_meta : StructuredBuffer<uint4>;
@@ -28,7 +26,7 @@ public var light_vertices : StructuredBuffer<float4>;
 /// 首行[count,mask,1,0]，后续每桶[key=globalQuadSlot+1,dataSlot+1,0,0]。
 [[vk::binding(33, 0)]]
 var light_inverse : StructuredBuffer<uint4>;
-/// regionKey.xyz与(activeRank<<2)|sideMask；平移在shader按当前anchor计算。
+/// regionKey.xyz 与 (localIndex<<2)|sideMask；局部编号不随其他区块变化。
 [[vk::binding(34, 0)]]
 public var light_regions : StructuredBuffer<int4>;
 /// 每资源世代唯一的静态纹理内alias，control.w>>1给出header word偏移。
@@ -44,7 +42,7 @@ public func emitter_vertices(index: uint)->light_sampling::LightQuadVertices
 /// 本帧已发布的活动灯数；策略权重不依赖单次面积proposal的接受结果。
 public func light_count()->uint
 {
-    return light_selection[0].x;
+    return light_tree[0].counts.x;
 }
 
 func light_hash(input_key: uint)->uint
@@ -114,17 +112,14 @@ public func sample_quad_light(surface_point: geometry::SurfacePoint, random_samp
     ->light_sampling::LightSample
 {
     var result : light_sampling::LightSample = {};
-    let header : uint4 = light_selection[0];
-    if (header.x == 0u)
-        return result;
-    let anchor : int3 = asint(light_selection[1].xyz);
-    let receiver : float3 =
-                       surface_point.position + float3(params.anchor_region.xyz - anchor) * 64.0;
-    var proposal : light_bvh::LightBvhProposal = { light_tree, 0, header.x };
-    let selected : light_bvh::LightBvhSample = proposal.sample(receiver, random_sample.z);
+    let world = light_tree[0];
+    let selected = light_bvh::sample_light_world(world, surface_point.position,
+                                                 params.anchor_region.xyz, random_sample.z);
     if (selected.pmf <= 0)
         return result;
-    let index : uint = light_selection[2u + (selected.light >> 2u)][selected.light & 3u];
+    let region = world.regions[selected.region];
+    let slots = (uint *)(region.words + light_bvh::region_payload(region.count));
+    let index = slots[selected.local];
     var meta : uint4 = light_meta[index];
     let primitive : uint = meta.w * 2u;
     let alias_offset : uint = PublishedArea.alias_offset(primitive);
@@ -165,10 +160,7 @@ public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float
     let index : uint = light_index(hit.identity.x >> 1u);
     if (index == 0xffffffffu)
         return 0;
-    let header : uint4 = light_selection[0];
-    let anchor : int3 = asint(light_selection[1].xyz);
-    let receiver : float3 = previous + float3(anchor_region - anchor) * 64.0;
-    let proposal : light_bvh::LightBvhProposal = { light_tree, 0, header.x };
+    let world = light_tree[0];
     var meta : uint4 = light_meta[index];
     let alias_offset : uint = Area.alias_offset(hit.identity.x);
     var uv : float2 = 0;
@@ -188,8 +180,11 @@ public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float
     }
     let emitter : light_sampling::LightSurfaceProposal = { meta, alias_offset };
     let distribution : light_sampling::TexturedEmitterAlias = { emission_alias_words };
-    let emitter_flags = uint(light_regions[index].w);
-    let selection_pmf = proposal.pmf(receiver, emitter_flags >> 2u);
+    let region = light_regions[index];
+    let emitter_flags = asuint(region.w);
+    let group = light_bvh::light_world_find_region(world, region.xyz);
+    let selection_pmf =
+        light_bvh::light_world_pmf(world, group, emitter_flags >> 2u, previous, anchor_region);
     return light_sampling::quad_emitter_pdf(distribution, emitter, selection_pmf, previous,
                                             hit.surface.position, hit.surface.normal,
                                             hit.identity.x & 1u, uv, emitter_flags & 3u);

@@ -139,9 +139,6 @@ pub enum Error {
     /// 活动光源目录准备失败。
     #[error(transparent)]
     LightRegistry(#[from] light_sampling::registry::Error),
-    /// 光源BVH输入或构建失败。
-    #[error(transparent)]
-    LightBvh(#[from] simple_engine::light_sampling::bvh::Error),
     /// 无法读取开发宿主的工作目录。
     #[error("无法读取开发宿主的工作目录")]
     DevelopmentDirectory(#[source] std::io::Error),
@@ -194,8 +191,7 @@ struct MaterialGpu {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct LightingGpu {
-    tree: Buffer,
-    selection: Buffer,
+    tree: vulkan::native::LightWorld,
     meta: Buffer,
     inverse: Buffer,
     regions: Buffer,
@@ -210,11 +206,7 @@ impl LightingGpu {
             Ok(buffer)
         };
         Ok(Self {
-            tree: Buffer::new(context, 32, false)?,
-            selection: upload(
-                context,
-                tables.map_or(&[0u8; 16], |t| bytemuck::cast_slice(&t.selection)),
-            )?,
+            tree: context.empty_light_world()?,
             meta: upload(
                 context,
                 tables.map_or(&[], |t| bytemuck::cast_slice(&t.meta)),
@@ -229,10 +221,9 @@ impl LightingGpu {
             )?,
         })
     }
-    fn roots(self) -> [vulkan::native::Resource; 5] {
+    fn roots(self) -> [vulkan::native::Resource; 4] {
         [
             self.tree.into(),
-            self.selection.into(),
             self.meta.into(),
             self.inverse.into(),
             self.regions.into(),

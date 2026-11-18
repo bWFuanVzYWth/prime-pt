@@ -674,7 +674,6 @@ impl Gpu {
                 },
                 self.has_emission,
                 self.resource_generation,
-                true,
             )?;
             metrics.light_pack_ns = elapsed_ns(light_started);
             metrics.geometry_ns += metrics.light_pack_ns;
@@ -686,7 +685,6 @@ impl Gpu {
                     };
                     LightingGpu {
                         tree: self.lighting_gpu.tree,
-                        selection: alloc(&mut self.context, tables.selection.len() * 16)?,
                         meta: alloc(&mut self.context, tables.meta.len() * 16)?,
                         regions: alloc(&mut self.context, tables.regions.len() * 16)?,
                         inverse: alloc(&mut self.context, tables.inverse.len() * 16)?,
@@ -699,8 +697,7 @@ impl Gpu {
             };
             if lights.tables.is_some() {
                 metrics.light_upload_ns = elapsed_ns(light_started);
-                metrics.light_upload_bytes = lighting_gpu.selection.len()
-                    + lighting_gpu.meta.len()
+                metrics.light_upload_bytes = lighting_gpu.meta.len()
                     + lighting_gpu.inverse.len()
                     + lighting_gpu.regions.len();
                 metrics.resources_ns += metrics.light_upload_ns;
@@ -738,17 +735,11 @@ impl Gpu {
                     columns.append(instance_quad_bases, offset, bytes)?;
                 }
                 if let Some(t) = &lights.tables {
-                    columns.append(
-                        lighting_gpu.selection,
-                        0,
-                        bytemuck::cast_slice(&t.selection),
-                    )?;
                     columns.append(lighting_gpu.meta, 0, bytemuck::cast_slice(&t.meta))?;
                     columns.append(lighting_gpu.regions, 0, bytemuck::cast_slice(&t.regions))?;
                     columns.append(lighting_gpu.inverse, 0, bytemuck::cast_slice(&t.inverse))?;
                 } else {
                     let p = &lights.patches;
-                    columns.rows(lighting_gpu.selection, &p.selection)?;
                     columns.rows(lighting_gpu.meta, &p.meta)?;
                     columns.rows(lighting_gpu.regions, &p.regions)?;
                     columns.rows(lighting_gpu.inverse, &p.inverse)?;
@@ -938,20 +929,27 @@ impl Gpu {
         };
         drop(pending);
         if let Some(proposal) = &lights.device {
-            let vertices = vertex_buffer.unwrap_or(self.geometry_placeholder);
+            use lighting::LightChunk;
+            use vulkan::native::{LightRegionInput, LightWorldInput};
+            let previous = self.context.light_regions(self.lighting_gpu.tree)?;
+            let mut regions =
+                simple_engine::light_sampling::registry::reserved(proposal.chunks.len())?;
+            regions.extend(proposal.chunks.iter().map(|entry| match *entry {
+                LightChunk::Reuse(index) => LightRegionInput::Reuse(previous[index]),
+                LightChunk::Build { grid, count } => LightRegionInput::Build { grid, count },
+            }));
+            let input = LightWorldInput {
+                vertices: vertex_buffer.unwrap_or(self.geometry_placeholder),
+                leaves: &proposal.leaves,
+                regions: &regions,
+                records: false,
+                source: leaf_source,
+            };
             lighting_gpu.tree = if queued {
-                self.context.enqueue_light_tree_from(
-                    vertices,
-                    &proposal.leaves,
-                    proposal.anchor,
-                    false,
-                    leaf_source,
-                )?
+                self.context.enqueue_light_world(input)?
             } else {
-                self.context
-                    .build_light_tree(vertices, &proposal.leaves, proposal.anchor, false)?
-            }
-            .tree;
+                self.context.build_light_world(input)?
+            };
             metrics.light_upload_bytes += size_of_val(proposal.leaves.as_slice()) as u64;
         }
         let geometry_buffer = vertex_buffer.unwrap_or(self.geometry_placeholder);
@@ -990,15 +988,11 @@ impl Gpu {
                 .map(|(row, value)| (row * 16, bytemuck::bytes_of(value)))
                 .collect()
         }
-        let selection_writes = rows(&patches.selection);
         let meta_writes = rows(&patches.meta);
         let inverse_writes = rows(&patches.inverse);
         let region_writes = rows(&patches.regions);
-        let light_patch_bytes = (selection_writes.len()
-            + meta_writes.len()
-            + inverse_writes.len()
-            + region_writes.len()) as u64
-            * 16;
+        let light_patch_bytes =
+            (meta_writes.len() + inverse_writes.len() + region_writes.len()) as u64 * 16;
 
         let writes: Vec<_> = ranges
             .iter()
@@ -1011,7 +1005,6 @@ impl Gpu {
             let patches: &[(&Buffer, &vulkan::native::BufferWriteRanges<'_>)] = &[
                 (&quads, &writes),
                 (&instance_quad_bases, base_write.as_slice()),
-                (&lighting_gpu.selection, &selection_writes),
                 (&lighting_gpu.meta, &meta_writes),
                 (&lighting_gpu.inverse, &inverse_writes),
                 (&lighting_gpu.regions, &region_writes),

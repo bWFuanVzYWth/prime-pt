@@ -33,16 +33,22 @@ struct Stamp {
 struct RegionLights {
     stamp: Stamp,
     ids: Vec<u32>,
+    world_index: usize,
 }
 
 enum PreparedRegion {
-    Reused { index: usize, stamp: Stamp },
+    Reused {
+        index: usize,
+        stamp: Stamp,
+        world_index: usize,
+    },
     Built(RegionLights),
 }
 
 struct Addition {
     entry: usize,
     position: usize,
+    leaf: usize,
     record: Record,
 }
 
@@ -70,7 +76,37 @@ pub(super) struct Preparation {
     update: LightingUpdate,
     pub tables: Option<Tables>,
     pub patches: TablePatches,
-    pub device: Option<registry::DeviceProposal>,
+    pub device: Option<WorldUpdate>,
+}
+
+pub(super) enum LightChunk {
+    Reuse(usize),
+    Build { grid: [i32; 3], count: u32 },
+}
+
+#[derive(Default)]
+pub(super) struct WorldUpdate {
+    pub chunks: Vec<LightChunk>,
+    pub leaves: Vec<[u32; 4]>,
+}
+
+impl WorldUpdate {
+    fn add_chunk(&mut self, chunk: LightChunk) -> Result<(), Error> {
+        self.chunks
+            .try_reserve(1)
+            .map_err(prime_scene::Error::Allocation)?;
+        self.chunks.push(chunk);
+        Ok(())
+    }
+
+    fn add_leaf(&mut self, record: Record, id: u32) -> Result<(), Error> {
+        self.leaves
+            .try_reserve(1)
+            .map_err(prime_scene::Error::Allocation)?;
+        self.leaves
+            .push([record.meta[3], record.power.to_bits(), id, 0]);
+        Ok(())
+    }
 }
 
 /// 独占已校验的CPU目录；GPU原子写成功后提交，丢弃则旧目录不变。
@@ -106,12 +142,17 @@ impl LightingPublication<'_> {
         for entry in update.entries {
             let region = match entry {
                 PreparedRegion::Built(region) => region,
-                PreparedRegion::Reused { index, stamp } => {
+                PreparedRegion::Reused {
+                    index,
+                    stamp,
+                    world_index,
+                } => {
                     while current.peek().is_some_and(|(old, _)| *old < index) {
                         current.next();
                     }
                     let mut region = current.next().expect("准备阶段保持有序复用身份").1;
                     region.stamp = stamp;
+                    region.world_index = world_index;
                     region
                 }
             };
@@ -149,7 +190,7 @@ impl Lighting {
             .map_err(|_| Error::Invalid("发光目录所有者身份耗尽"))?;
         Ok(Self {
             regions: Vec::new(),
-            registry: Registry::new(64.0)?,
+            registry: Registry::default(),
             owner,
             version: 0,
             epoch: 0,
@@ -174,7 +215,6 @@ impl Lighting {
             emitters,
             possible,
             epoch,
-            false,
         )
     }
     pub fn prepare_backend<'a>(
@@ -184,7 +224,6 @@ impl Lighting {
         emitters: Emitters<'_>,
         possible: bool,
         epoch: u64,
-        device: bool,
     ) -> Result<Preparation, Error> {
         if source.regions.len() != regions.len() {
             return Err(Error::Invalid("发光region与属性槽目录长度不匹配"));
@@ -193,6 +232,8 @@ impl Lighting {
         let next = reserved(source.regions.len())?;
         let mut writer = Writer::new(&self.registry);
         let mut additions = Vec::new();
+        let mut device = WorldUpdate::default();
+        let mut light_changed = false;
         let mut old_index = 0;
         let mut previous = None;
         let same_resources = self.epoch == epoch && self.possible == possible;
@@ -206,7 +247,9 @@ impl Lighting {
                 .get(old_index)
                 .is_some_and(|old| old.stamp.key < region.key)
             {
-                remove_region(&mut writer, &self.regions[old_index])?;
+                let old = &self.regions[old_index];
+                remove_region(&mut writer, old)?;
+                light_changed |= !old.ids.is_empty();
                 old_index += 1;
             }
             let old = self
@@ -245,21 +288,37 @@ impl Lighting {
                             writer.replace(id, record)?;
                         }
                     }
-                    entries.push(PreparedRegion::Reused { index, stamp });
+                    let world_index = device.chunks.len();
+                    if !old.ids.is_empty() {
+                        device.add_chunk(LightChunk::Reuse(old.world_index))?;
+                    }
+                    entries.push(PreparedRegion::Reused {
+                        index,
+                        stamp,
+                        world_index,
+                    });
                     continue;
                 }
             }
             let mut ids = reserved(cached.map_or(0, <[Record]>::len))?;
             let old_region = old.map(|index| &self.regions[index]);
+            let mut same_lights = old_region.is_some();
+            let first_leaf = device.leaves.len();
             let mut cursor = 0;
             for_each_light(*region, emitters, possible, cached, |mut record| {
                 ids.try_reserve(1).map_err(prime_scene::Error::Allocation)?;
+                if ids.len() >= light_sampling::SELECTORS as usize {
+                    return Err(Error::Invalid("区块光源数超过24位采样域"));
+                }
+                record.region[3] = (record.region[3] & 3) | ((ids.len() as u32) << 2);
                 let local_index = record.meta[3];
                 record.meta[3] = base
                     .checked_add(local_index)
                     .ok_or(Error::Invalid("发光属性槽溢出"))?;
                 if self.regions.is_empty() {
-                    ids.push(writer.add(record)?);
+                    let id = writer.add(record)?;
+                    ids.push(id);
+                    device.add_leaf(record, id)?;
                     return Ok(());
                 }
                 while let Some(old) = old_region
@@ -267,37 +326,67 @@ impl Lighting {
                     && local(&self.registry, old, id)? < local_index
                 {
                     writer.remove(id)?;
+                    same_lights = false;
                     cursor += 1;
                 }
                 let reused = old_region.and_then(|old| old.ids.get(cursor).copied());
                 if let Some(id) = reused
                     && local(&self.registry, old_region.expect("已有旧身份"), id)? == local_index
                 {
+                    let old = self.registry.record(id);
+                    same_lights &= old.power.to_bits() == record.power.to_bits()
+                        && old.vertices.map(|row| row.map(f32::to_bits))
+                            == record.vertices.map(|row| row.map(f32::to_bits));
                     writer.replace(id, record)?;
                     ids.push(id);
+                    device.add_leaf(record, id)?;
                     cursor += 1;
                 } else {
+                    same_lights = false;
                     additions
                         .try_reserve(1)
                         .map_err(prime_scene::Error::Allocation)?;
                     additions.push(Addition {
                         entry: entries.len(),
                         position: ids.len(),
+                        leaf: device.leaves.len(),
                         record,
                     });
                     ids.push(u32::MAX);
+                    device.add_leaf(record, u32::MAX)?;
                 }
                 Ok(())
             })?;
             if let Some(old) = old_region {
+                same_lights &= cursor == old.ids.len();
                 for &id in &old.ids[cursor..] {
                     writer.remove(id)?;
                 }
             }
-            entries.push(PreparedRegion::Built(RegionLights { stamp, ids }));
+            let world_index = device.chunks.len();
+            if ids.is_empty() {
+                light_changed |= old_region.is_some_and(|old| !old.ids.is_empty());
+            } else if same_lights {
+                device.leaves.truncate(first_leaf);
+                device.add_chunk(LightChunk::Reuse(
+                    old_region.expect("复用时存在旧区块").world_index,
+                ))?;
+            } else {
+                light_changed = true;
+                device.add_chunk(LightChunk::Build {
+                    grid: stamp.key,
+                    count: ids.len() as u32,
+                })?;
+            }
+            entries.push(PreparedRegion::Built(RegionLights {
+                stamp,
+                ids,
+                world_index,
+            }));
         }
         for old in &self.regions[old_index..] {
             remove_region(&mut writer, old)?;
+            light_changed |= !old.ids.is_empty();
         }
         // 所有删除先于新增分配，回收槽可在同一事务内复用，不产生临时容量峰值。
         for addition in additions {
@@ -306,13 +395,9 @@ impl Lighting {
                 unreachable!("新增灯属于新region记录")
             };
             region.ids[addition.position] = id;
+            device.leaves[addition.leaf][2] = id;
         }
-        let (registry, tables, patches, device) = if device {
-            writer.finish_for_gpu()?
-        } else {
-            let (r, t, p) = writer.finish()?;
-            (r, t, p, None)
-        };
+        let (registry, tables, patches) = writer.finish_for_gpu()?;
         Ok(Preparation {
             update: LightingUpdate {
                 owner: self.owner,
@@ -326,7 +411,7 @@ impl Lighting {
             },
             tables,
             patches,
-            device,
+            device: light_changed.then_some(device),
         })
     }
 
@@ -528,8 +613,7 @@ mod tests {
     }
 
     fn empty(patches: &TablePatches) -> bool {
-        patches.selection.is_empty()
-            && patches.meta.is_empty()
+        patches.meta.is_empty()
             && patches.vertices.is_empty()
             && patches.inverse.is_empty()
             && patches.regions.is_empty()
@@ -548,7 +632,6 @@ mod tests {
         let initial = lighting
             .prepare(view(&regions), &[0], EMITTERS, true, 1)
             .unwrap();
-        let tree_base = initial.tables.as_ref().unwrap().selection[0][1] as usize;
         lighting.publication(initial).unwrap().commit();
         let ids = lighting.regions[0].ids.clone();
         let mut changed = Mesh {
@@ -573,18 +656,7 @@ mod tests {
         assert!(prep.tables.is_none());
         assert_eq!(prep.patches.vertices.len(), 3);
         assert!(prep.patches.meta.is_empty());
-        assert!(
-            prep.patches
-                .selection
-                .iter()
-                .all(|(row, _)| *row == 0 || *row >= tree_base)
-        );
-        assert!(
-            prep.patches
-                .selection
-                .iter()
-                .any(|(row, _)| *row >= tree_base)
-        );
+        assert!(prep.device.is_some());
         assert!(
             prep.patches
                 .vertices
@@ -624,7 +696,7 @@ mod tests {
         let changed = lighting
             .prepare(view(&regions), &[0], emitters(&[1., 16.]), true, 2)
             .unwrap();
-        assert!(!changed.patches.selection.is_empty());
+        assert!(changed.device.is_some());
         assert!(changed.patches.vertices.is_empty());
         assert!(changed.patches.meta.is_empty());
         assert!(changed.patches.regions.is_empty());

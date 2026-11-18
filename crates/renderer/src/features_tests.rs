@@ -1469,7 +1469,7 @@ fn assert_light_pdfs(
 }
 
 #[test]
-#[ignore = "真实Vulkan RT；稳定灯数据槽与紧凑选择rank分离后正逆PDF保持一致"]
+#[ignore = "真实Vulkan RT；稳定灯数据槽与区块局部灯序号分离后正逆PDF保持一致"]
 fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
@@ -1495,17 +1495,14 @@ fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
     mesh.quads.push(quad);
     publish(&mut gpu, &mesh, 2, 3, [0.; 3])?;
     assert_eq!(gpu.lighting_gpu.roots()[1..], lighting.roots()[1..]);
-    let mut bytes = vec![0; lighting.selection.len() as usize];
-    lighting.selection.read(&mut gpu.context, 0, &mut bytes)?;
-    let selectors: Vec<u32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|v| u32::from_le_bytes(*v))
-        .collect();
-    assert_eq!(selectors[0], 6);
-    assert_eq!(selectors[9], 5, "末灯移到rank1且保留data slot5");
-    assert_eq!(selectors[13], 1, "新灯重用data slot1但位于rank5");
+    let mut bytes = vec![0; lighting.regions.len() as usize];
+    lighting.regions.read(&mut gpu.context, 0, &mut bytes)?;
+    let word = |slot: usize| {
+        let at = slot * 16 + 12;
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) >> 2
+    };
+    assert_eq!(word(5), 4, "原末灯在本区块内前移并保留 data slot5");
+    assert_eq!(word(1), 5, "新灯重用 data slot1 并位于本区块末尾");
     assert_light_pdfs(&host, &mut gpu, &image, "swap_and_reuse")?;
     mesh.quads[2] = Quad::with_material(
         quad.positions()
@@ -1522,7 +1519,64 @@ fn hardware_pt_light_slot_reuse_keeps_forward_and_reverse_pdf_equal()
 }
 
 #[test]
-#[ignore = "真实 Vulkan；多组灯跨越 64 项排序块时，空间重排仍能按原 rank 反查"]
+#[ignore = "真实 Vulkan；单区块改灯时复用另一块的设备子树"]
+fn hardware_pt_point_edit_reuses_other_light_regions() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    let lamp = MaterialDefinition {
+        emission: [1., 1., 1., 20.],
+        ..Default::default()
+    };
+    upload(&mut gpu, &[lamp], &[], &[[u32::MAX, 0, 0, 0]])?;
+    let q = scene().quads[1];
+    let lamp = Quad::with_material(q.positions(), q.uv(), q.tint(), MaterialId::new(0));
+    let mesh = Mesh { quads: vec![lamp] };
+    let changed = Mesh {
+        quads: vec![lamp, lamp],
+    };
+    let mut regions = [
+        RenderRegion {
+            key: [-1, 0, 0],
+            geometry_revision: 1,
+            content_revision: 1,
+            mesh: (&mesh).into(),
+        },
+        RenderRegion {
+            key: [1, 0, 0],
+            geometry_revision: 1,
+            content_revision: 1,
+            mesh: (&mesh).into(),
+        },
+    ];
+    let generation = gpu.resource_generation;
+    gpu.set_regions(RenderView {
+        generation,
+        regions: &regions,
+        anchor: [0.; 3],
+    })?;
+    let original = gpu.lighting_gpu.tree;
+    let before = gpu.context.light_regions(original)?.to_vec();
+    regions[0].geometry_revision += 1;
+    regions[0].content_revision += 1;
+    regions[0].mesh = (&changed).into();
+    gpu.set_regions(RenderView {
+        generation,
+        regions: &regions,
+        anchor: [0.; 3],
+    })?;
+    let rebuilt = gpu.lighting_gpu.tree;
+    assert_ne!(original, rebuilt);
+    let after = gpu.context.light_regions(rebuilt)?;
+    assert_eq!(after[0].count(), 2);
+    assert_ne!(before[0], after[0]);
+    assert_eq!(before[1], after[1]);
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan；区块内的灯跨越 64 项排序块时，空间重排仍能按原 rank 反查"]
 fn hardware_pt_spatial_light_merge_keeps_inverse_paths() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
     let mut session = host.gpu()?;
@@ -1550,27 +1604,9 @@ fn hardware_pt_spatial_light_merge_keeps_inverse_paths() -> Result<(), Box<dyn s
     };
     publish(&mut gpu, &mesh, 1, 1, [0.; 3])?;
     assert_light_pdfs(&host, &mut gpu, &image, "149_spatial_leaves")?;
-    let buffer = gpu.lighting_gpu.tree;
-    let readback = Buffer::new(&mut gpu.context, buffer.len(), true)?;
-    buffer.copy_prefix_to(&mut gpu.context, &readback, buffer.len())?;
-    let mut words = vec![0u32; buffer.len() as usize / 4];
-    readback.read(&mut gpu.context, 0, bytemuck::cast_slice_mut(&mut words))?;
-    let leaves = ((count - 1) * 10).next_multiple_of(8);
-    let mut ordered = Vec::new();
-    for rank in 0..count {
-        let leaf = &words[leaves + 8 * rank..];
-        let encoded = leaf[7];
-        let depth = encoded >> 27;
-        let path = (encoded & ((1 << 27) - 1)).reverse_bits();
-        assert!((7..=8).contains(&depth));
-        ordered.push((path, f32::from_bits(leaf[0])));
-    }
-    ordered.sort_unstable_by_key(|p| p.0);
-    assert!(
-        ordered
-            .windows(2)
-            .all(|p| p[0].0 < p[1].0 && p[0].1 < p[1].1)
-    );
+    let regions = gpu.context.light_regions(gpu.lighting_gpu.tree)?;
+    assert_eq!(regions.len(), 1);
+    assert_eq!(regions[0].count() as usize, count);
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }

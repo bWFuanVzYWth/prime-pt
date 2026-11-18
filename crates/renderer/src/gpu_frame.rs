@@ -37,7 +37,7 @@ impl Gpu {
             buffer(&materials.table),
             Binding::SampledImage(materials.mers),
             Binding::SampledImage(materials.auxiliary),
-            buffer(&lighting.selection),
+            buffer(&lighting.meta), // 预留原活动灯序号列的绑定。
             buffer(&lighting.meta),
             buffer(&self.known_geometry.unwrap_or(self.geometry_placeholder)),
             buffer(&lighting.inverse),
@@ -45,7 +45,7 @@ impl Gpu {
             buffer(&materials.emission_alias),
             buffer(&scene.instance_quad_bases),
             buffer(&scene.tokens),
-            buffer(&lighting.tree),
+            Binding::LightWorld(lighting.tree),
         ]);
         let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![
