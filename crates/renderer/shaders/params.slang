@@ -33,7 +33,7 @@ public struct Params
     public var previous_forward : float4;
     public var previous_right : float4;
     public var previous_up : float4;
-    /// xy=输出尺寸；z bit0诊断、bit2作者法线、bit5实时首面策略；w非零启用质量档平方根轮盘。
+    /// xy=输出尺寸；z bit0诊断、bit2作者法线、bit5实时首面策略。
     public var output_size : uint4;
     /// 当前64m anchor的整数region坐标；光源保持region-local不随anchor重打包。
     public var anchor_region : int4;
@@ -47,6 +47,5 @@ public struct Params
 
 public func settings(params: Params)->pt::Settings
 {
-    return { params.options.x, params.options.y, params.options.z, params.options.w,
-             params.output_size.w != 0 };
+    return { params.options.x, params.options.y, params.options.z, params.options.w };
 }

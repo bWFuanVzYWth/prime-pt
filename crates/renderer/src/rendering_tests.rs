@@ -276,16 +276,16 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
         let view = gpu.view.as_ref().unwrap();
         assert_eq!(view.extent, [32, 32]);
         assert!(!view.rr_enabled && gpu.rr_runtime.is_none());
-        assert_eq!(gpu.accumulated_samples(), 4);
+        assert_eq!(gpu.accumulated_samples(), 2);
         assert_eq!(view.accumulation, accumulation);
         assert_eq!(view.counts, counts);
-        assert_eq!(gpu.absolute_sample, sequence_start + (frame + 1) * 4);
+        assert_eq!(gpu.absolute_sample, sequence_start + (frame + 1) * 2);
         assert!(
             download_buffer(&mut gpu, counts)?
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .all(|v| u32::from_le_bytes(*v) == 4)
+                .all(|v| u32::from_le_bytes(*v) == 2)
         );
         displays.push(output.download(&mut gpu.context)?);
     }
@@ -301,19 +301,19 @@ fn hardware_pt_diagnostic_bypasses_reconstruction_and_accumulation()
         Environment::default(),
         options,
     )?;
-    assert_eq!(gpu.accumulated_samples(), 8);
+    assert_eq!(gpu.accumulated_samples(), 2);
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
 }
 
 #[test]
-#[ignore = "真实Vulkan RT；4 SPP诊断逐像素等于同一身份的四个1 SPP帧均值"]
+#[ignore = "真实Vulkan RT；2 SPP 诊断逐像素等于同一身份的两个离线单样本的均值"]
 fn hardware_pt_diagnostic_batch_matches_single_sample_mean()
 -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
     let mut expected = Vec::<Vec<f64>>::new();
-    for spp in [1, 4] {
+    for spp in [1, 2] {
         let mut session = host.gpu()?;
         let mut gpu = session.gpu();
         let output = image(&mut gpu)?;
@@ -321,7 +321,13 @@ fn hardware_pt_diagnostic_batch_matches_single_sample_mean()
         add_quad(&mut mesh, 2., [0.5; 2], [0.8, 0.6, 0.4], 4.);
         publish(&mut gpu, &mesh, 1)?;
         gpu.set_render_tuning(prime_scene::RenderTuning::new(true))?;
+        if spp == 1 {
+            gpu.set_rendering(prime_scene::RenderMode::Offline)?;
+        }
         for frame in 0..8 / spp {
+            if spp == 1 {
+                gpu.invalidate()?;
+            }
             host.render_options(
                 &mut gpu,
                 &output,
@@ -338,17 +344,17 @@ fn hardware_pt_diagnostic_batch_matches_single_sample_mean()
                 .map(|v| f64::from(f32::from_le_bytes(*v)))
                 .collect();
             if spp == 1 {
-                if frame % 4 == 0 {
+                if frame % 2 == 0 {
                     expected.push(vec![0.; values.len()]);
                 }
                 for (sum, value) in expected.last_mut().unwrap().iter_mut().zip(values) {
-                    *sum += value / 4.;
+                    *sum += value / 2.;
                 }
             } else {
                 for (actual, target) in values.iter().zip(&expected[frame as usize]) {
                     assert!(
                         (actual - target).abs() <= 5e-6 * target.abs().max(1.),
-                        "4 SPP={actual}, 1 SPP均值={target}"
+                        "2 SPP={actual}, 1 SPP均值={target}"
                     );
                 }
             }

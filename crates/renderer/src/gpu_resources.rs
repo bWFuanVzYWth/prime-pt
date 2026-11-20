@@ -507,7 +507,7 @@ impl Gpu {
                 if reordered && !self.context.capabilities().invocation_reorder {
                     continue;
                 }
-                for entry in ["render_rt1", "render_rt2_lane0", "render_rt2_lane1"]
+                for entry in ["render_rt2_lane0", "render_rt2_lane1"]
                     .into_iter()
                     .chain(cfg!(test).then_some("render_rt2_merged"))
                 {
@@ -778,25 +778,21 @@ impl Gpu {
                 }
             }
             if dispatch == 8 && !reference {
-                let base = usize::from(reordered) * if cfg!(test) { 4 } else { 3 };
+                let base = usize::from(reordered) * if cfg!(test) { 3 } else { 2 };
                 result.realtime = Some(RealtimePrograms {
                     primary: &primary_shaders,
-                    transport: RayShader {
-                        spirv: realtime_graphs[base].bytes(),
-                        entry: c"render_rt1",
-                    },
-                    transport_pair: Some([
+                    transport_pair: [
                         RayShader {
-                            spirv: realtime_graphs[base + 1].bytes(),
+                            spirv: realtime_graphs[base].bytes(),
                             entry: c"render_rt2_lane0",
                         },
                         RayShader {
-                            spirv: realtime_graphs[base + 2].bytes(),
+                            spirv: realtime_graphs[base + 1].bytes(),
                             entry: c"render_rt2_lane1",
                         },
-                    ]),
+                    ],
                     merged: cfg!(test).then(|| RayShader {
-                        spirv: realtime_graphs[base + 3].bytes(),
+                        spirv: realtime_graphs[base + 2].bytes(),
                         entry: c"render_rt2_merged",
                     }),
                     callables: &primary_callables,

@@ -524,7 +524,7 @@ impl Host {
             // SAFETY: Host::create 在该测试逻辑设备显式启用同一 NV 扩展。
             unsafe { gpu.enable_diagnostic_checkpoints()? };
         }
-        gpu.settings.samples = 64;
+        gpu.settings.samples = pt::REALTIME_SAMPLES;
         gpu.settings.max_bounces = 6;
         gpu.display_timeline.set_enabled(false);
         Ok(Session {
@@ -750,8 +750,8 @@ fn center(pixels: &[u8]) -> &[u8] {
 }
 
 #[test]
-#[ignore = "真实Vulkan RT；验证质量轮盘仅在实时质量档启用，覆盖Hit Group和兼容入口"]
-fn hardware_sampling_strategy_roulette_scope() -> Result<(), Box<dyn std::error::Error>> {
+#[ignore = "真实Vulkan RT；实时固定双样本，离线接受原批大小，覆盖 Hit Group 和兼容入口"]
+fn hardware_realtime_quality_and_offline_batches() -> Result<(), Box<dyn std::error::Error>> {
     for hit_groups in [false, true] {
         let host = Host::create(false, hit_groups)?;
         let mut session = host.gpu()?;
@@ -760,38 +760,22 @@ fn hardware_sampling_strategy_roulette_scope() -> Result<(), Box<dyn std::error:
         let mut mesh = Mesh::default();
         add_quad(&mut mesh, 2., [0.5; 2], [1.; 3], 1.5);
         gpu.set_scene(&mesh)?;
-        for (mode, samples, expected) in [
-            (prime_scene::RenderMode::Realtime, 1, 0u32),
-            (prime_scene::RenderMode::Realtime, 2, 1),
-            (prime_scene::RenderMode::Offline, 2, 0),
-            (prime_scene::RenderMode::Realtime, 1, 0),
+        for (mode, requested, expected) in [
+            (prime_scene::RenderMode::Realtime, 1, 2),
+            (prime_scene::RenderMode::Offline, 5, 5),
+            (prime_scene::RenderMode::Realtime, 5, 2),
         ] {
             gpu.set_rendering(mode)?;
+            let first = gpu.absolute_sample;
             host.render_options(
                 gpu,
                 &output,
                 &camera(),
                 Environment::default(),
-                Options::new(false, streamline::Quality::Dlaa, samples, 8)?,
+                Options::new(false, streamline::Quality::Dlaa, requested, 8)?,
             )?;
-            let view = gpu.view.as_ref().unwrap();
-            // 按Params字段定位output_size.w。
-            let policy_offset = (16
-                + 4
-                + 4
-                + gpu.display_drt.to_array().len()
-                + 4
-                + gpu.atmosphere.parameters().words().len()
-                + 4
-                + 4
-                + 4
-                + 16
-                + 3)
-                * 4;
-            let mut policy = [0; 4];
-            view.params
-                .read(&mut gpu.context, policy_offset as u64, &mut policy)?;
-            assert_eq!(u32::from_le_bytes(policy), expected);
+            assert_eq!(gpu.absolute_sample - first, expected);
+            assert_eq!(gpu.accumulated_samples(), expected);
         }
         assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     }
@@ -825,19 +809,21 @@ fn hardware_pt_ser_matches_plain() -> Result<(), Box<dyn std::error::Error>> {
         quad.translate([0.4, 0., 0.]);
     }
     gpu.set_scene(&mesh)?;
-    let mut view = View::new(&mut gpu.context, [32, 32], false)?;
+    let mut view = View::new(&mut gpu.context, [32, 32], false, &mut gpu.bloom_filter)?;
     view.accumulation = Buffer::new(&mut gpu.context, 32 * 32 * 16, true)?;
     view.counts = Buffer::new(&mut gpu.context, 32 * 32 * 4, true)?;
     view.prefix = Buffer::new(&mut gpu.context, 32 * 32 * 16, true)?;
     gpu.view = Some(view);
     // 对照开始前完成 SkyView/Aerial 首次生成，三个受检帧共用已完成的环境资源。
     host.render(&mut gpu, &image, &camera())?;
+    let first_sample = gpu.absolute_sample;
     let mut reference: Option<Frame> = None;
     let mut unchanged = true;
     for (index, invocation_reorder) in [false, false, true, false].into_iter().enumerate() {
         // 通过生产设置入口切换，只重置计数以比较同一绝对样本序列。
         gpu.set_ser(invocation_reorder)?;
         gpu.invalidate()?;
+        gpu.test_restart_sample_sequence(first_sample)?;
         let display = host.render(&mut gpu, &image, &camera())?;
         let mut hdr = vec![0; 32 * 32 * 16];
         gpu.view
@@ -858,7 +844,7 @@ fn hardware_pt_ser_matches_plain() -> Result<(), Box<dyn std::error::Error>> {
                 .as_chunks::<4>()
                 .0
                 .iter()
-                .all(|word| u32::from_le_bytes(*word) == 64)
+                .all(|word| u32::from_le_bytes(*word) == 2)
         );
         if let Ok(directory) = std::env::var("PRIMARY_RT_SER_CAPTURE") {
             let directory = std::path::Path::new(&directory);
@@ -957,7 +943,7 @@ fn hardware_pt_ser_toggle_preserves_history() -> Result<(), Box<dyn std::error::
     assert!(!gpu.invocation_reorder);
     let image = image(&mut gpu)?;
     host.render(&mut gpu, &image, &camera())?;
-    for (enabled, expected_samples) in [(true, 128), (false, 192), (true, 256)] {
+    for (enabled, expected_samples) in [(true, 4), (false, 6), (true, 8)] {
         let started = std::time::Instant::now();
         gpu.set_ser(enabled)?;
         eprintln!("mod SER={enabled} 切换准备耗时={:?}", started.elapsed());
@@ -965,7 +951,7 @@ fn hardware_pt_ser_toggle_preserves_history() -> Result<(), Box<dyn std::error::
         assert!(gpu.context.capabilities().invocation_reorder);
         assert_eq!(
             gpu.view.as_ref().unwrap().progress.samples(),
-            expected_samples - 64
+            expected_samples - 2
         );
         host.render(&mut gpu, &image, &camera())?;
         let view = gpu.view.as_ref().unwrap();
@@ -987,7 +973,7 @@ fn hardware_pt_ser_unavailable_uses_plain() -> Result<(), Box<dyn std::error::Er
     assert!(!gpu.invocation_reorder);
     let image = image(&mut gpu)?;
     host.render(&mut gpu, &image, &camera())?;
-    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 64);
+    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 2);
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
@@ -1030,9 +1016,11 @@ fn hardware_pt_alpha_cutout() -> Result<(), Box<dyn std::error::Error>> {
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 2., [0.75, 0.5], [1.; 3], 2.);
     gpu.set_scene(&mesh)?;
+    let first_sample = gpu.absolute_sample;
     let reference = host.render(&mut gpu, &image, &camera())?;
     add_quad(&mut mesh, 1., [0.25, 0.5], [1.; 3], 1.);
     gpu.set_scene(&mesh)?;
+    gpu.test_restart_sample_sequence(first_sample)?;
     let cutout = host.render(&mut gpu, &image, &camera())?;
     assert_eq!(center(&reference), center(&cutout));
     session.finish()?;
@@ -1176,9 +1164,12 @@ fn hardware_pt_sample_batching() -> Result<(), Box<dyn std::error::Error>> {
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 1., [0.5; 2], [0.5, 1., 0.5], 0.7);
     gpu.set_scene(&mesh)?;
+    gpu.set_rendering(prime_scene::RenderMode::Offline)?;
     gpu.settings.samples = 8;
+    let first = gpu.absolute_sample;
     let batched = host.render(&mut gpu, &image, &camera())?;
     gpu.restart_accumulation()?;
+    gpu.test_restart_sample_sequence(first)?;
     gpu.settings.samples = 1;
     let mut split = Vec::new();
     for _ in 0..8 {
@@ -1276,8 +1267,10 @@ fn hardware_pt_camera_resets_history() -> Result<(), Box<dyn std::error::Error>>
     host.render(&mut gpu, &image, &camera())?;
     let mut shifted = camera();
     shifted.origin[0] = 100.;
+    let first_sample = gpu.absolute_sample;
     let changed = host.render(&mut gpu, &image, &shifted)?;
     gpu.restart_accumulation()?;
+    gpu.test_restart_sample_sequence(first_sample)?;
     let fresh = host.render(&mut gpu, &image, &shifted)?;
     assert_eq!(changed, fresh);
     session.finish()?;
@@ -1299,6 +1292,7 @@ fn hardware_pt_sun_cutout_shadow() -> Result<(), Box<dyn std::error::Error>> {
     let mut mesh = Mesh::default();
     add_quad(&mut mesh, 3., [0.75, 0.5], [1.; 3], 5.);
     gpu.set_scene(&mesh)?;
+    let first_sample = gpu.absolute_sample;
     let lit = host.render_environment(&mut gpu, &image, &camera(), environment)?;
     let start = mesh.quads.len();
     add_quad(&mut mesh, 2., [0.25, 0.5], [1.; 3], 0.5);
@@ -1307,9 +1301,11 @@ fn hardware_pt_sun_cutout_shadow() -> Result<(), Box<dyn std::error::Error>> {
     }
     gpu.set_scene(&mesh)?;
     gpu.set_atlas(2, 1, &[255, 255, 255, 127, 255, 255, 255, 255])?;
+    gpu.test_restart_sample_sequence(first_sample)?;
     let cutout = host.render_environment(&mut gpu, &image, &camera(), environment)?;
     assert_eq!(center(&lit), center(&cutout));
     gpu.set_atlas(2, 1, &[255; 8])?;
+    gpu.test_restart_sample_sequence(first_sample)?;
     let shadow = host.render_environment(&mut gpu, &image, &camera(), environment)?;
     assert!(
         (0..3).all(|i| center(&lit)[i] > center(&shadow)[i] + 8),
@@ -1336,7 +1332,7 @@ fn hardware_pt_sky_direction() -> Result<(), Box<dyn std::error::Error>> {
     let forward = host.render_environment(&mut gpu, &image, &camera(), environment)?;
     environment.sun_direction = [0., 0.6, -0.8];
     let backward = host.render_environment(&mut gpu, &image, &camera(), environment)?;
-    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 64);
+    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 2);
     assert_ne!(center(&forward), center(&backward), "天空应随太阳方向变化");
     environment.sun_direction = [0.8, 0.6, 0.];
     let mut rotated = camera();
@@ -1391,7 +1387,7 @@ fn hardware_pt_exposure_preserves_history() -> Result<(), Box<dyn std::error::Er
     let mut session = host.gpu()?;
     let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
-    let mut view = View::new(&mut gpu.context, [32, 32], false)?;
+    let mut view = View::new(&mut gpu.context, [32, 32], false, &mut gpu.bloom_filter)?;
     view.accumulation = Buffer::new(&mut gpu.context, 32 * 32 * 16, true)?;
     gpu.view = Some(view);
     let mut environment = Environment::default();
@@ -1400,7 +1396,7 @@ fn hardware_pt_exposure_preserves_history() -> Result<(), Box<dyn std::error::Er
     let mapping = *gpu.atmosphere.sky_mapping();
     environment.exposure_ev = 2.;
     let exposed = host.render_environment(&mut gpu, &image, &camera(), environment)?;
-    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 128);
+    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 4);
     assert_eq!(gpu.atmosphere.parameters().words(), &atmosphere);
     assert_eq!(gpu.atmosphere.sky_mapping(), &mapping);
     let brightness = |pixels: &[u8]| {
@@ -1412,7 +1408,7 @@ fn hardware_pt_exposure_preserves_history() -> Result<(), Box<dyn std::error::Er
     assert!(brightness(&exposed) > brightness(&initial));
     environment.exposure_ev = -2.;
     let dark = host.render_environment(&mut gpu, &image, &camera(), environment)?;
-    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 192);
+    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 6);
     assert!(brightness(&dark) < brightness(&initial));
     let mut exposed_hdr = vec![0; 32 * 32 * 16];
     gpu.view
@@ -1421,17 +1417,19 @@ fn hardware_pt_exposure_preserves_history() -> Result<(), Box<dyn std::error::Er
         .accumulation
         .read(&mut gpu.context, 0, &mut exposed_hdr)?;
     gpu.restart_accumulation()?;
-    gpu.settings.samples = 192;
+    gpu.test_restart_sample_sequence(0)?;
     environment.exposure_ev = 0.;
-    host.render_environment(&mut gpu, &image, &camera(), environment)?;
+    for _ in 0..3 {
+        host.render_environment(&mut gpu, &image, &camera(), environment)?;
+    }
     let mut reference_hdr = vec![0; exposed_hdr.len()];
     gpu.view
         .as_ref()
         .unwrap()
         .accumulation
         .read(&mut gpu.context, 0, &mut reference_hdr)?;
-    assert_eq!(
-        exposed_hdr, reference_hdr,
+    assert!(
+        exposed_hdr == reference_hdr,
         "曝光不能改变同一绝对样本序列的 HDR"
     );
     session.finish()?;
@@ -1455,6 +1453,7 @@ fn exposure_state(gpu: &mut Gpu) -> Result<[u32; 4], Box<dyn std::error::Error>>
         .view
         .as_ref()
         .ok_or("曝光回读需要已创建视图")?
+        .presentation
         .display
         .state();
     let bindings = Bindings::new(
@@ -1506,7 +1505,7 @@ fn accumulated_rgb(gpu: &mut Gpu) -> Result<Vec<[f32; 3]>, Error> {
 }
 
 fn exposure_view(gpu: &mut Gpu) -> Result<(), Error> {
-    let mut view = View::new(&mut gpu.context, [32, 32], false)?;
+    let mut view = View::new(&mut gpu.context, [32, 32], false, &mut gpu.bloom_filter)?;
     view.accumulation = Buffer::new(&mut gpu.context, 32 * 32 * 16, true)?;
     gpu.view = Some(view);
     Ok(())
@@ -1538,7 +1537,7 @@ fn hardware_pt_sun_ev_doubles_disk_and_scattered_sky() -> Result<(), Box<dyn std
     gpu.absolute_sample = 0; // 同一组相机射线只改变太阳强度。
     host.render_options(&mut gpu, &image, &camera, Environment::default(), options)?;
     let brighter = accumulated_rgb(&mut gpu)?;
-    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 1);
+    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 2);
     let peak = baseline.iter().map(|pixel| pixel[0]).fold(0., f32::max);
     assert!(peak > 1000., "视野包含太阳盘，峰值 {peak}");
     assert!(
@@ -1561,6 +1560,432 @@ fn hardware_pt_sun_ev_doubles_disk_and_scattered_sky() -> Result<(), Box<dyn std
     Ok(())
 }
 
+fn diffraction_target(
+    host: &Host,
+    gpu: &mut Gpu,
+    [width, height]: [usize; 2],
+) -> Result<Image, Box<dyn std::error::Error>> {
+    let target = Image::new(
+        &mut gpu.context,
+        [width as u32, height as u32, 1],
+        ImageFormat::Rgba8Unorm,
+    )?;
+    gpu.test_roots.push(target.into());
+    host.render_options(
+        gpu,
+        &target,
+        &camera(),
+        Environment::default(),
+        Options::new(false, streamline::Quality::Dlaa, 1, 4)?,
+    )?;
+    Ok(target)
+}
+
+fn present_diffraction(
+    gpu: &mut Gpu,
+    target: Image,
+    pixels: &[[f32; 4]],
+) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error>> {
+    let view = gpu.view.as_ref().unwrap();
+    let bytes = bytemuck::cast_slice(pixels);
+    let source = Buffer::upload(&mut gpu.context, bytes)?;
+    source.copy_prefix_to(&mut gpu.context, &view.output, bytes.len() as u64)?;
+    view.presentation
+        .record(
+            &mut gpu.context,
+            Binding::StorageImage(target),
+            HdrSource::Raw,
+            false,
+        )?
+        .submit_and_wait(&mut gpu.context)?;
+    let hdr = view.presentation.hdr().download(&mut gpu.context)?;
+    let display = target.download(&mut gpu.context)?;
+    Ok((hdr, display))
+}
+
+fn write_diffraction_png(
+    path: &std::path::Path,
+    display: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::fs::File::create(path)?;
+    let mut png = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
+    png.set_color(png::ColorType::Rgba);
+    png.set_depth(png::BitDepth::Eight);
+    png.set_source_srgb(png::SrgbRenderingIntent::Perceptual);
+    let mut writer = png.write_header()?;
+    let mut stream = writer.stream_writer()?;
+    for row in display.chunks_exact(width * 4).rev() {
+        stream.write_all(row)?;
+    }
+    stream.finish()?;
+    writer.finish()?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件，在 Prime PT 的实际呈现链上检查快速圆孔点源"]
+fn hardware_pt_aperture_fast_point() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let [w, h] = [2191usize, 1933];
+    let [cx, cy] = [1224, 968];
+    let target = diffraction_target(&host, gpu, [w, h])?;
+    let mut pixels = vec![[0., 0., 0., 1.]; w * h];
+    let power = 2_097_152.;
+    pixels[cy * w + cx] = [power, power, power, 1.];
+    let (hdr, display) = present_diffraction(gpu, target, &pixels)?;
+    let mut flux = [0f64; 3];
+    for &word in hdr.as_chunks::<16>().0 {
+        let sample: [f32; 4] = bytemuck::cast(word);
+        assert_eq!(sample[3], 1.);
+        for c in 0..3 {
+            assert!(sample[c] >= 0.);
+            flux[c] += f64::from(sample[c]);
+        }
+    }
+    assert!(
+        flux.iter()
+            .all(|v| (v / f64::from(power) - 1.).abs() < 2e-5)
+    );
+    let center: [f32; 4] = bytemuck::cast(hdr.as_chunks::<16>().0[cy * w + cx]);
+    let [r, g, b, _] = center;
+    let near = [r, g, b].map(|value| value / power);
+    assert!(0.82 < near[0] && near[0] < near[1] && near[1] < near[2] && near[2] < 0.87);
+    eprintln!("快速圆形点光源 RGB 通量 {flux:?}，中心占比 {near:?}");
+    if let Some(path) = std::env::var_os("PRIME_PT_DIFFRACTION_OUTPUT") {
+        let path = std::path::Path::new(&path);
+        std::fs::create_dir_all(path)?;
+        write_diffraction_png(&path.join("fast-point-display.png"), &display, w, h)?;
+        std::fs::write(path.join("fast-point-linear.rgba32f"), hdr)?;
+        std::fs::write(
+            path.join("fast-point.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "extent":[w,h], "source":[cx,cy], "origin":"top-left", "power":power, "flux":flux, "center_fraction":near
+            }))?,
+        )?;
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件，核对相机光圈的点扩散函数"]
+fn hardware_pt_aperture_camera_point() -> Result<(), Box<dyn std::error::Error>> {
+    aperture_point(
+        fft_bloom::Aperture::Camera,
+        "camera-point",
+        [[22, 9], [59, 25], [119, 46], [292, 130]],
+    )
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件，核对导入瞳孔的点扩散函数"]
+fn hardware_pt_aperture_pupil_point() -> Result<(), Box<dyn std::error::Error>> {
+    aperture_point(
+        fft_bloom::Aperture::Pupil,
+        "pupil-point",
+        [[19, 14], [55, 32], [128, 4], [271, 170]],
+    )
+}
+
+fn aperture_point(
+    shape: fft_bloom::Aperture,
+    stem: &str,
+    probes: [[usize; 2]; 4],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    gpu.set_lens_bloom(Some(shape.into()));
+    let [width, height] = [2191usize, 1933];
+    let target = diffraction_target(&host, gpu, [width, height])?;
+    let [cx, cy] = [1224usize, 968];
+    let power = 2_097_152.0f32;
+    let mut pixels = vec![[0., 0., 0., 1.]; width * height];
+    pixels[cy * width + cx] = [power, power, power, 1.];
+    let (hdr, display) = present_diffraction(gpu, target, &pixels)?;
+    let kernel = shape.kernel()?;
+    let [side, _] = kernel.extent().map(|n| n as usize);
+    let mut flux = [0.0f64; 3];
+    let mut peak_error = 0.0f32;
+    for (i, &word) in hdr.as_chunks::<16>().0.iter().enumerate() {
+        let value: [f32; 4] = bytemuck::cast(word);
+        let x = (i % width + side / 2).checked_sub(cx);
+        let y = (i / width + side / 2).checked_sub(cy);
+        assert_eq!(value[3], 1.0);
+        for (c, weights) in kernel.channels().iter().enumerate() {
+            let expected = match (x, y) {
+                (Some(x), Some(y)) if x < side && y < side => power * weights[y * side + x],
+                _ => 0.0,
+            };
+            assert!(value[c].is_finite());
+            peak_error = peak_error.max((value[c] - expected).abs());
+            flux[c] += f64::from(value[c]);
+        }
+    }
+    eprintln!("{shape:?} 点光源 RGB 通量 {flux:?}，最大逐像素绝对误差 {peak_error:e}");
+    // 全图绝对误差限为输入通量的半个 ULP。不同方位的翼部另按当地亮度检查相对误差。
+    assert!(peak_error <= 0.5 * f32::EPSILON * power);
+    for [dx, dy] in probes {
+        let tip: [f32; 4] = bytemuck::cast(hdr.as_chunks::<16>().0[(cy + dy) * width + cx + dx]);
+        for (c, weights) in kernel.channels().iter().enumerate() {
+            let reference = power * weights[(side / 2 + dy) * side + side / 2 + dx];
+            assert!(
+                (tip[c] / reference - 1.).abs() < 0.03,
+                "翼部 {dx},{dy} 通道 {c}: {} / {reference}",
+                tip[c]
+            );
+        }
+    }
+    assert!(
+        flux.iter()
+            .all(|v| (v / f64::from(power) - 1.0).abs() < 1e-5)
+    );
+    let rgba = display.as_chunks::<4>().0;
+    assert_eq!(rgba[(height - 1 - cy) * width + cx], [255; 4]);
+    assert!(rgba.iter().any(|&[r, _, b, _]| r.abs_diff(b) > 10));
+    if let Some(path) = std::env::var_os("PRIME_PT_DIFFRACTION_OUTPUT") {
+        let path = std::path::Path::new(&path);
+        std::fs::create_dir_all(path)?;
+        write_diffraction_png(
+            &path.join(format!("{stem}-display.png")),
+            &display,
+            width,
+            height,
+        )?;
+        std::fs::write(path.join(format!("{stem}-linear.rgba32f")), hdr)?;
+        std::fs::write(
+            path.join(format!("{stem}.json")),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "extent":[width,height],"source":[cx,cy],"power":power,"origin":"top-left","flux":flux,"max_error":peak_error
+            }))?,
+        )?;
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 光追设备，检查泛光开关的呈现、内存回收和原视图恢复"]
+fn hardware_pt_aperture_toggle() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    gpu.set_lens_bloom(Some(fft_bloom::Aperture::Camera.into()));
+    let [w, h] = [193, 129];
+    let target = diffraction_target(&host, gpu, [w, h])?;
+    let mut pixels = vec![[0., 0., 0., 1.]; w * h];
+    pixels[h / 2 * w + w / 2] = [4096., 2048., 1024., 0.5];
+    let (on, display) = present_diffraction(gpu, target, &pixels)?;
+    let accumulation = gpu.view.as_ref().unwrap().accumulation;
+    gpu.collect_resources()?;
+    let active_bytes = gpu.context.allocated_bytes();
+    gpu.set_lens_bloom(Some(fft_bloom::Aperture::Pupil.into()));
+    host.render_options(
+        gpu,
+        &target,
+        &camera(),
+        Environment::default(),
+        Options::new(false, streamline::Quality::Dlaa, 2, 4)?,
+    )?;
+    let (rounded, _) = present_diffraction(gpu, target, &pixels)?;
+    let center = h / 2 * w + w / 2;
+    let rounded_center: [f32; 4] = bytemuck::cast(rounded.as_chunks::<16>().0[center]);
+    let original_center: [f32; 4] = bytemuck::cast(on.as_chunks::<16>().0[center]);
+    for (shape, center_value) in [
+        (fft_bloom::Aperture::Camera, original_center),
+        (fft_bloom::Aperture::Pupil, rounded_center),
+    ] {
+        let psf = shape.rgb32le().as_chunks::<12>().0;
+        let green = f32::from_le_bytes(psf[psf.len() / 2].as_chunks::<4>().0[1]);
+        assert!((center_value[1] - 2048. * green).abs() < 0.001);
+    }
+    gpu.collect_resources()?;
+    assert!(
+        gpu.context.allocated_bytes() < active_bytes + (1 << 20),
+        "同一时刻只保留一个完整工作区"
+    );
+    gpu.set_lens_bloom(Some(LensMode::FastCircular));
+    host.render_options(
+        gpu,
+        &target,
+        &camera(),
+        Environment::default(),
+        Options::new(false, streamline::Quality::Dlaa, 2, 4)?,
+    )?;
+    let (fast, _) = present_diffraction(gpu, target, &pixels)?;
+    assert_ne!(fast, rounded);
+    gpu.collect_resources()?;
+    assert!(
+        gpu.context.allocated_bytes() < active_bytes,
+        "快速模式须回收 FFT 工作区"
+    );
+    gpu.set_lens_bloom(None);
+    gpu.collect_resources()?;
+    assert!(gpu.context.allocated_bytes() < active_bytes);
+    let (off, bypass) = present_diffraction(gpu, target, &pixels)?;
+    assert_eq!(off, bytemuck::cast_slice::<_, u8>(&pixels));
+    assert_ne!(display, bypass);
+    gpu.set_lens_bloom(Some(fft_bloom::Aperture::Camera.into()));
+    host.render_options(
+        gpu,
+        &target,
+        &camera(),
+        Environment::default(),
+        Options::new(false, streamline::Quality::Dlaa, 1, 4)?,
+    )?;
+    assert_eq!(accumulation, gpu.view.as_ref().unwrap().accumulation);
+    let restored = present_diffraction(gpu, target, &pixels)?;
+    assert_eq!((on, display), restored);
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件，核对快速圆形泛光在太阳盘周围的衰减与圆度"]
+fn hardware_pt_aperture_fast_sun() -> Result<(), Box<dyn std::error::Error>> {
+    let [x, y] = aperture_sun(LensMode::FastCircular, "fast-sun")?;
+    assert!(x.min(y) > 100 && x.abs_diff(y) < x / 12);
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件，核对相机光圈对太阳盘的卷积"]
+fn hardware_pt_aperture_camera_sun() -> Result<(), Box<dyn std::error::Error>> {
+    let radii = aperture_sun(fft_bloom::Aperture::Camera.into(), "camera-sun")?;
+    assert!(radii.into_iter().all(|r| r > 5));
+    Ok(())
+}
+
+#[test]
+#[ignore = "需要 Vulkan 硬件，核对导入瞳孔对太阳盘的卷积"]
+fn hardware_pt_aperture_pupil_sun() -> Result<(), Box<dyn std::error::Error>> {
+    let radii = aperture_sun(fft_bloom::Aperture::Pupil.into(), "pupil-sun")?;
+    assert!(radii.into_iter().all(|r| r > 5));
+    Ok(())
+}
+
+fn aperture_sun(mode: LensMode, stem: &str) -> Result<[usize; 2], Box<dyn std::error::Error>> {
+    let host = Host::new()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    gpu.set_lens_bloom(Some(mode));
+    let [width, height] = [1916usize, 997];
+    let [cx, cy] = [940usize, 495];
+    let target = diffraction_target(&host, gpu, [width, height])?;
+    // 游戏中大气外太阳法向辐照度 Y=8、角半径约 0.00465 rad。此视场中盘半径为 5 像素。
+    let sky = [0.19, 0.31, 0.51, 1.];
+    let sun = [120_000., 110_000., 95_000., 1.];
+    let mut pixels = vec![sky; width * height];
+    let mut disc = Vec::new();
+    for dy in -5i32..=5 {
+        for dx in -5i32..=5 {
+            if dx * dx + dy * dy <= 25 {
+                pixels[(cy as i32 + dy) as usize * width + (cx as i32 + dx) as usize] = sun;
+                disc.push((dx, dy));
+            }
+        }
+    }
+    let (hdr, display) = present_diffraction(gpu, target, &pixels)?;
+    // 用同一天空对比度量可见半径，覆盖有限太阳盘对细线的展宽作用。
+    let [horizontal, vertical] =
+        [(1, 0, width - 1 - cx), (0, 1, height - 1 - cy)].map(|(dx, dy, end)| {
+            (0..=end)
+                .rfind(|&r| {
+                    let i = (cy + dy * r) * width + cx + dx * r;
+                    let pixel: [f32; 4] = bytemuck::cast(hdr.as_chunks::<16>().0[i]);
+                    pixel[1] > 1.01 * sky[1]
+                })
+                .unwrap_or(0)
+        });
+    eprintln!("{mode:?} 绿通道比天空亮 1% 的半径，横向 {horizontal} px，纵向 {vertical} px");
+    if let LensMode::Diffraction(shape) = mode {
+        let kernel = shape.kernel()?;
+        let side = kernel.extent()[0] as usize;
+        let radius = (side / 2) as i32;
+        for (dx, dy) in [
+            (0, 249),
+            (0, 256),
+            (0, 264),
+            (0, 400),
+            (320, 0),
+            (690, 0),
+            (940, 0),
+        ] {
+            let x = (cx as i32 + dx) as usize;
+            let y = (cy as i32 + dy) as usize;
+            let actual: [f32; 4] = bytemuck::cast(hdr.as_chunks::<16>().0[y * width + x]);
+            for (c, weights) in kernel.channels().iter().enumerate() {
+                // 画外补黑。只积分能落在本帧的背景，再逐个加入太阳盘相对背景的额外辐亮度。
+                let x0 = (x + radius as usize + 1).saturating_sub(width);
+                let x1 = (x + radius as usize + 1).min(side);
+                let y0 = (y + radius as usize + 1).saturating_sub(height);
+                let y1 = (y + radius as usize + 1).min(side);
+                let mass: f64 = weights
+                    .chunks_exact(side)
+                    .take(y1)
+                    .skip(y0)
+                    .flat_map(|row| &row[x0..x1])
+                    .copied()
+                    .map(f64::from)
+                    .sum();
+                let flux: f64 = disc
+                    .iter()
+                    .map(|(sx, sy)| {
+                        let (kx, ky) = (dx - sx, dy - sy);
+                        if kx.abs() <= radius && ky.abs() <= radius {
+                            f64::from(
+                                weights[(radius + ky) as usize * side + (radius + kx) as usize],
+                            )
+                        } else {
+                            0.0
+                        }
+                    })
+                    .sum();
+                let reference = mass * f64::from(sky[c]) + flux * f64::from(sun[c] - sky[c]);
+                assert!(
+                    (f64::from(actual[c]) - reference).abs() < 3e-4 + 0.002 * reference,
+                    "太阳翼部 {dx},{dy} 通道 {c}: {} / {reference}",
+                    actual[c]
+                );
+            }
+        }
+    } else {
+        for r in [64usize, 128, 256] {
+            let spread = 0.545 * 4. / 5. / (std::f64::consts::PI * r as f64).powi(3);
+            let reference = disc.len() as f64 * f64::from(sun[1] - sky[1]) * spread;
+            for (x, y) in [(cx + r, cy), (cx, cy + r)] {
+                let pixel: [f32; 4] = bytemuck::cast(hdr.as_chunks::<16>().0[y * width + x]);
+                assert!(
+                    (f64::from(pixel[1] - sky[1]) / reference - 1.).abs() < 0.30,
+                    "圆孔太阳远翼 {r} px 的绿通道增量 {}，参考 {reference}",
+                    pixel[1] - sky[1]
+                );
+            }
+        }
+    }
+    if let Some(path) = std::env::var_os("PRIME_PT_DIFFRACTION_OUTPUT") {
+        let path = std::path::Path::new(&path);
+        std::fs::create_dir_all(path)?;
+        write_diffraction_png(
+            &path.join(format!("{stem}-display.png")),
+            &display,
+            width,
+            height,
+        )?;
+        std::fs::write(path.join(format!("{stem}-linear.rgba32f")), hdr)?;
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok([horizontal, vertical])
+}
+
 #[test]
 #[ignore = "需要 Vulkan 硬件光追；验证自动测光只改变宿主呈现、不改变HDR"]
 fn hardware_pt_auto_exposure_preserves_hdr() -> Result<(), Box<dyn std::error::Error>> {
@@ -1569,7 +1994,7 @@ fn hardware_pt_auto_exposure_preserves_hdr() -> Result<(), Box<dyn std::error::E
     let mut gpu = session.gpu();
     let image = image(&mut gpu)?;
     exposure_view(&mut gpu)?;
-    let options = Options::new(false, streamline::Quality::Dlaa, 64, 6)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 6)?;
     let environment = Environment::default();
     host.render_options(&mut gpu, &image, &camera(), environment, options)?;
     let manual = image.download(&mut gpu.context)?;
@@ -1603,11 +2028,13 @@ fn hardware_pt_auto_exposure_strength_scales_target_ev() -> Result<(), Box<dyn s
     exposure_view(&mut gpu)?;
     freeze_exposure_clock(&mut gpu);
     gpu.set_display_options(1.0, 0.05, 0.75, 0.4)?;
-    let options = Options::new(false, streamline::Quality::Dlaa, 16, 6)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 6)?;
+    let first_sample = gpu.absolute_sample;
     host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
     let full = exposure_state(&mut gpu)?;
     gpu.set_display_options(0.5, 0.05, 0.75, 0.4)?;
     gpu.invalidate()?;
+    gpu.test_restart_sample_sequence(first_sample)?;
     host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
     let half = exposure_state(&mut gpu)?;
     assert!(f32::from_bits(full[2]).abs() > 0.01);
@@ -1627,7 +2054,7 @@ fn hardware_pt_drt_controls_only_change_display() -> Result<(), Box<dyn std::err
     let image = image(&mut gpu)?;
     exposure_view(&mut gpu)?;
     gpu.set_display_options(0.0, 0.05, 0.75, 0.4)?;
-    let options = Options::new(false, streamline::Quality::Dlaa, 16, 6)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 6)?;
     host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
     let first = image.download(&mut gpu.context)?;
     let hdr = exposure_hdr(&mut gpu)?;
@@ -1681,7 +2108,7 @@ fn hardware_pt_auto_exposure_manual_ev_is_display_only() -> Result<(), Box<dyn s
     exposure_view(&mut gpu)?;
     gpu.display_timeline.set_enabled(true);
     freeze_exposure_clock(&mut gpu);
-    let options = Options::new(false, streamline::Quality::Dlaa, 64, 6)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 6)?;
     host.render_options(&mut gpu, &image, &camera(), Environment::default(), options)?;
     let initial = image.download(&mut gpu.context)?;
     let initial_hdr = exposure_hdr(&mut gpu)?;
@@ -1787,6 +2214,7 @@ fn hardware_pt_general_quad_matches_two_triangles() -> Result<(), Box<dyn std::e
         quads: vec![Quad::new(p, uv, tint, Material::Opaque)],
     };
     gpu.set_scene(&mesh)?;
+    let first_sample = gpu.absolute_sample;
     let whole = host.render(&mut gpu, &image, &camera())?;
     mesh.quads = [[0, 1, 2, 2], [0, 2, 3, 3]]
         .map(|corners| {
@@ -1799,6 +2227,7 @@ fn hardware_pt_general_quad_matches_two_triangles() -> Result<(), Box<dyn std::e
         })
         .into();
     gpu.set_scene(&mesh)?;
+    gpu.test_restart_sample_sequence(first_sample)?;
     let split = host.render(&mut gpu, &image, &camera())?;
     assert_eq!(
         whole, split,
@@ -1892,7 +2321,7 @@ fn hardware_pt_rr_rebases_history_across_local_changes() -> Result<(), Box<dyn s
     host.render_options(&mut gpu, &image, &camera, environment, options)?;
     assert!(gpu.rr_previous.is_some());
     let view = gpu.view.as_ref().unwrap();
-    assert_eq!(view.progress.samples(), 1, "RR仍只累计本帧样本");
+    assert_eq!(view.progress.samples(), 2, "RR仍只累计本帧样本");
     let motion = half_pixel(
         &view.rr.images[2].download(&mut gpu.context)?,
         [512, 512],
@@ -1909,7 +2338,7 @@ fn hardware_pt_rr_rebases_history_across_local_changes() -> Result<(), Box<dyn s
             .as_chunks::<4>()
             .0
             .iter()
-            .all(|word| u32::from_le_bytes(*word) == 1)
+            .all(|word| u32::from_le_bytes(*word) == 2)
     );
 
     for event in [GlobalReset::WorldReplaced, GlobalReset::SceneDomainReplaced] {
@@ -1964,7 +2393,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         host.render_rr(&mut gpu, &image, &camera, environment)?;
         let view = gpu.view.as_ref().ok_or("RR 视图未创建")?;
         assert!(view.rr_enabled);
-        assert_eq!(view.progress.samples(), 1, "RR 输入每帧独立单样本");
+        assert_eq!(view.progress.samples(), 2, "RR 输入每帧独立双样本");
         assert!(
             gpu.rr_previous.is_some(),
             "RR 必须成功求值，不能只走 noisy 回退"
@@ -2039,7 +2468,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     camera.origin[0] += 0.125;
     host.render_options(&mut gpu, &image, &camera, environment, performance)?;
     let view = gpu.view.as_ref().unwrap();
-    assert_eq!(view.progress.samples(), 3);
+    assert_eq!(view.progress.samples(), 2);
     let input = view.extent;
     for (index, image) in view.rr.images.iter().enumerate() {
         let expected = if index == 6 { extent } else { input };
@@ -2064,7 +2493,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
             .as_chunks::<4>()
             .0
             .iter()
-            .all(|word| u32::from_le_bytes(*word) == 3)
+            .all(|word| u32::from_le_bytes(*word) == 2)
     );
     let mut accumulation = vec![0; view.accumulation.len() as usize];
     view.accumulation
@@ -2074,11 +2503,11 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     for (channel, mean) in mean[..3].iter().copied().enumerate() {
         let offset = pixel + channel * 4;
         let sum = f32::from_le_bytes(accumulation[offset..offset + 4].try_into()?);
-        assert!((mean - sum / 3.0).abs() <= mean.abs().max(1.0) * 0.001);
+        assert!((mean - sum / 2.0).abs() <= mean.abs().max(1.0) * 0.001);
     }
     let sample = gpu.absolute_sample;
     host.render_options(&mut gpu, &image, &camera, environment, performance)?;
-    assert_eq!(gpu.absolute_sample, sample + 3);
+    assert_eq!(gpu.absolute_sample, sample + 2);
     let next_noisy = gpu.view.as_ref().unwrap().rr.images[0].download(&mut gpu.context)?;
     assert_ne!(noisy, next_noisy, "静止相机的逐帧随机样本应独立");
     let presented = image.download(&mut gpu.context)?;
@@ -2139,30 +2568,13 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     );
     // SDK 求值失败分支独立录制，使用真实输入 HDR 验证整幅超分回退覆盖。
     resized.upload(&mut gpu.context, &vec![0; 1280 * 720 * 4])?;
-    let fallback_bindings = Bindings::new(
-        &mut gpu.context,
-        &[
-            Binding::StorageBuffer(view.params),
-            Binding::StorageBuffer(view.output),
-            Binding::StorageImage(view.rr.images[0]),
-            Binding::SampledImage(view.rr.images[6]),
+    view.presentation
+        .record(
+            &mut gpu.context,
             Binding::StorageImage(resized),
-            Binding::SampledImage(view.rr.images[1]),
-            Binding::SampledImage(view.rr.images[3]),
-            Binding::SampledImage(view.rr.images[4]),
-            Binding::SampledImage(view.rr.images[5]),
-            Binding::StorageBuffer(view.display.state()),
-            Binding::StorageBuffer(view.display.parameters()),
-        ],
-    )?;
-    let fallback = view.rr_fallback[usize::from(gpu.display_timeline.enabled())]
-        .rebind(&mut gpu.context, fallback_bindings)?;
-    let mut commands = Commands::new(&gpu.context)?;
-    commands.barrier();
-    commands.dispatch(fallback, [1280_u32.div_ceil(8), 720_u32.div_ceil(8), 1])?;
-    commands.barrier();
-    commands
-        .finish(&mut gpu.context)?
+            HdrSource::Spatial,
+            gpu.display_timeline.enabled(),
+        )?
         .submit_and_wait(&mut gpu.context)?;
     let pixels = resized.download(&mut gpu.context)?;
     assert!(
@@ -2191,18 +2603,20 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
             .all(|word| f32::from_bits(word).is_finite())
     );
     let mut exposure_frame = [0; 32];
-    gpu.view.as_ref().unwrap().display.parameters().read(
-        &mut gpu.context,
-        0,
-        &mut exposure_frame,
-    )?;
+    gpu.view
+        .as_ref()
+        .unwrap()
+        .presentation
+        .display
+        .parameters()
+        .read(&mut gpu.context, 0, &mut exposure_frame)?;
     assert_eq!(u32::from_le_bytes(exposure_frame[..4].try_into()?), 1280);
     assert_eq!(u32::from_le_bytes(exposure_frame[4..8].try_into()?), 720);
     // bridge 只允许一个 RR owner；第二会话必须在任何编码前回退，且保留 PT 累积。
     let mut fallback_session = host.gpu()?;
     let mut fallback = fallback_session.gpu();
     let fallback_image = self::image(&mut fallback)?;
-    for expected in [1, 2] {
+    for expected in [2, 4] {
         host.render_rr(&mut fallback, &fallback_image, &camera, environment)?;
         assert!(fallback.rr_unavailable.is_some());
         let view = fallback.view.as_ref().ok_or("回退 PT 未创建视图")?;

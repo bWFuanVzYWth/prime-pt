@@ -113,9 +113,8 @@ public func finish_vertex(inout data: pt::TransportCall)->void
             status = pt::PATH_DONE;
         else if (data.path.depth + 1 >= 2)
         {
-            let survival
-                : float = transport::roulette_probability(data.path.throughput, data.path.eta_scale,
-                                                          parameters[0].output_size.w != 0);
+            let survival : float = transport::roulette_probability(data.path.throughput,
+                                                                   data.path.eta_scale);
             let sampler : pt::PathSampler =
                               pt::path_sampler(data.pixel, data.sample, parameters[0].options.z,
                                                parameters[0].options.x);

@@ -87,7 +87,7 @@ impl Gpu {
             &mut out,
             &[
                 options.bounces,
-                options.samples,
+                self.frame_samples(options.samples),
                 sample,
                 // PRSCENE1 保留旧配置字，维持已有捕获文件的读取兼容。
                 0,

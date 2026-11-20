@@ -36,9 +36,9 @@ pub use api_session::{
 
 mod api_settings;
 pub use api_settings::{
-    prime_camera_medium, prime_reset, prime_set_display_options, prime_set_lighting_options,
-    prime_set_render_tuning, prime_set_rendering, prime_set_ser, prime_set_solar_orbit,
-    prime_set_update_budget,
+    prime_camera_medium, prime_reset, prime_set_display_options, prime_set_lens_bloom,
+    prime_set_lighting_options, prime_set_render_tuning, prime_set_rendering, prime_set_ser,
+    prime_set_solar_orbit, prime_set_update_budget,
 };
 
 mod api_capture;

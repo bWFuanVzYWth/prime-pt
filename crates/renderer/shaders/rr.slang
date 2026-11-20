@@ -1,8 +1,6 @@
 /// RR 在场景线性 HDR 中重建；曝光、DRT 和宿主上下翻转只在呈现执行。
 module rr;
 import params;
-import display.prime_drt;
-import display.exposure;
 import pt.guide_output;
 import denoise.spatial;
 
@@ -16,8 +14,8 @@ var noisy : RWTexture2D<float4>;
 [[vk::binding(3, 0)]]
 var reconstructed : Texture2D<float4>;
 [[vk::binding(4, 0)]]
-[[vk::image_format("rgba8")]]
-var target : RWTexture2D<float4>;
+[[vk::image_format("rgba32f")]]
+var linear_hdr : RWTexture2D<float4>;
 [[vk::binding(5, 0)]]
 var guide_depth : Texture2D<float>;
 [[vk::binding(6, 0)]]
@@ -26,19 +24,6 @@ var guide_normal : Texture2D<float4>;
 var guide_diffuse : Texture2D<float4>;
 [[vk::binding(8, 0)]]
 var guide_specular : Texture2D<float4>;
-[[vk::binding(9, 0)]]
-var exposure_state : StructuredBuffer<display::ExposureState>;
-[[vk::binding(10, 0)]]
-var exposure_parameters : StructuredBuffer<uint4>;
-
-func display_parameters<let automatic : bool>()->display::PrimeDrtParameters
-{
-    var drt : display::PrimeDrtParameters = parameters[0].drt;
-    if (automatic)
-        drt.exposure_multiplier *= exp2(exposure_state[0].exposure_ev);
-    return drt;
-}
-
 public struct SpatialInput : denoise::ISpatialImage
 {
     public func load(pixel: uint2)->denoise::SpatialSample
@@ -68,77 +53,37 @@ func pack_main(id: uint3: SV_DispatchThreadID)->void
     noisy[id.xy] = pt::reconstruction_input(hdr.xyz);
 }
 
-func present_pixel<let automatic : bool>(id: uint3)->void
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func resolve_raw(id: uint3: SV_DispatchThreadID)->void
 {
-    let p : Params = parameters[0];
-    if (any(id.xy >= p.output_size.xy))
-        return;
-    let hdr : float3 = reconstructed.Load(int3(id.xy, 0)).xyz;
-    let source : uint2 = min(id.xy * p.image.xy / p.output_size.xy, p.image.xy - 1);
-    let invalid : bool = pixels[source.y * p.image.x + source.x].w < 0;
-    target[uint2(id.x, p.output_size.y - 1 - id.y)] =
-        invalid ? float4(1, 0, 1, 1)
-                : float4(display::prime_drt_bt709(hdr, display_parameters<automatic>()), 1);
+    let p = parameters[0];
+    if (all(id.xy < p.image.xy))
+        linear_hdr[id.xy] = pixels[id.y * p.image.x + id.x];
 }
 
-/// 本帧求值安全失败时以已有输入和 guides 执行边界保护空间重建，再作显示变换。
-func fallback_pixel<let automatic : bool>(id: uint3)->void
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func resolve_rr(id: uint3: SV_DispatchThreadID)->void
 {
-    let p : Params = parameters[0];
+    let p = parameters[0];
+    if (any(id.xy >= p.output_size.xy))
+        return;
+    let source = min(id.xy * p.image.xy / p.output_size.xy, p.image.xy - 1);
+    linear_hdr[id.xy] =
+        float4(reconstructed.Load(int3(id.xy, 0)).xyz, pixels[source.y * p.image.x + source.x].w);
+}
+
+/// RR 本帧求值安全失败时，导引保护重建边界；无效标记随 HDR 进入呈现。
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func resolve_spatial(id: uint3: SV_DispatchThreadID)->void
+{
+    let p = parameters[0];
     if (any(id.xy >= p.output_size.xy))
         return;
     let source = fma(float2(id.xy) + 0.5, asfloat(p.programs.xy), -0.5);
     var valid : bool;
-    let hdr : float3 = denoise::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
-    target[uint2(id.x, p.output_size.y - 1 - id.y)] =
-        !valid ? float4(1, 0, 1, 1)
-               : float4(display::prime_drt_bt709(hdr, display_parameters<automatic>()), 1);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-func present_manual(id: uint3: SV_DispatchThreadID)->void
-{
-    present_pixel<false>(id);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-func present_automatic(id: uint3: SV_DispatchThreadID)->void
-{
-    present_pixel<true>(id);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-func present_main(id: uint3: SV_DispatchThreadID)->void
-{
-    if (asfloat(exposure_parameters[1].y) > 0)
-        present_pixel<true>(id);
-    else
-        present_pixel<false>(id);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-func fallback_manual(id: uint3: SV_DispatchThreadID)->void
-{
-    fallback_pixel<false>(id);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-func fallback_automatic(id: uint3: SV_DispatchThreadID)->void
-{
-    fallback_pixel<true>(id);
-}
-
-[shader("compute")]
-[numthreads(8, 8, 1)]
-func fallback_main(id: uint3: SV_DispatchThreadID)->void
-{
-    if (asfloat(exposure_parameters[1].y) > 0)
-        fallback_pixel<true>(id);
-    else
-        fallback_pixel<false>(id);
+    let hdr = denoise::spatial_reconstruct(SpatialInput(), source, p.image.xy, valid);
+    linear_hdr[id.xy] = float4(hdr, valid ? 1.0 : -1.0);
 }

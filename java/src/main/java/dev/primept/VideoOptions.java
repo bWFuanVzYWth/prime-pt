@@ -23,9 +23,9 @@ import net.minecraft.network.chat.Component;
 
 /** 视频列表中的 PT 设置；命令和控件共用 Settings，只有用户操作才写入配置。 */
 public final class VideoOptions {
-    enum Row { RESET, RENDER, ENABLED, MODE, DIAGNOSTIC, SER, RR, QUALITY, SAMPLES, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
+    enum Row { RESET, RENDER, ENABLED, MODE, DIAGNOSTIC, SER, RR, QUALITY, BOUNCES, UPDATE_BUDGET, LIGHTING, SUN_EV, BLOCK_EMISSION_EV,
         LATITUDE, SOLAR_LONGITUDE,
-        DISPLAY, EXPOSURE, AUTO_EXPOSURE, DRT_SATURATION, DRT_HUE, DRT_COMPRESSION_START }
+        DISPLAY, LENS_BLOOM, BLOOM_MODE, EXPOSURE, AUTO_EXPOSURE, DRT_SATURATION, DRT_HUE, DRT_COMPRESSION_START }
 
     @FunctionalInterface
     interface Action { void run() throws IOException; }
@@ -59,8 +59,9 @@ public final class VideoOptions {
     private CycleButton<Boolean> diagnostic;
     private CycleButton<Boolean> rr;
     private CycleButton<Boolean> ser;
+    private CycleButton<Boolean> lensBloom;
+    private CycleButton<BloomMode> bloomMode;
     private CycleButton<Quality> quality;
-    private CycleButton<SamplingStrategy> samplingStrategy;
     private CycleButton<UpdateBudget> updateBudget;
 
     private VideoOptions(OptionsList list, Screen screen, Runnable rebuild) {
@@ -133,16 +134,6 @@ public final class VideoOptions {
                         text("quality"), Settings::quality, Settings::setQuality, this::failed);
                 list.addBig(quality);
             }
-            case SAMPLES -> {
-                samplingStrategy = cycle(CycleButton.builder(
-                                (SamplingStrategy value) -> text("sampling_strategy." + value.key),
-                                SamplingStrategy.fromSamples(Settings.samples()))
-                        .withValues(List.of(SamplingStrategy.values()))
-                        .withTooltip(OptionInstance.cachedConstantTooltip(text("sampling_strategy.tooltip"))),
-                        text("sampling_strategy"), () -> SamplingStrategy.fromSamples(Settings.samples()),
-                        value -> Settings.setSamples(value.samples), this::failed);
-                list.addBig(samplingStrategy);
-            }
             case BOUNCES -> addSlider("bounces", Settings.MIN_BOUNCES, Settings.MAX_BOUNCES, 1,
                     Settings::bounces, value -> Settings.setBounces((int)value), ValueFormat.INTEGER);
             case UPDATE_BUDGET -> {
@@ -168,6 +159,20 @@ public final class VideoOptions {
             case SOLAR_LONGITUDE -> addSlider("solar_longitude", 0, 359, 1,
                     () -> Settings.solar().longitude(), value -> Settings.setSolarLongitude((int)value), ValueFormat.ANGLE);
             case DISPLAY -> list.addHeader(text("display"));
+            case LENS_BLOOM -> {
+                lensBloom = cycle(CycleButton.onOffBuilder(Settings.display().lensBloom())
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("lens_bloom.tooltip"))),
+                        text("lens_bloom"), () -> Settings.display().lensBloom(), Settings::setLensBloom, this::failed);
+                list.addBig(lensBloom);
+            }
+            case BLOOM_MODE -> {
+                bloomMode = cycle(CycleButton.builder(
+                                (BloomMode mode) -> text("bloom_mode." + mode.key), Settings.display().bloomMode())
+                        .withValues(List.of(BloomMode.values()))
+                        .withTooltip(OptionInstance.cachedConstantTooltip(text("bloom_mode.tooltip"))),
+                        text("bloom_mode"), () -> Settings.display().bloomMode(), Settings::setBloomMode, this::failed);
+                list.addBig(bloomMode);
+            }
             case EXPOSURE -> addSlider("exposure", Settings.MIN_EV, Settings.MAX_EV, 0.25,
                     Settings::exposure, value -> Settings.setExposure((float)value), ValueFormat.EXPOSURE);
             case AUTO_EXPOSURE -> addSlider("auto_exposure", 0, DisplaySettings.MAX_AUTO_EXPOSURE, 1,
@@ -228,6 +233,10 @@ public final class VideoOptions {
         if (enabled.getValue() != Settings.enabled()) enabled.setValue(Settings.enabled());
         if (mode.getValue() != Settings.mode()) mode.setValue(Settings.mode());
         mode.active = Settings.enabled();
+        lensBloom.active = Settings.enabled();
+        if (lensBloom.getValue() != Settings.display().lensBloom()) lensBloom.setValue(Settings.display().lensBloom());
+        bloomMode.active = Settings.enabled() && Settings.display().lensBloom();
+        if (bloomMode.getValue() != Settings.display().bloomMode()) bloomMode.setValue(Settings.display().bloomMode());
         boolean realtime = Settings.enabled() && !Settings.offline();
         ser.active = realtime;
         diagnostic.active = realtime;
@@ -235,9 +244,6 @@ public final class VideoOptions {
         rr.active = realtime && !Settings.diagnostic();
         quality.active = realtime && !Settings.diagnostic() && Settings.requestedRr();
         updateBudget.active = realtime;
-        samplingStrategy.active = realtime;
-        var strategy = SamplingStrategy.fromSamples(Settings.samples());
-        if (samplingStrategy.getValue() != strategy) samplingStrategy.setValue(strategy);
         for (var slider : sliders) {
             boolean display = switch (slider.key) {
                 case "exposure", "auto_exposure", "drt_saturation", "drt_hue", "drt_compression_start" -> true;

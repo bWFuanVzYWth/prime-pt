@@ -1172,6 +1172,7 @@ impl Gpu {
         roots.extend(self.program_lighting.roots());
         roots.extend(self.atmosphere.roots());
         roots.extend(self.program_view.roots());
+        roots.extend(self.bloom_filter.roots());
         if let Some(view) = &self.view {
             roots.extend(view.roots());
         }

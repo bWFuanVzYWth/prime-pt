@@ -15,8 +15,6 @@
   "primept.settings.quality.balanced": "均衡",
   "primept.settings.quality.performance": "性能（2×）",
   "primept.settings.quality.ultra_performance": "超级性能",
-  "primept.settings.sampling_strategy": "采样策略",
-  "primept.settings.sampling_strategy.tooltip": "性能：每像素1条随机路径。质量：每像素2条分离路径，并用平方根轮盘保留更多弱路径。只影响实时渲染；离线批大小通过 /pt spp 设置。\n命令：/pt sampling performance|quality",
   "primept.settings.bounces": "路径顶点预算",
   "primept.settings.bounces.tooltip": "每条路径最多 1–64 个顶点，包括主命中；最后一个顶点仍计算直接光与自发光。\n命令：/pt bounces 1..64",
   "primept.settings.display": "PT 显示",
@@ -36,6 +34,13 @@
   "primept.settings.update_budget.throughput": "吞吐",
   "primept.settings.exposure": "曝光",
   "primept.settings.exposure.tooltip": "在 RR 之后、显示映射之前调整亮度。+1 EV 将亮度加倍。滑块按 0.25 EV 步进，拖动时预览数值，松开后保存。打开设置保留命令输入的精确值。\n命令：/pt exposure -16..16",
+  "primept.settings.lens_bloom": "镜头泛光",
+  "primept.settings.lens_bloom.tooltip": "在太阳和明亮光源周围产生衍射泛光。关闭可节省 GPU 时间和显存。",
+  "primept.settings.bloom_mode": "泛光模式",
+  "primept.settings.bloom_mode.tooltip": "相机光圈和瞳孔使用工作台导出的衍射核。快速圆形让亮点和太阳呈现平滑圆晕。",
+  "primept.settings.bloom_mode.camera": "相机光圈（camara）",
+  "primept.settings.bloom_mode.pupil": "瞳孔（pupil）",
+  "primept.settings.bloom_mode.fast_circular": "快速圆形",
   "primept.settings.auto_exposure": "自动曝光强度",
   "primept.settings.auto_exposure.tooltip": "控制场景测光产生的曝光补偿。0% 关闭自动补偿，100% 应用完整补偿，默认 65%。手动 EV 仍作为额外偏移。",
   "primept.settings.drt_saturation": "DRT 饱和度补偿",
@@ -52,7 +57,5 @@
   "primept.settings.mode.offline": "离线快照",
   "primept.settings.mode.tooltip": "离线冻结当前场景、相机和光照，以完整输出分辨率持续累积独立路径；游戏逻辑仍继续运行。切回实时后恢复世界更新。离线模式仅在本次会话有效。\n命令：/pt mode realtime|offline",
   "primept.settings.diagnostic": "原生无累积诊断",
-  "primept.settings.diagnostic.tooltip": "使用原生分辨率，关闭RR和跨帧图像累积。PT按所设SPP平均本帧样本；显示曝光与画质偏好保持。\n命令：/pt diagnostic on|off",
-  "primept.settings.sampling_strategy.performance": "性能",
-  "primept.settings.sampling_strategy.quality": "质量"
+  "primept.settings.diagnostic.tooltip": "使用原生分辨率，关闭RR和跨帧图像累积。PT 每像素平均本帧的两条路径；显示曝光与画质偏好保持。\n命令：/pt diagnostic on|off"
 }

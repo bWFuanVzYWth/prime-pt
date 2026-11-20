@@ -54,7 +54,6 @@ $env:PT_QUALITY_CONFIG = 'C:\repositories\simple_engine\temp\pt-quality.json'
   "warmup": 20, "frames": 2048, "seeds": [17, 4106],
   "gpu_checkpoints_ms": [250, 1000, 4000],
   "variants": [
-    {"name": "pt1", "kind": "pt", "spp": 1},
     {"name": "pt2", "kind": "pt", "spp": 2},
     {"name": "offline4", "kind": "offline", "spp": 4}
   ]
@@ -72,7 +71,7 @@ GPU 时间包括首视线、导引、照明、后处理及启用时的 RR；准�
 常用输入：
 
 - `scene`：`direct` 为直接照明室内，`occluded` 的灯光受挡板遮挡，`glossy` 另有倾斜金属面。
-- `kind`：`pt` 使用实时策略，`spp` 为 1 或 2；`offline` 使用原材质概率，批量为 1–64。
+- `kind`：`pt` 使用实时质量策略，固定 2 spp；`offline` 使用原材质概率，批量为 1–64。
 - `rr: true` 固定原生 4K + DLAA。比较重建时删去 `offline4` 变体，保留正常镜头抖动与 RR 历史；输出 `rr-time-预算.f16` 为 RGBA16F。
 - `motion: true` 先静止 32 帧，再横移 32 帧，随后静止。此时删除 GPU 预算并设置固定帧数，例如 `frames: 96`；运动序列的跨帧均值不用于收敛判断。
 - `rr_frames`、`raw_frames` 指定额外保存图像的帧。默认保留末帧；`save_raw_final: false` 可省略未重建末帧。
@@ -222,3 +221,17 @@ cargo test --locked --release -p prime_renderer --lib hardware_pt_scene_baseline
 ```
 
 保留 `samples.jsonl`、输入摘要和构建身份。先冻结原始版本做同版本 A/A，再在同一环境对比成对样本。计时范围和排除项见 [CPU 基准注释](../crates/world/benches/source_pipeline.rs) 与 [GPU 场景基准注释](../crates/renderer/src/scene_bench.rs)。
+
+## 对照泛光模式下的点光源与太阳盘
+
+准备好[构建工具](build.md)和 Vulkan 光追设备后，在 Prime PT 根目录打开 PowerShell。无窗口测试用相同曝光将高亮白点和蓝天中的太阳盘送入实际呈现管线，分别检查相机光圈、瞳孔和快速圆形的点扩散与太阳周围的亮度。
+
+```powershell
+$env:VK_LAYER_PATH = Join-Path $env:VULKAN_SDK Bin
+$env:PRIME_PT_DIFFRACTION_OUTPUT = Join-Path (Get-Location) temp/point-source
+cargo test --release --locked -p prime_renderer hardware_pt_aperture_ -- --ignored --nocapture --test-threads=1
+```
+
+成功时七项测试通过。点光源用例报告 RGB 总通量，两个 FFT 镜头另报告相对导出核的最大逐像素绝对误差。太阳用例给出横、纵两个方向比天空亮 1% 的半径，单位为输出像素。切换用例覆盖更换光瞳、关闭泛光和恢复原选择，同时核对图像、累积历史与显存回收。
+
+在输出目录中并排打开 `camera-sun-display.png`、`pupil-sun-display.png` 和 `fast-sun-display.png`。同一前缀下，`*-point-display.png` 显示单像素白点，`*-linear.rgba32f` 保留对应的线性 HDR 回读，`*-point.json` 记录输入位置和通量。验证层或设备初始化失败时，先检查 Vulkan SDK 和显卡驱动。

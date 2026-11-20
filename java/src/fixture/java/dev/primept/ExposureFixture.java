@@ -41,9 +41,9 @@ final class ExposureFixture {
     private static void defaults(Path file) {
         var config = new SettingsConfig(file);
         require(config.rr() && config.quality() == Quality.PERFORMANCE && config.ev() == 0
-                && config.samples() == 1 && config.bounces() == 12 && config.ser()
-                && config.updateBudget() == UpdateBudget.BALANCED, "默认开启 SER、Performance RR、0 EV、1 SPP、12 顶点和平衡更新");
-        require(config.display().equals(new DisplaySettings(65, 5, 75, 40)), "自动曝光和 DRT 各自使用显示默认值");
+                && config.samples() == 2 && config.bounces() == 12 && config.ser()
+                && config.updateBudget() == UpdateBudget.BALANCED, "默认开启 SER、Performance RR、0 EV、2 SPP、12 顶点和平衡更新");
+        require(config.display().equals(new DisplaySettings(65, 5, 75, 40, true, BloomMode.FAST_CIRCULAR)), "显示默认值开启快速圆形泛光");
         require(config.lighting().equals(LightingSettings.DEFAULT), "太阳和方块发光默认各为 0 EV");
     }
 
@@ -59,7 +59,6 @@ final class ExposureFixture {
         var config = new SettingsConfig(file);
         config.setExposure(-2.5f);
         config.setQuality(Quality.BALANCED);
-        config.setSamples(2);
         config.setBounces(8);
         config.setRequestedRr(false);
         config.setRequestedSer(false);
@@ -79,7 +78,7 @@ final class ExposureFixture {
         saved.command("pt rr on");
         saved.command("pt ser on");
         var changed = new SettingsConfig(file);
-        require(changed.ev() == 1 && changed.quality() == Quality.QUALITY && changed.samples() == 1
+        require(changed.ev() == 1 && changed.quality() == Quality.QUALITY && changed.samples() == 2
                 && changed.bounces() == 16 && changed.rr() && changed.ser()
                 && changed.updateBudget() == UpdateBudget.SMOOTH, "命令写入与界面 setter 保持一致");
         changed.command("pt reset");
@@ -101,7 +100,7 @@ final class ExposureFixture {
         config.command("pt quality invalid");
         config.command("pt rr invalid");
         config.command("pt ser invalid");
-        require(config.samples() == 1 && config.bounces() == 12 && config.quality() == Quality.PERFORMANCE
+        require(config.samples() == 2 && config.bounces() == 12 && config.quality() == Quality.PERFORMANCE
                 && config.rr() && config.ser(), "无效值保持原模型");
         config.command("pt ev -16");
         config.command("pt mode offline");
@@ -115,7 +114,7 @@ final class ExposureFixture {
         var legacy = new SettingsConfig(file);
         require(legacy.ev() == -3 && !legacy.rr() && legacy.quality() == Quality.PERFORMANCE && legacy.ser(),
                 "旧配置保留曝光/RR，同时补入 Performance 与自动 SER");
-        legacy.setSamples(2);
+        legacy.setExposure(legacy.ev());
         var migrated = new SettingsConfig(file);
         require(migrated.ev() == -3 && !migrated.rr() && migrated.quality() == Quality.PERFORMANCE
                 && migrated.samples() == 2, "迁移后的保存保留全部旧值");
@@ -148,13 +147,26 @@ final class ExposureFixture {
     private static void displaySettings(Path file) throws Exception {
         Files.writeString(file, "exposure_ev=-3\ndisplay.saturation_percent=12\n");
         var config = new SettingsConfig(file);
-        require(config.display().equals(new DisplaySettings(65, 12, 75, 40)), "读取旧版显示键并补入缺省值");
-        var next = new DisplaySettings(0, 5, 100, 99);
+        require(config.display().equals(new DisplaySettings(65, 12, 75, 40, true, BloomMode.FAST_CIRCULAR)), "未指定泛光模式时使用快速圆形");
+        var next = new DisplaySettings(0, 5, 100, 99, false, BloomMode.PUPIL);
         config.setDisplay(next);
         require(config.ev() == -3, "修改自动曝光和 DRT 保留手动 EV");
         config.command("pt ev 1.23456");
         var saved = new SettingsConfig(file);
-        require(saved.ev() == 1.23456f && saved.display().equals(next), "修改手动 EV 保留自动曝光和 DRT 配置");
+        require(saved.ev() == 1.23456f && saved.display().equals(next) && saved.display().bloomWireId() == 0,
+                "关闭泛光并重载后仍保存瞳孔与显示参数");
+        saved.setDisplay(new DisplaySettings(0, 5, 100, 99, true, saved.display().bloomMode()));
+        require(new SettingsConfig(file).display().bloomWireId() == BloomMode.PUPIL.wireId, "重新开启使用已保存的瞳孔");
+        for (var aperture : BloomMode.values()) {
+            saved.setDisplay(new DisplaySettings(0, 5, 100, 99, true, aperture));
+            var reloaded = new SettingsConfig(file).display();
+            require(reloaded.bloomMode() == aperture && reloaded.bloomWireId() == aperture.wireId,
+                    "重载后继续使用选定的泛光模式");
+        }
+        Files.writeString(file, "display.aperture=chamfered\n");
+        require(new SettingsConfig(file).display().bloomMode() == BloomMode.CAMERA, "旧十二芒迁移到相机光圈");
+        Files.writeString(file, "display.aperture=iris\n");
+        require(new SettingsConfig(file).display().bloomMode() == BloomMode.PUPIL, "旧近圆光瞳迁移到瞳孔");
         saved.reset();
         defaults(file);
     }
@@ -179,7 +191,7 @@ final class ExposureFixture {
         Files.writeString(blocked, "blocked");
         try {
             var config = new SettingsConfig(blocked.resolve("config.properties"));
-            require(config.command("pt spp 2").contains("保存失败") && config.samples() == 1,
+            require(config.command("pt bounces 2").contains("保存失败") && config.bounces() == 12,
                     "保存失败反馈给用户且保留原内存值");
         } finally { Files.delete(blocked); }
     }

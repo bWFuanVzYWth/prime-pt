@@ -21,6 +21,7 @@ final class NativeBatchFixture {
             var error=linker.downcallHandle(symbols.find("prime_error").orElseThrow(),FunctionDescriptor.of(ADDRESS));
             var profile=linker.downcallHandle(symbols.find("prime_profile").orElseThrow(),FunctionDescriptor.of(JAVA_INT,JAVA_LONG,JAVA_LONG,ADDRESS,ADDRESS,JAVA_INT,JAVA_INT));
             var display = Native.bindDisplayOptions(symbols);
+            var lensBloom = Native.bindLensBloom(symbols);
             var tuning = Native.bindRenderTuning(symbols);
             if ((int)tuning.invokeExact(0L, 2) != -1
                     || !message(error).equals("诊断开关须为0或1"))
@@ -28,6 +29,11 @@ final class NativeBatchFixture {
             if (Native.invokeRenderTuning(tuning, 0L, new RenderTuning(true)) != -1
                     || !message(error).equals("无效 native 句柄"))
                 throw new AssertionError("输出采样参数须通过实际FFM入口并抵达会话查找");
+            if ((int) lensBloom.invokeExact(0L, 6) != -1 || !message(error).equals("未知镜头泛光模式"))
+                throw new AssertionError("未知光瞳须在会话查找前拒绝");
+            for (int mode : new int[]{0, 1, 2, 3, 4, 5})
+                if ((int) lensBloom.invokeExact(0L, mode) != -1 || !message(error).equals("无效 native 句柄"))
+                    throw new AssertionError("每种有效泛光模式须进入会话边界");
             if (Native.invokeDisplayOptions(display, 0L, DisplaySettings.DEFAULT) != -1 || !message(error).equals("无效 native 句柄"))
                 throw new AssertionError("显示参数须通过 FFM 并抵达会话查找");
             var lighting = Native.bindLightingOptions(symbols);

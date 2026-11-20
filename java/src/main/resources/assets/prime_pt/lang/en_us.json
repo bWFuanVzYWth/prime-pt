@@ -15,8 +15,6 @@
   "primept.settings.quality.balanced": "Balanced",
   "primept.settings.quality.performance": "Performance (2×)",
   "primept.settings.quality.ultra_performance": "Ultra Performance",
-  "primept.settings.sampling_strategy": "Sampling strategy",
-  "primept.settings.sampling_strategy.tooltip": "Performance: one random path per pixel. Quality: two separated paths with square-root Russian roulette to retain more low-throughput paths. Realtime only; use /pt spp for offline batch size.\nCommand: /pt sampling performance|quality",
   "primept.settings.bounces": "Path vertex budget",
   "primept.settings.bounces.tooltip": "Allow 1–64 vertices per path, including the primary hit. The last vertex still evaluates direct lighting and emission.\nCommand: /pt bounces 1..64",
   "primept.settings.display": "PT display",
@@ -36,6 +34,13 @@
   "primept.settings.update_budget.throughput": "Throughput",
   "primept.settings.exposure": "Exposure",
   "primept.settings.exposure.tooltip": "Adjust brightness after RR and before display mapping. +1 EV doubles brightness. The slider previews 0.25 EV steps and saves on release. Opening settings preserves precise command values.\nCommand: /pt exposure -16..16",
+  "primept.settings.lens_bloom": "Lens bloom",
+  "primept.settings.lens_bloom.tooltip": "Adds diffraction bloom around the sun and bright lights. Turn off to save GPU time and memory.",
+  "primept.settings.bloom_mode": "Bloom mode",
+  "primept.settings.bloom_mode.tooltip": "Camera aperture and custom pupil use the exported diffraction kernels. Fast circular gives bright lights a smooth halo.",
+  "primept.settings.bloom_mode.camera": "Camera aperture (camara)",
+  "primept.settings.bloom_mode.pupil": "Custom pupil (pupil)",
+  "primept.settings.bloom_mode.fast_circular": "Fast circular",
   "primept.settings.auto_exposure": "Auto exposure strength",
   "primept.settings.auto_exposure.tooltip": "Scales the exposure correction from scene metering. At 0% the automatic correction is off. At 100% the full correction applies. Defaults to 65%. Manual EV remains an additional offset.",
   "primept.settings.drt_saturation": "DRT saturation compensation",
@@ -52,7 +57,5 @@
   "primept.settings.mode.offline": "Offline snapshot",
   "primept.settings.mode.tooltip": "Offline freezes the current scene, camera and lighting and continuously accumulates independent paths at full output resolution. The game keeps running. Returning to realtime resumes world updates. Offline is session only.\nCommand: /pt mode realtime|offline",
   "primept.settings.diagnostic": "Native raw diagnostic",
-  "primept.settings.diagnostic.tooltip": "Native resolution, no RR or frame accumulation. PT averages the configured SPP within each frame. Display exposure and quality preferences remain active.\nCommand: /pt diagnostic on|off",
-  "primept.settings.sampling_strategy.performance": "Performance",
-  "primept.settings.sampling_strategy.quality": "Quality"
+  "primept.settings.diagnostic.tooltip": "Native resolution, no RR or frame accumulation. PT averages two paths per pixel within each frame. Display exposure and quality preferences remain active.\nCommand: /pt diagnostic on|off"
 }

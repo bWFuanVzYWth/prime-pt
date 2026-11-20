@@ -72,7 +72,7 @@ pub unsafe extern "C" fn prime_profile(
 /// environment 指向一份活动的 16B [`FrameEnvironment`]。曝光只影响呈现。
 /// rr=0 使用原始累积，rr=1 使用已完成早期 SDK 接入的 RR；其余值拒绝。
 /// quality=0..=4 对应 DLAA/Quality/Balanced/Performance/UltraPerformance；SDK 决定输入尺寸。
-/// samples=1..=64；RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为最多表面反弹次数，默认12；末顶点保留发光与NEE。
+/// 实时固定 2 spp，samples=1..=64 仅用于离线批大小。RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为最多表面反弹次数，默认12；末顶点保留发光与NEE。
 /// [`prime_set_rendering`] 选择离线时固定最近已接受帧的场景、相机、光照和路径预算，
 /// 只接受当前曝光、尺寸和每帧采样量；没有已接受帧时先绘制并接受首帧。离线禁用 RR，
 /// 离线累积将超过2^24个样本时显式返回错误；由用户重新进入离线模式，不自动丢弃均值。

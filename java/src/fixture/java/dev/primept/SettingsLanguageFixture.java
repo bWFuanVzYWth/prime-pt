@@ -65,15 +65,29 @@ final class SettingsLanguageFixture {
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us"), false));
                     requireText("render", "PT rendering");
                     requireRenderingHierarchy("Prime PT", "Rendering mode", "Offline snapshot", "Realtime renderer");
-                    requireWidgetText("Sampling strategy", "Quality", "DLSS quality", "Performance (2×)");
+                    requireWidgetText("DLSS quality", "Performance (2×)");
                     requireAutoExposure("Auto exposure strength");
+                    requireText("lens_bloom", "Lens bloom");
+                    requireText("lens_bloom.tooltip", "Adds diffraction bloom around the sun and bright lights. Turn off to save GPU time and memory.");
+                    requireText("bloom_mode", "Bloom mode");
+                    requireText("bloom_mode.tooltip", "Camera aperture and custom pupil use the exported diffraction kernels. Fast circular gives bright lights a smooth halo.");
+                    requireText("bloom_mode.camera", "Camera aperture (camara)");
+                    requireText("bloom_mode.pupil", "Custom pupil (pupil)");
+                    requireText("bloom_mode.fast_circular", "Fast circular");
                     requireLighting("Sun intensity", "Block emission intensity");
                     requireStartupNotice("Prime PT unavailable", "OpenGL is active.", "GPU or driver lacks:");
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "PT 渲染");
                     requireRenderingHierarchy("Prime PT 开关", "渲染模式", "离线快照", "实时渲染器");
-                    requireWidgetText("采样策略", "质量", "DLSS 质量", "性能（2×）");
+                    requireWidgetText("DLSS 质量", "性能（2×）");
                     requireAutoExposure("自动曝光强度");
+                    requireText("lens_bloom", "镜头泛光");
+                    requireText("lens_bloom.tooltip", "在太阳和明亮光源周围产生衍射泛光。关闭可节省 GPU 时间和显存。");
+                    requireText("bloom_mode", "泛光模式");
+                    requireText("bloom_mode.tooltip", "相机光圈和瞳孔使用工作台导出的衍射核。快速圆形让亮点和太阳呈现平滑圆晕。");
+                    requireText("bloom_mode.camera", "相机光圈（camara）");
+                    requireText("bloom_mode.pupil", "瞳孔（pupil）");
+                    requireText("bloom_mode.fast_circular", "快速圆形");
                     requireLighting("太阳强度", "方块发光强度");
                     requireStartupNotice("Prime PT 不可用", "当前使用 OpenGL。", "显卡或驱动缺少：");
                 }
@@ -84,7 +98,7 @@ final class SettingsLanguageFixture {
                 try (var resources = new MultiPackResourceManager(PackType.CLIENT_RESOURCES, List.of(vanilla, pack, userPack))) {
                     Language.inject(ClientLanguage.loadFrom(resources, List.of("en_us", "zh_cn"), false));
                     requireText("render", "资源包覆盖");
-                    requireText("sampling_strategy", "采样策略");
+                    requireText("lens_bloom", "镜头泛光");
                 }
             }
         } finally {
@@ -104,13 +118,7 @@ final class SettingsLanguageFixture {
         require(actual.equals(expected), key + " 的翻译为 " + actual + "，预期 " + expected);
     }
 
-    private static void requireWidgetText(String strategyTitle, String strategyValue, String quality, String performance) {
-        var sampling = VideoOptions.cycle(CycleButton.builder(
-                        (SamplingStrategy value) -> Component.translatable("primept.settings.sampling_strategy." + value.key), SamplingStrategy.QUALITY)
-                .withValues(SamplingStrategy.values()), Component.translatable("primept.settings.sampling_strategy"),
-                () -> SamplingStrategy.QUALITY, value -> {}, error -> { throw new AssertionError(error); });
-        var expectedSampling = CommonComponents.optionNameValue(Component.literal(strategyTitle), Component.literal(strategyValue));
-        require(sampling.getMessage().getString().equals(expectedSampling.getString()), "采样策略显示一次本地化标题和选项");
+    private static void requireWidgetText(String quality, String performance) {
         var cycle = VideoOptions.cycle(CycleButton.builder(
                         (String key) -> Component.translatable("primept.settings.quality." + key), "performance")
                 .withValues("performance", "quality"), Component.translatable("primept.settings.quality"),

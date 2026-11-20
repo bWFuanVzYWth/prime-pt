@@ -479,10 +479,15 @@ fn hardware_pt_equal_time_benchmark() -> Result {
         if offline && rr {
             return Err("离线正确性参考不启用RR".into());
         }
-        let spp = integer(variant, "spp", 1, if offline { 64 } else { 2 })?;
-        if spp == 0 {
-            return Err("无效spp".into());
-        }
+        let spp = if offline {
+            integer(variant, "spp", 1, 64)?
+        } else {
+            let n = integer(variant, "spp", pt::REALTIME_SAMPLES, pt::REALTIME_SAMPLES)?;
+            if n != pt::REALTIME_SAMPLES {
+                return Err("实时基准固定 2 spp".into());
+            }
+            n
+        };
         let options = Options::new(rr, streamline::Quality::Dlaa, spp, 12)?;
         gpu.test_roots.truncate(root_start);
         gpu.set_rendering(if offline {

@@ -137,6 +137,25 @@ pub extern "C" fn prime_set_display_options(
     })
 }
 
+/// 设置镜头泛光，0 关闭、3 相机光圈、4 瞳孔、5 快速圆形，旧值 1、2 分别映射到 3、4。实时和离线视图共享设置，下一次呈现生效。
+/// 成功返回 0，未知光瞳或无效会话返回 −1。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_set_lens_bloom(id: u64, mode: u32) -> i32 {
+    guarded(-1, || {
+        let aperture = match mode {
+            0 => None,
+            1 | 3 => Some(prime_renderer::Aperture::Camera.into()),
+            2 | 4 => Some(prime_renderer::Aperture::Pupil.into()),
+            5 => Some(prime_renderer::LensMode::FastCircular),
+            _ => return Err(Error::Input("未知镜头泛光模式")),
+        };
+        with_engine(id, |engine| {
+            engine.gpu.set_lens_bloom(aperture);
+            Ok(())
+        })
+    })
+}
+
 /// 设置太阳强度（−8..=8 EV）与方块发光强度（−10..=10 EV）。
 /// 只修改下一帧的 CPU 光照参数。成功返回 0，会话或参数无效返回 −1 并保留原值。
 #[unsafe(no_mangle)]

@@ -12,9 +12,12 @@
 //! 默认最多12次表面反弹，末顶点保留发光和NEE；原生诊断关闭RR和跨帧RGB累积。
 //! 每批随机样本基数只在完整记录经宿主编码、提交并完成后推进；失败和取消不接受新身份。
 
+mod bloom;
 mod gpu;
+pub use bloom::LensMode;
 mod reconstruction;
 pub mod streamline;
 pub use gpu::capture;
 pub use gpu::{Error, GlobalReset, Gpu, Options, ResourceUpload, SceneUpdateTiming};
 use prime_scene as scene;
+pub use simple_engine::fft_bloom::Aperture;

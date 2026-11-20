@@ -2,7 +2,7 @@
 //!
 //! PRIME_PT_SCENE_BENCH_OUTPUT 指定 temp/scene-bench 下的新目录。
 //! 视距4、Y为[-4,8) section，向4³对齐；基准相机窗口含1728个section/27个region，
-//! 其中固定64个非空section属于同一region，共98,304个quad；1024×576、1spp、12顶点、普通RT、RR关闭。
+//! 其中固定64个非空section属于同一region，共98,304个quad；1024×576、2spp、12顶点、普通RT、RR关闭。
 //! steady每轮从绝对样本0开始；edit只重捕一个section并重建所属region，消费生产增量入口。
 //! Host::render_options包含command pool/录制、参数上传、submit、queue idle及Flight完成，
 //! 是主机完成墙钟，不是GPU timestamp。plan、PRT2应答、apply、prepare/GPU/commit另行报告；
@@ -548,7 +548,7 @@ fn hardware_pt_scene_baseline() -> Result {
             "atlas":save(&root,"atlas.rgba8",&atlas)?,"atlas_extent":[16,16],
             "camera":{"origin":camera.origin,"forward":camera.forward,"right":camera.right,"up":camera.up},
             "environment":{"sun_direction":environment.sun_direction,"sea_level":environment.sea_level,"exposure_ev":environment.exposure_ev},
-            "integrator":{"samples":1,"max_bounces":12,"seed":0,"max_dielectric_events":128,"rr":false,"ser":false},
+            "integrator":{"samples":pt::REALTIME_SAMPLES,"max_bounces":12,"seed":0,"max_dielectric_events":128,"rr":false,"ser":false},
             "rounds":ROUNDS,"steady_frames_per_round":FRAMES,"edits_per_round":EDITS,
             "boundary":"Host::render_options: command-pool creation, draw/encode, submit, queue idle, Flight completion; readback excluded",
             "scene_update_boundary":"manager_complete: plan+PRT2 packet response+apply+prepare+set_sections+commit/retire; all empty resources included; output file writes excluded",
@@ -606,7 +606,7 @@ fn hardware_pt_scene_baseline() -> Result {
         ImageFormat::Rgba8Unorm,
     )?;
     gpu.test_roots.push(image.into());
-    let options = Options::new(false, streamline::Quality::Dlaa, 1, 12)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 12)?;
     for _ in 0..3 {
         host.render_options(&mut gpu, &image, &camera, environment, options)?;
     }
@@ -680,7 +680,7 @@ fn hardware_pt_scene_baseline() -> Result {
             record(
                 &mut raw,
                 &json!({"case":"steady","round":round,"frame":frame,
-                "first_sample":frame,"samples":1,"draw_complete_ns":draw_complete_ns,
+                "first_sample":frame * pt::REALTIME_SAMPLES as usize,"samples":pt::REALTIME_SAMPLES,"draw_complete_ns":draw_complete_ns,
                 "manager_steady_ns":manager_steady_ns,"frame_complete_ns":frame_complete_ns}),
             )?;
         }
@@ -689,7 +689,7 @@ fn hardware_pt_scene_baseline() -> Result {
             &image,
             &root,
             &format!("steady-{round}"),
-            FRAMES as u32,
+            FRAMES as u32 * pt::REALTIME_SAMPLES,
         )?);
     }
     // 编辑同样请求真实刷新ticket；PRT2响应、空源与全部manager调度计入完整准备。
@@ -720,13 +720,19 @@ fn hardware_pt_scene_baseline() -> Result {
             record(
                 &mut raw,
                 &json!({"case":"single_section_edit","round":round,"edit":edit,
-                "variant":variant,"first_sample":0,"samples":1,"apply_ns":apply_ns,
+                "variant":variant,"first_sample":0,"samples":pt::REALTIME_SAMPLES,"apply_ns":apply_ns,
                 "merge_ns":merge_ns,"set_scene_complete_ns":set_scene_complete_ns,
                 "prepare_complete_ns":prepare_complete_ns,"draw_complete_ns":draw_complete_ns,
                 "update_draw_complete_ns":update_draw_complete_ns,"manager":manager.report(),"packets":packets,"scene_build":scene_build_metrics(&gpu)}),
             )?;
         }
-        captures.push(capture.save(&mut gpu, &image, &root, &format!("edit-{round}"), 1)?);
+        captures.push(capture.save(
+            &mut gpu,
+            &image,
+            &root,
+            &format!("edit-{round}"),
+            pt::REALTIME_SAMPLES,
+        )?);
     }
     raw.flush()?;
     let errors = host.errors.load(Ordering::Relaxed);

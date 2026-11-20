@@ -31,7 +31,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "cargo::rustc-env=PRIME_ENGINE_SHADERS_RELATIVE={}",
         relative.display()
     );
-    let exposure_source = format!("{}/display/exposure_compute.slang", shader_library::root());
+    let display_root = simple_engine::display::shader_root();
+    let display_relative = relative_path(Path::new(display_root), Path::new(&manifest))?;
+    println!(
+        "cargo::rustc-env=PRIME_DISPLAY_SHADERS_RELATIVE={}",
+        display_relative.display()
+    );
+    let exposure_source = format!("{display_root}/display/exposure_compute.slang");
     let stages = [
         ("prefix_main", "raygeneration", "prefix.spv"),
         ("render_main", "raygeneration", "render.spv"),
@@ -130,8 +136,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         ("shaders/present.slang", "present_main", "present.spv"),
         ("shaders/rr.slang", "pack_main", "rr_pack.spv"),
-        ("shaders/rr.slang", "present_main", "rr_present.spv"),
-        ("shaders/rr.slang", "fallback_main", "rr_fallback.spv"),
+        ("shaders/rr.slang", "resolve_raw", "resolve_raw.spv"),
+        ("shaders/rr.slang", "resolve_rr", "resolve_rr.spv"),
+        ("shaders/rr.slang", "resolve_spatial", "resolve_spatial.spv"),
         (
             "shaders/visibility_test.slang",
             "visibility_main",
@@ -223,26 +230,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "present_automatic",
             "present_present_automatic.spv",
         ),
-        (
-            "shaders/rr.slang",
-            "present_manual",
-            "rr_present_manual.spv",
-        ),
-        (
-            "shaders/rr.slang",
-            "present_automatic",
-            "rr_present_automatic.spv",
-        ),
-        (
-            "shaders/rr.slang",
-            "fallback_manual",
-            "rr_fallback_manual.spv",
-        ),
-        (
-            "shaders/rr.slang",
-            "fallback_automatic",
-            "rr_fallback_automatic.spv",
-        ),
     ] {
         recipes.push(Recipe {
             source,
@@ -253,6 +240,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args: &["-fp-mode", "precise"],
         });
     }
-    build(&recipes, &["shaders", shader_library::root()], &["src"])?;
+    build(
+        &recipes,
+        &["shaders", shader_library::root(), display_root],
+        &["src"],
+    )?;
     Ok(())
 }

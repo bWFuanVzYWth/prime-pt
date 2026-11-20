@@ -53,7 +53,6 @@ public final class Settings {
     public static void setRequestedRr(boolean value) throws IOException { Holder.CONFIG.setRequestedRr(value); }
     public static void setRequestedSer(boolean value) throws IOException { Holder.CONFIG.setRequestedSer(value); }
     public static void setQuality(Quality value) throws IOException { Holder.CONFIG.setQuality(value); }
-    public static void setSamples(int value) throws IOException { Holder.CONFIG.setSamples(value); }
     public static void setBounces(int value) throws IOException { Holder.CONFIG.setBounces(value); }
     static void setUpdateBudget(UpdateBudget value) throws IOException { Holder.CONFIG.setUpdateBudget(value); }
     static void setSolarLatitude(int value) throws IOException {
@@ -70,19 +69,27 @@ public final class Settings {
     }
     static void setAutoExposure(int value) throws IOException {
         var options = display();
-        Holder.CONFIG.setDisplay(new DisplaySettings(value, options.saturation(), options.hue(), options.compressionStart()));
+        Holder.CONFIG.setDisplay(new DisplaySettings(value, options.saturation(), options.hue(), options.compressionStart(), options.lensBloom(), options.bloomMode()));
     }
     static void setDrtSaturation(int value) throws IOException {
         var options = display();
-        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), value, options.hue(), options.compressionStart()));
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), value, options.hue(), options.compressionStart(), options.lensBloom(), options.bloomMode()));
     }
     static void setDrtHue(int value) throws IOException {
         var options = display();
-        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), value, options.compressionStart()));
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), value, options.compressionStart(), options.lensBloom(), options.bloomMode()));
     }
     static void setDrtCompressionStart(int value) throws IOException {
         var options = display();
-        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), options.hue(), value));
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), options.hue(), value, options.lensBloom(), options.bloomMode()));
+    }
+    static void setLensBloom(boolean enabled) throws IOException {
+        var options = display();
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), options.hue(), options.compressionStart(), enabled, options.bloomMode()));
+    }
+    static void setBloomMode(BloomMode bloomMode) throws IOException {
+        var options = display();
+        Holder.CONFIG.setDisplay(new DisplaySettings(options.autoExposure(), options.saturation(), options.hue(), options.compressionStart(), options.lensBloom(), bloomMode));
     }
     public static void reset() throws IOException { Holder.CONFIG.reset(); }
 

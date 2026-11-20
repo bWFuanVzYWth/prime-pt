@@ -137,9 +137,22 @@ impl Gpu {
         rr_enabled: bool,
     ) -> Result<Vec<Recorded>, Error> {
         self.complete_previous()?;
+        // 换光瞳或重新开启时，先回收已完成的旧 FFT 工作区，再为当前视图分配。
+        if self.bloom_filter.enabled()
+            && self
+                .view
+                .as_ref()
+                .is_some_and(|v| v.presentation.bloom.is_none())
+        {
+            match &target {
+                Binding::StorageImage(image) => self.collect_with(&[(*image).into()])?,
+                _ => self.collect_with(&[])?,
+            }
+        }
+        let samples = self.frame_samples(self.settings.samples);
         let next_absolute = self
             .absolute_sample
-            .checked_add(self.settings.samples)
+            .checked_add(samples)
             .ok_or(pt::Error::SampleOverflow)?;
         let diagnostic = self.diagnostic();
         if extent.into_iter().any(|n| n == 0 || n > 65536) {
@@ -223,14 +236,16 @@ impl Gpu {
                 };
                 let next = View::new_scaled(
                     &mut self.context,
-                    input,
-                    extent,
+                    Some(&mut self.bloom_filter),
+                    [input, extent],
                     rr_enabled,
                     self.rr_quality,
                     Some(
                         self.view
                             .as_ref()
-                            .map_or(&self.program_view.display, |view| &view.display),
+                            .map_or(&self.program_view.presentation.display, |view| {
+                                &view.presentation.display
+                            }),
                     ),
                     Some(&self.program_view),
                 )?;
@@ -241,6 +256,13 @@ impl Gpu {
                 self.view = Some(next);
                 self.renderer = None;
                 self.guide_pipeline = None;
+            } else if self.bloom_filter.enabled()
+                && let Some(view) = &mut self.view
+                && view.presentation.bloom.is_none()
+            {
+                view.presentation.bloom = self
+                    .bloom_filter
+                    .bind(&mut self.context, view.presentation.linear_hdr)?;
             }
 
             let realtime_pt =
@@ -255,16 +277,11 @@ impl Gpu {
             let frame_film = rr_enabled;
             #[cfg(test)]
             let frame_film = frame_film || self.test_center_film;
-            let split = self.settings.samples == 2;
+            #[cfg(not(test))]
+            let split = true;
             #[cfg(test)]
-            let split = split && self.test_split_transport;
-            let frame_plan = FramePlan::new(
-                realtime_pt,
-                self.settings.samples,
-                split,
-                frame_film,
-                composite,
-            )?;
+            let split = self.test_split_transport;
+            let frame_plan = FramePlan::new(realtime_pt, split, frame_film, composite);
             if self.renderer.is_none() {
                 self.renderer = Some(self.create_renderer()?);
             }
@@ -299,7 +316,7 @@ impl Gpu {
             self.prepare_accumulation_history(key, rr_enabled || diagnostic)?;
             let view = self.view.as_mut().unwrap();
             let extent = view.extent;
-            let batch = view.progress.begin(self.settings.samples)?;
+            let batch = view.progress.begin(samples)?;
             let mut words: Vec<u32> = vectors.into_iter().flatten().map(f32::to_bits).collect();
             words[3] = environment.sea_level.to_bits();
             words.extend([extent[0], extent[1], batch.first(), batch.samples()]);
@@ -380,7 +397,7 @@ impl Gpu {
                             .is_some_and(|g| g.hit.authored_normals),
                     ) << 2)
                     | (u32::from(realtime_pt) << 5),
-                u32::from(!self.offline && self.settings.samples == 2),
+                0,
             ]);
             words.extend(self.anchor.map(|v| ((v / 64.) as i32) as u32));
             words.push(0);
@@ -473,18 +490,6 @@ impl Gpu {
                 batch.commit();
                 return Ok(());
             }
-            let bindings = Bindings::new(
-                &mut self.context,
-                &[
-                    Binding::StorageBuffer(view.params),
-                    Binding::StorageBuffer(view.output),
-                    target,
-                    Binding::StorageBuffer(view.display.state()),
-                    Binding::StorageBuffer(view.display.parameters()),
-                ],
-            )?;
-            let pipeline = view.present[usize::from(self.display_timeline.enabled())]
-                .rebind(&mut self.context, bindings)?;
             let frame = if self.offline {
                 simple_engine::display::exposure::Frame::new(
                     extent,
@@ -499,20 +504,22 @@ impl Gpu {
                     .prepare(extent, true, self.display_origin.elapsed())?
             };
             let meter = self.display_timeline.enabled() && (!self.offline || !self.offline_metered);
-            if let Some(exposure) = view
-                .display
-                .record(&mut self.context, frame, false, meter)?
+            if let Some(exposure) =
+                view.presentation
+                    .display
+                    .record(&mut self.context, frame, false, meter)?
             {
                 result.push(exposure);
             }
             if self.offline {
                 self.offline_metered = true;
             }
-            let mut present = Commands::new(&self.context)?;
-            present.barrier();
-            present.dispatch(pipeline, [extent[0].div_ceil(8), extent[1].div_ceil(8), 1])?;
-            present.barrier();
-            result.push(present.finish(&mut self.context)?);
+            result.push(view.presentation.record(
+                &mut self.context,
+                target,
+                HdrSource::Raw,
+                self.display_timeline.enabled(),
+            )?);
             batch.commit();
             Ok(())
         })();
@@ -728,29 +735,6 @@ impl Gpu {
                 };
                 // SAFETY: 与 RR 前相同的宿主录制边界。
                 unsafe { self.context.diagnostic_checkpoint(command, "rr/end")? };
-                let bindings = Bindings::new(
-                    &mut self.context,
-                    &[
-                        Binding::StorageBuffer(view.params),
-                        Binding::StorageBuffer(view.output),
-                        Binding::StorageImage(view.rr.images[0]),
-                        Binding::SampledImage(view.rr.images[6]),
-                        Binding::External(target),
-                        Binding::SampledImage(view.rr.images[1]),
-                        Binding::SampledImage(view.rr.images[3]),
-                        Binding::SampledImage(view.rr.images[4]),
-                        Binding::SampledImage(view.rr.images[5]),
-                        Binding::StorageBuffer(view.display.state()),
-                        Binding::StorageBuffer(view.display.parameters()),
-                    ],
-                )?;
-                let pipeline = if evaluated {
-                    view.rr_present[usize::from(self.display_timeline.enabled())]
-                        .rebind(&mut self.context, bindings)?
-                } else {
-                    view.rr_fallback[usize::from(self.display_timeline.enabled())]
-                        .rebind(&mut self.context, bindings)?
-                };
                 let measurement_extent = if evaluated {
                     view.output_extent
                 } else {
@@ -761,19 +745,24 @@ impl Gpu {
                     true,
                     self.display_origin.elapsed(),
                 )?;
-                let exposure = view.display.record(
+                let exposure = view.presentation.display.record(
                     &mut self.context,
                     frame,
                     evaluated,
                     self.display_timeline.enabled(),
                 )?;
                 recordings.extend(exposure);
-                let mut present = Commands::new(&self.context)?;
-                present.barrier();
-                present.dispatch(pipeline, [extent[0].div_ceil(8), extent[1].div_ceil(8), 1])?;
-                present.barrier();
-                let present = present.finish(&mut self.context)?;
-                recordings.push(present);
+                let source = if evaluated {
+                    HdrSource::Reconstructed
+                } else {
+                    HdrSource::Spatial
+                };
+                recordings.push(view.presentation.record(
+                    &mut self.context,
+                    Binding::External(target),
+                    source,
+                    self.display_timeline.enabled(),
+                )?);
                 // SAFETY: 同本帧前序命令，宿主持有并独占 command 至完成。
                 unsafe {
                     self.encode_recordings(std::mem::take(&mut recordings), command)?;

@@ -161,6 +161,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "circular_bloom"
+version = "0.1.0"
+dependencies = [
+ "color",
+ "libm",
+ "shader_build",
+ "vulkan",
+]
+
+[[package]]
 name = "codespan-reporting"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -172,6 +182,9 @@ dependencies = [
 [[package]]
 name = "color"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "constant_time_eq"
@@ -245,6 +258,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "display"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "vulkan",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -272,6 +293,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "fft_bloom"
+version = "0.1.0"
+dependencies = [
+ "shader_build",
+ "thiserror",
+ "vulkan",
 ]
 
 [[package]]
@@ -735,6 +765,7 @@ dependencies = [
  "ash 0.38.0+1.4.352",
  "blake3",
  "bytemuck",
+ "png",
  "prime_scene",
  "prime_world",
  "rayon",
@@ -954,7 +985,10 @@ dependencies = [
  "atmosphere",
  "camera",
  "chunk_manager",
+ "circular_bloom",
  "color",
+ "display",
+ "fft_bloom",
  "frame_loop",
  "light_sampling",
  "opacity",
@@ -962,7 +996,6 @@ dependencies = [
  "pt",
  "scene_cache",
  "shader_build",
- "thiserror",
  "vulkan",
  "wgpu",
 ]

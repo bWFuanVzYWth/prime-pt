@@ -35,6 +35,6 @@ func shade_primary(inout call: pt::MaterialCall)->void
     let material : transport::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
                        hit, parameters[0].block_emission_scale, { auxiliary });
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true>(
-        ModScene(), call, hit, material, ray.xyz, settings(parameters[0]), parameters[0].image.w,
+        ModScene(), call, hit, material, ray.xyz, settings(parameters[0]),
         asuint(call.origin_pixel.y));
 }

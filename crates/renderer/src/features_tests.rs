@@ -29,6 +29,37 @@ fn publish_stream(
 }
 
 #[test]
+#[ignore = "独立进程：4K RR 与 SER，流式光源树发布后立即绘制首帧"]
+fn streamed_light_world_is_ready_for_the_first_frame() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_rr_ser()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let lamp = MaterialDefinition {
+        emission: [1., 1., 1., 20.],
+        ..Default::default()
+    };
+    upload(
+        gpu,
+        &[MaterialDefinition::default(), lamp],
+        &[],
+        &[[u32::MAX, 0, 0, 0]; 2],
+    )?;
+    let output = Image::new(&mut gpu.context, [3840, 2160, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    let options = Options::new(true, streamline::Quality::Performance, 1, 12)?;
+    publish_stream(gpu, &scene(), 1, 1, [0.; 3])?;
+
+    // 同队列上已发布的区块可以立即复用；查询也不收取地形 fence。
+    let regions = gpu.context.light_regions(gpu.lighting_gpu.tree)?;
+    assert!(matches!(regions, [region] if region.count() == 1));
+    host.render_options(gpu, &output, &camera(), Environment::default(), options)?;
+    assert!(gpu.rr_previous.is_some(), "首帧必须完成 RR 求值");
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实 Vulkan；大批纯 tint 在后台准备，保持 BLAS 和未变化属性"]
 fn streamed_large_tint_only_touches_the_requested_faces() -> Result<(), Box<dyn std::error::Error>>
 {
@@ -603,8 +634,12 @@ fn hardware_pt_guide_source_reload_replaces_the_executed_program()
         }
     }
     let engine = root.join(env!("PRIME_ENGINE_SHADERS_RELATIVE"));
-    gpu.compiler =
-        shader_build::RuntimeCompiler::new(scratch.join("cache"), &[&sources, &engine], &[])?;
+    let display = root.join(env!("PRIME_DISPLAY_SHADERS_RELATIVE"));
+    gpu.compiler = shader_build::RuntimeCompiler::new(
+        scratch.join("cache"),
+        &[&sources, &engine, &display],
+        &[],
+    )?;
     gpu.shader_source = sources.join("primary.slang");
     let definitions = [MaterialDefinition::default()];
     let areas = [[u32::MAX, 0, 0, 0]];
@@ -630,7 +665,7 @@ fn hardware_pt_guide_source_reload_replaces_the_executed_program()
     );
     assert_eq!(pt, generation.code[0]);
     let guide = generation.guide_regular.unwrap();
-    let view = View::new(&mut gpu.context, [32, 32], true)?;
+    let view = View::new(&mut gpu.context, [32, 32], true, &mut gpu.bloom_filter)?;
     let descriptors = gpu.renderer_bindings(
         &view,
         &gpu.atlas,
@@ -1266,7 +1301,7 @@ fn hardware_pt_block_ev_doubles_visible_and_sampled_emission()
         sun_direction: [0.; 3],
         ..Environment::default()
     };
-    let options = Options::new(false, streamline::Quality::Dlaa, 4, 4)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 4)?;
     host.render_options(&mut gpu, &image, &camera(), environment, options)?;
     let baseline = accumulated_rgb(&mut gpu)?;
     gpu.set_lighting_options(0., 1.)?;
@@ -1274,7 +1309,7 @@ fn hardware_pt_block_ev_doubles_visible_and_sampled_emission()
     gpu.test_restart_sample_sequence(0)?;
     host.render_options(&mut gpu, &image, &camera(), environment, options)?;
     let brighter = accumulated_rgb(&mut gpu)?;
-    assert_eq!(gpu.view.as_ref().unwrap().progress.samples(), 4);
+    assert_eq!(gpu.accumulated_samples(), pt::REALTIME_SAMPLES);
     let receiver = |pixels: &[[f32; 3]]| -> f32 {
         pixels
             .as_chunks::<32>()
@@ -1836,6 +1871,8 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
         let mut session = host.gpu()?;
         let mut gpu = session.gpu();
         gpu.experiment_dispatch = dispatch;
+        // 缓存的两条路径共享首条射线；直接命中对照也使用同一像素中心。
+        gpu.test_center_film = staged;
         let output = image(&mut gpu)?;
         let mut receiver = MaterialDefinition {
             base_roughness: [0.8, 0.8, 0.8, 1.],
@@ -1874,12 +1911,7 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
                 sun_direction: [0.; 3],
                 ..Default::default()
             },
-            Options::new(
-                false,
-                streamline::Quality::Dlaa,
-                if staged { 1 } else { 16 },
-                1,
-            )?,
+            Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 1)?,
         )?;
         let hdr = gpu.view.as_ref().unwrap().output;
         let readback = Buffer::new(&mut gpu.context, hdr.len(), true)?;

@@ -296,7 +296,7 @@ public struct OfflinePixelAdapter : pt::IPixelTransport
     }
 };
 
-func render_pixel<A : pt::IPixelTransport, let realtime : bool, let samples : uint, let lane : int,
+func render_pixel<A : pt::IPixelTransport, let realtime : bool, let lane : int,
                   let ignore_failure : bool>(adapter: A, pixel: uint, coordinate: uint2)
     ->void
 {
@@ -308,22 +308,10 @@ func render_pixel<A : pt::IPixelTransport, let realtime : bool, let samples : ui
     var previous = float4(0);
     if (lane == 1)
         previous = output_image[pixel];
-    let result = pt::integrate_pixel<A, realtime, samples, lane>(adapter, coordinate, previous);
+    let result = pt::integrate_pixel<A, realtime, lane>(adapter, coordinate, previous);
     if (lane != 1)
         prefix_image[pixel] = float4(0, 0, 0, realtime ? primary_ray[pixel].w : result.distance);
     output_image[pixel] = result.radiance;
-}
-
-[shader("raygeneration")]
-func render_rt1()->void
-{
-#if PRIMEPT_OMM
-    ENGINE_OPACITY_MICROMAP(render_rt1)
-#endif
-    let coordinate = DispatchRaysIndex().xy;
-    let pixel = primary_pixel();
-    let adapter : RealtimePixelAdapter = { coordinate, pixel };
-    render_pixel<RealtimePixelAdapter, true, 1, -1, false>(adapter, pixel, coordinate);
 }
 
 [shader("raygeneration")]
@@ -335,7 +323,7 @@ func render_rt2_lane0()->void
     let coordinate = DispatchRaysIndex().xy;
     let pixel = primary_pixel();
     let adapter : RealtimePixelAdapter = { coordinate, pixel };
-    render_pixel<RealtimePixelAdapter, true, 2, 0, false>(adapter, pixel, coordinate);
+    render_pixel<RealtimePixelAdapter, true, 0, false>(adapter, pixel, coordinate);
 }
 
 [shader("raygeneration")]
@@ -347,7 +335,7 @@ func render_rt2_lane1()->void
     let coordinate = DispatchRaysIndex().xy;
     let pixel = primary_pixel();
     let adapter : RealtimePixelAdapter = { coordinate, pixel };
-    render_pixel<RealtimePixelAdapter, true, 2, 1, false>(adapter, pixel, coordinate);
+    render_pixel<RealtimePixelAdapter, true, 1, false>(adapter, pixel, coordinate);
 }
 
 [shader("raygeneration")]
@@ -359,7 +347,7 @@ func render_offline()->void
     let coordinate = DispatchRaysIndex().xy;
     let pixel = primary_pixel();
     let adapter : OfflinePixelAdapter = { coordinate, pixel };
-    render_pixel<OfflinePixelAdapter, false, 1, -1, false>(adapter, pixel, coordinate);
+    render_pixel<OfflinePixelAdapter, false, -1, false>(adapter, pixel, coordinate);
 }
 
 [shader("raygeneration")]
@@ -371,7 +359,7 @@ func render_rt2_merged()->void
     let coordinate = DispatchRaysIndex().xy;
     let pixel = primary_pixel();
     let adapter : RealtimePixelAdapter = { coordinate, pixel };
-    render_pixel<RealtimePixelAdapter, true, 2, -1, false>(adapter, pixel, coordinate);
+    render_pixel<RealtimePixelAdapter, true, -1, false>(adapter, pixel, coordinate);
 }
 
 // 原混合入口只供显式参考/诊断；生产链接到上面的固定执行计划。
@@ -386,20 +374,17 @@ func render_fused()->void
     if ((parameters[0].output_size.z & 1u) != 0)
     {
         let adapter : OfflinePixelAdapter = { coordinate, pixel };
-        render_pixel<OfflinePixelAdapter, false, 1, -1, true>(adapter, pixel, coordinate);
+        render_pixel<OfflinePixelAdapter, false, -1, true>(adapter, pixel, coordinate);
     }
     else if (realtime_pt())
     {
         let adapter : RealtimePixelAdapter = { coordinate, pixel };
-        if (parameters[0].image.w == 2)
-            render_pixel<RealtimePixelAdapter, true, 2, -1, false>(adapter, pixel, coordinate);
-        else
-            render_pixel<RealtimePixelAdapter, true, 1, -1, false>(adapter, pixel, coordinate);
+        render_pixel<RealtimePixelAdapter, true, -1, false>(adapter, pixel, coordinate);
     }
     else
     {
         let adapter : OfflinePixelAdapter = { coordinate, pixel };
-        render_pixel<OfflinePixelAdapter, false, 1, -1, false>(adapter, pixel, coordinate);
+        render_pixel<OfflinePixelAdapter, false, -1, false>(adapter, pixel, coordinate);
     }
 }
 
@@ -413,5 +398,5 @@ func render_diagnostic()->void
     let coordinate = DispatchRaysIndex().xy;
     let pixel = primary_pixel();
     let adapter : OfflinePixelAdapter = { coordinate, pixel };
-    render_pixel<OfflinePixelAdapter, false, 1, -1, true>(adapter, pixel, coordinate);
+    render_pixel<OfflinePixelAdapter, false, -1, true>(adapter, pixel, coordinate);
 }

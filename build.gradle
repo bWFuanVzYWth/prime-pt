@@ -159,9 +159,13 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
                 'params.slang', 'mod_*.slang', 'known_geometry.slang'
         into 'shaders/prime'
     }
+    from('../../crates/display/shaders') {
+        include 'display/prime_drt.slang'
+        into 'shaders/engine'
+    }
     from('../../shaders') {
         include 'atmosphere/*.slang', 'camera/*.slang', 'color/*.slang', 'denoise/*.slang',
-                'display/prime_drt.slang', 'geometry/*.slang', 'light_bvh/sample.slang',
+                'geometry/*.slang', 'light_bvh/sample.slang', 'light_bvh/world.slang',
                 'light_sampling/*.slang', 'math/*.slang', 'opacity/*.inc.slang', 'openpbr/**/*.slang',
                 'pt/*.slang', 'sampling/*.slang', 'scene_cache/identity.slang', 'transport/*.slang'
         into 'shaders/engine'
@@ -175,7 +179,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
                  'shaders/engine/pt/scene.slang', 'shaders/engine/pt/hit_transport.slang',
                  'shaders/engine/pt/key_guides.slang',
                  'shaders/engine/sampling/sobol_bits.slang', 'shaders/engine/math/constants.slang',
-                 'shaders/engine/scene_cache/identity.slang']
+                 'shaders/engine/display/prime_drt.slang', 'shaders/engine/scene_cache/identity.slang']
         for (def path : required) {
             def file = new File(directory, path)
             if (!file.isFile() || file.length() == 0) throw new GradleException("发行运行时缺少 ${path}")

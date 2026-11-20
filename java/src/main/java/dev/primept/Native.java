@@ -20,6 +20,7 @@ final class Native implements AutoCloseable {
     private final MethodHandle setSolarOrbit;
     private SolarSettings solar;
     private final MethodHandle setDisplayOptions;
+    private final MethodHandle setLensBloom;
     private DisplaySettings display;
     private final MethodHandle setLightingOptions;
     private LightingSettings lighting;
@@ -76,6 +77,7 @@ final class Native implements AutoCloseable {
         setUpdateBudget = bind(symbols, "prime_set_update_budget", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         setSolarOrbit = bind(symbols, "prime_set_solar_orbit", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT));
         setDisplayOptions = bindDisplayOptions(symbols);
+        setLensBloom = bindLensBloom(symbols);
         setLightingOptions = bindLightingOptions(symbols);
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
         sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
@@ -156,6 +158,8 @@ final class Native implements AutoCloseable {
         if (next.equals(display)) return;
         try {
             check(invokeDisplayOptions(setDisplayOptions, handle, next));
+            if (display == null || next.bloomWireId() != display.bloomWireId())
+                check((int) setLensBloom.invokeExact(handle, next.bloomWireId()));
             display = next;
         } catch (Throwable e) { throw unchecked(e); }
     }
@@ -163,6 +167,10 @@ final class Native implements AutoCloseable {
     static MethodHandle bindDisplayOptions(SymbolLookup symbols) {
         return bind(symbols, "prime_set_display_options", FunctionDescriptor.of(JAVA_INT, JAVA_LONG,
                 JAVA_FLOAT, JAVA_FLOAT, JAVA_FLOAT, JAVA_FLOAT));
+    }
+
+    static MethodHandle bindLensBloom(SymbolLookup symbols) {
+        return bind(symbols, "prime_set_lens_bloom", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
     }
 
     /** 生产和真实 FFM 夹具共用整数百分比到 native 归一化参数的调用点。 */

@@ -7,7 +7,7 @@ import display.exposure;
 [[vk::binding(0, 0)]]
 var parameters : StructuredBuffer<Params>;
 [[vk::binding(1, 0)]]
-var pixels : StructuredBuffer<float4>;
+var pixels : Texture2D<float4>;
 [[vk::binding(2, 0)]]
 [[vk::image_format("rgba8")]]
 var output_image : RWTexture2D<float4>;
@@ -19,13 +19,13 @@ var exposure_parameters : StructuredBuffer<uint4>;
 func present_pixel<let automatic : bool>(id: uint3)->void
 {
     let params : Params = parameters[0];
-    if (any(id.xy >= params.image.xy))
+    if (any(id.xy >= params.output_size.xy))
         return;
-    let hdr : float4 = pixels[id.y * params.image.x + id.x];
+    let hdr : float4 = pixels.Load(int3(id.xy, 0));
     var drt : display::PrimeDrtParameters = params.drt;
     if (automatic)
         drt.exposure_multiplier *= exp2(exposure_state[0].exposure_ev);
-    let target = uint2(id.x, params.image.y - 1 - id.y);
+    let target = uint2(id.x, params.output_size.y - 1 - id.y);
     output_image[target] =
         hdr.w < 0 ? float4(1, 0, 1, 1) : float4(display::prime_drt_bt709(hdr.xyz, drt), 1);
 }

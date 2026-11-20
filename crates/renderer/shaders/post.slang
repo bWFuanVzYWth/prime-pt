@@ -152,24 +152,24 @@ func post_main(id: uint3: SV_DispatchThreadID)->void
     let p = parameters[0];
     let composite = p.lighting.w > 0 && all(p.initial_medium == float4(1, 0, 0, 0));
     let frame_film = p.reconstruction.w > 0;
-    let paths = (p.output_size.z & 32u) != 0 ? p.image.w : 1u;
+    let realtime = (p.output_size.z & 32u) != 0;
     if (!composite)
     {
-        if (paths == 2)
+        if (realtime)
             post_pixel<2, 0, false>(id);
         else
             post_pixel<1, 0, false>(id);
     }
     else if (frame_film)
     {
-        if (paths == 2)
+        if (realtime)
             post_pixel<2, 3, true>(id);
         else
             post_pixel<1, 3, true>(id);
     }
     else
     {
-        if (paths == 2)
+        if (realtime)
             post_pixel<2, 3, false>(id);
         else
             post_pixel<1, 3, false>(id);

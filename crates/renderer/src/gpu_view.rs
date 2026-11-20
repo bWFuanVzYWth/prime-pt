@@ -71,10 +71,10 @@ impl View {
             self.pack.into(),
         ];
         roots.extend(
-            self.present
+            self.presentation
+                .present
                 .into_iter()
-                .chain(self.rr_present)
-                .chain(self.rr_fallback)
+                .chain(self.presentation.resolve)
                 .map(vulkan::native::Resource::from),
         );
         roots.extend(
@@ -89,7 +89,10 @@ impl View {
                 .into_iter()
                 .map(vulkan::native::Resource::from),
         );
-        roots.extend(self.display.roots());
+        if let Some(bloom) = &self.presentation.bloom {
+            roots.extend(bloom.roots());
+        }
+        roots.extend(self.presentation.display.roots());
         roots
     }
 
@@ -98,11 +101,12 @@ impl View {
         context: &mut Context,
         extent: [u32; 2],
         rr_enabled: bool,
+        filter: &mut BloomFilters,
     ) -> Result<Self, Error> {
         Self::new_scaled(
             context,
-            extent,
-            extent,
+            Some(filter),
+            [extent; 2],
             rr_enabled,
             streamline::Quality::Dlaa,
             None,
@@ -112,8 +116,8 @@ impl View {
 
     pub(super) fn new_scaled(
         context: &mut Context,
-        extent: [u32; 2],
-        output_extent: [u32; 2],
+        filter: Option<&mut BloomFilters>,
+        [extent, output_extent]: [[u32; 2]; 2],
         rr_enabled: bool,
         quality: streamline::Quality,
         previous_display: Option<&exposure::Display>,
@@ -151,11 +155,20 @@ impl View {
         )?;
         // 缓存 program 只引用自有占位资源；宿主 view 每帧通过 rebind 借出。
         let placeholder = Image::new(context, [1, 1, 1], ImageFormat::Rgba8Unorm)?;
+        let linear_hdr = Image::new(
+            context,
+            [output_extent[0], output_extent[1], 1],
+            ImageFormat::Rgba32Float,
+        )?;
+        let bloom = match filter {
+            Some(filters) => filters.bind(context, linear_hdr)?,
+            None => None,
+        };
         let present_bindings = Bindings::new(
             context,
             &[
                 Binding::StorageBuffer(params),
-                Binding::StorageBuffer(output),
+                Binding::SampledImage(linear_hdr),
                 Binding::StorageImage(placeholder),
                 Binding::StorageBuffer(display.state()),
                 Binding::StorageBuffer(display.parameters()),
@@ -164,7 +177,7 @@ impl View {
         let present = display_variants(
             context,
             present_bindings,
-            templates.map(|t| t.present),
+            templates.map(|t| t.presentation.present),
             [
                 shader(
                     include_bytes!(concat!(env!("OUT_DIR"), "/present_present_manual.spv")),
@@ -183,13 +196,11 @@ impl View {
                 Binding::StorageBuffer(output),
                 Binding::StorageImage(rr.images[0]),
                 Binding::SampledImage(rr.images[6]),
-                Binding::StorageImage(placeholder),
+                Binding::StorageImage(linear_hdr),
                 Binding::SampledImage(rr.images[1]),
                 Binding::SampledImage(rr.images[3]),
                 Binding::SampledImage(rr.images[4]),
                 Binding::SampledImage(rr.images[5]),
-                Binding::StorageBuffer(display.state()),
-                Binding::StorageBuffer(display.parameters()),
             ],
         )?;
         let pack_bindings = Bindings::new(
@@ -212,36 +223,41 @@ impl View {
                 ),
             )?
         };
-        let rr_present = display_variants(
-            context,
-            bindings,
-            templates.map(|t| t.rr_present),
+        let resolve = if let Some(templates) = templates {
+            let [raw, rr, spatial] = templates.presentation.resolve;
             [
-                shader(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_present_manual.spv")),
-                    c"present_manual",
-                ),
-                shader(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_present_automatic.spv")),
-                    c"present_automatic",
-                ),
-            ],
-        )?;
-        let rr_fallback = display_variants(
-            context,
-            bindings,
-            templates.map(|t| t.rr_fallback),
+                raw.rebind(context, bindings)?,
+                rr.rebind(context, bindings)?,
+                spatial.rebind(context, bindings)?,
+            ]
+        } else {
             [
-                shader(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_fallback_manual.spv")),
-                    c"fallback_manual",
-                ),
-                shader(
-                    include_bytes!(concat!(env!("OUT_DIR"), "/rr_fallback_automatic.spv")),
-                    c"fallback_automatic",
-                ),
-            ],
-        )?;
+                ComputePipeline::new(
+                    context,
+                    bindings,
+                    shader(
+                        include_bytes!(concat!(env!("OUT_DIR"), "/resolve_raw.spv")),
+                        c"resolve_raw",
+                    ),
+                )?,
+                ComputePipeline::new(
+                    context,
+                    bindings,
+                    shader(
+                        include_bytes!(concat!(env!("OUT_DIR"), "/resolve_rr.spv")),
+                        c"resolve_rr",
+                    ),
+                )?,
+                ComputePipeline::new(
+                    context,
+                    bindings,
+                    shader(
+                        include_bytes!(concat!(env!("OUT_DIR"), "/resolve_spatial.spv")),
+                        c"resolve_spatial",
+                    ),
+                )?,
+            ]
+        };
         Ok(Self {
             extent,
             output_extent,
@@ -253,14 +269,58 @@ impl View {
             prefix: Buffer::new(context, pixels * 16, false)?,
             progress: history::Accumulation::new(),
             jitter: [0.; 2],
-            present,
+            presentation: Presentation {
+                params,
+                present,
+                resolve,
+                linear_hdr,
+                bloom,
+                display,
+            },
             rr_enabled,
             quality,
             rr,
             pack,
-            rr_present,
-            rr_fallback,
-            display,
         })
+    }
+}
+
+impl Presentation {
+    pub(super) fn hdr(&self) -> Image {
+        self.bloom
+            .as_ref()
+            .map_or(self.linear_hdr, vulkan::native::ImagePasses::output)
+    }
+
+    pub(super) fn record(
+        &self,
+        context: &mut Context,
+        target: Binding,
+        source: HdrSource,
+        automatic: bool,
+    ) -> Result<Recorded, Error> {
+        let bindings = Bindings::new(
+            context,
+            &[
+                Binding::StorageBuffer(self.params),
+                Binding::SampledImage(self.hdr()),
+                target,
+                Binding::StorageBuffer(self.display.state()),
+                Binding::StorageBuffer(self.display.parameters()),
+            ],
+        )?;
+        let present = self.present[usize::from(automatic)].rebind(context, bindings)?;
+        let [x, y, _] = self.linear_hdr.extent().map(|n| n.div_ceil(8));
+        let mut commands = Commands::new(context)?;
+        commands.barrier();
+        commands.dispatch(self.resolve[source as usize], [x, y, 1])?;
+        if let Some(bloom) = &self.bloom {
+            bloom.record_into(&mut commands)?;
+        } else {
+            commands.barrier();
+        }
+        commands.dispatch(present, [x, y, 1])?;
+        commands.barrier();
+        Ok(commands.finish(context)?)
     }
 }

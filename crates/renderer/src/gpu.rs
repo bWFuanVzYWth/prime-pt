@@ -16,7 +16,7 @@
 //! 是否实际执行SER由设置选择。未启用该能力时保留Flow callable兼容路径，其作者法线预解码
 //! 与旧导引仍是通用实现，不属于完整Hit Group路径的逐阶段材质裁剪保证。实时PT先缓存首视线，再独立运行delta导引
 //! 和随机输运；Guide与输运从同一首面重启，不共用后缀。离线仍追踪完整路径且不生成导引。
-//! 实时1／2样本与离线采用独立入口及最小链接集；有限film、合成和显示程序在准备阶段建立，
+//! 实时双样本与离线采用独立入口及最小链接集；有限film、合成和显示程序在准备阶段建立，
 //! FramePlan统一选择录制与参数，帧内只重绑和选择已有程序。
 
 #[path = "gpu_frame.rs"]
@@ -28,8 +28,14 @@ mod gpu_scene;
 #[path = "gpu_view.rs"]
 mod gpu_view;
 
-use crate::scene::{Camera, Environment, Mesh};
+use crate::{
+    LensMode,
+    bloom::BloomFilters,
+    scene::{Camera, Environment, Mesh},
+};
 use prime_scene::MaterialDefinition;
+#[cfg(test)]
+use simple_engine::fft_bloom;
 use simple_engine::{
     atmosphere, camera, light_sampling, openpbr, pt, scene_cache, shader_build, vulkan,
 };
@@ -394,6 +400,12 @@ fn elapsed_ns(started: std::time::Instant) -> u64 {
     u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+enum HdrSource {
+    Raw,
+    Reconstructed,
+    Spatial,
+}
+
 struct View {
     extent: [u32; 2],
     output_extent: [u32; 2],
@@ -405,13 +417,19 @@ struct View {
     prefix: Buffer,
     progress: history::Accumulation,
     jitter: [f32; 2],
-    present: [ComputePipeline; 2],
+    presentation: Presentation,
     rr_enabled: bool,
     quality: streamline::Quality,
     rr: RrImages,
     pack: ComputePipeline,
-    rr_present: [ComputePipeline; 2],
-    rr_fallback: [ComputePipeline; 2],
+}
+
+struct Presentation {
+    params: Buffer,
+    present: [ComputePipeline; 2],
+    resolve: [ComputePipeline; 3],
+    linear_hdr: Image,
+    bloom: Option<vulkan::native::ImagePasses>,
     display: exposure::Display,
 }
 
@@ -623,7 +641,7 @@ pub struct Options {
 }
 
 impl Options {
-    /// 校验SPP和路径预算；SDK档位只记录选择，在实际视图创建时协商。
+    /// 校验离线批大小和路径预算；SDK档位只记录选择，在实际视图创建时协商。
     pub fn new(
         rr: bool,
         quality: streamline::Quality,
@@ -707,6 +725,7 @@ pub struct Gpu {
     sun_gain: f32,
     block_emission_gain: f32,
     view: Option<View>,
+    bloom_filter: BloomFilters,
     program_view: View,
     compiler: shader_build::RuntimeCompiler,
     shader_source: PathBuf,
@@ -744,6 +763,14 @@ pub struct Gpu {
 }
 
 impl Gpu {
+    pub(super) const fn frame_samples(&self, offline_batch: u32) -> u32 {
+        if self.offline {
+            offline_batch
+        } else {
+            pt::REALTIME_SAMPLES
+        }
+    }
+
     /// 宿主完成旧命令后发布固定采样偏好；输出概率/M cap热切换保留路径历史。
     /// CV切换只显式失效颜色历史。诊断仅在实时生效，切换时重启RGB累积，离线继续普通PT。
     /// # Errors
@@ -954,29 +981,36 @@ impl Gpu {
         ser_requested: bool,
         runtime_root: Option<&Path>,
     ) -> Result<Self, Error> {
-        let (cache, prime_shaders, engine_shaders) = if let Some(root) = runtime_root {
-            (
-                root.join("cache"),
-                root.join("shaders/prime"),
-                root.join("shaders/engine"),
-            )
-        } else {
-            let current = match std::env::var_os("PRIME_PT_SOURCE_ROOT") {
-                Some(path) => PathBuf::from(path),
-                None => std::env::current_dir().map_err(Error::DevelopmentDirectory)?,
+        let (cache, prime_shaders, engine_shaders, display_shaders) =
+            if let Some(root) = runtime_root {
+                (
+                    root.join("cache"),
+                    root.join("shaders/prime"),
+                    root.join("shaders/engine"),
+                    None,
+                )
+            } else {
+                let current = match std::env::var_os("PRIME_PT_SOURCE_ROOT") {
+                    Some(path) => PathBuf::from(path),
+                    None => std::env::current_dir().map_err(Error::DevelopmentDirectory)?,
+                };
+                let root = current
+                    .ancestors()
+                    .find(|path| path.join("crates/renderer/shaders/primary.slang").is_file())
+                    .ok_or(Error::Invalid("开发宿主须从 Prime PT 源码目录启动"))?;
+                (
+                    root.join("target"),
+                    root.join("crates/renderer/shaders"),
+                    root.join("crates/renderer")
+                        .join(env!("PRIME_ENGINE_SHADERS_RELATIVE")),
+                    Some(
+                        root.join("crates/renderer")
+                            .join(env!("PRIME_DISPLAY_SHADERS_RELATIVE")),
+                    ),
+                )
             };
-            let root = current
-                .ancestors()
-                .find(|path| path.join("crates/renderer/shaders/primary.slang").is_file())
-                .ok_or(Error::Invalid("开发宿主须从 Prime PT 源码目录启动"))?;
-            (
-                root.join("target"),
-                root.join("crates/renderer/shaders"),
-                root.join("crates/renderer")
-                    .join(env!("PRIME_ENGINE_SHADERS_RELATIVE")),
-            )
-        };
-        let includes = [prime_shaders.as_path(), engine_shaders.as_path()];
+        let mut includes = vec![prime_shaders.as_path(), engine_shaders.as_path()];
+        includes.extend(display_shaders.as_deref());
         let shader_cache = cache.join("shaders");
         let compiler = if let Some(root) = runtime_root {
             shader_build::RuntimeCompiler::from_executable(
@@ -1045,10 +1079,11 @@ impl Gpu {
         let solar = atmosphere.parameters().solar_irradiance_rgb();
         // 太阳基准为大气外法向辐照度 Y=8，太阳盘辐亮度由 shader 推导。
         let solar_y = 0.262_700_2 * solar[0] + 0.677_998_07 * solar[1] + 0.059_301_715 * solar[2];
+        let bloom_filter = BloomFilters::new(&mut context)?;
         let program_view = View::new_scaled(
             &mut context,
-            [1, 1],
-            [1, 1],
+            None,
+            [[1, 1]; 2],
             false,
             streamline::Quality::Dlaa,
             None,
@@ -1154,6 +1189,7 @@ impl Gpu {
             sun_gain: 1.0,
             block_emission_gain: 1.0,
             view: None,
+            bloom_filter,
             program_view,
             compiler,
             shader_source,
@@ -1195,6 +1231,16 @@ impl Gpu {
             gpu
         };
         Ok(gpu)
+    }
+
+    /// 选择显示变换前的泛光滤波器，`None` 关闭泛光。保留 PT、RR 与曝光历史，下一帧生效。
+    /// 形状变化与关闭都撤下旧视图绑定，已录制命令按原有完成边界退役。
+    pub fn set_lens_bloom(&mut self, mode: Option<LensMode>) {
+        if self.bloom_filter.select(mode)
+            && let Some(view) = &mut self.view
+        {
+            view.presentation.bloom = None;
+        }
     }
 
     /// 更新自动测光强度与 SDR 显示曲线，手动 EV 仍取自帧环境。

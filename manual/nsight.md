@@ -83,7 +83,6 @@ Get-Content -Raw .\target\nsight-launch\arguments.txt | Set-Clipboard
 /pt enabled on
 /pt mode realtime
 /pt bounces 12
-/pt spp 1
 /pt ser on
 /pt diagnostic on
 ```
