@@ -21,7 +21,7 @@ public struct Params
     public var atmosphere : atmosphere::Params;
     /// Rec.2020 辐亮度倍率与 Aerial 最远距离 km。
     public var atmosphere_settings : float4;
-    /// xy=全帧主射线偏移，z=历史有效，w=0原生、2 RR。
+    /// xy 为全帧主射线偏移，z 标记历史有效，w 选择原生、RR 或 NRD。
     public var reconstruction : float4;
     /// 本批绝对随机样本基数；与静态累积count独立，失效不回退。
     public var rr_sample : uint;
@@ -33,7 +33,8 @@ public struct Params
     public var previous_forward : float4;
     public var previous_right : float4;
     public var previous_up : float4;
-    /// xy=输出尺寸；z bit0诊断、bit2作者法线、bit5实时首面策略。
+    /// xy 为输出尺寸，z bit0 诊断、bit2 作者法线、bit5 实时首面策略，w 为 NRD
+    /// 光路历史的写入帧奇偶。
     public var output_size : uint4;
     /// 当前64m anchor的整数region坐标；光源保持region-local不随anchor重打包。
     public var anchor_region : int4;

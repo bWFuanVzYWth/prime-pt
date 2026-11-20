@@ -6,6 +6,7 @@ pub(super) struct NrdView {
     runtime: nrd::Runtime,
     images: [Image; 18],
     constants: Buffer,
+    sun_radius_tan: f32,
     pack: ComputePipeline,
     resolve: ComputePipeline,
     post: ComputePipeline,
@@ -73,10 +74,7 @@ impl NrdView {
                 external,
             )?
         };
-        let constants = Buffer::upload(
-            context,
-            bytemuck::cast_slice(&[w, h, radius.tan().to_bits(), 0]),
-        )?;
+        let constants = Buffer::new(context, 5 * 16, true)?;
         let sampled = Binding::SampledImage;
         let storage = Binding::StorageImage;
         let buffer = Binding::StorageBuffer;
@@ -131,6 +129,7 @@ impl NrdView {
             runtime,
             images,
             constants,
+            sun_radius_tan: radius.tan(),
             pack,
             resolve,
             post,
@@ -148,7 +147,17 @@ impl NrdView {
         &self,
         context: &mut Context,
         extent: [u32; 2],
+        camera: [f32; 16],
+        jitter: [f32; 2],
     ) -> Result<Recorded, Error> {
+        let mut words = [0; 20];
+        words[..4].copy_from_slice(&[extent[0], extent[1], self.sun_radius_tan.to_bits(), 0]);
+        words[4..].copy_from_slice(&camera.map(f32::to_bits));
+        // 相机 right/up 的保留分量传递实际 film jitter。
+        words[15] = jitter[0].to_bits();
+        words[19] = jitter[1].to_bits();
+        self.constants
+            .write(context, 0, bytemuck::cast_slice(&words))?;
         let mut c = Commands::new(context)?;
         c.barrier();
         c.dispatch(self.pack, [extent[0].div_ceil(8), extent[1].div_ceil(8), 1])?;

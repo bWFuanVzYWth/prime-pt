@@ -56,8 +56,6 @@ var output_image : RWStructuredBuffer<float4>;
 var accumulation : RWStructuredBuffer<float4>;
 [[vk::binding(9, 0)]]
 var sample_counts : RWStructuredBuffer<uint>;
-[[vk::binding(15, 0)]]
-var prefix_image : RWStructuredBuffer<float4>;
 public struct HitScene : pt::IHitScene
 {
     public func guides_enabled()->bool
@@ -384,7 +382,13 @@ func render_pixel<A : pt::IPixelTransport, let realtime : bool, let lane : int,
         previous = output_image[pixel];
     let result = pt::integrate_pixel<A, realtime, lane>(adapter, coordinate, previous);
     if (lane != 1)
-        prefix_image[pixel] = float4(0, 0, 0, realtime ? primary_ray[pixel].w : result.distance);
+    {
+        let distance = realtime ? primary_ray[pixel].w : result.distance;
+        if (realtime && parameters[0].reconstruction.w == 3 && distance != pt::FAR)
+            prefix_image[pixel].w = distance;
+        else
+            prefix_image[pixel] = float4(0, 0, 0, distance);
+    }
     output_image[pixel] = result.radiance;
 }
 

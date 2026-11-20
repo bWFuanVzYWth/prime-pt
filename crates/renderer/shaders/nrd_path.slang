@@ -59,7 +59,7 @@ func combine(inout uint2 signal, inout uint2 moment, indirect: float3, direction
 
 public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLighting, hit: pt::Hit,
                                           mat: transport::SurfaceMaterial, incident: float4,
-                                          view: float3)
+                                          view: float3, inout previous_pdf: float)
     ->float
 {
     let normal = pt::shading_normal(hit, mat);
@@ -80,8 +80,9 @@ public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLigh
     lane.diffuse_direction = pack_signal(
         float4(observed.local_light.xyz, abs(dot(observed.sun_ray.direction, hit.surface.normal))));
     lane.specular_direction = pack_signal(float4(observed.local_light.xyz, float(observed.events)));
-    let pixel_angle = 2 * parameters[0].current_camera.position.w * parameters[0].inverse_extent.y;
-    lane.view_angle = pack_signal(float4(view, pixel_angle));
+    if ((observed.events & openpbr::DISCRETE) != 0)
+        previous_pdf =
+            emission_prefix(DispatchRaysIndex().xy, (observed.events & openpbr::REFLECTION) != 0);
     if (glass || (fixed_guide_candidate(flow) &&
                   openpbr::is_discrete_only_flow<flow>(mat.pbr, incident, mat.transmitted)))
     {
@@ -98,9 +99,6 @@ public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLigh
     }
     else
         lane.sun = pack_signal(float4(observed.sun, blocker));
-    if (any(observed.emitted > 0))
-        combine(lane.diffuse, lane.diffuse_direction, observed.emitted, float3(0), 0.00006103515625,
-                true);
     signal_lanes[index] = lane;
     return blocker;
 }

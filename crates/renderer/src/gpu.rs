@@ -429,6 +429,7 @@ struct View {
     counts: Buffer,
     landing: Vec<Buffer>,
     signal_lanes: Buffer,
+    optical_history: [Buffer; 2],
     prefix: Buffer,
     progress: history::Accumulation,
     jitter: [f32; 2],

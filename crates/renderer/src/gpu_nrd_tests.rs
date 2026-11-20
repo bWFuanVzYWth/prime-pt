@@ -45,15 +45,22 @@ fn plane(left: f32, right: f32, z: f32, id: u32) -> Quad {
 }
 
 fn surface_pixel(gpu: &mut Gpu, capture: Buffer, offset: u64) -> Result<[f32; 4], Error> {
-    let view = gpu.view.as_ref().unwrap();
-    view.output
-        .copy_prefix_to(&mut gpu.context, &capture, offset + 16)?;
-    let mut pixel = [0.0_f32; 4];
-    capture.read(
+    linear_pixel(
         &mut gpu.context,
+        gpu.view.as_ref().unwrap().output,
+        capture,
         offset,
-        bytemuck::cast_slice_mut(&mut pixel),
-    )?;
+    )
+}
+fn linear_pixel(
+    context: &mut Context,
+    source: Buffer,
+    capture: Buffer,
+    offset: u64,
+) -> Result<[f32; 4], Error> {
+    source.copy_prefix_to(context, &capture, offset + 16)?;
+    let mut pixel = [0.0_f32; 4];
+    capture.read(context, offset, bytemuck::cast_slice_mut(&mut pixel))?;
     Ok(pixel)
 }
 
@@ -245,7 +252,7 @@ fn hardware_nrd_glass_disocclusion() -> Result<(), Box<dyn std::error::Error>> {
                     (dm[0] - 64. * 1.2 / 8.).abs() < 0.01 && (rm[0] - 64. * 1.2 / 7.).abs() < 0.01
                 );
             }
-            // 两条实际路径各承载一个事件；两色发光面分别只出现在自己的 NRD 波瓣。
+            // 两条实际路径各承载一个事件。固定光路的自发光已完整加回，滤波器只接收命中距离。
             gpu.view.as_ref().unwrap().signal_lanes.copy_prefix_to(
                 &mut gpu.context,
                 &lanes,
@@ -262,20 +269,12 @@ fn hardware_nrd_glass_disocclusion() -> Result<(), Box<dyn std::error::Error>> {
                 let [diff, spec] = [0, 4].map(|j| [0, 1, 2, 3].map(|c| half(lane[j + c])));
                 if diff[3] > 0. {
                     assert_eq!(spec, [0.; 4]);
-                    assert!(
-                        (diff[on] * 0.5 - 0.92308).abs() < 0.002
-                            && diff[off] == 0.
-                            && diff[2] == 0.
-                    );
+                    assert_eq!(&diff[..3], &[0.; 3]);
                     samples[0] += 1;
                 } else {
                     assert_eq!(diff, [0.; 4]);
-                    assert!(
-                        spec[0] == 0.
-                            && spec[1] == 0.
-                            && (spec[2] * 0.5 - 0.07692).abs() < 0.002
-                            && spec[3] > 0.
-                    );
+                    assert_eq!(&spec[..3], &[0.; 3]);
+                    assert!(spec[3] > 0.);
                     samples[1] += 1;
                 }
             }
@@ -300,7 +299,7 @@ fn hardware_nrd_glass_filtered_lobes() -> Result<(), Box<dyn std::error::Error>>
     gpu.test_roots.push(output.into());
     gpu.test_roots.push(capture.into());
     let options = Options::new(false, streamline::Quality::Dlaa, 2, 6)?.with_nrd();
-    // 透明无吸收的外部介质隔离相机段空气散射，清空表面光后实际最终合成应为零。
+    // 用无吸收的外部介质隔离相机段空气散射。
     gpu.set_initial_medium([1.1, 0., 0., 0.])?;
     for roughness in [0., 0.25] {
         let mut glass = MaterialDefinition::default();
@@ -358,6 +357,10 @@ fn hardware_nrd_glass_filtered_lobes() -> Result<(), Box<dyn std::error::Error>>
             if i == 0 {
                 assert!(full[0] > 0.01 && full[1] > 0.01 && full[2] > rgb[2]);
                 assert!(rgb[0].abs() < 0.003 && rgb[1].abs() < 0.003 && rgb[2] > 0.1);
+            } else if roughness == 0. {
+                let f = ((1.5_f32 - 1.1) / (1.5 + 1.1)).powi(2);
+                assert!((rgb[2] - 8. * 2. * f / (1. + f)).abs() < 0.003);
+                assert_eq!(&rgb[..2], &[0.; 2]);
             } else {
                 assert_eq!(&rgb[..3], &[0.; 3]);
             }
@@ -450,22 +453,28 @@ fn hardware_nrd_delta_texture() -> Result<(), Box<dyn std::error::Error>> {
             ] {
                 values.push(half_pixel(&img.download(&mut gpu.context)?, extent, 4)[0]);
             }
+            let emission = linear_pixel(&mut gpu.context, view.prefix, capture, offset)?[0];
             let rgb = surface_pixel(gpu, capture, offset)?;
             eprintln!(
                 "texture self_lit={self_lit} frame={i} factors/input/output={values:?} final={}",
                 rgb[0]
             );
-            assert!((rgb[0] - (values[0] * values[3] + values[1] * values[5])).abs() < 0.008);
+            assert!(
+                (rgb[0] - (emission + values[0] * values[3] + values[1] * values[5])).abs() < 0.008
+            );
             if self_lit {
-                assert!(values[2..].iter().all(|v| (v - 1.).abs() < 0.035));
+                assert!(values[2..].iter().all(|v| v.abs() < 0.0001));
+                let dim = ((96. / 255. + 0.055_f32) / 1.055).powf(2.4);
+                let (through, mirror) = if i < 40 { (dim, 1.) } else { (1., dim) };
+                assert!((emission - 4. * (12. * through + mirror) / 13.).abs() < 0.002);
+            } else {
+                assert!((emission - 4. / 13.).abs() < 0.002);
             }
             samples.push(values);
         }
         let (a, b) = (&samples[0], &samples[1]);
-        assert!(b[0] > 3. * a[0] && b[3] > 0.);
-        if self_lit {
-            assert!(a[1] > 3. * b[1]);
-        } else {
+        if !self_lit {
+            assert!(b[0] > 3. * a[0] && b[3] > 0.);
             assert!((a[3] / b[3] - 1.).abs() < 0.18);
         }
     }
@@ -522,8 +531,7 @@ fn hardware_nrd_layered_lobes() -> Result<(), Box<dyn std::error::Error>> {
                 bytemuck::cast_slice_mut(&mut words),
             )?;
             for lane in words {
-                let [inside, outside] =
-                    [0, 4].map(|j| lane[j..j + 3].iter().any(|x| half(*x) > 0.));
+                let [inside, outside] = [3, 7].map(|j| half(lane[j]) > 0.);
                 assert!(!(inside && outside));
                 sampled[0] += u32::from(inside);
                 sampled[1] += u32::from(outside);
@@ -618,11 +626,12 @@ fn hardware_nrd_solid_refraction() -> Result<(), Box<dyn std::error::Error>> {
     assert!((z - 7.5).abs() < 0.002 && (0.89..0.95).contains(&radiance[0]));
     assert!((radiance[1] / radiance[0] - transmittance).abs() < 0.01 && radiance[2] < 0.01);
     // 在狭视场中心独立求解斯涅尔定律的前帧入射角。目标在 z=6，空气中走 5，玻璃中走 1。
-    let color = half_pixel(
-        &gpu.view.as_ref().unwrap().rr.images[4].download(&mut gpu.context)?,
-        [65, 65],
-        4,
-    );
+    let color = linear_pixel(
+        &mut gpu.context,
+        gpu.view.as_ref().unwrap().prefix,
+        capture,
+        at,
+    )?;
     assert!((color[1] / color[0] - transmittance).abs() < 0.002);
     camera.origin[0] = 0.01;
     host.render_options(gpu, &output, &camera, dark, options)?;
@@ -647,6 +656,227 @@ fn hardware_nrd_solid_refraction() -> Result<(), Box<dyn std::error::Error>> {
     let projected = 3250. * (0.8 * low - 0.6 * cos_i) / (0.6 * low + 0.8 * cos_i);
     eprintln!("玻璃板折射运动 {} px，斯涅尔参考 {projected}", mv[0]);
     assert!((f64::from(mv[0]) - projected).abs() < 0.02 && mv[1].abs() < 0.002);
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "斜视光滑金属时固定光路保留当前 Fresnel 和发光纹素的线性强度"]
+fn hardware_nrd_mirror_emission() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(false, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let color = [0.24, 0.55, 0.8];
+    let mirror = MaterialDefinition {
+        base_roughness: [color[0], color[1], color[2], 0.],
+        surface: [1.5, 1., 0., 0.],
+        control: [0, 3, 0, 0],
+        ..Default::default()
+    };
+    materials(gpu, &[mirror, emitter([4.; 3])], [0; 4])?;
+    gpu.set_scene(&Mesh {
+        quads: vec![plane(-100., 100., 2., 0), plane(-100., 100., -1., 1)],
+    })?;
+    let output = Image::new(&mut gpu.context, [65, 65, 1], ImageFormat::Rgba8Unorm)?;
+    let at = (32 * 65 + 32) * 16;
+    let pickup = Buffer::new(&mut gpu.context, at + 16, true)?;
+    gpu.test_roots
+        .extend([vulkan::native::Resource::from(output), pickup.into()]);
+    let cos_i = 0.32_f32;
+    let sin_i = (1. - cos_i * cos_i).sqrt();
+    let mut camera = camera();
+    camera.forward = [sin_i, 0., cos_i, 0.];
+    camera.right = [cos_i, 0., -sin_i, 0.];
+    let dark = Environment {
+        sun_direction: [0.; 3],
+        ..Default::default()
+    };
+    host.render_options(
+        gpu,
+        &output,
+        &camera,
+        dark,
+        Options::new(false, streamline::Quality::Dlaa, 2, 4)?.with_nrd(),
+    )?;
+    let fixed = linear_pixel(
+        &mut gpu.context,
+        gpu.view.as_ref().unwrap().prefix,
+        pickup,
+        at,
+    )?;
+    let final_rgb = surface_pixel(gpu, pickup, at)?;
+    for i in 0..3 {
+        let expected = 4. * (color[i] + (1. - color[i]) * (1. - cos_i).powi(5));
+        assert!(
+            (fixed[i] - expected).abs() < 0.001,
+            "Fresnel {fixed:?}, expected={expected}"
+        );
+        assert!((final_rgb[i] - fixed[i]).abs() < 0.0001);
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "斜视厚玻璃横移半格时，用前帧实际光路校验亚像素对应，并拒绝被遮挡的历史"]
+fn hardware_nrd_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(false, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let native_4k = std::env::var_os("PRIME_NRD_4K").is_some();
+    let extent = if native_4k { [3840, 2160] } else { [257, 65] };
+    let output = Image::new(
+        &mut gpu.context,
+        [extent[0], extent[1], 1],
+        ImageFormat::Rgba8Unorm,
+    )?;
+    gpu.test_roots.push(output.into());
+    let glass = MaterialDefinition {
+        base_roughness: [1., 1., 1., 0.],
+        control: [1, 3, 0, 0],
+        ..Default::default()
+    };
+    materials(gpu, &[glass, emitter([1.; 3])], [0; 4])?;
+    let options = Options::new(false, streamline::Quality::Dlaa, 2, 8)?.with_nrd();
+    let dark = Environment {
+        sun_direction: [0.; 3],
+        ..Default::default()
+    };
+    // 实体厚 1、空气段合计 5。独立解出前帧能看见同一终点的入射角。
+    let dx = 0.55;
+    let theta = 0.6f64.asin();
+    let scale = f64::from(extent[0]) / 0.2;
+    let center = if extent[0] % 2 == 0 { 0.5 } else { 0. };
+    let ray_angle = theta + (center / scale).atan();
+    let x = |angle: f64| 5. * angle.tan() + (angle.sin() / 1.5).asin().tan();
+    let (mut lo, mut hi) = (ray_angle, 1.);
+    for _ in 0..50 {
+        let mid = (lo + hi) * 0.5;
+        if x(mid) < x(ray_angle) + dx {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let expected = (lo - theta).tan() * scale - center;
+    for blocked in [false, true] {
+        let mut quads = vec![
+            plane(-12., 12., 2., 0),
+            plane(12., -12., 3., 0),
+            plane(-12., 12., 6., 1),
+        ];
+        if blocked {
+            let center = lo.tan() as f32;
+            quads.push(plane(center - 0.04, center + 0.04, 1., 1));
+        }
+        gpu.set_scene(&Mesh { quads })?;
+        let mut camera = camera();
+        camera.forward = [0.6, 0., 0.8, 0.];
+        camera.right = [0.08, 0., -0.06, 0.];
+        camera.up[1] = 0.1 * extent[1] as f32 / extent[0] as f32;
+        host.render_options(gpu, &output, &camera, dark, options)?;
+        camera.origin[0] = dx as f32;
+        host.render_options(gpu, &output, &camera, dark, options)?;
+        let view = gpu.view.as_ref().unwrap();
+        let mv = half_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
+        eprintln!("折射对应 blocked={blocked} measured={mv:?} reference={expected}");
+        if blocked {
+            assert!(mv[0] >= extent[0] as f32);
+        } else {
+            let tolerance = if native_4k { 0.6 } else { 0.1 };
+            assert!((f64::from(mv[0]) - expected).abs() < tolerance && mv[1].abs() < 0.1);
+            if native_4k {
+                let queries = [
+                    vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+                    vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+                ];
+                gpu.test_roots
+                    .extend(queries.map(vulkan::native::Resource::from));
+                let mut times = Vec::new();
+                for i in 0..15 {
+                    camera.origin[0] = if i % 2 == 0 { 0. } else { dx as f32 };
+                    let [_, ns] =
+                        host.render_profiled(gpu, &output, &camera, dark, options, Some(queries))?;
+                    if i >= 4 {
+                        times.push(ns as f64 * 1e-6);
+                    }
+                }
+                times.sort_by(f64::total_cmp);
+                assert!(times.iter().all(|t| t.is_finite() && *t > 0.));
+                eprintln!(
+                    "NRD moving solid glass native=3840x2160 spp=2 depth=8 gpu_median_ms={:.3}",
+                    times[times.len() / 2]
+                );
+            }
+        }
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "同一个 quad 的发光贴图阶跃；无入射光时相邻非发光纹素的线性辐亮度为零"]
+fn hardware_nrd_emissive_texel_edge() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(false, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = Image::new(&mut gpu.context, [64, 32, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    let pickup = Buffer::new(&mut gpu.context, 64 * 32 * 16, true)?;
+    gpu.test_roots.push(pickup.into());
+    let lamp = MaterialDefinition {
+        base_roughness: [0.7, 0.7, 0.7, 1.],
+        surface: [1., 0., 0., 0.],
+        emission: [1., 1., 1., 4.],
+        control: [
+            0,
+            3,
+            MaterialDefinition::TEXTURED_EMISSION | MaterialDefinition::MERS,
+            0,
+        ],
+        ..Default::default()
+    };
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: [2, 1],
+        albedo: &[255; 8],
+        materials: &[lamp],
+        mers: &[0, 255, 255, 0, 0, 0, 255, 0],
+        auxiliary: &[0; 8],
+        emission_alias_words: &[],
+        opacity_quads: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]],
+    })?;
+    gpu.set_scene(&Mesh {
+        quads: vec![Quad::with_material(
+            plane(-12., 12., 6., 0).positions(),
+            [[0., 0.], [0., 1.], [1., 1.], [1., 0.]],
+            [1.; 3],
+            prime_scene::MaterialId::new(0),
+        )],
+    })?;
+    let options = Options::new(false, streamline::Quality::Dlaa, 2, 3)?.with_nrd();
+    let dark = Environment {
+        sun_direction: [0.; 3],
+        ..Default::default()
+    };
+    let mut camera = camera();
+    for i in 0..20 {
+        if i == 19 {
+            camera.origin[0] = 0.375;
+        }
+        host.render_options(gpu, &output, &camera, dark, options)?;
+        if i == 0 || i >= 18 {
+            let first_dark = if i == 19 { 30 } else { 32 };
+            let left = surface_pixel(gpu, pickup, (16 * 64 + first_dark - 1) * 16)?[0];
+            let right = surface_pixel(gpu, pickup, (16 * 64 + first_dark) * 16)?[0];
+            eprintln!("发光边缘 frame={i} bright={left} dark={right}");
+            assert_eq!([left, right], [4., 0.]);
+        }
+    }
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())

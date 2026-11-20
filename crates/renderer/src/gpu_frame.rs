@@ -50,6 +50,8 @@ impl Gpu {
             buffer(&view.signal_lanes),
             Binding::StorageImage(view.rr.images[6]),
             Binding::StorageImage(view.rr.images[0]),
+            buffer(&view.optical_history[0]),
+            buffer(&view.optical_history[1]),
         ]);
         let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![
@@ -428,7 +430,7 @@ impl Gpu {
                             .is_some_and(|g| g.hit.authored_normals),
                     ) << 2)
                     | (u32::from(realtime_pt) << 5),
-                0,
+                self.rr_index & 1,
             ]);
             words.extend(self.anchor.map(|v| ((v / 64.) as i32) as u32));
             words.push(0);
@@ -513,7 +515,12 @@ impl Gpu {
                 result.push(recorded);
             }
             if let Some(nrd) = &view.nrd {
-                result.push(nrd.prepare(&mut self.context, view.extent)?);
+                result.push(nrd.prepare(
+                    &mut self.context,
+                    view.extent,
+                    current.camera_words(self.anchor)?,
+                    view.jitter,
+                )?);
                 batch.commit();
                 return Ok(());
             }

@@ -76,6 +76,7 @@ impl View {
             self.signal_lanes.into(),
             self.pack.into(),
         ];
+        roots.extend(self.optical_history.map(vulkan::native::Resource::from));
         roots.extend(
             self.presentation
                 .present
@@ -159,6 +160,15 @@ impl View {
             false,
         )?;
         let rr_enabled = mode == Denoiser::Dlss;
+        let optical_bytes = if mode == Denoiser::Nrd {
+            pixels * 16
+        } else {
+            16
+        };
+        let optical_history = [
+            Buffer::new(context, optical_bytes, false)?,
+            Buffer::new(context, optical_bytes, false)?,
+        ];
         let params = Buffer::new(context, 784, true)?;
         let output = Buffer::new(context, pixels * 16, false)?;
         let rr = RrImages::new(context, extent, output_extent, mode)?;
@@ -287,6 +297,7 @@ impl View {
             counts: Buffer::new(context, pixels * 4, false)?,
             landing,
             signal_lanes,
+            optical_history,
             prefix: Buffer::new(context, pixels * 16, false)?,
             progress: history::Accumulation::new(),
             jitter: [0.; 2],

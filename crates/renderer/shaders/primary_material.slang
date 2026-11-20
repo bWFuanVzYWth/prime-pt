@@ -43,7 +43,7 @@ func shade_primary(inout call: pt::MaterialCall)->void
         pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
             ModScene(), call, hit, material, ray.xyz, settings(parameters[0]), lane, signals);
         let blocker = begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, hit, material, incident,
-                                                 -ray.xyz);
+                                                 -ray.xyz, call.previous_pdf);
         if (blocker == pt::FAR)
             call.radiance += signals.sun;
         return;

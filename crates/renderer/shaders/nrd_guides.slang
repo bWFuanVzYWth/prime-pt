@@ -6,6 +6,7 @@ import pt.surface_guides;
 import transport.medium;
 import mod_materials;
 import pt.reconstruction;
+import pt.optical_history;
 import pt.scene;
 import transport.surface_material;
 import openpbr.flow;
@@ -13,6 +14,8 @@ import camera.pinhole;
 import denoise.guide;
 import params;
 
+[[vk::binding(15, 0)]]
+public var prefix_image : RWStructuredBuffer<float4>;
 [[vk::binding(19, 0)]]
 [[vk::image_format("r32f")]]
 var depth_image : RWTexture2D<float>;
@@ -38,14 +41,38 @@ var reflected_normal : RWTexture2D<float2>;
 [[vk::binding(42, 0)]]
 [[vk::image_format("rgba16f")]]
 var reflected_motion : RWTexture2D<float4>;
+[[vk::binding(43, 0)]]
+var optical_even : RWStructuredBuffer<uint4>;
+[[vk::binding(44, 0)]]
+var optical_odd : RWStructuredBuffer<uint4>;
+
+struct OpticalKey : pt::IOpticalPathKey
+{
+    static func boundary(key: uint, hit: uint4, front: bool, reflection: bool, eta: float)->uint
+    {
+        return pt::optical_key(key, stable_triangle(hit.x).xy,
+                               asuint(eta) ^ uint(front) ^ (uint(reflection) << 1));
+    }
+};
+func publish_optics(pixel: uint2, record: uint4)->void
+{
+    let p = parameters[0];
+    let index = pixel.y * p.image.x + pixel.x;
+    if ((p.output_size.w & 1u) == 0)
+        optical_even[index] = record;
+    else
+        optical_odd[index] = record;
+}
 
 public func sky_signal(pixel: uint2)->void
 {
+    prefix_image[pixel.y * parameters[0].image.x + pixel.x].xyz = 0;
     depth_image[pixel] = reflected_depth[pixel] = 1e7;
     motion_image[pixel] = reflected_motion[pixel] = 0;
     normal_image[pixel] = float4(0, 0, 1, 1);
     reflected_normal[pixel] = 0;
     albedo_image[pixel] = specular_color_image[pixel] = 0;
+    publish_optics(pixel, 0);
 }
 public func fixed_guide_candidate(flow: uint)->bool
 {
@@ -62,6 +89,9 @@ struct SurfaceGuide
     var use_sh_color : bool;
     var replaced : bool;
     var material : uint;
+    var optical : uint2;
+    var emission : float3;
+    var emission_vertices : uint;
 };
 
 func material_class(hit: pt::Hit, mat: transport::SurfaceMaterial)->uint
@@ -100,17 +130,29 @@ func geometry_guide(position: float3, normal: float3, previous_target: float3,
 func write_guides(interior: SurfaceGuide, reflection: SurfaceGuide)->void
 {
     let pixel = DispatchRaysIndex().xy;
+    prefix_image[pixel.y * parameters[0].image.x + pixel.x].xyz =
+        interior.emission + reflection.emission;
+    publish_optics(pixel, uint4(interior.optical, reflection.optical));
     depth_image[pixel] = interior.depth;
     normal_image[pixel] = float4(interior.normal, interior.roughness);
     motion_image[pixel] =
-        float4(interior.motion, float(interior.material + (interior.replaced ? 8u : 0u)));
+        float4(interior.motion, float(interior.material + (interior.replaced ? 8u : 0u) +
+                                      (interior.emission_vertices << 4)));
     albedo_image[pixel] = float4(interior.factor, interior.use_sh_color ? 2 : 1);
     reflected_depth[pixel] = reflection.depth;
     reflected_normal[pixel] = oct_normal(reflection.normal);
     reflected_motion[pixel] =
-        float4(reflection.motion, float(reflection.material + (reflection.use_sh_color ? 4u : 0u) +
-                                        (reflection.replaced ? 8u : 0u)));
+        float4(reflection.motion,
+               float(reflection.material + (reflection.use_sh_color ? 4u : 0u) +
+                     (reflection.replaced ? 8u : 0u) + (reflection.emission_vertices << 4)));
     specular_color_image[pixel] = float4(reflection.factor, reflection.roughness);
+}
+/// 首个离散事件已经选定采样分量，剩余的固定顶点只扣除自身发光。
+public func emission_prefix(pixel: uint2, reflection: bool)->float
+{
+    let flags = reflection ? reflected_motion[pixel].w : motion_image[pixel].w;
+    let vertices = uint(flags) >> 4;
+    return -float(max(1u, vertices) - 1u);
 }
 /// 两路都落在当前非 delta 表面时只投影一次，分别保存方向能量。
 public func physical_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, incident: float4,
@@ -127,8 +169,8 @@ public func physical_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, incid
     inside.material = material_class(hit, mat);
     let beer = transport::segment_transmittance(incident.yzw, hit.distance);
     var outside = inside;
-    inside.factor = beer * (energies.diffuse_albedo + mat.emission);
-    inside.use_sh_color = inside.use_sh_color || any(mat.emission > 0);
+    inside.factor = beer * energies.diffuse_albedo;
+    inside.emission = beer * mat.emission;
     outside.factor = beer * energies.specular_albedo;
     write_guides(inside, outside);
 }
@@ -139,8 +181,8 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     ->SurfaceGuide
 {
     let p = parameters[0];
-    let end =
-        pt::trace_lobe_guide<reflection>(scene, first, p.options.y, front, p.previous_position.xyz);
+    let end = pt::trace_lobe_guide<reflection, OpticalKey>(scene, first, p.options.y, front,
+                                                           p.previous_position.xyz, p.options.w);
     let sky = (end.flags & pt::GUIDE_SKY) != 0;
     let replaced = end.psr.count != 0;
     let glass = (front.pbr.control.x & 1u) != 0;
@@ -158,6 +200,23 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     var target = sky ? end.camera_direction : position + pt::psr_direction(end.psr, pose_delta);
     var previous_z = dot(position - p.previous_position.xyz, p.previous_forward.xyz);
     var valid = (end.flags & (pt::GUIDE_SURFACE_PROXY | pt::GUIDE_INVALID)) == 0;
+    var record = uint2(0);
+    if (end.psr.refracted && valid)
+    {
+        if (sky)
+            record = pt::optical_sample(pt::optical_key(end.optical_key, uint2(0), 4u),
+                                        0.5 * oct_normal(end.direction) + 0.5);
+        else
+        {
+            let id = end.hit.identity;
+            let b = asfloat(id.yz);
+            // 两个三角形 ABC、ACD 共享同一套 quad 坐标，允许跨对角线重投影。
+            let uv = (id.x & 1u) == 0u ? float2(b.x + b.y, b.y) : float2(b.x, b.x + b.y);
+            record = pt::optical_sample(pt::optical_key(end.optical_key, stable_triangle(id.x).xy,
+                                                        uint(end.hit.front) + 2u),
+                                        uv);
+        }
+    }
     if ((end.psr.refracted || (replaced && end.optical_motion.moving)) && p.reconstruction.z > 0)
     {
         var previous_ray : float3;
@@ -165,6 +224,28 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
             end.camera_direction, sky ? float3(0) : pose_delta,
             sky ? end.direction : end.hit.surface.normal, sky, previous_ray);
         valid = valid && solved;
+        if (valid && record.x != 0)
+        {
+            let previous : camera::Camera = { p.previous_position, p.previous_forward,
+                                              p.previous_right, p.previous_up };
+            let projection = camera::camera_project_direction(previous, previous_ray, p.image.xy);
+            if (projection.valid)
+            {
+                let seed = projection.pixel - 0.5;
+                var matched : float2;
+                if ((p.output_size.w & 1u) == 0)
+                    valid = pt::previous_optical_pixel<reflection>(optical_odd, p.image.xy, record,
+                                                                   seed, matched);
+                else
+                    valid = pt::previous_optical_pixel<reflection>(optical_even, p.image.xy, record,
+                                                                   seed, matched);
+                if (valid && any(abs(matched - seed) > 0.045))
+                    previous_ray =
+                        camera::camera_direction(previous, (matched + 0.5) * p.inverse_extent);
+            }
+            else
+                valid = false;
+        }
         if (sky)
             target = previous_ray;
         else
@@ -191,6 +272,9 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     else if (!sky)
         previous_z = dot(target - p.previous_position.xyz, p.previous_forward.xyz);
     var g = geometry_guide(position, normal, target, previous_z, sky, valid);
+    g.optical = record;
+    g.emission = end.fixed_emission;
+    g.emission_vertices = end.emission_vertices;
     g.replaced = replaced;
     g.roughness = reflection && glass ? front.pbr.base_roughness.w
                   : sky               ? front.pbr.base_roughness.w
@@ -198,8 +282,6 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     g.material = sky ? material_class(first.hit, front) : material_class(end.hit, end.material);
     g.use_sh_color = glass || replaced ||
                      openpbr::is_discrete_only(front.pbr, first.path.medium, front.transmitted);
-    if (!reflection && any(end.reference_emission > 0))
-        g.use_sh_color = true;
     var terminal = float3(1);
     if (!sky)
     {
@@ -211,7 +293,7 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
                    : reflection ? e.specular_albedo
                                 : e.diffuse_albedo;
     }
-    g.factor = end.reference_emission + end.attenuation * terminal;
+    g.factor = end.attenuation * terminal;
     return g;
 }
 public func write_fixed_guides<Scene : pt::IGuideScene>(scene: Scene, first: pt::TransportCall)

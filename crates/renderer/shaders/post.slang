@@ -49,6 +49,7 @@ func post_pixel<let paths : uint, let composite : uint, let frame_film : bool,
     let tail : float4 = output_image[pixel];
     var count : uint = sample_counts[pixel];
     let prefix : float4 = prefix_image[pixel];
+    // NRD 的 prefix 只含当前像素固定光路上的自发光，和已滤波照明一起进入相机段大气。
     var radiance : float3 = prefix.xyz + tail.xyz;
     if (composite != 0 && tail.w >= 0 &&
         (!denoised || (params.lighting.w > 0 && all(params.initial_medium == float4(1, 0, 0, 0)))))

@@ -52,8 +52,6 @@ var landing_header : RWStructuredBuffer<uint>;
 var landing_direction_yz : RWStructuredBuffer<float2>;
 [[vk::binding(14, 0)]]
 var landing_distance : RWStructuredBuffer<float>;
-[[vk::binding(15, 0)]]
-var prefix_image : RWStructuredBuffer<float4>;
 
 [[vk::binding(26, 0)]]
 var landing_identity : RWStructuredBuffer<uint4>;
@@ -184,7 +182,10 @@ func prefix_main()->void
     else
         pt::trace_prefix(provider, data, settings(params), distance);
     store_landing(pixel, data);
-    prefix_image[pixel] = float4(data.path.radiance, distance);
+    if (params.reconstruction.w == 3 && distance != pt::FAR)
+        prefix_image[pixel].w = distance;
+    else
+        prefix_image[pixel] = float4(data.path.radiance, distance);
 }
 
 [shader("raygeneration")]
@@ -267,8 +268,9 @@ func shade_opaque(inout call: ModTransportCall)->void
         pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
             provider, first, data.hit, mat, data.path.direction, settings(parameters[0]), lane,
             signals);
-        let blocker = begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, data.hit, mat,
-                                                 data.path.medium, -data.path.direction);
+        let blocker =
+            begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, data.hit, mat, data.path.medium,
+                                       -data.path.direction, first.previous_pdf);
         if (blocker == pt::FAR)
             first.radiance += signals.sun;
         call.store<OPENPBR_FLOW>(first.result());
