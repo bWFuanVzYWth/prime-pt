@@ -49,6 +49,7 @@ impl Gpu {
             buffer(&self.known_geometry.unwrap_or(self.geometry_placeholder)),
             buffer(&view.signal_lanes),
             Binding::StorageImage(view.rr.images[6]),
+            Binding::StorageImage(view.rr.images[0]),
         ]);
         let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![

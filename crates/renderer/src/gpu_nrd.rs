@@ -4,7 +4,7 @@ use vulkan::nrd;
 
 pub(super) struct NrdView {
     runtime: nrd::Runtime,
-    images: [Image; 14],
+    images: [Image; 18],
     constants: Buffer,
     pack: ComputePipeline,
     resolve: ComputePipeline,
@@ -53,8 +53,12 @@ impl NrdView {
             texture(context, half)?,
             texture(context, half)?,
             texture(context, scalar)?,
+            rr[0],
+            texture(context, ImageFormat::Rgb10a2Unorm)?,
+            rr[7],
+            texture(context, scalar)?,
         ];
-        let mut external = [nrd::Image::new(0, 0); 14];
+        let mut external = [nrd::Image::new(0, 0); 18];
         for (dest, image) in external.iter_mut().zip(images) {
             let raw = image.raw(context)?;
             *dest = nrd::Image::new(raw.image, raw.format);
@@ -99,6 +103,12 @@ impl NrdView {
                     storage(images[8]),
                     sampled(images[13]),
                     buffer(view.output),
+                    sampled(rr[7]),
+                    sampled(rr[8]),
+                    sampled(rr[0]),
+                    storage(images[15]),
+                    storage(images[17]),
+                    sampled(rr[6]),
                 ],
             )?;
             Ok(ComputePipeline::new(

@@ -1,7 +1,8 @@
 /// 普通PT生产入口；材质来源单独适配，路径和数值叶子由引擎维护。
 module pt_hit;
 import nrd_path;
-import nrd_optics;
+import nrd_guides;
+import pt.reconstruction;
 import known_geometry;
 #include "opacity/micromap.inc.slang"
 #ifndef PRIMEPT_OMM
@@ -235,7 +236,7 @@ func known_hit(identity: uint4, direction: float3, distance: float)->pt::Hit
     return hit;
 }
 
-struct HitOptics : INrdOptics
+struct HitGuideScene : pt::IGuideScene
 {
     func intersect(origin: float3, direction: float3, out hit: pt::Hit)->bool
     {
@@ -251,23 +252,20 @@ struct HitOptics : INrdOptics
                         found.GetRayDesc().TMax);
         return true;
     }
-    func shade_receiver(inout data: pt::TransportCall, lane: uint)->void
+    func resolve_hit(inout hit: pt::Hit, incident: float4)->void
     {
-        var call = pt::MaterialCall::input(data);
-        call.previous_pdf = -1;
-        call.previous = asfloat(data.hit.identity.xyz);
-        call.direction = data.path.direction;
-        call.origin_pixel.y = asfloat(lane);
-        let program = material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2;
-        if (hit_reorder)
-            ReorderThread(program, 32u);
-        CallShader(program, call);
-        data.path = call.result();
     }
-    func tail(inout data: pt::TransportCall)->float
+    func guide_material(hit: pt::Hit, incident: float4)->transport::SurfaceMaterial
     {
-        return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, hit_reorder, true>(
-            HitScene(), pt::NoPrefixGuides(), data);
+        return ModScene().guide_material(hit, incident);
+    }
+    func energy()->openpbr::Energy
+    {
+        return ModScene().energy();
+    }
+    func guide_pose(hit: pt::Hit)->pt::GuidePose
+    {
+        return ModScene().guide_pose(hit);
     }
 };
 
@@ -300,13 +298,12 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
         else
         {
             let start = material_id(primitive) * 112u + 64u;
-            if (parameters[0].reconstruction.w == 3 &&
-                optical_candidate(material_words.Load(start + 8u) >> 20))
+            if (lane == 0 && parameters[0].reconstruction.w == 3 &&
+                fixed_guide_candidate(material_words.Load(start + 8u) >> 20))
             {
                 data.hit =
                     known_hit(primary_identity[pixel], data.path.direction, primary_ray[pixel].w);
-                if (render_optical(HitOptics(), data, lane))
-                    return float2(-1, 0);
+                write_fixed_guides(HitGuideScene(), data);
             }
             let program = material_words.Load(start) >> 2u;
             var call = pt::MaterialCall::primary_input(data.sample, lane, data.path.radiance);
@@ -319,8 +316,6 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
     }
     public func trace(inout data: pt::TransportCall, film: float2)->float
     {
-        if (film.x < 0)
-            return pt::FAR;
         if (parameters[0].reconstruction.w == 3 && primary_identity[pixel].x != 0xffffffffu)
         {
             let before = data.path.radiance;
@@ -329,7 +324,7 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
             let distance = pt::trace_hit_path<HitScene, pt::NoPrefixGuides, hit_reorder, true>(
                 HitScene(), pt::NoPrefixGuides(), data);
             finish_signal(pixel * 2 + (data.sample - parameters[0].rr_sample),
-                          max(data.path.radiance, 0), direction, distance, -primary_ray[pixel].xyz);
+                          max(data.path.radiance, 0), direction, distance);
             data.path.radiance += before;
             return distance;
         }

@@ -7,7 +7,7 @@ module primary;
 import mod_scene;
 import mod_call;
 import nrd_path;
-import nrd_optics;
+import nrd_guides;
 import pt.material_vertex;
 import mod_guides;
 import params;
@@ -187,37 +187,6 @@ func prefix_main()->void
     prefix_image[pixel] = float4(data.path.radiance, distance);
 }
 
-struct CallableOptics : INrdOptics
-{
-    func intersect(origin: float3, direction: float3, out hit: pt::Hit)->bool
-    {
-        return ModScene().intersect(origin, direction, hit);
-    }
-    func shade_receiver(inout data: pt::TransportCall, lane: uint)->void
-    {
-        let program = material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2;
-        var first = ModTransportCall.input(data);
-        first.state |= 0x80000000u;
-        CallShader(program, first);
-        data.path = first.result();
-    }
-    func tail(inout data: pt::TransportCall)->float
-    {
-        var provider : ModScene;
-        if (data.path.status != pt::PATH_ACTIVE)
-            return pt::FAR;
-        if (!provider.intersect(data.path.origin, data.path.direction, data.hit))
-        {
-            pt::escape(provider, data.path);
-            return pt::FAR;
-        }
-        let distance = data.hit.distance;
-        provider.resolve_hit(data.hit, data.path.medium);
-        pt::trace_tail(provider, data);
-        return distance;
-    }
-};
-
 [shader("raygeneration")]
 func render_main()->void
 {
@@ -242,22 +211,33 @@ func render_main()->void
     if (params.reconstruction.w == 3)
     {
         let start = material_id(data.hit.identity.x) * 112u + 64u;
-        let lane = data.sample - params.rr_sample;
-        data.path.origin = params.origin.xyz;
-        if (!optical_candidate(material_words.Load(start + 8u) >> 20) ||
-            !render_optical(CallableOptics(), data, lane))
+        if (data.sample == params.rr_sample &&
+            fixed_guide_candidate(material_words.Load(start + 8u) >> 20))
         {
-            let eye = -data.path.direction;
-            var first = ModTransportCall.input(data);
-            CallShader(material_words.Load(start) >> 2, first);
-            data.path = first.result();
-            let before = data.path.radiance;
-            data.path.radiance = 0;
-            let direction = data.path.direction;
-            let distance = CallableOptics().tail(data);
-            finish_signal(pixel * 2 + lane, max(data.path.radiance, 0), direction, distance, eye);
-            data.path.radiance += before;
+            data.path.origin = params.origin.xyz;
+            write_fixed_guides(provider, data);
         }
+        let program = material_words.Load(start) >> 2;
+        var first = ModTransportCall.input(data);
+        CallShader(program, first);
+        data.path = first.result();
+        let before = data.path.radiance;
+        data.path.radiance = 0;
+        let direction = data.path.direction;
+        var distance = pt::FAR;
+        if (data.path.status == pt::PATH_ACTIVE)
+        {
+            if (provider.intersect(data.path.origin, direction, data.hit))
+            {
+                provider.resolve_hit(data.hit, data.path.medium);
+                distance = pt::trace_tail<ModScene, true>(provider, data);
+            }
+            else
+                pt::escape(provider, data.path);
+        }
+        finish_signal(pixel * 2 + (data.sample - params.rr_sample), max(data.path.radiance, 0),
+                      direction, distance);
+        data.path.radiance += before;
     }
     else
         pt::trace_tail(provider, data);
@@ -275,22 +255,20 @@ func shade_opaque(inout call: ModTransportCall)->void
 #endif
     var data : pt::TransportCall = call.unpack();
     var provider : ModScene;
-    let replaced = (call.state & 0x80000000u) != 0;
-    if (parameters[0].reconstruction.w == 3 && (data.path.depth == 0 || replaced))
+    if (parameters[0].reconstruction.w == 3 && data.path.depth == 0)
     {
         let lane = data.sample - parameters[0].rr_sample;
         let pixel = data.pixel.y * parameters[0].image.x + data.pixel.x;
         let mat = provider.resolve_flow(data.hit, OPENPBR_FLOW, data.path.medium);
-        var first = pt::MaterialCall::input(data);
-        data.hit.distance =
-            replaced ? 0 : length(data.hit.surface.position - parameters[0].origin.xyz);
+        var first = pt::MaterialCall::primary_input(data.sample, lane, data.path.radiance);
+        first.initialize_primary(data.path.medium);
+        data.hit.distance = length(data.hit.surface.position - parameters[0].origin.xyz);
         var signals : pt::PrimaryLighting;
         pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
             provider, first, data.hit, mat, data.path.direction, settings(parameters[0]), lane,
             signals);
-        let blocker =
-            begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, data.hit, mat, data.path.medium,
-                                       -data.path.direction, first.direction, replaced);
+        let blocker = begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, data.hit, mat,
+                                                 data.path.medium, -data.path.direction);
         if (blocker == pt::FAR)
             first.radiance += signals.sun;
         call.store<OPENPBR_FLOW>(first.result());

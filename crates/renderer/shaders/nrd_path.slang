@@ -1,75 +1,16 @@
 module nrd_path;
 import denoise.nrd_signal;
-import mod_materials;
+import nrd_guides;
 import mod_scene;
-import primary_cache;
 import pt.material_vertex;
-import pt.reconstruction;
+import pt.surface_guides;
 import pt.scene;
-import denoise.guide;
-import camera.pinhole;
 import params;
-import geometry.ray;
 import transport.surface_material;
 import openpbr.flow;
 
 [[vk::binding(40, 0)]]
 public var signal_lanes : RWStructuredBuffer<SignalLane>;
-[[vk::binding(19, 0)]]
-[[vk::image_format("r32f")]]
-var depth_image : RWTexture2D<float>;
-[[vk::binding(41, 0)]]
-[[vk::image_format("rgba16f")]]
-var motion_image : RWTexture2D<float4>;
-[[vk::binding(21, 0)]]
-[[vk::image_format("rgba16f")]]
-var normal_image : RWTexture2D<float4>;
-[[vk::binding(22, 0)]]
-[[vk::image_format("rgba16f")]]
-var albedo_image : RWTexture2D<float4>;
-[[vk::binding(23, 0)]]
-[[vk::image_format("rgba16f")]]
-var f0_image : RWTexture2D<float4>;
-
-public func sky_signal(pixel: uint2)->void
-{
-    depth_image[pixel] = 1e7;
-    motion_image[pixel] = 0;
-    normal_image[pixel] = float4(0, 0, 1, 1);
-    albedo_image[pixel] = 0;
-    f0_image[pixel] = 0;
-}
-/// 位置和法线位于同一相机侧空间；颜色、粗糙度及介质来自对应的实际接收面。
-public func surface_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, position: float3,
-                           normal: float3, view: float3, incident: float4, replaced: bool)
-    ->void
-{
-    let p = parameters[0];
-    let pixel = DispatchRaysIndex().xy;
-    let previous : camera::Camera = { p.previous_position, p.previous_forward, p.previous_right,
-                                      p.previous_up };
-    let film = camera::camera_sample_uv_offset(pixel, p.inverse_extent, 0.5 + p.reconstruction.xy);
-    var motion : float2 = 0;
-    if (p.reconstruction.z > 0 &&
-        !denoise::denoise_motion(previous, film, position, false, p.image.xy, motion))
-        motion = float2(p.image.xy);
-    let depth = dot(position - p.origin.xyz, p.current_camera.forward.xyz);
-    let previous_depth = dot(position - p.previous_position.xyz, p.previous_forward.xyz);
-    motion_image[pixel] = float4(motion, p.reconstruction.z > 0 ? previous_depth - depth : 0, 0);
-    depth_image[pixel] = depth;
-    normal_image[pixel] =
-        float4(dot(normal, view) < 0 ? -normal : normal, mat.pbr.base_roughness.w);
-    let metal = mat.pbr.surface.y;
-    let flags = material_words.Load(material_id(hit.identity.x) * 112u + 72u);
-    let material_class = mat.pbr.control.x != 0 ? 3u
-                         : (flags & 8u) != 0    ? 2u
-                         : metal >= 0.5         ? 1u
-                                                : 0u;
-    let base = mat.pbr.base_roughness.xyz;
-    let f = (mat.pbr.surface.x - incident.x) / max(mat.pbr.surface.x + incident.x, 1e-6);
-    albedo_image[pixel] = float4((1 - metal) * base, replaced ? 2 : 1);
-    f0_image[pixel] = float4(lerp(float3(f * f), base, metal), float(material_class));
-}
 
 /// 用相同闭包的有色与黑色介质求值之差分离底层响应。对金属混合保留原有覆盖权重。
 public func diffuse_fraction<let flow : uint>(mat: transport::SurfaceMaterial, normal: float3,
@@ -100,33 +41,6 @@ public func diffuse_fraction<let flow : uint>(mat: transport::SurfaceMaterial, n
     return saturate((with_base - coat) * (1 - mat.pbr.surface.y) / max(total, 1e-20));
 }
 
-public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLighting, hit: pt::Hit,
-                                          mat: transport::SurfaceMaterial, incident: float4,
-                                          view: float3, direction: float3, replaced: bool = false)
-    ->float
-{
-    let normal = pt::shading_normal(hit, mat);
-    if (!replaced && (index & 1u) == 0)
-        surface_guides(hit, mat, hit.surface.position, normal, view, incident, false);
-    let fraction =
-        diffuse_fraction<flow>(mat, normal, view, observed.local_light.xyz, incident, false);
-    let blocker = any(observed.sun > 0) ? ModScene().blocker_distance<false>(observed.sun_ray) : 0;
-    var lane : SignalLane = {};
-    lane.sun = pack_signal(float4(observed.sun, blocker));
-    lane.emission = pack_signal(
-        float4(observed.emitted, abs(dot(observed.sun_ray.direction, hit.surface.normal))));
-    lane.diffuse = pack_signal(float4(observed.local * fraction, observed.local_light.w));
-    lane.specular = pack_signal(float4(observed.local * (1 - fraction), observed.local_light.w));
-    lane.diffuse_direction = pack_signal(float4(observed.local_light.xyz, 0));
-    lane.specular_direction = lane.diffuse_direction;
-    lane.fraction =
-        pack_signal(float4(diffuse_fraction<flow>(mat, normal, view, direction, incident,
-                                                  (observed.events & openpbr::DISCRETE) != 0),
-                           float(observed.events)));
-    signal_lanes[index] = lane;
-    return blocker;
-}
-
 func combine(inout uint2 signal, inout uint2 moment, indirect: float3, direction: float3,
              distance: float, sampled: bool)
     ->void
@@ -140,35 +54,66 @@ func combine(inout uint2 signal, inout uint2 moment, indirect: float3, direction
     let hit = sum > 0 ? (first * direct.w + second * min(distance, 65504)) / sum
                       : (sampled ? min(distance, 65504) : 0);
     signal = pack_signal(float4(direct.xyz + indirect, hit));
-    moment = pack_signal(float4(mean, 0));
+    moment = pack_signal(float4(mean, unpack_signal(moment).w));
 }
-public func finish_signal(index: uint, tail: float3, direction: float3, distance: float,
-                          view: float3, psr: pt::Psr, weight: float3, prefix_radiance: float3)
-    ->void
+
+public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLighting, hit: pt::Hit,
+                                          mat: transport::SurfaceMaterial, incident: float4,
+                                          view: float3)
+    ->float
+{
+    let normal = pt::shading_normal(hit, mat);
+    let glass = (mat.pbr.control.x & 1u) != 0;
+    if ((index & 1u) == 0 && !fixed_guide_candidate(flow))
+        physical_guides(
+            hit, mat, incident,
+            pt::denoise_surface_flow<flow>(ModScene().energy(), mat, normal, view, incident));
+    let side = dot(view, hit.surface.normal);
+    let local_diffuse = glass ? float3(side * dot(observed.local_light.xyz, hit.surface.normal) < 0)
+                              : diffuse_fraction<flow>(mat, normal, view, observed.local_light.xyz,
+                                                       incident, false);
+    let blocker = any(observed.sun > 0) ? ModScene().blocker_distance<false>(observed.sun_ray) : 0;
+    var lane : SignalLane = {};
+    lane.diffuse = pack_signal(float4(observed.local * local_diffuse, observed.local_light.w));
+    lane.specular =
+        pack_signal(float4(observed.local * (1 - local_diffuse), observed.local_light.w));
+    lane.diffuse_direction = pack_signal(
+        float4(observed.local_light.xyz, abs(dot(observed.sun_ray.direction, hit.surface.normal))));
+    lane.specular_direction = pack_signal(float4(observed.local_light.xyz, float(observed.events)));
+    let pixel_angle = 2 * parameters[0].current_camera.position.w * parameters[0].inverse_extent.y;
+    lane.view_angle = pack_signal(float4(view, pixel_angle));
+    if (glass || (fixed_guide_candidate(flow) &&
+                  openpbr::is_discrete_only_flow<flow>(mat.pbr, incident, mat.transmitted)))
+    {
+        // 局部光和太阳的直接估计按各自的几何半球归属。采样器已计入首界面的权重。
+        if (blocker == pt::FAR)
+        {
+            if (side * dot(observed.sun_ray.direction, hit.surface.normal) < 0)
+                combine(lane.diffuse, lane.diffuse_direction, observed.sun,
+                        observed.sun_ray.direction, pt::FAR, true);
+            else
+                combine(lane.specular, lane.specular_direction, observed.sun,
+                        observed.sun_ray.direction, pt::FAR, true);
+        }
+    }
+    else
+        lane.sun = pack_signal(float4(observed.sun, blocker));
+    if (any(observed.emitted > 0))
+        combine(lane.diffuse, lane.diffuse_direction, observed.emitted, float3(0), 0.00006103515625,
+                true);
+    signal_lanes[index] = lane;
+    return blocker;
+}
+
+public func finish_signal(index: uint, tail: float3, direction: float3, distance: float)->void
 {
     var lane = signal_lanes[index];
-    let fraction = unpack_signal(lane.fraction);
-    let events = uint(fraction.w);
-    combine(lane.diffuse, lane.diffuse_direction, tail * fraction.xyz, direction, distance,
-            (events & openpbr::DIFFUSE) != 0);
-    combine(lane.specular, lane.specular_direction, tail * (1 - fraction.xyz), direction, distance,
-            (events & (openpbr::GLOSSY | openpbr::DISCRETE)) != 0);
-    if (psr.count != 0)
-    {
-        lane.diffuse_direction = pack_signal(
-            float4(pt::psr_direction(psr, unpack_signal(lane.diffuse_direction).xyz), 0));
-        lane.specular_direction = pack_signal(
-            float4(pt::psr_direction(psr, unpack_signal(lane.specular_direction).xyz), 0));
-        let emitted = unpack_signal(lane.emission);
-        lane.emission = pack_signal(float4(prefix_radiance + weight * emitted.xyz, emitted.w));
-    }
-    let pixel_angle = 2 * parameters[0].current_camera.position.w * parameters[0].inverse_extent.y;
-    lane.fraction = pack_signal(float4((index & 1u) != 0 ? weight : view, pixel_angle));
+    let events = uint(unpack_signal(lane.specular_direction).w);
+    let interior = (events & (openpbr::DIFFUSE | openpbr::TRANSMISSION)) != 0;
+    let reflection = events != 0 && !interior;
+    combine(lane.diffuse, lane.diffuse_direction, interior ? tail : float3(0), direction, distance,
+            interior);
+    combine(lane.specular, lane.specular_direction, reflection ? tail : float3(0), direction,
+            distance, reflection);
     signal_lanes[index] = lane;
-}
-public func finish_signal(index: uint, tail: float3, direction: float3, distance: float,
-                          view: float3)
-    ->void
-{
-    finish_signal(index, tail, direction, distance, view, pt::psr_initial(), 1, 0);
 }

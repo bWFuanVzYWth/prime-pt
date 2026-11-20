@@ -26,7 +26,7 @@ impl RrImages {
             .map(|(index, format)| {
                 let size = match (mode, index) {
                     (Denoiser::Dlss, 6) => output,
-                    (Denoiser::Dlss, _) | (Denoiser::Nrd, 1 | 3..=6) => extent,
+                    (Denoiser::Dlss, _) | (Denoiser::Nrd, 0 | 1 | 3..=8) => extent,
                     _ => [1, 1],
                 };
                 Image::new(context, [size[0], size[1], 1], format)
@@ -152,9 +152,9 @@ impl View {
         let signal_lanes = Buffer::new(
             context,
             if mode == Denoiser::Nrd {
-                pixels * 112
+                pixels * vulkan::nrd::SIGNAL_BYTES_PER_PIXEL
             } else {
-                112
+                vulkan::nrd::SIGNAL_BYTES_PER_PIXEL
             },
             false,
         )?;

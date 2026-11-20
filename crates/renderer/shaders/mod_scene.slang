@@ -140,7 +140,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
     {
         var hit = input_hit;
         hit.texel = texel(hit.identity.x, asfloat(hit.identity.yz));
-        return resolve_material(hit, ~openpbr::FLOW_EMISSION, ~0u, 1.0);
+        return resolve_material(hit, ~0u, ~0u, parameters[0].block_emission_scale);
     }
 
     public func intersect(origin: float3, direction: float3, out hit: pt::Hit)->bool
