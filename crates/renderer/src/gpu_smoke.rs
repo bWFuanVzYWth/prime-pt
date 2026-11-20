@@ -27,6 +27,9 @@ mod region_update_tests;
 #[path = "rendering_tests.rs"]
 mod rendering_tests;
 
+#[path = "terrain_volume_tests.rs"]
+mod terrain_volume_tests;
+
 #[path = "pt_quality_bench.rs"]
 mod pt_quality_bench;
 

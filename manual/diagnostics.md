@@ -222,6 +222,16 @@ cargo test --locked --release -p prime_renderer --lib hardware_pt_scene_baseline
 
 保留 `samples.jsonl`、输入摘要和构建身份。先冻结原始版本做同版本 A/A，再在同一环境对比成对样本。计时范围和排除项见 [CPU 基准注释](../crates/world/benches/source_pipeline.rs) 与 [GPU 场景基准注释](../crates/renderer/src/scene_bench.rs)。
 
+## 检查水平转向与远处方块的体积光
+
+准备好 Vulkan 光追设备后，在 Prime PT 根目录的 PowerShell 中运行无窗口测试。
+
+```powershell
+cargo test --release --locked -p prime_renderer --lib terrain_volume -- --ignored --nocapture --test-threads=1
+```
+
+转向用例比较转向首帧与在同一视角重建的画面。远景用例确认主射线命中一米宽方块，再把方块表面的空气散射与同深度的大平面比较。输出还包含原生 3840×2160 连续转向的整帧 GPU 耗时。计时场景有近墙和远墙，预热 8 帧后报告 17 帧的中位数。出现断言失败时，可按输出中的用例名称单独重跑。
+
 ## 对照泛光模式下的点光源与太阳盘
 
 准备好[构建工具](build.md)和 Vulkan 光追设备后，在 Prime PT 根目录打开 PowerShell。无窗口测试用相同曝光将高亮白点和蓝天中的太阳盘送入实际呈现管线，分别检查相机光圈、瞳孔和快速圆形的点扩散与太阳周围的亮度。
