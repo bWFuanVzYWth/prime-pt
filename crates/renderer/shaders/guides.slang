@@ -16,11 +16,13 @@ func write_guides<let cached : bool>()->void
                         camera::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
     var trace : GuideTrace;
     var first : pt::KeyGuideVertex;
+    var identity : uint4;
     var found : bool;
     if (cached)
     {
         let index : uint = primary_pixel();
-        let primitive : uint = primary_identity[index].x;
+        identity = primary_identity[index];
+        let primitive : uint = identity.x;
         direction = primary_ray[index].xyz;
         found = primitive != 0xffffffffu;
         first = {};
@@ -37,13 +39,14 @@ func write_guides<let cached : bool>()->void
         }
     }
     else
-        found = trace.intersect_guide(p.origin.xyz, direction, p.initial_medium, first);
+        found =
+            trace.intersect_identified(p.origin.xyz, direction, p.initial_medium, first, identity);
     let current = p.current_camera;
     let previous : camera::Camera = { p.previous_position, p.previous_forward, p.previous_right,
                                       p.previous_up };
     var guides : Guides = { pixel, film, current, previous };
     if (found)
-        guides.write_key(trace, first, p.origin.xyz, direction, p.initial_medium, cached);
+        guides.write_key(trace, first, identity, p.origin.xyz, direction, p.initial_medium, cached);
     else
         guides.sky(direction);
 }

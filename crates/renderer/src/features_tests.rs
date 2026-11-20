@@ -764,10 +764,10 @@ fn hardware_pt_rr_keyed_program_preserves_opaque_and_glass_guides()
             let center = (extent[1] / 2 * extent[0] + extent[0] / 2) as usize;
             let depth = view.rr.images[1].download(&mut gpu.context)?;
             let depth = f32::from_le_bytes(depth[center * 4..center * 4 + 4].try_into()?);
-            let normal = half_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
-            let diffuse = half_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
-            let specular = half_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
-            let motion = half_pixel(&view.rr.images[2].download(&mut gpu.context)?, extent, 2);
+            let normal = float_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
+            let diffuse = float_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
+            let specular = float_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
+            let motion = float_pixel(&view.rr.images[2].download(&mut gpu.context)?, extent, 2);
             assert!(depth.is_finite() && depth > 1.);
             assert!((normal[2] + 1.).abs() < 0.001);
             assert!(diffuse[..3].iter().all(|&v| v > 0. && v < 1.));

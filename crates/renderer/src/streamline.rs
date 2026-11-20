@@ -39,8 +39,12 @@ impl Runtime {
     }
 
     /// # Safety
-    /// 遵守 vulkan::streamline::Runtime::evaluate 的命令和图像契约。
-    pub(crate) unsafe fn evaluate(&mut self, frame: &Frame) -> Result<(), EvaluationFailure> {
-        unsafe { self.0.evaluate(frame) }
+    /// 遵守 vulkan::streamline::Runtime::evaluate_with_disocclusion 的命令和图像契约。
+    pub(crate) unsafe fn evaluate_with_disocclusion(
+        &mut self,
+        frame: &Frame,
+        mask: &Resource,
+    ) -> Result<(), EvaluationFailure> {
+        unsafe { self.0.evaluate_with_disocclusion(frame, mask) }
     }
 }

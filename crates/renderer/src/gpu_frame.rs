@@ -31,7 +31,8 @@ impl Gpu {
             Binding::SampledImage(*self.atmosphere.bindings().sky),
             Binding::SampledImage(*self.atmosphere.bindings().optical_depth),
         ]);
-        trace.extend([1, 2, 3, 4, 5, 7, 8].map(|i| Binding::StorageImage(view.rr.images[i])));
+        trace.extend([1, 2, 3, 4, 5, 7].map(|i| Binding::StorageImage(view.rr.images[i])));
+        trace.push(Binding::StorageImage(view.rr.nrd_reflected_normal));
         trace.extend([
             buffer(&view.landing[5]),
             buffer(&materials.table),
@@ -48,10 +49,12 @@ impl Gpu {
             Binding::LightWorld(lighting.tree),
             buffer(&self.known_geometry.unwrap_or(self.geometry_placeholder)),
             buffer(&view.signal_lanes),
-            Binding::StorageImage(view.rr.images[6]),
-            Binding::StorageImage(view.rr.images[0]),
+            Binding::StorageImage(view.rr.nrd_motion[0]),
+            Binding::StorageImage(view.rr.nrd_motion[1]),
             buffer(&view.optical_history[0]),
             buffer(&view.optical_history[1]),
+            Binding::StorageImage(view.rr.disocclusion),
+            Binding::StorageImage(view.rr.rr_specular_motion),
         ]);
         let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![
@@ -413,13 +416,14 @@ impl Gpu {
                 (1.0 / extent[0] as f32).to_bits(),
                 (1.0 / extent[1] as f32).to_bits(),
             ]);
-            words.extend(
-                previous_camera
-                    .as_ref()
-                    .unwrap_or(&current)
-                    .camera_words(self.anchor)?
-                    .map(f32::to_bits),
-            );
+            let mut previous_words = previous_camera
+                .as_ref()
+                .unwrap_or(&current)
+                .camera_words(self.anchor)?;
+            // 相机右、上向量的保留分量标出已接受 RR 帧的实际采样格，投影只读 xyz。
+            previous_words[11] = view.rr.previous_jitter[0];
+            previous_words[15] = view.rr.previous_jitter[1];
+            words.extend(previous_words.map(f32::to_bits));
             words.extend([
                 view.output_extent[0],
                 view.output_extent[1],
@@ -778,8 +782,13 @@ impl Gpu {
                         self.absolute_sample
                     );
                 }
-                let evaluated = match unsafe { self.rr_runtime.as_mut().unwrap().evaluate(&frame) }
-                {
+                let mask = view.rr.mask(&self.context)?;
+                let evaluated = match unsafe {
+                    self.rr_runtime
+                        .as_mut()
+                        .unwrap()
+                        .evaluate_with_disocclusion(&frame, &mask)
+                } {
                     Ok(()) => true,
                     Err(error) if error.unsafe_recording() => return Err(error.source.into()),
                     Err(error) => {
@@ -829,6 +838,8 @@ impl Gpu {
                     );
                 }
                 if evaluated {
+                    let view = self.view.as_mut().unwrap();
+                    view.rr.previous_jitter = view.jitter;
                     self.rr_previous = Some(current);
                 } else {
                     self.transition_history(history::Event::RrEvaluationFailed)?;

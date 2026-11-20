@@ -12,7 +12,7 @@ impl RrImages {
         let formats = [
             ImageFormat::Rgba16Float,
             ImageFormat::R32Float,
-            ImageFormat::Rg16Float,
+            ImageFormat::Rg32Float,
             ImageFormat::Rgba16Float,
             ImageFormat::Rgba16Float,
             ImageFormat::Rgba16Float,
@@ -20,10 +20,16 @@ impl RrImages {
             ImageFormat::R32Float,
             ImageFormat::Rg16Float,
         ];
-        let images = formats
+        let images: [Image; 9] = formats
             .into_iter()
             .enumerate()
             .map(|(index, format)| {
+                // 输入像素位移在半精度的 2048 像素以上已经无法逐像素表示。
+                let format = match (mode, index) {
+                    (Denoiser::Dlss, 8) => ImageFormat::Rg32Float,
+                    (Denoiser::Nrd, 0 | 6) => ImageFormat::Rgba32Float,
+                    _ => format,
+                };
                 let size = match (mode, index) {
                     (Denoiser::Dlss, 6) => output,
                     (Denoiser::Dlss, _) | (Denoiser::Nrd, 0 | 1 | 3..=8) => extent,
@@ -35,33 +41,62 @@ impl RrImages {
             .try_into()
             .ok()
             .unwrap();
-        Ok(Self { images })
+        let mask_extent = if mode == Denoiser::Dlss {
+            extent
+        } else {
+            [1, 1]
+        };
+        // 同一光追管线含两种降噪器的入口。即使某帧不访问，storage 视图格式也必须匹配 SPIR-V。
+        let nrd_motion = if mode == Denoiser::Nrd {
+            [images[6], images[0]]
+        } else {
+            [Image::new(context, [1, 1, 1], ImageFormat::Rgba32Float)?; 2]
+        };
+        let (nrd_reflected_normal, rr_specular_motion) = if mode == Denoiser::Dlss {
+            (
+                Image::new(context, [1, 1, 1], ImageFormat::Rg16Float)?,
+                images[8],
+            )
+        } else {
+            (images[8], images[2])
+        };
+        Ok(Self {
+            images,
+            nrd_motion,
+            nrd_reflected_normal,
+            rr_specular_motion,
+            disocclusion: Image::new(
+                context,
+                [mask_extent[0], mask_extent[1], 1],
+                ImageFormat::R8Unorm,
+            )?,
+            previous_jitter: [0.; 2],
+        })
     }
 
     pub(super) fn resources(&self, context: &Context) -> Result<[streamline::Resource; 9], Error> {
-        let raw = self
-            .images
-            .each_ref()
-            .map(|image| image.raw(context))
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(raw
-            .into_iter()
-            .map(|raw| streamline::Resource {
-                image: raw.image,
-                view: raw.view,
-                memory: raw.memory,
-                width: raw.extent[0],
-                height: raw.extent[1],
-                format: raw.format,
-                layout: raw.layout,
-                usage: raw.usage,
-                reserved: 0,
-            })
-            .collect::<Vec<_>>()
-            .try_into()
-            .ok()
-            .expect("固定九个图像"))
+        let mut resources = [streamline::Resource::default(); 9];
+        for (description, image) in resources.iter_mut().zip(self.images) {
+            *description = Self::describe(context, image)?;
+        }
+        Ok(resources)
+    }
+    fn describe(context: &Context, image: Image) -> Result<streamline::Resource, Error> {
+        let raw = image.raw(context)?;
+        Ok(streamline::Resource {
+            image: raw.image,
+            view: raw.view,
+            memory: raw.memory,
+            width: raw.extent[0],
+            height: raw.extent[1],
+            format: raw.format,
+            layout: raw.layout,
+            usage: raw.usage,
+            reserved: 0,
+        })
+    }
+    pub(super) fn mask(&self, context: &Context) -> Result<streamline::Resource, Error> {
+        Self::describe(context, self.disocclusion)
     }
 }
 
@@ -77,6 +112,9 @@ impl View {
             self.pack.into(),
         ];
         roots.extend(self.optical_history.map(vulkan::native::Resource::from));
+        roots.extend(self.rr.nrd_motion.map(vulkan::native::Resource::from));
+        roots.push(self.rr.nrd_reflected_normal.into());
+        roots.push(self.rr.disocclusion.into());
         roots.extend(
             self.presentation
                 .present
@@ -160,7 +198,7 @@ impl View {
             false,
         )?;
         let rr_enabled = mode == Denoiser::Dlss;
-        let optical_bytes = if mode == Denoiser::Nrd {
+        let optical_bytes = if mode != Denoiser::Off {
             pixels * 16
         } else {
             16

@@ -2286,14 +2286,23 @@ fn hardware_pt_quad_material_preset_is_consumed() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn half_pixel(bytes: &[u8], extent: [u32; 2], components: usize) -> Vec<f32> {
-    let center = ((extent[1] / 2 * extent[0] + extent[0] / 2) as usize) * components * 2;
-    bytes[center..center + components * 2]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|word| half(u16::from_le_bytes(*word)))
+fn float_pixel(bytes: &[u8], extent: [u32; 2], components: usize) -> Vec<f32> {
+    let texel = (extent[1] / 2 * extent[0] + extent[0] / 2) as usize;
+    let width = bytes.len() / ((extent[0] * extent[1]) as usize * components);
+    (0..components)
+        .map(|c| float_component(bytes, texel * components + c, width))
         .collect()
+}
+
+fn float_component(bytes: &[u8], component: usize, width: usize) -> f32 {
+    let start = component * width;
+    match width {
+        2 => half(u16::from_le_bytes(
+            bytes[start..start + 2].try_into().unwrap(),
+        )),
+        4 => f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()),
+        _ => panic!("测试纹理分量只支持 FP16 或 FP32"),
+    }
 }
 
 fn finite_half_image(bytes: &[u8]) -> bool {
@@ -2346,7 +2355,7 @@ fn hardware_pt_rr_rebases_history_across_local_changes() -> Result<(), Box<dyn s
     assert!(gpu.rr_previous.is_some());
     let view = gpu.view.as_ref().unwrap();
     assert_eq!(view.progress.samples(), 2, "RR仍只累计本帧样本");
-    let motion = half_pixel(
+    let motion = float_pixel(
         &view.rr.images[2].download(&mut gpu.context)?,
         [512, 512],
         2,
@@ -2369,7 +2378,7 @@ fn hardware_pt_rr_rebases_history_across_local_changes() -> Result<(), Box<dyn s
         gpu.invalidate_history(event)?;
         camera.origin[0] += 0.25;
         host.render_options(&mut gpu, &image, &camera, environment, options)?;
-        let motion = half_pixel(
+        let motion = float_pixel(
             &gpu.view.as_ref().unwrap().rr.images[2].download(&mut gpu.context)?,
             [512, 512],
             2,
@@ -2443,8 +2452,8 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
         gpu.set_scene(&mesh)?;
         host.render_options(gpu, &output, &camera(), Environment::default(), options)?;
         let guides = gpu.view.as_ref().unwrap().rr.images;
-        let n = half_pixel(&guides[3].download(&mut gpu.context)?, extent, 4);
-        let f0 = half_pixel(&guides[5].download(&mut gpu.context)?, extent, 4);
+        let n = float_pixel(&guides[3].download(&mut gpu.context)?, extent, 4);
+        let f0 = float_pixel(&guides[5].download(&mut gpu.context)?, extent, 4);
         eprintln!("SPBR tile={tile} normal_roughness={n:?} F0_class={f0:?}");
         assert!((n[3] - expected_roughness).abs() < 0.001 && n[0].abs() + n[1].abs() > 0.4);
         assert!(f0[..3].iter().all(|f| (f - expected_f0).abs() < 0.002) && f0[3] == class);
@@ -2453,7 +2462,7 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
             let [specular, direction, filtered] = nrd.specular_signals();
             let diffuse = nrd.diffuse_pair()[0];
             let mut pixel = |image: Image| -> Result<Vec<f32>, Error> {
-                Ok(half_pixel(&image.download(&mut gpu.context)?, extent, 4))
+                Ok(float_pixel(&image.download(&mut gpu.context)?, extent, 4))
             };
             let input = pixel(specular)?[0];
             let output = pixel(filtered)?[0];
@@ -2530,19 +2539,19 @@ fn hardware_nrd_history() -> Result<(), Box<dyn std::error::Error>> {
                 .diffuse_pair();
             let mut values = [0.; 2];
             for (value, image) in values.iter_mut().zip(pair) {
-                *value = f64::from(half_pixel(&image.download(&mut gpu.context)?, extent, 4)[0]);
+                *value = f64::from(float_pixel(&image.download(&mut gpu.context)?, extent, 4)[0]);
             }
             diffuse.push(values);
         }
     }
     let view = gpu.view.as_ref().unwrap();
     assert!(view.nrd.is_some() && gpu.rr_previous.is_some());
-    let motion = half_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
+    let motion = float_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
     assert!(
         motion[0] > 0.5 && motion[1].abs() < 0.1 && (motion[2] - 0.25).abs() < 0.002,
         "横移并向前移动的 2.5D 运动 {motion:?}"
     );
-    let center = half_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
+    let center = float_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
     assert!(center[0] > 0. && center[3] == 1., "首表面 {center:?}");
     let hdr = view.presentation.linear_hdr.download(&mut gpu.context)?;
     assert!(
@@ -2699,8 +2708,8 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         let noisy = images[0].download(&mut gpu.context)?;
         let output = images[6].download(&mut gpu.context)?;
         assert!(finite_half_image(&noisy) && finite_half_image(&output));
-        let noisy_pixel = half_pixel(&noisy, extent, 4);
-        let output_pixel = half_pixel(&output, extent, 4);
+        let noisy_pixel = float_pixel(&noisy, extent, 4);
+        let output_pixel = float_pixel(&output, extent, 4);
         assert!(
             noisy_pixel[..3].iter().any(|&v| v > 0.01),
             "太阳和大气 HDR：{noisy_pixel:?}"
@@ -2713,23 +2722,23 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         let center = ((extent[1] / 2 * extent[0] + extent[0] / 2) as usize) * 4;
         let depth = f32::from_le_bytes(depth[center..center + 4].try_into()?);
         assert!((depth - 3.0).abs() < 1e-4, "首命中 view-Z：{depth}");
-        let motion = half_pixel(&images[2].download(&mut gpu.context)?, extent, 2);
+        let motion = float_pixel(&images[2].download(&mut gpu.context)?, extent, 2);
         let expected = if frame == 1 { 40.0 } else { 0.0 };
         assert!(
             (motion[0] - expected).abs() < 0.1 && motion[1].abs() < 0.1,
             "frame={frame}，运动={motion:?}，预期x={expected}"
         );
-        let normal = half_pixel(&images[3].download(&mut gpu.context)?, extent, 4);
+        let normal = float_pixel(&images[3].download(&mut gpu.context)?, extent, 4);
         assert!(normal[0].abs() < 1e-4 && normal[1].abs() < 1e-4 && (normal[2] + 1.0).abs() < 1e-4);
         assert!((normal[3] - 0.9).abs() < 0.001);
-        let diffuse = half_pixel(&images[4].download(&mut gpu.context)?, extent, 4);
-        let specular = half_pixel(&images[5].download(&mut gpu.context)?, extent, 4);
+        let diffuse = float_pixel(&images[4].download(&mut gpu.context)?, extent, 4);
+        let specular = float_pixel(&images[5].download(&mut gpu.context)?, extent, 4);
         assert!(diffuse[..3].iter().all(|&v| v > 0.0 && v < 1.0));
         assert!(specular[..3].iter().all(|&v| v > 0.0 && v < 1.0));
         let distance = images[7].download(&mut gpu.context)?;
         let distance = f32::from_le_bytes(distance[center..center + 4].try_into()?);
         assert!((distance - 5.0).abs() < 0.001, "反射段距离：{distance}");
-        let reflected = half_pixel(&images[8].download(&mut gpu.context)?, extent, 2);
+        let reflected = float_pixel(&images[8].download(&mut gpu.context)?, extent, 2);
         let expected = if frame == 1 { 15.0 } else { 0.0 };
         assert!(
             (reflected[0] - expected).abs() < 0.1 && reflected[1].abs() < 0.1,
@@ -2771,8 +2780,8 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         let expected = if index == 6 { extent } else { input };
         assert_eq!(image.extent(), [expected[0], expected[1], 1]);
     }
-    let motion = half_pixel(&view.rr.images[2].download(&mut gpu.context)?, input, 2);
-    let specular = half_pixel(&view.rr.images[8].download(&mut gpu.context)?, input, 2);
+    let motion = float_pixel(&view.rr.images[2].download(&mut gpu.context)?, input, 2);
+    let specular = float_pixel(&view.rr.images[8].download(&mut gpu.context)?, input, 2);
     assert!(
         (motion[0] - 20.0).abs() < 0.1 && motion[1].abs() < 0.1,
         "超分运动：{motion:?}"
@@ -2795,7 +2804,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     let mut accumulation = vec![0; view.accumulation.len() as usize];
     view.accumulation
         .read(&mut gpu.context, 0, &mut accumulation)?;
-    let mean = half_pixel(&noisy, input, 4);
+    let mean = float_pixel(&noisy, input, 4);
     let pixel = ((input[1] / 2 * input[0] + input[0] / 2) as usize) * 16;
     for (channel, mean) in mean[..3].iter().copied().enumerate() {
         let offset = pixel + channel * 4;
@@ -2832,7 +2841,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let view = gpu.view.as_ref().unwrap();
         assert_eq!(view.extent, expected);
-        let motion = half_pixel(&view.rr.images[2].download(&mut gpu.context)?, expected, 2);
+        let motion = float_pixel(&view.rr.images[2].download(&mut gpu.context)?, expected, 2);
         assert!(
             motion.iter().all(|value| value.abs() < 0.001),
             "档位切换须重置历史：{motion:?}"
@@ -2845,7 +2854,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     let view = gpu.view.as_ref().unwrap();
     assert_eq!(view.extent, [640, 360]);
     assert_eq!(view.output_extent, [1280, 720]);
-    let motion = half_pixel(
+    let motion = float_pixel(
         &view.rr.images[2].download(&mut gpu.context)?,
         view.extent,
         2,

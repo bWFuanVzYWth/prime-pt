@@ -1,6 +1,8 @@
 //! 通过两种实际追踪入口检查透明接收面及几何边缘的太阳信号。
 use super::*;
 use vulkan::nrd::SIGNAL_BYTES_PER_PIXEL;
+#[path = "gpu_projection_tests.rs"]
+mod projection;
 
 fn materials<const N: usize>(
     gpu: &mut Gpu,
@@ -145,10 +147,10 @@ fn hardware_nrd_glass_receiver() -> Result<(), Box<dyn std::error::Error>> {
             let depth = view.rr.images[1].download(&mut gpu.context)?;
             let at = (48 * 128 + 64) * 4;
             let z = f32::from_le_bytes(depth[at..at + 4].try_into()?);
-            let n = half_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
-            let mv = half_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
+            let n = float_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
+            let mv = float_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
             eprintln!("glass receiver depth={z} roughness={} motion={mv:?}", n[3]);
-            let spec = half_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
+            let spec = float_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
             assert!((z - 6.).abs() < 0.001 && (n[3] - 0.9).abs() < 0.001 && spec[3] == 0.);
             if i == 48 {
                 assert!((mv[0] - 2.).abs() < 0.01 && mv[1].abs() < 0.01);
@@ -160,7 +162,7 @@ fn hardware_nrd_glass_receiver() -> Result<(), Box<dyn std::error::Error>> {
                 .iter_mut()
                 .zip(view.nrd.as_ref().unwrap().diffuse_pair())
             {
-                *v = f64::from(half_pixel(&image.download(&mut gpu.context)?, extent, 4)[0]);
+                *v = f64::from(float_pixel(&image.download(&mut gpu.context)?, extent, 4)[0]);
             }
             history.push(sample);
         }
@@ -243,8 +245,8 @@ fn hardware_nrd_glass_disocclusion() -> Result<(), Box<dyn std::error::Error>> {
             };
             let dz = z_at(&mut gpu.context, rr[1])?;
             let rz = z_at(&mut gpu.context, rr[7])?;
-            let dm = half_pixel(&rr[6].download(&mut gpu.context)?, extent, 4);
-            let rm = half_pixel(&rr[0].download(&mut gpu.context)?, extent, 4);
+            let dm = float_pixel(&rr[6].download(&mut gpu.context)?, extent, 4);
+            let rm = float_pixel(&rr[0].download(&mut gpu.context)?, extent, 4);
             eprintln!("分路深度 D={dz} R={rz} 运动 D={} R={}", dm[0], rm[0]);
             assert!((dz - if i == 16 { 4. } else { 8. }).abs() < 0.001 && (rz - 7.).abs() < 0.001);
             if i == 17 {
@@ -317,16 +319,16 @@ fn hardware_nrd_glass_filtered_lobes() -> Result<(), Box<dyn std::error::Error>>
             host.render_options(gpu, &output, &camera, Environment::default(), options)?;
         }
         let view = gpu.view.as_ref().unwrap();
-        let normal = half_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
+        let normal = float_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
         let depth = view.rr.images[1].download(&mut gpu.context)?;
         let zi = (32 * 65 + 32) * 4;
         let z = f32::from_le_bytes(depth[zi..zi + 4].try_into()?);
         assert!((z - 2.).abs() < 0.001 && (normal[3] - roughness).abs() < 0.001);
         let r_depth = view.rr.images[7].download(&mut gpu.context)?;
         let rz = f32::from_le_bytes(r_depth[zi..zi + 4].try_into()?);
-        let d_motion = half_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
-        let r_motion = half_pixel(&view.rr.images[0].download(&mut gpu.context)?, extent, 4);
-        let spec = half_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
+        let d_motion = float_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
+        let r_motion = float_pixel(&view.rr.images[0].download(&mut gpu.context)?, extent, 4);
+        let spec = float_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
         assert!((spec[3] - roughness).abs() < 0.001);
         if roughness == 0. {
             assert!(d_motion[0].abs() < 0.001 && (rz - 7.).abs() < 0.001 && r_motion[0] > 0.1);
@@ -451,7 +453,7 @@ fn hardware_nrd_delta_texture() -> Result<(), Box<dyn std::error::Error>> {
                 nrd.specular_signals()[0],
                 nrd.specular_signals()[2],
             ] {
-                values.push(half_pixel(&img.download(&mut gpu.context)?, extent, 4)[0]);
+                values.push(float_pixel(&img.download(&mut gpu.context)?, extent, 4)[0]);
             }
             let emission = linear_pixel(&mut gpu.context, view.prefix, capture, offset)?[0];
             let rgb = surface_pixel(gpu, capture, offset)?;
@@ -552,7 +554,7 @@ fn hardware_nrd_layered_lobes() -> Result<(), Box<dyn std::error::Error>> {
         };
         let dz = depth(&mut gpu.context, rr[1])?;
         let rz = depth(&mut gpu.context, rr[7])?;
-        let factor = half_pixel(&rr[5].download(&mut gpu.context)?, extent, 4);
+        let factor = float_pixel(&rr[5].download(&mut gpu.context)?, extent, 4);
         eprintln!(
             "分层材质 roughness={roughness} metal={metal} samples={sampled:?} depth=({dz},{rz}) spec={factor:?}"
         );
@@ -635,7 +637,7 @@ fn hardware_nrd_solid_refraction() -> Result<(), Box<dyn std::error::Error>> {
     assert!((color[1] / color[0] - transmittance).abs() < 0.002);
     camera.origin[0] = 0.01;
     host.render_options(gpu, &output, &camera, dark, options)?;
-    let mv = half_pixel(
+    let mv = float_pixel(
         &gpu.view.as_ref().unwrap().rr.images[6].download(&mut gpu.context)?,
         [65, 65],
         4,
@@ -722,7 +724,17 @@ fn hardware_nrd_mirror_emission() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 #[ignore = "斜视厚玻璃横移半格时，用前帧实际光路校验亚像素对应，并拒绝被遮挡的历史"]
 fn hardware_nrd_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
-    let host = Host::create(false, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
+    refracted_history(false)
+}
+
+#[test]
+#[ignore = "真实 DLSS RR/DLAA 的折射重投影，包括帧间 jitter、横移和前帧遮挡"]
+fn hardware_rr_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
+    refracted_history(true)
+}
+
+fn refracted_history(rr: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(rr, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
     let mut session = host.gpu()?;
     let gpu = session.gpu();
     let native_4k = std::env::var_os("PRIME_NRD_4K").is_some();
@@ -739,7 +751,8 @@ fn hardware_nrd_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     materials(gpu, &[glass, emitter([1.; 3])], [0; 4])?;
-    let options = Options::new(false, streamline::Quality::Dlaa, 2, 8)?.with_nrd();
+    let options = Options::new(rr, streamline::Quality::Dlaa, 2, 8)?;
+    let options = if rr { options } else { options.with_nrd() };
     let dark = Environment {
         sun_direction: [0.; 3],
         ..Default::default()
@@ -760,7 +773,7 @@ fn hardware_nrd_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
             hi = mid;
         }
     }
-    let expected = (lo - theta).tan() * scale - center;
+    let mut checks = Vec::new();
     for blocked in [false, true] {
         let mut quads = vec![
             plane(-12., 12., 2., 0),
@@ -777,16 +790,57 @@ fn hardware_nrd_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
         camera.right = [0.08, 0., -0.06, 0.];
         camera.up[1] = 0.1 * extent[1] as f32 / extent[0] as f32;
         host.render_options(gpu, &output, &camera, dark, options)?;
+        host.render_options(gpu, &output, &camera, dark, options)?;
+        let motion_image = if rr { 2 } else { 6 };
+        let channels = if rr { 2 } else { 4 };
+        let view = gpu.view.as_ref().unwrap();
+        assert_eq!(view.rr_enabled, rr);
+        let stationary = float_pixel(
+            &view.rr.images[motion_image].download(&mut gpu.context)?,
+            extent,
+            channels,
+        );
+        eprintln!("固定相机 jitter={:?} motion={stationary:?}", view.jitter);
+        if !blocked {
+            checks.push(stationary[..2].iter().all(|v| v.abs() < 0.05));
+        }
         camera.origin[0] = dx as f32;
         host.render_options(gpu, &output, &camera, dark, options)?;
         let view = gpu.view.as_ref().unwrap();
-        let mv = half_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
-        eprintln!("折射对应 blocked={blocked} measured={mv:?} reference={expected}");
+        let mv = float_pixel(
+            &view.rr.images[motion_image].download(&mut gpu.context)?,
+            extent,
+            channels,
+        );
+        let current = center + f64::from(view.jitter[0]);
+        let current_angle = theta + (current / scale).atan();
+        let (mut low, mut high) = (current_angle, 1.);
+        for _ in 0..50 {
+            let mid = (low + high) * 0.5;
+            if x(mid) < x(current_angle) + dx {
+                low = mid;
+            } else {
+                high = mid;
+            }
+        }
+        let expected = (low - theta).tan() * scale - current;
+        eprintln!(
+            "折射对应 RR={rr} blocked={blocked} measured={mv:?} reference={expected} jitter={:?}",
+            view.jitter
+        );
+        if rr {
+            let mask = view.rr.disocclusion.download(&mut gpu.context)?;
+            let center_index = (extent[0] * (extent[1] / 2) + extent[0] / 2) as usize;
+            eprintln!("前帧遮挡 blocked={blocked} mask={}", mask[center_index]);
+            checks.push(mask[center_index] == if blocked { 255 } else { 0 });
+        }
         if blocked {
-            assert!(mv[0] >= extent[0] as f32);
+            if !rr {
+                checks.push(mv[0] >= extent[0] as f32);
+            }
         } else {
             let tolerance = if native_4k { 0.6 } else { 0.1 };
-            assert!((f64::from(mv[0]) - expected).abs() < tolerance && mv[1].abs() < 0.1);
+            checks.push((f64::from(mv[0]) - expected).abs() < tolerance && mv[1].abs() < 0.1);
             if native_4k {
                 let queries = [
                     vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
@@ -806,7 +860,7 @@ fn hardware_nrd_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
                 times.sort_by(f64::total_cmp);
                 assert!(times.iter().all(|t| t.is_finite() && *t > 0.));
                 eprintln!(
-                    "NRD moving solid glass native=3840x2160 spp=2 depth=8 gpu_median_ms={:.3}",
+                    "moving solid glass RR={rr} native=3840x2160 spp=2 depth=8 gpu_median_ms={:.3}",
                     times[times.len() / 2]
                 );
             }
@@ -814,6 +868,10 @@ fn hardware_nrd_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
     }
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    assert!(
+        checks.into_iter().all(|matched| matched),
+        "折射历史与参考光路不一致"
+    );
     Ok(())
 }
 
@@ -915,7 +973,7 @@ fn hardware_nrd_optical_sky() -> Result<(), Box<dyn std::error::Error>> {
     host.render_options(gpu, &output, &camera, Environment::default(), options)?;
     let rr = &gpu.view.as_ref().unwrap().rr.images;
     for image in [rr[6], rr[0]] {
-        let mv = half_pixel(&image.download(&mut gpu.context)?, extent, 4);
+        let mv = float_pixel(&image.download(&mut gpu.context)?, extent, 4);
         eprintln!("天空运动 xy=({}, {}) dz={}", mv[0], mv[1], mv[2]);
         assert!(mv[0].abs() < 0.001 && mv[1].abs() < 0.001 && (mv[2] + 0.15).abs() < 0.001);
     }
@@ -1012,7 +1070,7 @@ fn hardware_nrd_sun_geometric_edge() -> Result<(), Box<dyn std::error::Error>> {
         };
         host.render_options(gpu, &image, &camera(), env, options)?;
         let view = gpu.view.as_ref().unwrap();
-        let n = half_pixel(&view.rr.images[3].download(&mut gpu.context)?, [32, 32], 4);
+        let n = float_pixel(&view.rr.images[3].download(&mut gpu.context)?, [32, 32], 4);
         assert!(n[0] > 0.7 && n[2] < -0.5, "边缘有倾斜的贴图法线 {n:?}");
         view.signal_lanes
             .copy_prefix_to(&mut gpu.context, &readback, size)?;

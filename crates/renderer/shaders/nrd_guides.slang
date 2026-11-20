@@ -6,7 +6,7 @@ import pt.surface_guides;
 import transport.medium;
 import mod_materials;
 import pt.reconstruction;
-import pt.optical_history;
+import mod_optical_history;
 import pt.scene;
 import transport.surface_material;
 import openpbr.flow;
@@ -20,7 +20,7 @@ public var prefix_image : RWStructuredBuffer<float4>;
 [[vk::image_format("r32f")]]
 var depth_image : RWTexture2D<float>;
 [[vk::binding(41, 0)]]
-[[vk::image_format("rgba16f")]]
+[[vk::image_format("rgba32f")]]
 var motion_image : RWTexture2D<float4>;
 [[vk::binding(21, 0)]]
 [[vk::image_format("rgba16f")]]
@@ -39,31 +39,8 @@ var reflected_depth : RWTexture2D<float>;
 [[vk::image_format("rg16f")]]
 var reflected_normal : RWTexture2D<float2>;
 [[vk::binding(42, 0)]]
-[[vk::image_format("rgba16f")]]
+[[vk::image_format("rgba32f")]]
 var reflected_motion : RWTexture2D<float4>;
-[[vk::binding(43, 0)]]
-var optical_even : RWStructuredBuffer<uint4>;
-[[vk::binding(44, 0)]]
-var optical_odd : RWStructuredBuffer<uint4>;
-
-struct OpticalKey : pt::IOpticalPathKey
-{
-    static func boundary(key: uint, hit: uint4, front: bool, reflection: bool, eta: float)->uint
-    {
-        return pt::optical_key(key, stable_triangle(hit.x).xy,
-                               asuint(eta) ^ uint(front) ^ (uint(reflection) << 1));
-    }
-};
-func publish_optics(pixel: uint2, record: uint4)->void
-{
-    let p = parameters[0];
-    let index = pixel.y * p.image.x + pixel.x;
-    if ((p.output_size.w & 1u) == 0)
-        optical_even[index] = record;
-    else
-        optical_odd[index] = record;
-}
-
 public func sky_signal(pixel: uint2)->void
 {
     prefix_image[pixel.y * parameters[0].image.x + pixel.x].xyz = 0;
@@ -130,6 +107,20 @@ func geometry_guide(position: float3, normal: float3, previous_target: float3,
 func write_guides(interior: SurfaceGuide, reflection: SurfaceGuide)->void
 {
     let pixel = DispatchRaysIndex().xy;
+    var interior = interior;
+    var reflection = reflection;
+    let p = parameters[0];
+    if (p.reconstruction.z > 0)
+    {
+        let film_pixel = float2(pixel) + 0.5 + p.reconstruction.xy;
+        let uncovered =
+            uncovered_paths(uint2(interior.optical.x, reflection.optical.x),
+                            film_pixel + interior.motion.xy, film_pixel + reflection.motion.xy);
+        if (uncovered.x)
+            interior.motion = float3(float2(p.image.xy), 0);
+        if (uncovered.y)
+            reflection.motion = float3(float2(p.image.xy), 0);
+    }
     prefix_image[pixel.y * parameters[0].image.x + pixel.x].xyz =
         interior.emission + reflection.emission;
     publish_optics(pixel, uint4(interior.optical, reflection.optical));
@@ -200,59 +191,63 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     var target = sky ? end.camera_direction : position + pt::psr_direction(end.psr, pose_delta);
     var previous_z = dot(position - p.previous_position.xyz, p.previous_forward.xyz);
     var valid = (end.flags & (pt::GUIDE_SURFACE_PROXY | pt::GUIDE_INVALID)) == 0;
-    var record = uint2(0);
-    if (end.psr.refracted && valid)
-    {
-        if (sky)
-            record = pt::optical_sample(pt::optical_key(end.optical_key, uint2(0), 4u),
-                                        0.5 * oct_normal(end.direction) + 0.5);
-        else
-        {
-            let id = end.hit.identity;
-            let b = asfloat(id.yz);
-            // 两个三角形 ABC、ACD 共享同一套 quad 坐标，允许跨对角线重投影。
-            let uv = (id.x & 1u) == 0u ? float2(b.x + b.y, b.y) : float2(b.x, b.x + b.y);
-            record = pt::optical_sample(pt::optical_key(end.optical_key, stable_triangle(id.x).xy,
-                                                        uint(end.hit.front) + 2u),
-                                        uv);
-        }
-    }
-    if ((end.psr.refracted || (replaced && end.optical_motion.moving)) && p.reconstruction.z > 0)
+    let record = optical_record(end);
+    if ((end.sampled_motion || (replaced && end.optical_motion.moving)) && p.reconstruction.z > 0)
     {
         var previous_ray : float3;
         let solved = end.optical_motion.previous_ray(
             end.camera_direction, sky ? float3(0) : pose_delta,
             sky ? end.direction : end.hit.surface.normal, sky, previous_ray);
-        valid = valid && solved;
         if (valid && record.x != 0)
         {
             let previous : camera::Camera = { p.previous_position, p.previous_forward,
                                               p.previous_right, p.previous_up };
             let projection = camera::camera_project_direction(previous, previous_ray, p.image.xy);
-            if (projection.valid)
+            let seed = projection.pixel - 0.5;
+            var matched : float2;
+            valid = solved && projection.valid && match_optics<reflection>(record, seed, matched);
+            if (!valid)
             {
-                let seed = projection.pixel - 0.5;
-                var matched : float2;
-                if ((p.output_size.w & 1u) == 0)
-                    valid = pt::previous_optical_pixel<reflection>(optical_odd, p.image.xy, record,
-                                                                   seed, matched);
-                else
-                    valid = pt::previous_optical_pixel<reflection>(optical_even, p.image.xy, record,
-                                                                   seed, matched);
-                if (valid && any(abs(matched - seed) > 0.045))
-                    previous_ray =
-                        camera::camera_direction(previous, (matched + 0.5) * p.inverse_extent);
+                // 大幅横移时一阶光线微分可能越过旧视野，从虚拟平面再尝试同一个实测终点。
+                let plane = sky ? camera::camera_project_direction(previous, target, p.image.xy)
+                                : camera::camera_project(previous, target, p.image.xy);
+                if (plane.valid && (!solved || !projection.valid ||
+                                    any(abs(plane.pixel - projection.pixel) > 0.5)))
+                    valid = match_optics<reflection>(record, plane.pixel - 0.5, matched);
             }
-            else
-                valid = false;
+            if (valid && (!solved || !projection.valid || any(abs(matched - seed) > 0.045)))
+                previous_ray =
+                    camera::camera_direction(previous, (matched + 0.5) * p.inverse_extent);
         }
+        else
+            valid = valid && solved;
         if (sky)
             target = previous_ray;
         else
         {
             let n = pt::psr_direction(end.psr, end.hit.surface.normal);
             let denom = dot(n, previous_ray);
-            let plane = pt::psr_point(end.psr, end.hit.surface.position + pose_delta);
+            var plane = pt::psr_point(end.psr, end.hit.surface.position + pose_delta);
+            if (end.psr.count == 1 && end.psr.odd && end.sampled_motion)
+            {
+                // 贴图镜面的反射法线和几何法线不同。旧射线落在界面的另一点，
+                // 需以该点展开旧终面，才能给 NRD 正确的 previous view-Z。
+                let interface_normal = first.hit.surface.normal;
+                let optical_normal = pt::shading_normal(first.hit, front);
+                let pose = scene.guide_pose(first.hit);
+                let previous_point =
+                    pose.known ? pose.previous_position : first.hit.surface.position;
+                let incidence = dot(interface_normal, previous_ray);
+                let distance =
+                    abs(incidence) > 1e-6
+                        ? dot(interface_normal, previous_point - p.previous_position.xyz) /
+                              incidence
+                        : 0;
+                valid = valid && distance > 0;
+                let offset =
+                    p.previous_position.xyz + distance * previous_ray - first.hit.surface.position;
+                plane += 2 * optical_normal * dot(optical_normal, offset);
+            }
             let t = abs(denom) > 1e-5 ? dot(plane - p.previous_position.xyz, n) / denom : 0;
             valid = valid && t > 0 && isfinite(t);
             target = p.previous_position.xyz + t * previous_ray;

@@ -546,13 +546,14 @@ fn guided_suffix_across_materials(
                 let offset = (extent[1] / 2 * extent[0] + extent[0] / 2) as usize * 4;
                 let depth = view.rr.images[1].download(&mut gpu.context)?;
                 let depth = f32::from_le_bytes(depth[offset..offset + 4].try_into()?);
-                let normal = half_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
-                let diffuse = half_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
+                let normal = float_pixel(&view.rr.images[3].download(&mut gpu.context)?, extent, 4);
+                let diffuse =
+                    float_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
                 let specular =
-                    half_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
-                let motion = half_pixel(&view.rr.images[2].download(&mut gpu.context)?, extent, 2);
+                    float_pixel(&view.rr.images[5].download(&mut gpu.context)?, extent, 4);
+                let motion = float_pixel(&view.rr.images[2].download(&mut gpu.context)?, extent, 2);
                 let specular_motion =
-                    half_pixel(&view.rr.images[8].download(&mut gpu.context)?, extent, 2);
+                    float_pixel(&view.rr.images[8].download(&mut gpu.context)?, extent, 2);
                 let reflected = view.rr.images[7].download(&mut gpu.context)?;
                 let reflected = f32::from_le_bytes(reflected[offset..offset + 4].try_into()?);
                 assert!(

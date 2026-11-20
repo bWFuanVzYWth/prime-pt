@@ -456,6 +456,11 @@ struct Presentation {
 /// distance 仅用于 mod 诊断；SDK 使用额外理想反射射线生成的局部平面 specular motion。
 struct RrImages {
     images: [Image; 9],
+    nrd_motion: [Image; 2],
+    nrd_reflected_normal: Image,
+    rr_specular_motion: Image,
+    disocclusion: Image,
+    previous_jitter: [f32; 2],
 }
 
 fn display_variants(
