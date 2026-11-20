@@ -2598,6 +2598,9 @@ fn hardware_nrd_history() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[path = "gpu_nrd_tests.rs"]
+mod nrd_surfaces;
+
 #[test]
 #[ignore = "实际太阳遮挡距离与 SIGMA 历史输出"]
 fn hardware_nrd_sun_blocker() -> Result<(), Box<dyn std::error::Error>> {

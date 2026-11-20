@@ -21,12 +21,17 @@ func shade_primary(inout call: pt::MaterialCall)->void
 #if PRIMEPT_OMM
     ENGINE_OPACITY_MICROMAP(shade_primary)
 #endif
-    call.initialize_primary(parameters[0].initial_medium);
     let pixel : uint = primary_pixel();
+    // 虚拟终点复用输入位置携带当前世代的三角形与重心；负 PDF 仅在调度边界有效。
+    let replaced = parameters[0].reconstruction.w == 3 && call.previous_pdf < 0;
     var hit : pt::Hit = {};
-    hit.identity = primary_identity[pixel];
+    hit.identity = replaced ? uint4(asuint(call.previous), 0) : primary_identity[pixel];
+    let ray = replaced ? float4(call.direction, 0) : primary_ray[pixel];
+    if (replaced)
+        call.previous_pdf = 0;
+    else
+        call.initialize_primary(parameters[0].initial_medium);
     hit.surface = geometry::surface_point(known_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
-    let ray : float4 = primary_ray[pixel];
     hit.distance = ray.w;
     hit.front = dot(ray.xyz, hit.surface.normal) < 0;
     let auxiliary : float4 =
@@ -43,7 +48,7 @@ func shade_primary(inout call: pt::MaterialCall)->void
         pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
             ModScene(), call, hit, material, ray.xyz, settings(parameters[0]), lane, signals);
         let blocker = begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, hit, material, incident,
-                                                 -ray.xyz, call.direction);
+                                                 -ray.xyz, call.direction, replaced);
         if (blocker == pt::FAR)
             call.radiance += signals.sun;
         return;

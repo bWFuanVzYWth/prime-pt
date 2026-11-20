@@ -1,6 +1,8 @@
 /// 普通PT生产入口；材质来源单独适配，路径和数值叶子由引擎维护。
 module pt_hit;
 import nrd_path;
+import nrd_optics;
+import known_geometry;
 #include "opacity/micromap.inc.slang"
 #ifndef PRIMEPT_OMM
 #define PRIMEPT_OMM 0
@@ -220,6 +222,55 @@ func trace_path(coordinate: uint2, film: float2, inout data: pt::TransportCall)
         HitScene(), pt::NoPrefixGuides(), data);
 }
 
+func known_hit(identity: uint4, direction: float3, distance: float)->pt::Hit
+{
+    var hit : pt::Hit = {};
+    let bary = asfloat(identity.yz);
+    hit.surface = geometry::surface_point(known_endpoint(identity.x, bary));
+    hit.identity = identity;
+    if ((material_words.Load(material_id(identity.x) * 112u + 76u) & 1u) != 0)
+        hit.identity.w = known_normal<~0u>(identity.x, bary, hit.surface.normal);
+    hit.front = dot(direction, hit.surface.normal) < 0;
+    hit.distance = distance;
+    return hit;
+}
+
+struct HitOptics : INrdOptics
+{
+    func intersect(origin: float3, direction: float3, out hit: pt::Hit)->bool
+    {
+        let ray : RayDesc = { origin, 0, direction, pt::FAR };
+        var unused = 0u;
+        var found = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+        hit = {};
+        if (!found.IsHit())
+            return false;
+        let attr = found.GetAttributes<BuiltInTriangleIntersectionAttributes>();
+        let primitive = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());
+        hit = known_hit(uint4(primitive, asuint(attr.barycentrics), 0), direction,
+                        found.GetRayDesc().TMax);
+        return true;
+    }
+    func shade_receiver(inout data: pt::TransportCall, lane: uint)->void
+    {
+        var call = pt::MaterialCall::input(data);
+        call.previous_pdf = -1;
+        call.previous = asfloat(data.hit.identity.xyz);
+        call.direction = data.path.direction;
+        call.origin_pixel.y = asfloat(lane);
+        let program = material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2;
+        if (hit_reorder)
+            ReorderThread(program, 32u);
+        CallShader(program, call);
+        data.path = call.result();
+    }
+    func tail(inout data: pt::TransportCall)->float
+    {
+        return pt::trace_hit_path<HitScene, pt::NoPrefixGuides, hit_reorder, true>(
+            HitScene(), pt::NoPrefixGuides(), data);
+    }
+};
+
 public struct RealtimePixelAdapter : pt::IPixelTransport
 {
     public var coordinate : uint2;
@@ -248,7 +299,16 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
         }
         else
         {
-            let program = material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
+            let start = material_id(primitive) * 112u + 64u;
+            if (parameters[0].reconstruction.w == 3 &&
+                optical_candidate(material_words.Load(start + 8u) >> 20))
+            {
+                data.hit =
+                    known_hit(primary_identity[pixel], data.path.direction, primary_ray[pixel].w);
+                if (render_optical(HitOptics(), data, lane))
+                    return float2(-1, 0);
+            }
+            let program = material_words.Load(start) >> 2u;
             var call = pt::MaterialCall::primary_input(data.sample, lane, data.path.radiance);
             if (hit_reorder)
                 ReorderThread(program, 32u);
@@ -259,6 +319,8 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
     }
     public func trace(inout data: pt::TransportCall, film: float2)->float
     {
+        if (film.x < 0)
+            return pt::FAR;
         if (parameters[0].reconstruction.w == 3 && primary_identity[pixel].x != 0xffffffffu)
         {
             let before = data.path.radiance;

@@ -4,6 +4,7 @@ import mod_materials;
 import mod_scene;
 import primary_cache;
 import pt.material_vertex;
+import pt.reconstruction;
 import pt.scene;
 import denoise.guide;
 import camera.pinhole;
@@ -38,8 +39,9 @@ public func sky_signal(pixel: uint2)->void
     albedo_image[pixel] = 0;
     f0_image[pixel] = 0;
 }
-func surface_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, normal: float3, view: float3,
-                    incident: float4)
+/// 位置和法线位于同一相机侧空间；颜色、粗糙度及介质来自对应的实际接收面。
+public func surface_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, position: float3,
+                           normal: float3, view: float3, incident: float4, replaced: bool)
     ->void
 {
     let p = parameters[0];
@@ -49,11 +51,10 @@ func surface_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, normal: float
     let film = camera::camera_sample_uv_offset(pixel, p.inverse_extent, 0.5 + p.reconstruction.xy);
     var motion : float2 = 0;
     if (p.reconstruction.z > 0 &&
-        !denoise::denoise_motion(previous, film, hit.surface.position, false, p.image.xy, motion))
+        !denoise::denoise_motion(previous, film, position, false, p.image.xy, motion))
         motion = float2(p.image.xy);
-    let depth = dot(hit.surface.position - p.origin.xyz, p.current_camera.forward.xyz);
-    let previous_depth =
-        dot(hit.surface.position - p.previous_position.xyz, p.previous_forward.xyz);
+    let depth = dot(position - p.origin.xyz, p.current_camera.forward.xyz);
+    let previous_depth = dot(position - p.previous_position.xyz, p.previous_forward.xyz);
     motion_image[pixel] = float4(motion, p.reconstruction.z > 0 ? previous_depth - depth : 0, 0);
     depth_image[pixel] = depth;
     normal_image[pixel] =
@@ -66,7 +67,7 @@ func surface_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, normal: float
                                                 : 0u;
     let base = mat.pbr.base_roughness.xyz;
     let f = (mat.pbr.surface.x - incident.x) / max(mat.pbr.surface.x + incident.x, 1e-6);
-    albedo_image[pixel] = float4((1 - metal) * base, 1);
+    albedo_image[pixel] = float4((1 - metal) * base, replaced ? 2 : 1);
     f0_image[pixel] = float4(lerp(float3(f * f), base, metal), float(material_class));
 }
 
@@ -101,19 +102,19 @@ public func diffuse_fraction<let flow : uint>(mat: transport::SurfaceMaterial, n
 
 public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLighting, hit: pt::Hit,
                                           mat: transport::SurfaceMaterial, incident: float4,
-                                          view: float3, direction: float3)
+                                          view: float3, direction: float3, replaced: bool = false)
     ->float
 {
     let normal = pt::shading_normal(hit, mat);
-    if ((index & 1u) == 0)
-        surface_guides(hit, mat, normal, view, incident);
+    if (!replaced && (index & 1u) == 0)
+        surface_guides(hit, mat, hit.surface.position, normal, view, incident, false);
     let fraction =
         diffuse_fraction<flow>(mat, normal, view, observed.local_light.xyz, incident, false);
-    let blocker =
-        any(observed.sun > 0) ? ModScene().blocker_distance<false>(observed.sun_ray) : pt::FAR;
+    let blocker = any(observed.sun > 0) ? ModScene().blocker_distance<false>(observed.sun_ray) : 0;
     var lane : SignalLane = {};
     lane.sun = pack_signal(float4(observed.sun, blocker));
-    lane.emission = pack_signal(float4(observed.emitted, 0));
+    lane.emission = pack_signal(
+        float4(observed.emitted, abs(dot(observed.sun_ray.direction, hit.surface.normal))));
     lane.diffuse = pack_signal(float4(observed.local * fraction, observed.local_light.w));
     lane.specular = pack_signal(float4(observed.local * (1 - fraction), observed.local_light.w));
     lane.diffuse_direction = pack_signal(float4(observed.local_light.xyz, 0));
@@ -142,7 +143,7 @@ func combine(inout uint2 signal, inout uint2 moment, indirect: float3, direction
     moment = pack_signal(float4(mean, 0));
 }
 public func finish_signal(index: uint, tail: float3, direction: float3, distance: float,
-                          view: float3)
+                          view: float3, psr: pt::Psr, weight: float3, prefix_radiance: float3)
     ->void
 {
     var lane = signal_lanes[index];
@@ -152,6 +153,22 @@ public func finish_signal(index: uint, tail: float3, direction: float3, distance
             (events & openpbr::DIFFUSE) != 0);
     combine(lane.specular, lane.specular_direction, tail * (1 - fraction.xyz), direction, distance,
             (events & (openpbr::GLOSSY | openpbr::DISCRETE)) != 0);
-    lane.fraction = pack_signal(float4(view, 0));
+    if (psr.count != 0)
+    {
+        lane.diffuse_direction = pack_signal(
+            float4(pt::psr_direction(psr, unpack_signal(lane.diffuse_direction).xyz), 0));
+        lane.specular_direction = pack_signal(
+            float4(pt::psr_direction(psr, unpack_signal(lane.specular_direction).xyz), 0));
+        let emitted = unpack_signal(lane.emission);
+        lane.emission = pack_signal(float4(prefix_radiance + weight * emitted.xyz, emitted.w));
+    }
+    let pixel_angle = 2 * parameters[0].current_camera.position.w * parameters[0].inverse_extent.y;
+    lane.fraction = pack_signal(float4((index & 1u) != 0 ? weight : view, pixel_angle));
     signal_lanes[index] = lane;
+}
+public func finish_signal(index: uint, tail: float3, direction: float3, distance: float,
+                          view: float3)
+    ->void
+{
+    finish_signal(index, tail, direction, distance, view, pt::psr_initial(), 1, 0);
 }
