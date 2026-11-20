@@ -13,11 +13,18 @@
 | `/pt enabled on\|off` | 默认开启；关闭恢复原版，保留实时渲染器偏好。 |
 | `/pt mode realtime\|offline` | 默认 `realtime`；离线不使用 RR。 |
 | `/pt diagnostic on\|off` | 默认关闭；实时模式使用原生分辨率，关闭RR和跨帧图像累积；普通PT保留每帧SPP。 |
-| `/pt ser on\|off`、`/pt rr on\|off` | 默认开启，设备能力不足时回退。 |
+| `/pt denoiser dlss\|nrd\|off` | 实时降噪器。默认选择 DLSS，缺少 DLSS 时自动选用设备支持的 NRD。旧配置的 `rr=false` 对应关闭。 |
+| `/pt ser on\|off`、`/pt rr on\|off` | SER 开关和旧版 DLSS 开关。 |
 | `/pt quality 档位` | `dlaa`、`quality`、`balanced`、`performance`（默认）、`ultra_performance` |
 | `/pt spp 数量` | 实时固定为 2。离线可设置每批 1–64 条路径，默认为 1。旧配置中的采样数会作为离线批大小读取。 |
 | `/pt bounces 顶点数` | 默认12，范围1–64。 |
 | `/pt ev EV` | 默认 0，范围 −16 至 16。设定自动曝光后的手动补偿，`exposure` 是别名。 |
+
+在视频设置中选择「降噪器」，或输入 `/pt denoiser nrd` 以原生分辨率使用 NRD。它单独过滤太阳阴影、漫反射和高光。静止场景的间接光照历史最多保留 63 帧，太阳阴影最多保留 7 帧。大幅跳转相机、切换降噪器或重建视图会重置历史。DLSS 的质量档控制 DLSS 的输入分辨率。
+
+要试用 LabPBR 资源包，在游戏「选项 → 资源包」打开资源包文件夹，把 ZIP 放进去，返回选择它并点击「完成」。查看受阳光照射的金属、钻石块和暗处的萤石，可以分别检查反射、法线与自发光。资源包可单独覆盖法线图（`_n`）和材质图（`_s`），并沿用原版底色。当前材质图集使用动画的首个指定帧。高度视差、环境遮蔽和孔隙吸水属于可选效果，当前材质路径使用法线、平滑度、反射率、薄表面散射和自发光。[LabPBR 材质规范](https://shaderlabs.org/wiki/LabPBR_Material_Standard)
+
+开发时可在 mod 根目录的 PowerShell 运行 `.\gradlew.bat labPbrFixture "-PlabPbrPack=C:\资源包\SPBR-22_6.zip"`，再运行 `cargo test --release -p prime_minecraft spbr_materials_reach -- --ignored`。看到 `1 passed` 表示测试贴图已通过游戏资源栈、解码和图集检查。若未生成数据，先检查 ZIP 路径和 Gradle 输出。
 
 在视频设置的「PT 显示」中开启「镜头泛光」，用「泛光模式」选择外观。
 

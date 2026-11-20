@@ -46,7 +46,14 @@ public final class Settings {
     static SolarSettings solar() { return Holder.CONFIG.solar(); }
     static DisplaySettings display() { return Holder.CONFIG.display(); }
     static LightingSettings lighting() { return Holder.CONFIG.lighting(); }
-    static boolean rr() { return enabled() && !offline() && !diagnostic() && requestedRr() && StreamlineBootstrap.available(); }
+    static Denoiser denoiser() { return Holder.CONFIG.denoiser(); }
+    static void setDenoiser(Denoiser mode) throws IOException { Holder.CONFIG.setDenoiser(mode); }
+    static Denoiser activeDenoiser() {
+        if (!enabled() || offline() || diagnostic()) return Denoiser.OFF;
+        var choice = denoiser();
+        if (choice == Denoiser.DLSS && StreamlineBootstrap.available()) return choice;
+        return choice != Denoiser.OFF && Bootstrap.nrdAvailable() ? Denoiser.NRD : Denoiser.OFF;
+    }
 
     /** 保存成功后才发布新值；输入无效抛出 IllegalArgumentException，IO 失败抛出 IOException。 */
     public static void setExposure(float value) throws IOException { Holder.CONFIG.setExposure(value); }

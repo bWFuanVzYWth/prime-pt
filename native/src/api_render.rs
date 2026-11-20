@@ -95,7 +95,7 @@ pub unsafe extern "C" fn prime_draw(
     bounces: u32,
 ) -> i32 {
     guarded(-1, || {
-        if rr > 1
+        if rr > 3
             || [command, image, image_view].contains(&0)
             || width == 0
             || height == 0
@@ -111,11 +111,16 @@ pub unsafe extern "C" fn prime_draw(
         // SAFETY: 调用者借出完整帧环境包，不要求源指针对齐。
         let source_environment = unsafe { environment.read_unaligned() };
         let options = gpu::Options::new(
-            rr != 0,
+            rr == 1 || rr == 3,
             streamline::Quality::try_from(quality)?,
             samples,
             bounces,
         )?;
+        let options = match rr {
+            1 => options.with_nrd_fallback(),
+            2 => options.with_nrd(),
+            _ => options,
+        };
         with_engine(id, |engine| {
             let incoming = source_environment.resolve(engine.solar_orbit, source_anchor[1])?;
             let frozen = engine.rendering.frozen();

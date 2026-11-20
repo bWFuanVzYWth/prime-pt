@@ -1,5 +1,6 @@
 /// 普通PT生产入口；材质来源单独适配，路径和数值叶子由引擎维护。
 module pt_hit;
+import nrd_path;
 #include "opacity/micromap.inc.slang"
 #ifndef PRIMEPT_OMM
 #define PRIMEPT_OMM 0
@@ -240,7 +241,11 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
         data.path.direction = primary_ray[pixel].xyz;
         let primitive = primary_identity[pixel].x;
         if (primitive == 0xffffffffu)
+        {
+            if (lane == 0 && parameters[0].reconstruction.w == 3)
+                sky_signal(coordinate);
             pt::escape(HitScene(), data.path);
+        }
         else
         {
             let program = material_words.Load(material_id(primitive) * 112u + 64u) >> 2u;
@@ -254,6 +259,18 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
     }
     public func trace(inout data: pt::TransportCall, film: float2)->float
     {
+        if (parameters[0].reconstruction.w == 3 && primary_identity[pixel].x != 0xffffffffu)
+        {
+            let before = data.path.radiance;
+            data.path.radiance = 0;
+            let direction = data.path.direction;
+            let distance = pt::trace_hit_path<HitScene, pt::NoPrefixGuides, hit_reorder, true>(
+                HitScene(), pt::NoPrefixGuides(), data);
+            finish_signal(pixel * 2 + (data.sample - parameters[0].rr_sample),
+                          max(data.path.radiance, 0), direction, distance, -primary_ray[pixel].xyz);
+            data.path.radiance += before;
+            return distance;
+        }
         return trace_path(coordinate, film, data);
     }
 };

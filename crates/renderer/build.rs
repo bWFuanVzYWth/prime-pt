@@ -129,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "triangle_identity_probe.spv",
         ),
         ("shaders/post.slang", "post_main", "post.spv"),
+        ("shaders/post.slang", "post_nrd", "post_nrd.spv"),
         (
             "shaders/shadow_columns.slang",
             "shadow_columns",
@@ -138,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ("shaders/rr.slang", "pack_main", "rr_pack.spv"),
         ("shaders/rr.slang", "resolve_raw", "resolve_raw.spv"),
         ("shaders/rr.slang", "resolve_rr", "resolve_rr.spv"),
-        ("shaders/rr.slang", "resolve_spatial", "resolve_spatial.spv"),
+        ("shaders/rr.slang", "resolve_scaled", "resolve_scaled.spv"),
         (
             "shaders/visibility_test.slang",
             "visibility_main",

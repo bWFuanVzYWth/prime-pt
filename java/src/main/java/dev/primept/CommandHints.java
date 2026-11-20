@@ -29,6 +29,7 @@ public final class CommandHints {
         for (var value : RenderMode.values()) mode.then(command(value.key));
         root.then(mode);
         root.then(CommandHints.<S>command("diagnostic").then(command("on")).then(command("off")));
+        root.then(CommandHints.<S>command("denoiser").then(command("dlss")).then(command("nrd")).then(command("off")));
         root.then(CommandHints.<S>command("rr").then(command("on")).then(command("off")));
         root.then(CommandHints.<S>command("ser").then(command("on")).then(command("off")));
         var quality = CommandHints.<S>command("quality");

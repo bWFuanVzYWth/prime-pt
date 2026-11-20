@@ -46,6 +46,9 @@ impl Gpu {
             buffer(&scene.instance_quad_bases),
             buffer(&scene.tokens),
             Binding::LightWorld(lighting.tree),
+            buffer(&self.known_geometry.unwrap_or(self.geometry_placeholder)),
+            buffer(&view.signal_lanes),
+            Binding::StorageImage(view.rr.images[6]),
         ]);
         let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![
@@ -66,11 +69,8 @@ impl Gpu {
 
     pub(super) fn allocate_bindings(
         &mut self,
-        (mut trace, post): (Vec<Binding>, Vec<Binding>),
+        (trace, post): (Vec<Binding>, Vec<Binding>),
     ) -> Result<(Bindings, Bindings), Error> {
-        trace.push(Binding::StorageBuffer(
-            self.known_geometry.unwrap_or(self.geometry_placeholder),
-        ));
         Ok((
             Bindings::new(&mut self.context, &trace)?,
             Bindings::new(&mut self.context, &post)?,
@@ -79,16 +79,13 @@ impl Gpu {
 
     pub(super) fn create_guide_pipeline(&mut self) -> Result<RayTracingPipeline, Error> {
         let view = self.view.as_ref().expect("已创建view");
-        let (mut trace, _) = self.renderer_bindings(
+        let (trace, _) = self.renderer_bindings(
             view,
             &self.atlas,
             &self.scene,
             self.material_gpu,
             self.lighting_gpu,
         );
-        trace.push(Binding::StorageBuffer(
-            self.known_geometry.unwrap_or(self.geometry_placeholder),
-        ));
         let bindings = Bindings::new(&mut self.context, &trace)?;
         let generation = self.generation.as_ref().expect("完整资源世代");
         let program = if self.invocation_reorder {
@@ -201,9 +198,11 @@ impl Gpu {
                     );
                 }
             }
+            let nrd_enabled = self.requested_nrd && !rr_enabled && !self.offline && !diagnostic;
             if self.view.as_ref().is_none_or(|view| {
                 view.output_extent != extent
                     || view.rr_enabled != rr_enabled
+                    || view.nrd.is_some() != nrd_enabled
                     || (rr_enabled && view.quality != self.rr_quality)
             }) || (rr_enabled && self.rr_runtime.is_none())
             {
@@ -212,7 +211,9 @@ impl Gpu {
                     Some(view) if view.output_extent != extent => {
                         history::StorageEvent::ExtentChanged
                     }
-                    Some(view) if view.rr_enabled != rr_enabled => {
+                    Some(view)
+                        if view.rr_enabled != rr_enabled || view.nrd.is_some() != nrd_enabled =>
+                    {
                         history::StorageEvent::ReconstructionChanged
                     }
                     Some(view) if rr_enabled && view.quality != self.rr_quality => {
@@ -234,11 +235,17 @@ impl Gpu {
                 } else {
                     extent
                 };
-                let next = View::new_scaled(
+                let mut next = View::new_scaled(
                     &mut self.context,
                     Some(&mut self.bloom_filter),
                     [input, extent],
-                    rr_enabled,
+                    if nrd_enabled {
+                        Denoiser::Nrd
+                    } else if rr_enabled {
+                        Denoiser::Dlss
+                    } else {
+                        Denoiser::Off
+                    },
                     self.rr_quality,
                     Some(
                         self.view
@@ -249,6 +256,23 @@ impl Gpu {
                     ),
                     Some(&self.program_view),
                 )?;
+                if nrd_enabled {
+                    let (_, post) = self.renderer_bindings(
+                        &next,
+                        &self.atlas,
+                        &self.scene,
+                        self.material_gpu,
+                        self.lighting_gpu,
+                    );
+                    let post = Bindings::new(&mut self.context, &post)?;
+                    next.nrd = Some(NrdView::new(
+                        &mut self.context,
+                        &next,
+                        &self.rr_init,
+                        post,
+                        self.atmosphere.parameters().sun_angular_radius(),
+                    )?);
+                }
                 if !rr_enabled {
                     self.rr_runtime = None;
                 }
@@ -274,7 +298,7 @@ impl Gpu {
             } else {
                 Composite::Clear
             };
-            let frame_film = rr_enabled;
+            let frame_film = rr_enabled || nrd_enabled;
             #[cfg(test)]
             let frame_film = frame_film || self.test_center_film;
             #[cfg(not(test))]
@@ -313,7 +337,7 @@ impl Gpu {
                     ][i - 16]
                 }
             });
-            self.prepare_accumulation_history(key, rr_enabled || diagnostic)?;
+            self.prepare_accumulation_history(key, rr_enabled || nrd_enabled || diagnostic)?;
             let view = self.view.as_mut().unwrap();
             let extent = view.extent;
             let batch = view.progress.begin(samples)?;
@@ -357,7 +381,13 @@ impl Gpu {
             } else {
                 jitter
             };
-            let film_mode = if rr_enabled { 2.0 } else { 0.0 };
+            let film_mode = if nrd_enabled {
+                3.0
+            } else if rr_enabled {
+                2.0
+            } else {
+                0.0
+            };
             #[cfg(test)]
             let film_mode = if self.test_center_film && !rr_enabled {
                 1.0
@@ -480,6 +510,11 @@ impl Gpu {
                     renderer.record(&mut self.context, batch.samples(), frame_plan.post)?
                 };
                 result.push(recorded);
+            }
+            if let Some(nrd) = &view.nrd {
+                result.push(nrd.prepare(&mut self.context, view.extent)?);
+                batch.commit();
+                return Ok(());
             }
             if rr_enabled {
                 let mut pack = Commands::new(&self.context)?;
@@ -635,7 +670,7 @@ impl Gpu {
         let target =
             unsafe { ExternalBinding::new(&self.context, view, ExternalKind::StorageImage)? };
         let diagnostic = self.diagnostic();
-        let rr = options.rr && !self.offline && !diagnostic;
+        let rr = options.denoiser == Denoiser::Dlss && !self.offline && !diagnostic;
         let quality_changed = self.rr_quality != options.quality;
         let output_changed = self
             .view
@@ -648,6 +683,8 @@ impl Gpu {
             self.rr_unavailable = None;
         }
         let requested = rr && self.rr_unavailable.is_none();
+        self.requested_nrd =
+            options.denoiser == Denoiser::Nrd || (rr && !requested && options.allow_nrd);
         // record_frame 不编码宿主 command；SDK 初始化失败仍可安全重新准备原始 PT。
         let mut recordings = match self.record_frame(
             extent,
@@ -658,9 +695,17 @@ impl Gpu {
         ) {
             Ok(recordings) => recordings,
             Err(Error::Streamline(error)) if requested => {
-                eprintln!("RR 不可用，回退 PT：{error}");
+                eprintln!(
+                    "RR 不可用，回退到{}：{error}",
+                    if options.allow_nrd {
+                        "NRD"
+                    } else {
+                        "原始 PT"
+                    }
+                );
                 self.rr_unavailable = Some(error);
                 self.rr_runtime = None;
+                self.requested_nrd = options.allow_nrd;
                 self.record_frame(
                     extent,
                     camera,
@@ -674,7 +719,8 @@ impl Gpu {
         let mut rr_touched = false;
         let result = (|| -> Result<(), Error> {
             let rr = self.view.as_ref().unwrap().rr_enabled;
-            let next_index = if rr {
+            let nrd = self.view.as_ref().unwrap().nrd.is_some();
+            let next_index = if rr || nrd {
                 self.rr_index
                     .checked_add(1)
                     .ok_or(pt::Error::SampleOverflow)?
@@ -683,7 +729,7 @@ impl Gpu {
             };
             if self.diagnostic_sync {
                 eprintln!(
-                    "[prime_pt] gpu_frame sample={} rr_index={} renderer=pt rr={rr} quality={:?} ser={} output={extent:?} input={:?} regions={} anchor={:?} camera={:?} records={}",
+                    "[prime_pt] gpu_frame sample={} rr_index={} renderer=pt rr={rr} nrd={nrd} quality={:?} ser={} output={extent:?} input={:?} regions={} anchor={:?} camera={:?} records={}",
                     self.absolute_sample,
                     self.rr_index,
                     self.rr_quality,
@@ -730,6 +776,7 @@ impl Gpu {
                     Err(error) if error.unsafe_recording() => return Err(error.source.into()),
                     Err(error) => {
                         eprintln!("RR 本帧回退：{error}");
+                        self.rr_unavailable = Some(error.source);
                         false
                     }
                 };
@@ -755,7 +802,7 @@ impl Gpu {
                 let source = if evaluated {
                     HdrSource::Reconstructed
                 } else {
-                    HdrSource::Spatial
+                    HdrSource::ScaledRaw
                 };
                 recordings.push(view.presentation.record(
                     &mut self.context,
@@ -778,6 +825,95 @@ impl Gpu {
                 } else {
                     self.transition_history(history::Event::RrEvaluationFailed)?;
                 }
+                self.rr_index = next_index;
+            }
+            if nrd {
+                let current = CameraFrame::new(camera, self.anchor)?;
+                let [projection, world_view] = current.nrd_matrices(self.anchor)?;
+                let view = self.view.as_mut().unwrap();
+                let denoiser = view.nrd.as_mut().unwrap();
+                let now = std::time::Instant::now();
+                let gains = [self.sun_gain, self.block_emission_gain];
+                let light = (environment.sun_direction, environment.enabled(), gains);
+                let light_cut = denoiser
+                    .light
+                    .is_none_or(|(direction, sky, previous_gains)| {
+                        sky != light.1
+                            || (light.1
+                                && direction
+                                    .into_iter()
+                                    .zip(light.0)
+                                    .map(|(a, b)| a * b)
+                                    .sum::<f32>()
+                                    < 0.98)
+                            || gains
+                                .into_iter()
+                                .zip(previous_gains)
+                                .any(|(a, b)| a != b && (a >= 2. * b || b >= 2. * a))
+                    });
+                let reset = light_cut
+                    || match self.rr_previous {
+                        Some(previous) => current.camera_cut(previous)?,
+                        None => true,
+                    };
+                let [previous_projection, previous_view] = if reset {
+                    [projection, world_view]
+                } else {
+                    self.rr_previous
+                        .expect("连续帧已提交上一相机")
+                        .nrd_matrices(self.anchor)?
+                };
+                let frame = vulkan::nrd::Frame {
+                    projection,
+                    previous_projection,
+                    view: world_view,
+                    previous_view,
+                    jitter: view.jitter,
+                    previous_jitter: if reset {
+                        view.jitter
+                    } else {
+                        denoiser.previous_jitter
+                    },
+                    sun: environment.sun_direction,
+                    milliseconds: if reset {
+                        16.667
+                    } else {
+                        (now - denoiser.last_frame)
+                            .as_secs_f32()
+                            .mul_add(1000., 0.)
+                            .clamp(1., 250.)
+                    },
+                    index: self.rr_index,
+                    reset: reset.into(),
+                };
+                rr_touched = true;
+                // SAFETY: draw 在同队列完成前持有视图，此处在 PT 输入屏障之后录制。
+                unsafe { denoiser.evaluate(command, &frame)? };
+                recordings.push(denoiser.compose(&mut self.context, view.extent)?);
+                let exposure = self.display_timeline.prepare(
+                    view.extent,
+                    true,
+                    self.display_origin.elapsed(),
+                )?;
+                recordings.extend(view.presentation.display.record(
+                    &mut self.context,
+                    exposure,
+                    false,
+                    self.display_timeline.enabled(),
+                )?);
+                recordings.push(view.presentation.record(
+                    &mut self.context,
+                    Binding::External(target),
+                    HdrSource::Raw,
+                    self.display_timeline.enabled(),
+                )?);
+                // SAFETY: 与本帧前序命令共用同一提交边界。
+                unsafe { self.encode_recordings(std::mem::take(&mut recordings), command)? };
+                let denoiser = self.view.as_mut().unwrap().nrd.as_mut().unwrap();
+                denoiser.last_frame = now;
+                denoiser.previous_jitter = frame.jitter;
+                denoiser.light = Some(light);
+                self.rr_previous = Some(current);
                 self.rr_index = next_index;
             }
             self.collect_resources()?;

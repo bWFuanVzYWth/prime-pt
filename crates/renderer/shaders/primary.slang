@@ -6,6 +6,8 @@ module primary;
 #endif
 import mod_scene;
 import mod_call;
+import nrd_path;
+import pt.material_vertex;
 import mod_guides;
 import params;
 import pt.integrator;
@@ -164,7 +166,13 @@ func prefix_main()->void
     data.path.medium = parameters[0].initial_medium;
     var distance : float;
     var provider : ModScene;
-    if (params.reconstruction.w > 0)
+    if (params.reconstruction.w == 3)
+    {
+        pt::trace_prefix(provider, data, settings(params), distance);
+        if (distance == pt::FAR)
+            sky_signal(coordinate);
+    }
+    else if (params.reconstruction.w > 0)
     {
         let previous : camera::Camera = { params.previous_position, params.previous_forward,
                                           params.previous_right, params.previous_up };
@@ -199,7 +207,34 @@ func render_main()->void
     }
     var data : pt::TransportCall = load_landing(pixel, coordinate, header);
     var provider : ModScene;
-    pt::trace_tail(provider, data);
+    if (params.reconstruction.w == 3)
+    {
+        let eye = -data.path.direction;
+        let program = material_words.Load(material_id(data.hit.identity.x) * 112u + 64u) >> 2;
+        var first = ModTransportCall.input(data);
+        CallShader(program, first);
+        data.path = first.result();
+        let before = data.path.radiance;
+        data.path.radiance = 0;
+        let direction = data.path.direction;
+        var distance = pt::FAR;
+        if (data.path.status == pt::PATH_ACTIVE)
+        {
+            if (provider.intersect(data.path.origin, direction, data.hit))
+            {
+                distance = data.hit.distance;
+                provider.resolve_hit(data.hit, data.path.medium);
+                pt::trace_tail(provider, data);
+            }
+            else
+                pt::escape(provider, data.path);
+        }
+        finish_signal(pixel * 2 + (data.sample - params.rr_sample), max(data.path.radiance, 0),
+                      direction, distance, eye);
+        data.path.radiance += before;
+    }
+    else
+        pt::trace_tail(provider, data);
     output_image[pixel] =
         float4(data.path.radiance, data.path.status == pt::PATH_INVALID            ? -1
                                    : data.path.status == pt::PATH_DIELECTRIC_LIMIT ? -3
@@ -214,6 +249,26 @@ func shade_opaque(inout call: ModTransportCall)->void
 #endif
     var data : pt::TransportCall = call.unpack();
     var provider : ModScene;
+    if (parameters[0].reconstruction.w == 3 && data.path.depth == 0)
+    {
+        let lane = data.sample - parameters[0].rr_sample;
+        let pixel = data.pixel.y * parameters[0].image.x + data.pixel.x;
+        let mat = provider.resolve_flow(data.hit, OPENPBR_FLOW, data.path.medium);
+        var first = pt::MaterialCall::primary_input(data.sample, lane, data.path.radiance);
+        first.initialize_primary(data.path.medium);
+        data.hit.distance = length(data.hit.surface.position - parameters[0].origin.xyz);
+        var signals : pt::PrimaryLighting;
+        pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
+            provider, first, data.hit, mat, data.path.direction, settings(parameters[0]), lane,
+            signals);
+        let blocker =
+            begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, data.hit, mat, data.path.medium,
+                                       -data.path.direction, first.direction);
+        if (blocker == pt::FAR)
+            first.radiance += signals.sun;
+        call.store<OPENPBR_FLOW>(first.result());
+        return;
+    }
     pt::process_flow<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, false>(provider, data,
                                                                         settings(parameters[0]));
     call.store<OPENPBR_FLOW>(data.path);

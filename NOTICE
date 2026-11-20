@@ -5,6 +5,8 @@ Copyright (c) 2026 linlin
 依赖 simple_engine；第三方 Streamline、DLSS 与 Vulkan-Headers 保留各自许可，见 licenses/。
 SDK 构建和部署由 simple_engine 的受控安装器维护，不纳入本仓库。
 
+NRD 4.18、NRI 191 及其依赖的许可随 JAR 放在 META-INF/licenses/simple-engine/LICENSES/。
+
 太阳体积光包含对 Intel Outdoor Light Scattering（Copyright 2017 Intel Corporation）的适配。
 其 Apache-2.0 许可与来源通知随 JAR 放在 META-INF/licenses/simple-engine/LICENSES/，
 文件名前缀为 intel-outdoor-light-scattering-。

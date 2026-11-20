@@ -72,6 +72,7 @@ final class SettingsLanguageFixture {
                     requireText("bloom_mode", "Bloom mode");
                     requireText("bloom_mode.tooltip", "Camera aperture and custom pupil use the exported diffraction kernels. Fast circular gives bright lights a smooth halo.");
                     requireText("bloom_mode.camera", "Camera aperture (camara)");
+                    requireText("denoiser.nrd", "NRD (SIGMA and REBLUR SH)");
                     requireText("bloom_mode.pupil", "Custom pupil (pupil)");
                     requireText("bloom_mode.fast_circular", "Fast circular");
                     requireLighting("Sun intensity", "Block emission intensity");
@@ -86,6 +87,7 @@ final class SettingsLanguageFixture {
                     requireText("bloom_mode", "泛光模式");
                     requireText("bloom_mode.tooltip", "相机光圈和瞳孔使用工作台导出的衍射核。快速圆形让亮点和太阳呈现平滑圆晕。");
                     requireText("bloom_mode.camera", "相机光圈（camara）");
+                    requireText("denoiser.nrd", "NRD（SIGMA 和 REBLUR SH）");
                     requireText("bloom_mode.pupil", "瞳孔（pupil）");
                     requireText("bloom_mode.fast_circular", "快速圆形");
                     requireLighting("太阳强度", "方块发光强度");

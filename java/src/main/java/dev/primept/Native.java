@@ -310,9 +310,10 @@ final class Native implements AutoCloseable {
     }
 
     void draw(long command, long image, long view, int width, int height, ByteBuffer camera, ByteBuffer environment,
-            boolean rr, Quality quality, int samples, int bounces) {
+            Denoiser denoiser, Quality quality, int samples, int bounces) {
         try { check((int) draw.invokeExact(handle, command, image, view, width, height,
-                MemorySegment.ofBuffer(camera), MemorySegment.ofBuffer(environment), rr ? 1 : 0,
+                MemorySegment.ofBuffer(camera), MemorySegment.ofBuffer(environment),
+                denoiser == Denoiser.DLSS && !Bootstrap.nrdAvailable() ? 3 : denoiser.wire,
                 quality.wireId(), samples, bounces)); }
         catch (Throwable e) { throw unchecked(e); }
     }

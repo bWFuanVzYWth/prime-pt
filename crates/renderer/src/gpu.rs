@@ -21,12 +21,15 @@
 
 #[path = "gpu_frame.rs"]
 mod gpu_frame;
+#[path = "gpu_nrd.rs"]
+mod gpu_nrd;
 #[path = "gpu_resources.rs"]
 mod gpu_resources;
 #[path = "gpu_scene.rs"]
 mod gpu_scene;
 #[path = "gpu_view.rs"]
 mod gpu_view;
+use gpu_nrd::NrdView;
 
 use crate::{
     LensMode,
@@ -124,6 +127,9 @@ pub enum Error {
     /// SDK初始化或求值失败。
     #[error(transparent)]
     Streamline(#[from] streamline::Error),
+    /// 官方 NRD Vulkan 会话创建或录制失败。
+    #[error(transparent)]
+    Nrd(#[from] vulkan::nrd::Error),
     /// 受控Slang编译失败。
     #[error(transparent)]
     Shader(#[from] shader_build::Error),
@@ -403,10 +409,18 @@ fn elapsed_ns(started: std::time::Instant) -> u64 {
 enum HdrSource {
     Raw,
     Reconstructed,
-    Spatial,
+    ScaledRaw,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Denoiser {
+    Off,
+    Dlss,
+    Nrd,
 }
 
 struct View {
+    nrd: Option<NrdView>,
     extent: [u32; 2],
     output_extent: [u32; 2],
     params: Buffer,
@@ -414,6 +428,7 @@ struct View {
     accumulation: Buffer,
     counts: Buffer,
     landing: Vec<Buffer>,
+    signal_lanes: Buffer,
     prefix: Buffer,
     progress: history::Accumulation,
     jitter: [f32; 2],
@@ -630,11 +645,11 @@ fn atlas_flow(pixels: &[u8]) -> Result<openpbr::FlowKey, Error> {
     .flow())
 }
 
-/// 已校验的 mod 设置；UI 与命令共享 Java 配置，此边界只接受实际支持的范围。
 #[derive(Clone, Copy)]
 /// 已校验的逐帧积分与重建设置；不拥有SDK或资源。
 pub struct Options {
-    rr: bool,
+    denoiser: Denoiser,
+    allow_nrd: bool,
     quality: streamline::Quality,
     samples: u32,
     bounces: u32,
@@ -658,11 +673,23 @@ impl Options {
         }
         .validate()?;
         Ok(Self {
-            rr,
+            denoiser: if rr { Denoiser::Dlss } else { Denoiser::Off },
+            allow_nrd: false,
             quality,
             samples,
             bounces,
         })
+    }
+
+    /// 原生分辨率下使用 SIGMA 与 REBLUR SH，覆盖 DLSS 选择。
+    pub const fn with_nrd(mut self) -> Self {
+        self.denoiser = Denoiser::Nrd;
+        self
+    }
+    /// 宿主已启用 NRD 能力时，在 DLSS 不可用的情况下用原生 NRD 过滤同一场景。
+    pub const fn with_nrd_fallback(mut self) -> Self {
+        self.allow_nrd = true;
+        self
     }
 }
 
@@ -683,6 +710,7 @@ pub struct Gpu {
     rr_unavailable: Option<streamline::Error>,
     rr_init: streamline::Init,
     rr_previous: Option<CameraFrame>,
+    requested_nrd: bool,
     rr_index: u32,
     rr_quality: streamline::Quality,
     context: Context,
@@ -968,6 +996,7 @@ impl Gpu {
     /// opacity_micromap 为 true 时须启用 VK_KHR_opacity_micromap 与 micromap 特性。
     /// 设备须启用 Vulkan 1.3 subgroupSizeControl，compute 支持请求32-lane subgroup。
     /// ser_requested 为当前偏好；关闭不抹去逻辑设备能力。
+    /// 宿主仅在逻辑设备已开启 [vulkan::nrd::Runtime::new] 所需特性时选择 NRD 或 NRD 回退。
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn attach_options(
         instance: u64,
@@ -1084,7 +1113,7 @@ impl Gpu {
             &mut context,
             None,
             [[1, 1]; 2],
-            false,
+            Denoiser::Off,
             streamline::Quality::Dlaa,
             None,
             None,
@@ -1148,6 +1177,7 @@ impl Gpu {
                 queue_index,
             },
             rr_previous: None,
+            requested_nrd: false,
             rr_index: 0,
             rr_quality: streamline::Quality::Performance,
             context,
@@ -1392,6 +1422,9 @@ impl Gpu {
             runtime.close()?;
         }
         self.rr_runtime = None;
+        if let Some(view) = &mut self.view {
+            view.nrd = None;
+        }
         Ok(())
     }
 }
@@ -1402,6 +1435,9 @@ impl Drop for Gpu {
             // SDK 释放失败不能靠 Drop 重试后继续拆除其图像和设备依赖。
             self.context.retain_failed_shutdown();
             std::mem::forget(self.rr_runtime.take());
+            if let Some(view) = &mut self.view {
+                std::mem::forget(view.nrd.take());
+            }
             use std::io::Write as _;
             let _ = writeln!(
                 std::io::stderr().lock(),

@@ -191,7 +191,7 @@ public final class Renderer {
         var command = encoder.allocateAndBeginTransientCommandBuffer();
         ENVIRONMENT.putFloat(EnvironmentPacket.EXPOSURE_OFFSET, Settings.exposure());
         renderer.draw(command.address(), texture.vkImage(), view.vkImageView(), target.width, target.height,
-                CAMERA, ENVIRONMENT, Settings.rr(), Settings.quality(), Settings.samples(), Settings.bounces());
+                CAMERA, ENVIRONMENT, Settings.activeDenoiser(), Settings.quality(), Settings.samples(), Settings.bounces());
         hasFrame = true;
         int status = VK10.vkEndCommandBuffer(command);
         if (status != VK10.VK_SUCCESS) throw new IllegalStateException("vkEndCommandBuffer: " + status);

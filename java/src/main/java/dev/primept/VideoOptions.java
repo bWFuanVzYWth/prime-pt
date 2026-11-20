@@ -57,7 +57,7 @@ public final class VideoOptions {
     private CycleButton<Boolean> enabled;
     private CycleButton<RenderMode> mode;
     private CycleButton<Boolean> diagnostic;
-    private CycleButton<Boolean> rr;
+    private CycleButton<Denoiser> denoiser;
     private CycleButton<Boolean> ser;
     private CycleButton<Boolean> lensBloom;
     private CycleButton<BloomMode> bloomMode;
@@ -120,11 +120,12 @@ public final class VideoOptions {
                 list.addBig(ser);
             }
             case RR -> {
-                rr = cycle(CycleButton.onOffBuilder(Settings.requestedRr())
-                        .withTooltip(value -> Tooltip.create(text("rr.tooltip").copy()
-                                .append("\n" + Settings.rrStatus()))),
-                        text("rr"), Settings::requestedRr, Settings::setRequestedRr, this::failed);
-                list.addBig(rr);
+                denoiser = cycle(CycleButton.builder((Denoiser mode) -> text("denoiser." + mode.key), Settings.denoiser())
+                        .withValues(Denoiser.values()).withTooltip(value -> Tooltip.create(text("denoiser.tooltip").copy()
+                                .append("\n").append(Component.translatable("primept.settings.denoiser.device",
+                                        text("denoiser." + Settings.activeDenoiser().key))))),
+                        text("denoiser"), Settings::denoiser, Settings::setDenoiser, this::failed);
+                list.addBig(denoiser);
             }
             case QUALITY -> {
                 quality = cycle(CycleButton.builder(
@@ -241,8 +242,8 @@ public final class VideoOptions {
         ser.active = realtime;
         diagnostic.active = realtime;
         if (diagnostic.getValue() != Settings.tuning().diagnostic()) diagnostic.setValue(Settings.tuning().diagnostic());
-        rr.active = realtime && !Settings.diagnostic();
-        quality.active = realtime && !Settings.diagnostic() && Settings.requestedRr();
+        denoiser.active = realtime && !Settings.diagnostic();
+        quality.active = Settings.activeDenoiser() == Denoiser.DLSS;
         updateBudget.active = realtime;
         for (var slider : sliders) {
             boolean display = switch (slider.key) {
@@ -252,7 +253,7 @@ public final class VideoOptions {
             slider.active = Settings.enabled() && (!Settings.offline() || display || slider.key.equals("samples"));
         }
         if (ser.getValue() != Settings.requestedSer()) ser.setValue(Settings.requestedSer());
-        if (rr.getValue() != Settings.requestedRr()) rr.setValue(Settings.requestedRr());
+        if (denoiser.getValue() != Settings.denoiser()) denoiser.setValue(Settings.denoiser());
         if (quality.getValue() != Settings.quality()) quality.setValue(Settings.quality());
         if (updateBudget.getValue() != Settings.updateBudget()) updateBudget.setValue(Settings.updateBudget());
         for (var slider : sliders) slider.sync();

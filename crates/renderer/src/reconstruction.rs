@@ -45,6 +45,32 @@ impl CameraFrame {
         self.world.relative(anchor)
     }
 
+    /// NRD 以列向量解释矩阵，字节布局与引擎的行向量行主序等价。
+    pub(crate) fn nrd_matrices(self, anchor: [f64; 3]) -> Result<[[f32; 16]; 2], camera::Error> {
+        Ok([
+            self.projection.view_to_clip().to_array(),
+            self.relative(anchor)?.world_to_view().to_array(),
+        ])
+    }
+
+    pub(crate) fn camera_cut(self, previous: Self) -> Result<bool, camera::Error> {
+        let now = self.relative(self.anchor)?;
+        let last = previous.relative(self.anchor)?;
+        let distance: f32 = now
+            .position()
+            .into_iter()
+            .zip(last.position())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum();
+        let facing: f32 = now
+            .forward()
+            .into_iter()
+            .zip(last.forward())
+            .map(|(a, b)| a * b)
+            .sum();
+        Ok(distance >= 64. * 64. || facing <= 0.)
+    }
+
     /// 与 `geometry::Camera` 的四个float4一致；前帧也必须使用本帧anchor，不含jitter。
     pub(crate) fn camera_words(self, anchor: [f64; 3]) -> Result<[f32; 16], camera::Error> {
         Ok(self.relative(anchor)?.words())

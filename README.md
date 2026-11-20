@@ -17,9 +17,10 @@ Minecraft Java 版的路径追踪 mod，基于 Vulkan 硬件光追管线。
 | 游戏与加载器 | Minecraft Java 版 **26.3**、Java **25** 和 Fabric Loader **0.19.5 或更新版本**。Fabric Loader 负责让游戏加载 Mod。 |
 | 显卡与驱动 | 能运行 Vulkan **1.4**，并支持硬件光追管线、射线查询（RayQuery）、`VK_KHR_ray_tracing_position_fetch`、`VK_KHR_device_address_commands` 和可请求32线程组的 `subgroupSizeControl`。详细能力见[设备检查](manual/build.md#检查显卡与驱动)。 |
 | 启动方式 | 把 JAR 放入该游戏实例的 `mods/`，并以 `--graphicsBackend VULKAN` 启动。具体步骤见[安装发行包](manual/build.md#安装发行包)。 |
-| 可选的画面重建 | DLSS RR 需要支持该功能的 NVIDIA 显卡和驱动。设备缺少 RR 能力时可用原始路径追踪，基础 Vulkan 光追仍是必需条件。当前不提供 DLSS 帧生成。 |
+| 实时降噪 | 可选 DLSS 光线重建、原生分辨率 NRD 或关闭。NRD 分别处理阳光阴影、漫反射和高光。DLSS RR 需要支持该功能的 NVIDIA 显卡和驱动。 |
+| 方块材质 | 支持 shaderLABS LabPBR 1.3 资源包的法线、高光、金属与发光贴图，可以叠加在原版底色上。 |
 
-发行包内含 Slang 编译器、原生运行库和相关资源。手上已有 JAR 时，按游戏安装步骤即可。若要从源码构建或修改 Mod，则需要按目录放置 simple_engine 源码，并准备 Java 25 JDK、仓库固定的 Rust nightly、PowerShell 7、MSVC x64 C++ 构建工具、Slang 和 Streamline SDK。步骤见[源码构建](manual/build.md#准备源码环境)。
+发行包内含 Slang 编译器、原生运行库和相关资源。手上已有 JAR 时，按游戏安装步骤即可。若要从源码构建或修改 Mod，则需要按目录放置 simple_engine 源码，并准备 Java 25 JDK、仓库固定的 Rust nightly、PowerShell 7、MSVC x64 C++ 构建工具、Git、CMake、Vulkan SDK、Slang 和 Streamline SDK。步骤见[源码构建](manual/build.md#准备源码环境)。
 
 ## 文档
 

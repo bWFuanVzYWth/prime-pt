@@ -49,6 +49,8 @@ Java 和 javac 应显示 25，Cargo 与 Gradle 应能打印版本。找不到 ja
 
 安装 Streamline SDK，这是构建中使用的 NVIDIA 重建接口开发包。
 
+NRD 还需要 Git、CMake 和带有 DXC 编译器的 Vulkan SDK。在本终端运行 `cmake --version` 和 `Test-Path "$env:VULKAN_SDK/Bin/dxc.exe"`，后者应显示 `True`。首次构建会在引擎的 `target/` 下准备锁定的 NRD 源码并编译 SPIR-V，发行 JAR 内已包含结果。[引擎开发检查](../../../manual/development.md)
+
 ```powershell
 ./scripts/setup-streamline.ps1
 ```

@@ -14,6 +14,7 @@ final class ExposureFixture {
         sharedModel(file);
         rejectedInputs(file);
         migration(file);
+        denoiserSelection(file);
         solarSettings(file);
         displaySettings(file);
         lightingSettings(file);
@@ -130,6 +131,15 @@ final class ExposureFixture {
         require(new SettingsConfig(file, false).ser(), "已保存开启值优先于启动默认值");
         config.command("pt reset");
         require(new SettingsConfig(file, false).ser(), "恢复默认写回自动开启，不沿用旧启动默认值");
+    }
+
+    private static void denoiserSelection(Path file) throws Exception {
+        var config = new SettingsConfig(file);
+        require(config.denoiser() == Denoiser.OFF, "旧配置 rr=false 应停用降噪");
+        config.command("pt denoiser nrd");
+        require(new SettingsConfig(file).denoiser() == Denoiser.NRD, "NRD 选择跨会话保留");
+        config.command("pt rr on");
+        require(new SettingsConfig(file).denoiser() == Denoiser.DLSS, "旧命令开启 DLSS");
     }
 
     private static void solarSettings(Path file) throws Exception {

@@ -31,18 +31,27 @@ var terrain_radiance : Texture3D<float4>;
 [[vk::binding(10, 0)]]
 var first_hits : StructuredBuffer<uint>;
 
-func post_pixel<let paths : uint, let composite : uint, let frame_film : bool>(id: uint3)->void
+func post_pixel<let paths : uint, let composite : uint, let frame_film : bool,
+                let denoised : bool = false>(id: uint3)
+    ->void
 {
     let params : Params = parameters[0];
     if (any(id.xy >= params.image.xy))
         return;
     let pixel : uint = id.y * params.image.x + id.x;
+    if (!denoised && params.reconstruction.w == 3)
+    {
+        if ((params.output_size.z & 32u) == 0)
+            sample_counts[pixel]++;
+        return;
+    }
     var sum : float4 = accumulation[pixel];
     let tail : float4 = output_image[pixel];
     var count : uint = sample_counts[pixel];
     let prefix : float4 = prefix_image[pixel];
     var radiance : float3 = prefix.xyz + tail.xyz;
-    if (composite != 0 && tail.w >= 0)
+    if (composite != 0 && tail.w >= 0 &&
+        (!denoised || (params.lighting.w > 0 && all(params.initial_medium == float4(1, 0, 0, 0)))))
     {
         let sampler = pt::path_sampler(
             id.xy, params.rr_sample + (count >= params.image.z ? count - params.image.z : 0u),
@@ -65,6 +74,11 @@ func post_pixel<let paths : uint, let composite : uint, let frame_film : bool>(i
                 radiance);
         radiance = max(radiance, 0);
     }
+    if (denoised)
+    {
+        output_image[pixel] = float4(radiance, tail.w);
+        return;
+    }
     // 本次均值代表1或2条输运路径，累积计数仍按实际路径计。
     for (var lane: uint = 0; lane < paths; lane++)
         pt::accumulate_sample(sum, count, radiance, tail.w);
@@ -72,6 +86,13 @@ func post_pixel<let paths : uint, let composite : uint, let frame_film : bool>(i
     sample_counts[pixel] = count;
     if (sum.w < 0 || count == params.image.z + params.image.w)
         output_image[pixel] = pt::resolve_linear_hdr(sum, count);
+}
+
+[shader("compute")]
+[numthreads(8, 8, 1)]
+func post_nrd(id: uint3: SV_DispatchThreadID)->void
+{
+    post_pixel<2, 3, true, true>(id);
 }
 
 [shader("compute")]

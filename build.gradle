@@ -155,6 +155,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'slang'
     }
     from('crates/renderer/shaders') {
+        include 'nrd_path.slang'
         include 'primary.slang', 'pt_hit.slang', 'guides.slang', 'guide_material.slang', 'primary_cache.slang', 'primary_material.slang',
                 'params.slang', 'mod_*.slang', 'known_geometry.slang'
         into 'shaders/prime'
@@ -164,6 +165,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'shaders/engine'
     }
     from('../../shaders') {
+        exclude 'denoise/nrd.slang'
         include 'atmosphere/*.slang', 'camera/*.slang', 'color/*.slang', 'denoise/*.slang',
                 'geometry/*.slang', 'light_bvh/sample.slang', 'light_bvh/world.slang',
                 'light_sampling/*.slang', 'math/*.slang', 'opacity/*.inc.slang', 'openpbr/**/*.slang',
@@ -175,7 +177,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         def required = nativeFiles + vcFiles + (slangFiles + vcFiles).collect { 'slang/' + it } +
                 ['slang/LICENSE', 'shaders/prime/primary.slang', 'shaders/prime/pt_hit.slang',
                  'shaders/prime/guides.slang', 'shaders/prime/guide_material.slang', 'shaders/prime/primary_cache.slang', 'shaders/prime/primary_material.slang',
-                 'shaders/prime/known_geometry.slang',
+                 'shaders/prime/known_geometry.slang', 'shaders/prime/nrd_path.slang', 'shaders/engine/denoise/nrd_signal.slang',
                  'shaders/engine/pt/scene.slang', 'shaders/engine/pt/hit_transport.slang',
                  'shaders/engine/pt/key_guides.slang',
                  'shaders/engine/sampling/sobol_bits.slang', 'shaders/engine/math/constants.slang',

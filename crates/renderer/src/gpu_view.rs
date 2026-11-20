@@ -7,6 +7,7 @@ impl RrImages {
         context: &mut Context,
         extent: [u32; 2],
         output: [u32; 2],
+        mode: Denoiser,
     ) -> Result<Self, Error> {
         let formats = [
             ImageFormat::Rgba16Float,
@@ -23,7 +24,11 @@ impl RrImages {
             .into_iter()
             .enumerate()
             .map(|(index, format)| {
-                let size = if index == 6 { output } else { extent };
+                let size = match (mode, index) {
+                    (Denoiser::Dlss, 6) => output,
+                    (Denoiser::Dlss, _) | (Denoiser::Nrd, 1 | 3..=6) => extent,
+                    _ => [1, 1],
+                };
                 Image::new(context, [size[0], size[1], 1], format)
             })
             .collect::<Result<Vec<_>, _>>()?
@@ -68,6 +73,7 @@ impl View {
             self.accumulation.into(),
             self.counts.into(),
             self.prefix.into(),
+            self.signal_lanes.into(),
             self.pack.into(),
         ];
         roots.extend(
@@ -93,6 +99,9 @@ impl View {
             roots.extend(bloom.roots());
         }
         roots.extend(self.presentation.display.roots());
+        if let Some(nrd) = &self.nrd {
+            nrd.roots(&mut roots);
+        }
         roots
     }
 
@@ -107,7 +116,11 @@ impl View {
             context,
             Some(filter),
             [extent; 2],
-            rr_enabled,
+            if rr_enabled {
+                Denoiser::Dlss
+            } else {
+                Denoiser::Off
+            },
             streamline::Quality::Dlaa,
             None,
             None,
@@ -118,7 +131,7 @@ impl View {
         context: &mut Context,
         filter: Option<&mut BloomFilters>,
         [extent, output_extent]: [[u32; 2]; 2],
-        rr_enabled: bool,
+        mode: Denoiser,
         quality: streamline::Quality,
         previous_display: Option<&exposure::Display>,
         templates: Option<&Self>,
@@ -136,13 +149,19 @@ impl View {
             .map(|stride| Buffer::new(context, pixels * stride, false))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
+        let signal_lanes = Buffer::new(
+            context,
+            if mode == Denoiser::Nrd {
+                pixels * 112
+            } else {
+                112
+            },
+            false,
+        )?;
+        let rr_enabled = mode == Denoiser::Dlss;
         let params = Buffer::new(context, 784, true)?;
         let output = Buffer::new(context, pixels * 16, false)?;
-        let rr = RrImages::new(
-            context,
-            if rr_enabled { extent } else { [1, 1] },
-            if rr_enabled { output_extent } else { [1, 1] },
-        )?;
+        let rr = RrImages::new(context, extent, output_extent, mode)?;
         let display = exposure::Display::new(
             context,
             output,
@@ -224,11 +243,11 @@ impl View {
             )?
         };
         let resolve = if let Some(templates) = templates {
-            let [raw, rr, spatial] = templates.presentation.resolve;
+            let [raw, rr, scaled] = templates.presentation.resolve;
             [
                 raw.rebind(context, bindings)?,
                 rr.rebind(context, bindings)?,
-                spatial.rebind(context, bindings)?,
+                scaled.rebind(context, bindings)?,
             ]
         } else {
             [
@@ -252,13 +271,14 @@ impl View {
                     context,
                     bindings,
                     shader(
-                        include_bytes!(concat!(env!("OUT_DIR"), "/resolve_spatial.spv")),
-                        c"resolve_spatial",
+                        include_bytes!(concat!(env!("OUT_DIR"), "/resolve_scaled.spv")),
+                        c"resolve_scaled",
                     ),
                 )?,
             ]
         };
         Ok(Self {
+            nrd: None,
             extent,
             output_extent,
             params,
@@ -266,6 +286,7 @@ impl View {
             accumulation: Buffer::new(context, pixels * 16, false)?,
             counts: Buffer::new(context, pixels * 4, false)?,
             landing,
+            signal_lanes,
             prefix: Buffer::new(context, pixels * 16, false)?,
             progress: history::Accumulation::new(),
             jitter: [0.; 2],

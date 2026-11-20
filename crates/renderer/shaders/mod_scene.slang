@@ -250,19 +250,20 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
                                                       parameters[0].anchor_region.xyz);
     }
 
-    public func occluded(connection: geometry::Ray)->bool
+    public func blocker_distance<let first : bool>(connection: geometry::Ray)->float
     {
         let ray : RayDesc = { connection.origin, connection.t_min, connection.direction,
                               connection.t_max };
 #if PRIMEPT_COVERAGE_MASK == 0
         {
-            var opaque : RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_FORCE_OPAQUE>;
+            var opaque : RayQuery<(first ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : 0) |
+                                  RAY_FLAG_FORCE_OPAQUE>;
             opaque.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
             opaque.Proceed();
-            return opaque.CommittedStatus() != COMMITTED_NOTHING;
+            return opaque.CommittedStatus() == COMMITTED_NOTHING ? pt::FAR : opaque.CommittedRayT();
         }
 #else
-        var query : RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH>;
+        var query : RayQuery<first ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : 0>;
         query.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
         while (query.Proceed())
         {
@@ -273,8 +274,13 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
                     query.CandidateTriangleBarycentrics(), query.CandidateTriangleFrontFace()))
                 query.CommitNonOpaqueTriangleHit();
         }
-        return query.CommittedStatus() != COMMITTED_NOTHING;
+        return query.CommittedStatus() == COMMITTED_NOTHING ? pt::FAR : query.CommittedRayT();
 #endif
+    }
+
+    public func occluded(connection: geometry::Ray)->bool
+    {
+        return blocker_distance<true>(connection) < pt::FAR;
     }
 
     public func environment(direction: float3, previous: float3, depth: uint)->pt::Environment

@@ -7,6 +7,7 @@ module primary_material;
 import primary_cache;
 import known_geometry;
 import mod_decode;
+import nrd_path;
 import pt.material_vertex;
 import mod_scene;
 import pt.scene;
@@ -34,6 +35,19 @@ func shade_primary(inout call: pt::MaterialCall)->void
         known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
     let material : transport::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
                        hit, parameters[0].block_emission_scale, { auxiliary });
+    if (parameters[0].reconstruction.w == 3)
+    {
+        let lane = asuint(call.origin_pixel.y);
+        let incident = call.medium;
+        var signals : pt::PrimaryLighting;
+        pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
+            ModScene(), call, hit, material, ray.xyz, settings(parameters[0]), lane, signals);
+        let blocker = begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, hit, material, incident,
+                                                 -ray.xyz, call.direction);
+        if (blocker == pt::FAR)
+            call.radiance += signals.sun;
+        return;
+    }
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true>(
         ModScene(), call, hit, material, ray.xyz, settings(parameters[0]),
         asuint(call.origin_pixel.y));

@@ -129,11 +129,18 @@ unsafe extern "system" fn diagnostic(
     unsafe {
         let message = CStr::from_ptr((*data).p_message).to_string_lossy();
         // AGENTS.md 中用户批准的第三方例外；原始消息仍完整写入日志。
-        let known_sl = message.starts_with("vkCmdClearColorImage(): WRITE_AFTER_WRITE")
-            && message.contains("[nv.ngx.dlssd.resource]")
-            && message.contains("vkCmdPipelineBarrier[nv.ngx.dlssd.Evaluate]")
-            && message.contains("VK_ACCESS_2_TRANSFER_WRITE_BIT")
-            && message.contains("VK_PIPELINE_STAGE_2_CLEAR_BIT");
+        let body = message
+            .split_once('\n')
+            .filter(|(heading, _)| {
+                heading.starts_with("(Warning - This VUID has now been reported ")
+                    && heading.contains("duplicate_message_limit")
+            })
+            .map_or(message.as_ref(), |(_, detail)| detail);
+        let known_sl = body.starts_with("vkCmdClearColorImage(): WRITE_AFTER_WRITE")
+            && body.contains("[nv.ngx.dlssd.resource]")
+            && body.contains("vkCmdPipelineBarrier[nv.ngx.dlssd.Evaluate]")
+            && body.contains("VK_ACCESS_2_TRANSFER_WRITE_BIT")
+            && body.contains("VK_PIPELINE_STAGE_2_CLEAR_BIT");
         if severity.contains(vk::DebugUtilsMessageSeverityFlagsEXT::ERROR) && !known_sl {
             (*user.cast::<AtomicUsize>()).fetch_add(1, Ordering::Relaxed);
         }
@@ -333,6 +340,9 @@ impl Host {
                     CStr::from_ptr(extension.extension_name.as_ptr())
                         == ash::khr::opacity_micromap::NAME
                 });
+                let push_descriptors = extensions.iter().any(|e| {
+                    CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME
+                });
                 let mut omm = vk::PhysicalDeviceOpacityMicromapFeaturesKHR::default();
                 if supports_omm {
                     host.instance.get_physical_device_features2(
@@ -364,6 +374,11 @@ impl Host {
                 host.instance
                     .get_physical_device_features2(physical, &mut features);
                 let supported = features.features;
+                let nrd = push_descriptors
+                    && core12.descriptor_binding_partially_bound != 0
+                    && supported.shader_storage_image_write_without_format != 0
+                    && supported.shader_int16 != 0
+                    && core12.shader_float16 != 0;
                 if core12.buffer_device_address == 0
                     || core13.synchronization2 == 0
                     || core13.subgroup_size_control == 0
@@ -388,6 +403,9 @@ impl Host {
                     .queue_family_index(family as u32)
                     .queue_priorities(&priorities)];
                 let mut extensions: Vec<_> = required.iter().map(|name| name.as_ptr()).collect();
+                if nrd {
+                    extensions.push(ash::khr::push_descriptor::NAME.as_ptr());
+                }
                 if host.opacity_micromap {
                     extensions.push(ash::khr::opacity_micromap::NAME.as_ptr());
                 }
@@ -402,6 +420,8 @@ impl Host {
                 let mut position = vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
                     .ray_tracing_position_fetch(true);
                 let mut core12 = vk::PhysicalDeviceVulkan12Features::default()
+                    .descriptor_binding_partially_bound(nrd)
+                    .shader_float16(nrd)
                     .buffer_device_address(true)
                     .timeline_semaphore(rr)
                     .descriptor_indexing(rr);
@@ -414,7 +434,8 @@ impl Host {
                         .ray_tracing_invocation_reorder(true);
                 let enabled = vk::PhysicalDeviceFeatures::default()
                     .shader_storage_image_extended_formats(true)
-                    .shader_storage_image_write_without_format(rr);
+                    .shader_int16(nrd)
+                    .shader_storage_image_write_without_format(rr || nrd);
                 let mut device_info = vk::DeviceCreateInfo::default()
                     .queue_create_infos(&queues)
                     .enabled_extension_names(&extensions)
@@ -2364,6 +2385,276 @@ fn hardware_pt_rr_rebases_history_across_local_changes() -> Result<(), Box<dyn s
 }
 
 #[test]
+#[ignore = "需执行 labPbrFixture，使用实际 SPBR 贴图和 Vulkan 读回首表面"]
+fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
+    let packet = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/lab-pbr-fixture.bin"
+    ))?;
+    let mut catalog = prime_minecraft::Catalog::default();
+    let mut candidate = catalog.stage_resources(&packet)?;
+    let albedo = [255; 80 * 16 * 4];
+    let maps = candidate.material_resources([80, 16], &albedo)?;
+    let host = Host::create(false, true)?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let extent = [32, 32];
+    let output = Image::new(&mut gpu.context, [32, 32, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    let definitions = [0u32, 1].map(|tile| {
+        let mut material = MaterialDefinition::default();
+        material.control[2] = MaterialDefinition::MERS
+            | MaterialDefinition::AUXILIARY
+            | MaterialDefinition::LAB_SPECULAR;
+        material.control[3] = MaterialDefinition::AUTHORED_NORMAL;
+        material.uv_bounds = [tile as f32 / 5., 0., (tile + 1) as f32 / 5., 1.];
+        material
+    });
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: maps.extent,
+        albedo: &albedo,
+        materials: &definitions,
+        mers: &maps.mers,
+        auxiliary: &maps.auxiliary,
+        emission_alias_words: &[],
+        opacity_quads: &[],
+        light_areas: &[[u32::MAX, 0, 0, 0]; 2],
+    })?;
+    let options = Options::new(false, streamline::Quality::Dlaa, 2, 4)?.with_nrd();
+    for (tile, expected_roughness, expected_f0, class) in
+        [(0, 35. / 255., 1., 1.), (1, 1. / 255., 44. / 255., 0.)]
+    {
+        let x = tile as f32 / 5.;
+        // 使用每张源图第一个 texel 的内部区域，同时保留二维 UV 导数。
+        let mesh = Mesh {
+            quads: vec![Quad::with_material(
+                [[-8., -8., 3.], [8., -8., 3.], [8., 8., 3.], [-8., 8., 3.]],
+                [
+                    [x + 0.002, 0.01],
+                    [x + 0.008, 0.01],
+                    [x + 0.008, 0.05],
+                    [x + 0.002, 0.05],
+                ],
+                [1.; 3],
+                prime_scene::MaterialId::new(tile),
+            )],
+        };
+        gpu.set_scene(&mesh)?;
+        host.render_options(gpu, &output, &camera(), Environment::default(), options)?;
+        let guides = gpu.view.as_ref().unwrap().rr.images;
+        let n = half_pixel(&guides[3].download(&mut gpu.context)?, extent, 4);
+        let f0 = half_pixel(&guides[5].download(&mut gpu.context)?, extent, 4);
+        eprintln!("SPBR tile={tile} normal_roughness={n:?} F0_class={f0:?}");
+        assert!((n[3] - expected_roughness).abs() < 0.001 && n[0].abs() + n[1].abs() > 0.4);
+        assert!(f0[..3].iter().all(|f| (f - expected_f0).abs() < 0.002) && f0[3] == class);
+        if tile == 0 {
+            let nrd = gpu.view.as_ref().unwrap().nrd.as_ref().unwrap();
+            let [specular, direction, filtered] = nrd.specular_signals();
+            let diffuse = nrd.diffuse_pair()[0];
+            let mut pixel = |image: Image| -> Result<Vec<f32>, Error> {
+                Ok(half_pixel(&image.download(&mut gpu.context)?, extent, 4))
+            };
+            let input = pixel(specular)?[0];
+            let output = pixel(filtered)?[0];
+            assert_eq!(pixel(diffuse)?[0], 0., "纯金属没有漫反射");
+            assert!(input > 0. && output > 0.);
+            assert!(pixel(direction)?[..3].iter().any(|x| x.abs() > 0.001));
+            eprintln!("SPBR 铜块高光 SH0 输入={input} 输出={output}");
+        }
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan/SPIR-V NRD 输入、历史、移动和切换"]
+fn hardware_nrd_history() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(false, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
+    let mut session = host.gpu()?;
+    let mut gpu = session.gpu();
+    let extent = if std::env::var_os("PRIME_NRD_4K").is_some() {
+        [3840, 2160]
+    } else {
+        [128, 96]
+    };
+    let image = Image::new(
+        &mut gpu.context,
+        [extent[0], extent[1], 1],
+        ImageFormat::Rgba8Unorm,
+    )?;
+    gpu.test_roots.push(image.into());
+    let mut mesh = Mesh::default();
+    add_quad(&mut mesh, 3., [0.5; 2], [0.7, 0.4, 0.2], 8.);
+    gpu.set_scene(&mesh)?;
+    let env = Environment {
+        sun_direction: [0.28f32.sqrt(), 0.6, -0.6],
+        ..Default::default()
+    };
+    let raw = Options::new(false, streamline::Quality::Dlaa, 2, 4)?;
+    let queries = [
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+    ];
+    gpu.test_roots
+        .extend(queries.map(vulkan::native::Resource::from));
+    let mut camera = camera();
+    let frames = if extent[0] == 3840 { 14 } else { 68 };
+    let mut durations = vec![];
+    let mut diffuse = Vec::new();
+    for i in 0..frames {
+        if i == frames - 1 {
+            camera.origin[0] = 0.125;
+            camera.origin[2] = 0.25;
+        }
+        let [_, ns] = host.render_profiled(
+            &mut gpu,
+            &image,
+            &camera,
+            env,
+            raw.with_nrd(),
+            Some(queries),
+        )?;
+        if i >= 3 && i + 1 < frames {
+            durations.push(ns as f64 * 1e-6);
+        }
+        if extent[0] == 128 && i >= 20 && i + 1 < frames {
+            let pair = gpu
+                .view
+                .as_ref()
+                .unwrap()
+                .nrd
+                .as_ref()
+                .unwrap()
+                .diffuse_pair();
+            let mut values = [0.; 2];
+            for (value, image) in values.iter_mut().zip(pair) {
+                *value = f64::from(half_pixel(&image.download(&mut gpu.context)?, extent, 4)[0]);
+            }
+            diffuse.push(values);
+        }
+    }
+    let view = gpu.view.as_ref().unwrap();
+    assert!(view.nrd.is_some() && gpu.rr_previous.is_some());
+    let motion = half_pixel(&view.rr.images[6].download(&mut gpu.context)?, extent, 4);
+    assert!(
+        motion[0] > 0.5 && motion[1].abs() < 0.1 && (motion[2] - 0.25).abs() < 0.002,
+        "横移并向前移动的 2.5D 运动 {motion:?}"
+    );
+    let center = half_pixel(&view.rr.images[4].download(&mut gpu.context)?, extent, 4);
+    assert!(center[0] > 0. && center[3] == 1., "首表面 {center:?}");
+    let hdr = view.presentation.linear_hdr.download(&mut gpu.context)?;
+    assert!(
+        hdr.chunks_exact(4)
+            .all(|p| f32::from_le_bytes(p.try_into().unwrap()).is_finite())
+    );
+    let at = ((extent[1] / 2 * extent[0] + extent[0] / 2) * 16) as usize;
+    assert!(f32::from_le_bytes(hdr[at..at + 4].try_into()?) > 0.);
+    durations.sort_by(f64::total_cmp);
+    eprintln!(
+        "NRD native={}x{} frames={} frame_gpu_ms_median={:.3}",
+        extent[0],
+        extent[1],
+        frames,
+        durations[durations.len() / 2]
+    );
+    if !diffuse.is_empty() {
+        let variance = |channel: usize| {
+            let n = diffuse.len() as f64;
+            let mean = diffuse.iter().map(|v| v[channel]).sum::<f64>() / n;
+            diffuse
+                .iter()
+                .map(|v| (v[channel] - mean).powi(2))
+                .sum::<f64>()
+                / n
+        };
+        let [raw, filtered] = [variance(0), variance(1)];
+        eprintln!(
+            "NRD static diffuse frames={} raw_variance={raw:.8} filtered_variance={filtered:.8}",
+            diffuse.len()
+        );
+        assert!(raw > 0. && filtered < raw, "静止材质漫反射的帧间波动应下降");
+    }
+    host.render_options(&mut gpu, &image, &camera, env, raw)?;
+    assert!(gpu.view.as_ref().unwrap().nrd.is_none());
+    if extent[0] == 3840 {
+        let mut timings = Vec::new();
+        for i in 0..frames {
+            let [_, ns] =
+                host.render_profiled(&mut gpu, &image, &camera, env, raw, Some(queries))?;
+            if i >= 3 && i + 1 < frames {
+                timings.push(ns as f64 * 1e-6);
+            }
+        }
+        timings.sort_by(f64::total_cmp);
+        eprintln!(
+            "PT native=3840x2160 denoiser=off frame_gpu_ms_median={:.3}",
+            timings[timings.len() / 2]
+        );
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "实际太阳遮挡距离与 SIGMA 历史输出"]
+fn hardware_nrd_sun_blocker() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(false, true)?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = image(gpu)?;
+    let mut mesh = Mesh::default();
+    add_quad(&mut mesh, 3., [0.5; 2], [1.; 3], 8.);
+    let env = Environment {
+        sun_direction: [0.8, 0., -0.6],
+        ..Default::default()
+    };
+    let options = Options::new(false, streamline::Quality::Dlaa, 2, 4)?.with_nrd();
+    let mut read_shadow = |mesh: &Mesh| -> Result<[f32; 2], Box<dyn std::error::Error>> {
+        gpu.set_scene(mesh)?;
+        for _ in 0..12 {
+            host.render_options(gpu, &output, &camera(), env, options)?;
+        }
+        let images = gpu
+            .view
+            .as_ref()
+            .unwrap()
+            .nrd
+            .as_ref()
+            .unwrap()
+            .shadow_pair();
+        let mut samples = [0.; 2];
+        for (sample, img) in samples.iter_mut().zip(images) {
+            let bytes = img.download(&mut gpu.context)?;
+            let index = (16 * 32 + 16) * 4;
+            *sample = f32::from_le_bytes(bytes[index..index + 4].try_into()?);
+        }
+        Ok(samples)
+    };
+    let lit = read_shadow(&mesh)?;
+    mesh.quads.push(Quad::new(
+        [
+            [1.3, -0.75, 1.5],
+            [2.7, -0.75, 1.5],
+            [2.7, 0.75, 1.5],
+            [1.3, 0.75, 1.5],
+        ],
+        [[0.5; 2]; 4],
+        [1.; 3],
+        Material::Opaque,
+    ));
+    let blocked = read_shadow(&mesh)?;
+    eprintln!("SIGMA [penumbra,shadow] lit={lit:?} blocked={blocked:?}");
+    assert!(lit[0] >= 65500. && lit[1] > 0.95);
+    assert!(blocked[0] > 0. && blocked[0] < 0.08 && blocked[1] < 0.05);
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "独立进程运行此 filter：early interposer + PT/guide/RR/超分/呈现完整链路"]
 fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_rr()?;
@@ -2575,7 +2866,7 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         .record(
             &mut gpu.context,
             Binding::StorageImage(resized),
-            HdrSource::Spatial,
+            HdrSource::ScaledRaw,
             gpu.display_timeline.enabled(),
         )?
         .submit_and_wait(&mut gpu.context)?;
@@ -2625,6 +2916,19 @@ fn hardware_pt_rr_full_chain() -> Result<(), Box<dyn std::error::Error>> {
         let view = fallback.view.as_ref().ok_or("回退 PT 未创建视图")?;
         assert!(!view.rr_enabled);
         assert_eq!(view.progress.samples(), expected);
+    }
+    let automatic = Options::new(true, streamline::Quality::Dlaa, 2, 4)?.with_nrd_fallback();
+    for _ in 0..2 {
+        host.render_options(
+            &mut fallback,
+            &fallback_image,
+            &camera,
+            environment,
+            automatic,
+        )?;
+        let view = fallback.view.as_ref().unwrap();
+        assert!(view.nrd.is_some() && !view.rr_enabled && fallback.rr_previous.is_some());
+        assert_eq!(view.extent, view.output_extent);
     }
     let pixels = fallback_image.download(&mut fallback.context)?;
     assert!(

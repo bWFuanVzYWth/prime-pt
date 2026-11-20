@@ -766,6 +766,7 @@ dependencies = [
  "blake3",
  "bytemuck",
  "png",
+ "prime_minecraft",
  "prime_scene",
  "prime_world",
  "rayon",

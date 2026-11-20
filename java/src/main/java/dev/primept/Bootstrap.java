@@ -50,6 +50,14 @@ public final class Bootstrap {
             new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageExtendedFormats"),
             new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat"));
     private static final String OMM_EXTENSION = "VK_KHR_opacity_micromap";
+    private static final String NRD_PUSH = "VK_KHR_push_descriptor";
+    private static final Set<VulkanFeature> NRD_FEATURES = Set.of(
+            new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderInt16"),
+            new VulkanFeature(VulkanFeatureSets.VK12_FEATURES_STRUCT, "shaderFloat16", VkPhysicalDeviceVulkan12Features.SHADERFLOAT16),
+            new VulkanFeature(VulkanFeatureSets.VK12_FEATURES_STRUCT, "descriptorBindingPartiallyBound", VkPhysicalDeviceVulkan12Features.DESCRIPTORBINDINGPARTIALLYBOUND),
+            new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "shaderStorageImageWriteWithoutFormat"));
+    private static long nrdDevice;
+    static boolean nrdAvailable() { return nrdDevice != 0 && nrdDevice == ptDevice; }
     private static final VulkanFeature OMM_FEATURE = new VulkanFeature(
             new VulkanPNextStruct(VkPhysicalDeviceOpacityMicromapFeaturesKHR.class),
             "micromap", VkPhysicalDeviceOpacityMicromapFeaturesKHR.MICROMAP);
@@ -89,6 +97,7 @@ public final class Bootstrap {
 
     /** 缺少能力时不追加 RT 扩展或特性，原因交给界面通知；仅完整支持后允许 native 接入。 */
     public static FeatureSet enable(FeatureSet original, VulkanPhysicalDevice physical) {
+        nrdDevice=0;
         ptPhysical = ptDevice = 0;
         rrPhysical = 0;
         serPhysical = 0;
@@ -141,6 +150,11 @@ public final class Bootstrap {
             var available = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default()
                     .pNext(address).pNext(commands).pNext(synchronization).pNext(acceleration).pNext(pipeline).pNext(query).pNext(position).pNext(subgroup);
             VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), available);
+            if (physical.hasDeviceExtension(NRD_PUSH) && address.descriptorBindingPartiallyBound() && address.shaderFloat16() && available.features().shaderInt16()
+                    && available.features().shaderStorageImageWriteWithoutFormat()) {
+                extensions.add(NRD_PUSH);
+                features.addAll(NRD_FEATURES);
+            }
             if (!address.bufferDeviceAddress()) missing.add("bufferDeviceAddress");
             if (!acceleration.accelerationStructure()) missing.add("accelerationStructure");
             if (!pipeline.rayTracingPipeline()) missing.add("rayTracingPipeline");
@@ -225,6 +239,7 @@ public final class Bootstrap {
             return;
         }
         ptDevice = device.address();
+        nrdDevice = enabled.extensions().contains(NRD_PUSH) && enabled.features().containsAll(NRD_FEATURES) ? ptDevice : 0;
         ommDevice = ommPhysical == device.getPhysicalDevice().address() && enabled.extensions().contains(OMM_EXTENSION)
                 && enabled.features().contains(OMM_FEATURE) ? device.address() : 0;
         if ("1".equals(System.getenv("PRIME_PT_DIAGNOSTIC_CHECKPOINTS"))

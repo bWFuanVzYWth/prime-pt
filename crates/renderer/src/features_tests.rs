@@ -498,7 +498,7 @@ fn streamed_region_preserves_resident_quad_ids() -> Result<(), Box<dyn std::erro
             gpu.lighting_gpu,
         );
         let read = Buffer::new(&mut gpu.context, 32, true)?;
-        bindings.push(Binding::StorageBuffer(read));
+        bindings[39] = Binding::StorageBuffer(read);
         let bindings = Bindings::new(&mut gpu.context, &bindings)?;
         let pipe = ComputePipeline::new(
             &mut gpu.context,
@@ -897,7 +897,7 @@ fn hardware_pt_region_primitive_index_keeps_full_quad_base()
     base_buffer.write(&mut gpu.context, 0, bytemuck::cast_slice(&bases))?;
     bindings[36] = Binding::StorageBuffer(base_buffer);
     let output = Buffer::new(&mut gpu.context, 16, true)?;
-    bindings.push(Binding::StorageBuffer(output));
+    bindings[39] = Binding::StorageBuffer(output);
     let bindings = Bindings::new(&mut gpu.context, &bindings)?;
     let pipeline = ComputePipeline::new(
         &mut gpu.context,
@@ -1470,7 +1470,7 @@ fn assert_light_pdfs(
         gpu.lighting_gpu,
     );
     let output = Buffer::new(&mut gpu.context, 32 * 16, true)?;
-    bindings.push(Binding::StorageBuffer(output));
+    bindings[39] = Binding::StorageBuffer(output);
     let bindings = Bindings::new(&mut gpu.context, &bindings)?;
     let pipeline = ComputePipeline::new(
         &mut gpu.context,
