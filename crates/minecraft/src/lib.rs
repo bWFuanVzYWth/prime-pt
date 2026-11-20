@@ -20,6 +20,7 @@ mod emission_power;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod fixtures;
 mod fluid;
+mod lab_pbr;
 mod materials;
 mod palette;
 mod resources;
@@ -35,6 +36,7 @@ pub use compile::{
 };
 pub use compile::{CompiledSlab, Neighbor, Neighborhood, SlabCompile, TintRequest, compile_slab};
 pub use dependencies::{SlabDependencies, SlabDependency, dependent_slabs};
+pub use lab_pbr::MaterialImage;
 pub use materials::MaterialResources;
 pub use palette::{SectionSource, SectionStorage, decode_sections};
 pub use resources::{Catalog, ImageSource, PreparedCatalog, ResourceChange, SpriteSource};
@@ -64,7 +66,7 @@ pub enum Error {
         /// 下一项输出所需的最小quad总数。
         required: usize,
     },
-    /// 内嵌原版材质PNG无效。
+    /// 源材质 PNG 解码失败。
     #[error(transparent)]
     Png(#[from] png::DecodingError),
     /// 通用静态发光面积或alias输入无效。

@@ -245,6 +245,15 @@ tasks.register('wireFixture', JavaExec) {
     args rootProject.file('target/java-source.prt').absolutePath
 }
 
+tasks.register('labPbrFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.LabPbrFixture'
+    doFirst {
+        args file(providers.gradleProperty('labPbrPack').get()), file('target/lab-pbr-fixture.bin')
+    }
+}
+
 tasks.register('cameraFixture', JavaExec) {
     dependsOn fixtureClasses
     classpath = sourceSets.fixture.runtimeClasspath

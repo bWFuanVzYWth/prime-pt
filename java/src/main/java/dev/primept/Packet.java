@@ -9,6 +9,7 @@ import net.minecraft.client.resources.model.geometry.BakedQuad;
 final class Packet {
     private static final int MAX_BYTES = 256 * 1024 * 1024;
     private ByteBuffer bytes = ByteBuffer.allocateDirect(1 << 20).order(ByteOrder.LITTLE_ENDIAN);
+    private byte[] streamBuffer;
 
     void clear() { bytes.clear(); }
     int position() { return bytes.position(); }
@@ -18,6 +19,17 @@ final class Packet {
     void putFloat(float value) { reserve(4); bytes.putFloat(value); }
     void putDouble(double value) { reserve(8); bytes.putDouble(value); }
     void putBytes(byte[] value) { reserve(value.length); bytes.put(value); }
+    void putStream(java.io.InputStream input) throws java.io.IOException {
+        int start = position();
+        putInt(0);
+        if (streamBuffer == null) streamBuffer = new byte[8192];
+        int read;
+        while ((read = input.read(streamBuffer)) != -1) {
+            reserve(read);
+            bytes.put(streamBuffer, 0, read);
+        }
+        patchInt(start, position() - start - 4);
+    }
     void putBuffer(ByteBuffer value) { var copy=value.duplicate();reserve(copy.remaining());bytes.put(copy); }
     void putString(String value) {
         byte[] encoded = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);

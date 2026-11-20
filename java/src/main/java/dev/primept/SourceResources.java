@@ -197,9 +197,7 @@ final class SourceResources {
         for(int i=0;i<models.size();i++)writeModel(i+1,models.get(i));
         for(int i=0;i<faces.size();i++)writeFace(i+2,faces.get(i));
         for(int i=0;i<fluids.size();i++)writeFluid(i+1,fluids.get(i));
-        int unsupported=0;
-        for(int i=0;i<sprites.size();i++){writeSprite(i+1,sprites.get(i));if(hasExternalPbr(sprites.get(i)))unsupported++;}
-        if(unsupported!=0)System.getLogger("prime_pt").log(System.Logger.Level.WARNING,"资源世代 "+generation+" 包含 "+unsupported+" 个外部_n/_s sprite；当前仅消费内嵌原版PBR，外部LabPBR尚未接入");
+        for(int i=0;i<sprites.size();i++)writeSprite(i+1,sprites.get(i));
         var tint=biomes.packet();packet.putInt(tint.remaining());packet.putBuffer(tint);
         return packet.finish();
     }
@@ -263,11 +261,8 @@ final class SourceResources {
         var image=((dev.primept.mixin.SpriteAccess)c).primept$image();packet.putInt(image.getWidth());packet.putInt(image.getHeight());
         if(frames.isEmpty())packet.putInt(0);
         else{int count=Math.multiplyExact(Math.multiplyExact(image.getWidth(),image.getHeight()),4);packet.putInt(count);var pixels=image.getPixelBytes().duplicate();pixels.position(0).limit(count);packet.putBuffer(pixels);}
-        packet.putInt(0);packet.putInt(0);
-    }
-    private boolean hasExternalPbr(TextureAtlasSprite sprite){
-        var name=sprite.contents().name();var manager=minecraft.getResourceManager();
-        return manager.getResource(net.minecraft.resources.Identifier.fromNamespaceAndPath(name.getNamespace(),"textures/"+name.getPath()+"_n.png")).isPresent()||manager.getResource(net.minecraft.resources.Identifier.fromNamespaceAndPath(name.getNamespace(),"textures/"+name.getPath()+"_s.png")).isPresent();
+        LabPbrSource.write(packet,minecraft.getResourceManager(),c.name(),"_n");
+        LabPbrSource.write(packet,minecraft.getResourceManager(),c.name(),"_s");
     }
     private static Field field(Class<?> owner,String name){try{var f=owner.getDeclaredField(name);f.setAccessible(true);return f;}catch(ReflectiveOperationException e){throw new ExceptionInInitializerError(e);}}
     private static Method method(Class<?> owner,String name,Class<?>...args){try{var m=owner.getDeclaredMethod(name,args);m.setAccessible(true);return m;}catch(ReflectiveOperationException e){throw new ExceptionInInitializerError(e);}}

@@ -275,7 +275,31 @@ func material_variant(material: ModMaterial)->uint
     let sides : uint = material.control.y & ((flags & 32u) != 0 ? 1u : 3u);
     let emission : uint = material.emission.w > 0 ? (sides << 4u) | (flags & 4u) : 0;
     return (flags & 3u) | ((material.control.w & 1u) << 3u) | emission |
-           ((material.control.x & 3u) << 6u) | ((flags & material_overlay_flags) << 1u);
+           ((material.control.x & 3u) << 6u) | ((flags & material_overlay_flags) << 1u) |
+           ((flags & 512u) << 7u);
+}
+
+/// shaderLABS LabPBR 1.3 规定介质的绿色通道为线性 F0。金属的界面不进入介质栈。
+public func lab_ior(encoded: float)->float
+{
+    let value = uint(round(saturate(encoded) * 255));
+    if (value >= 230u)
+        return 1.5;
+    let amplitude = sqrt(float(value) / 255);
+    return (1 + amplitude) / (1 - amplitude);
+}
+
+/// 由规范所列 n、k 的正入射复 Fresnel 反射率计算，底色负责给反射着色。
+public func lab_metal_tint(encoded: float)->float3
+{
+    static const float3 reflectance[8] = {
+        float3(0.5312288, 0.5123572, 0.4958285), float3(0.9442300, 0.7761021, 0.3734020),
+        float3(0.9122980, 0.9138506, 0.9196806), float3(0.5555968, 0.5545371, 0.5547794),
+        float3(0.9259522, 0.7209016, 0.5041542), float3(0.6324838, 0.6259371, 0.6414789),
+        float3(0.6788492, 0.6424006, 0.5884096), float3(0.9620000, 0.9494681, 0.9221157)
+    };
+    let index = uint(round(saturate(encoded) * 255)) - 230u;
+    return index < 8u ? reflectance[min(index, 7u)] : float3(1);
 }
 
 /// 消费已通过覆盖测试的命中；callable 的 Flow 和 variant 都在资源准备时特化。
@@ -336,13 +360,17 @@ public func resolve_material<let has_aux : bool = false, let read_color : bool =
     {
         result.pbr.base_roughness.w = mers.z;
         result.pbr.surface.y = mers.x;
-        result.pbr.surface.z = mers.w;
+        result.pbr.surface.z =
+            (material.control.z & 512u) != 0 && (material.control.z & 96u) == 0 ? 0 : mers.w;
     }
     var medium : float4 = material.extinction;
     if ((mask & 2u) != 0)
     {
         let auxiliary : float4 = has_aux ? sampled_aux : aux_atlas.Load(sprite_address(uv, bounds));
-        let ior : float = 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) * (1.0 / 255.0));
+        let lab = (mask & 65536u) != 0;
+        let ior = lab ? lab_ior(auxiliary.w) : 1.0 + 1.5 * auxiliary.w;
+        if (lab)
+            result.pbr.base_roughness.xyz *= lab_metal_tint(auxiliary.w);
         result.pbr.surface.x = ior;
         medium.x = ior;
         if ((mask & 8u) != 0)

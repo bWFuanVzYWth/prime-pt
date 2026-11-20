@@ -112,6 +112,8 @@ impl MaterialDefinition {
     pub const OVERLAY: u32 = 1 << 7;
     /// 二层覆盖sprite提供独立MERS。要求 `OVERLAY`。
     pub const OVERLAY_MERS: u32 = 1 << 8;
+    /// 辅助图 A 保存 LabPBR 原始 F0／金属编号，MERS 已在准备阶段转码。
+    pub const LAB_SPECULAR: u32 = 1 << 9;
     /// normalFlags的bit0表示实际源中存在作者切线法线。
     pub const AUTHORED_NORMAL: u32 = 1;
 
@@ -154,7 +156,9 @@ impl MaterialDefinition {
             && self.emission.into_iter().all(|v| v >= 0.)
             && self.control[0] & !3 == 0
             && (1..=3).contains(&self.control[1])
-            && flags & !511 == 0
+            && flags & !1023 == 0
+            && (flags & Self::LAB_SPECULAR == 0
+                || flags & (Self::AUXILIARY | Self::MERS) == (Self::AUXILIARY | Self::MERS))
             && self.uv_bounds[0] < self.uv_bounds[2]
             && self.uv_bounds[1] < self.uv_bounds[3]
             && if flags & Self::OVERLAY != 0 {

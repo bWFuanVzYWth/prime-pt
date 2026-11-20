@@ -102,10 +102,10 @@ pub struct SpriteSource {
     pub frames: Vec<[u32; 2]>,
     /// 宿主mip/frame sheet；静态base可仅转发维度，避免重复atlas像素。
     pub images: Vec<ImageSource>,
-    /// 宿主实际可选LabPBR normal源；不存在时不冒充已支持的内容。
-    pub normal: Option<ImageSource>,
+    /// 资源包栈中获胜的 LabPBR 法线图及独立帧布局。
+    pub normal: Option<crate::MaterialImage>,
     /// 宿主实际可选LabPBR specular源。
-    pub specular: Option<ImageSource>,
+    pub specular: Option<crate::MaterialImage>,
 }
 
 /// 一次成功的完整资源世代发布；运行期不追加身份。
@@ -186,10 +186,20 @@ fn image(reader: &mut Reader<'_>, allow_empty: bool) -> Result<ImageSource, Erro
     })
 }
 
-fn optional_image(reader: &mut Reader<'_>) -> Result<Option<ImageSource>, Error> {
+fn optional_image(
+    reader: &mut Reader<'_>,
+    base: &ImageSource,
+    tile: [u32; 2],
+    frames: &[[u32; 2]],
+    interpolate: bool,
+) -> Result<Option<crate::MaterialImage>, Error> {
     match reader.u32()? {
         0 => Ok(None),
-        1 => Ok(Some(image(reader, false)?)),
+        1 => {
+            crate::MaterialImage::inherited(image(reader, false)?, base, tile, frames, interpolate)
+                .map(Some)
+        }
+        2 => crate::MaterialImage::read(reader, base, tile, frames, interpolate).map(Some),
         _ => Err(Error::Input("可选源图像标记无效")),
     }
 }
@@ -441,8 +451,6 @@ fn decode(bytes: &[u8]) -> Result<(Catalog, bool), Error> {
         for _ in 0..count {
             images.push(image(&mut r, true)?);
         }
-        let normal = optional_image(&mut r)?;
-        let specular = optional_image(&mut r)?;
         let base = images
             .first()
             .ok_or(Error::Input("sprite缺少base图像布局"))?;
@@ -457,6 +465,8 @@ fn decode(bytes: &[u8]) -> Result<(Catalog, bool), Error> {
         {
             return Err(Error::Input("sprite动画帧与源图像布局不一致"));
         }
+        let normal = optional_image(&mut r, base, extent, &frames, flags & 2 != 0)?;
+        let specular = optional_image(&mut r, base, extent, &frames, flags & 2 != 0)?;
         insert(
             &mut next.sprites,
             id,

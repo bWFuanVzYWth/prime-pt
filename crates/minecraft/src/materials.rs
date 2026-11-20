@@ -1,6 +1,6 @@
 //! 资源准备阶段构造共享数据atlas、材质身份、静态面积与纹理内alias。
 //!
-//! 原版 PBR 按 sprite 身份读取冻结数据。外部资源的 `_n`／`_s` 贴图当前只做检测和报告。
+//! 优先使用当前资源包栈提供的 LabPBR 伴随图。纯原版 sprite 可使用冻结预设。
 //! 动画包络用于准备保守材质能力，绘制使用准备时的首帧，材质 atlas 不随 tick 切换。
 use crate::{
     Error, ImageSource, PreparedCatalog, SpriteSource,
@@ -35,6 +35,7 @@ struct SpriteMaps {
     authored: bool,
     mers: bool,
     auxiliary: bool,
+    lab_specular: bool,
     textured: bool,
     proposal: Option<EmissionProposal>,
     power: Option<PowerMoments>,
@@ -218,7 +219,7 @@ fn sample(image: &ImageSource, x: usize, y: usize, extent: [u32; 2], frame: usiz
 }
 fn sample_material(
     image: &ImageSource,
-    layout: crate::vanilla_frames::Layout,
+    layout: crate::vanilla_frames::Layout<'_>,
     frame: u32,
     texel: [u32; 2],
     target: [u32; 2],
@@ -235,17 +236,42 @@ fn prepare_sprite(
     mers: &mut [u8],
     aux: &mut [u8],
 ) -> Result<SpriteMaps, Error> {
-    let entry = if s.vanilla {
+    let external = s.normal.is_some() || s.specular.is_some();
+    let entry = if s.vanilla && !external {
         crate::vanilla::find(&s.name)
     } else {
         None
     };
     let images = entry.map(crate::vanilla::Entry::images).transpose()?;
-    let material = images.as_ref().map(|p| &p.0);
-    let auxiliary = images.as_ref().and_then(|p| p.1.as_ref());
-    let layout = material
-        .map(|image| crate::vanilla_frames::layout(&s.name, [image.width, image.height]))
-        .transpose()?;
+    let material = s
+        .specular
+        .as_ref()
+        .map(|m| &m.image)
+        .or_else(|| images.as_ref().map(|p| &p.0));
+    let auxiliary = s
+        .normal
+        .as_ref()
+        .map(|m| &m.image)
+        .or_else(|| images.as_ref().and_then(|p| p.1.as_ref()));
+    let layout = if let Some(map) = &s.specular {
+        Some(map.layout())
+    } else {
+        material
+            .map(|image| crate::vanilla_frames::layout(&s.name, [image.width, image.height]))
+            .transpose()?
+    };
+    let normal_layout = s.normal.as_ref().map(|m| m.layout()).or(layout);
+    let normal_frame = normal_layout
+        .and_then(|l| l.frames().first())
+        .map_or(0, |v| v[0]);
+    let lab_specular = s.specular.is_some();
+    let emission = |p: [u8; 4]| {
+        if lab_specular {
+            crate::lab_pbr::emission(p[3])
+        } else {
+            p[1]
+        }
+    };
     let dx = (s.bounds[0] * extent[0] as f32).round() as usize;
     let dy = (s.bounds[1] * extent[1] as f32).round() as usize;
     let w = ((s.bounds[2] - s.bounds[0]) * extent[0] as f32).round() as usize;
@@ -262,26 +288,40 @@ fn prepare_sprite(
             let point = [x as u32, y as u32];
             let target = [w as u32, h as u32];
             if let Some(i) = material {
-                mers[at..at + 4].copy_from_slice(&sample_material(
-                    i,
-                    layout.expect("材质已建立布局"),
-                    frame,
-                    point,
-                    target,
-                ));
+                let texel =
+                    sample_material(i, layout.expect("材质已建立布局"), frame, point, target);
+                mers[at..at + 4].copy_from_slice(&if lab_specular {
+                    crate::lab_pbr::mers(texel)
+                } else {
+                    texel
+                });
+                if lab_specular {
+                    aux[at + 3] = texel[1];
+                }
             }
             if let Some(i) = auxiliary {
-                aux[at..at + 4].copy_from_slice(&sample_material(
+                let texel = sample_material(
                     i,
-                    layout.expect("辅助图与材质同布局"),
-                    frame,
+                    normal_layout.expect("辅助图已建立布局"),
+                    normal_frame,
                     point,
                     target,
-                ));
+                );
+                if external {
+                    aux[at..at + 2].copy_from_slice(&texel[..2]);
+                } else {
+                    aux[at..at + 4].copy_from_slice(&texel);
+                }
             }
         }
     }
-    let textured = material.is_some_and(|m| m.pixels.as_chunks::<4>().0.iter().any(|p| p[1] != 0));
+    let textured = material.is_some_and(|m| {
+        m.pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|&p| emission(p) != 0)
+    });
     let source_frames = if s.frames.is_empty() {
         &[[0, 1]][..]
     } else {
@@ -327,9 +367,13 @@ fn prepare_sprite(
                 } else {
                     host_frame
                 };
-                let g = f64::from(
-                    sample_material(material, layout, material_frame, texel, s.extent)[1],
-                ) / 255.;
+                let g = f64::from(emission(sample_material(
+                    material,
+                    layout,
+                    material_frame,
+                    texel,
+                    s.extent,
+                ))) / 255.;
                 moments[0] += energy;
                 moments[1] += energy * g;
                 if alpha >= 128 {
@@ -365,9 +409,13 @@ fn prepare_sprite(
                 for y in 0..s.extent[1] {
                     for x in 0..s.extent[0] {
                         let at = (y * s.extent[0] + x) as usize;
-                        let emission = f32::from(
-                            sample_material(material, layout, frame, [x, y], s.extent)[1],
-                        ) / 255.;
+                        let emission = f32::from(emission(sample_material(
+                            material,
+                            layout,
+                            frame,
+                            [x, y],
+                            s.extent,
+                        ))) / 255.;
                         emission_envelope[at] = emission_envelope[at].max(emission);
                     }
                 }
@@ -381,9 +429,10 @@ fn prepare_sprite(
         None
     };
     Ok(SpriteMaps {
-        authored: entry.is_some_and(|e| e.authored_normal),
+        authored: s.normal.is_some() || entry.is_some_and(|e| e.authored_normal),
         mers: material.is_some(),
-        auxiliary: auxiliary.is_some(),
+        auxiliary: auxiliary.is_some() || lab_specular,
+        lab_specular,
         textured,
         proposal,
         power,
@@ -429,6 +478,9 @@ fn definition(
     }
     if m.auxiliary {
         v.control[2] |= Definition::AUXILIARY;
+    }
+    if m.lab_specular {
+        v.control[2] |= Definition::LAB_SPECULAR;
     }
     v.control[3] = u32::from(m.authored);
     if m.textured {

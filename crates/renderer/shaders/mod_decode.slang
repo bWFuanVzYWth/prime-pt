@@ -312,7 +312,11 @@ struct MappedIor : IAuxResponse
     }
     static func ior(start: uint, auxiliary: float4)->float
     {
+#if defined(OPENPBR_VARIANT) && (OPENPBR_VARIANT & 65536)
+        return lab_ior(auxiliary.w);
+#else
         return 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) * (1.0 / 255.0));
+#endif
     }
     static func medium_ior(start: uint, auxiliary: float4)->float
     {
@@ -421,7 +425,13 @@ public func decode_surface<C : IDecodeColor, A : IDecodeAux>(input_hit: pt::Hit,
     var result : transport::SurfaceMaterial = {};
     result.pbr.base_roughness =
         float4(ColorResponse.read(start, layer.color), AuxResponse.roughness(layer.weights.x, aux));
+#if OPENPBR_VARIANT & 65536
+    result.pbr.base_roughness.xyz *= lab_metal_tint(aux.w);
+#endif
     result.pbr.surface = float4(ior, layer.weights.yz, Boundary.thickness(start));
+#if (OPENPBR_VARIANT & 65536) && !(OPENPBR_VARIANT & 131072)
+    result.pbr.surface.z = 0;
+#endif
     result.pbr.control.x = Boundary.flags();
     result.normal = AuxResponse.normal(hit);
     result.transmitted = Boundary.medium(hit, start, AuxResponse.medium_ior(start, aux));

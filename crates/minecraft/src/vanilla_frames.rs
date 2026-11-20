@@ -15,20 +15,33 @@ include!("../assets/vanilla_pbr/frames.rs");
 
 /// 一张已校验sheet的只读布局；Copy只复制尺寸及静态序列引用，不复制像素。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Layout {
+pub struct Layout<'a> {
     sheet: [u32; 2],
     frame: [u32; 2],
-    sequence: &'static [[u32; 2]],
+    sequence: &'a [[u32; 2]],
     interpolate: bool,
 }
-impl Layout {
+impl<'a> Layout<'a> {
+    pub(crate) const fn from_validated(
+        sheet: [u32; 2],
+        frame: [u32; 2],
+        sequence: &'a [[u32; 2]],
+        interpolate: bool,
+    ) -> Self {
+        Self {
+            sheet,
+            frame,
+            sequence,
+            interpolate,
+        }
+    }
     /// 材质PNG内单个逻辑帧尺寸，独立于Java sprite tile。
     pub const fn frame_extent(self) -> [u32; 2] {
         self.frame
     }
     /// 完整材质时间序列`[sheet_frame_index,duration_ticks]`；空为静态frame0。
     /// 资源发光包络须访问此序列，即使Java albedo没有动画；重复帧可由调用者去重。
-    pub const fn frames(self) -> &'static [[u32; 2]] {
+    pub const fn frames(self) -> &'a [[u32; 2]] {
         self.sequence
     }
     /// 原始时间序列的插值标志；保存它不代表已经接入运行期动画播放。
@@ -66,7 +79,7 @@ impl Layout {
 /// 按明确原版sprite身份解析26.3帧布局，并校验解码PNG尺寸。
 /// 未命中冻结动画表时使用整PNG静态帧；零或超过16384的尺寸、已知sheet尺寸不符返回错误。
 /// 这里没有I/O、像素分配、JSON解析或缓存；资源所有者只需每sheet建立一次。
-pub fn layout(name: &str, sheet_extent: [u32; 2]) -> Result<Layout, Error> {
+pub fn layout(name: &str, sheet_extent: [u32; 2]) -> Result<Layout<'static>, Error> {
     if sheet_extent.iter().any(|&v| v == 0 || v > 16384) {
         return Err(Error::Input("材质sheet尺寸无效"));
     }

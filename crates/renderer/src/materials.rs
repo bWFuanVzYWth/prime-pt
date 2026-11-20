@@ -94,7 +94,9 @@ pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinitio
     } else {
         0
     };
+    let lab_specular = flags & MaterialDefinition::LAB_SPECULAR != 0;
     if normal == 0
+        && !lab_specular
         && flow.bits() & openpbr::FlowKey::CONDUCTOR_REFLECTION != 0
         && flow.bits() & openpbr::FlowKey::MIXED_METALNESS == 0
     {
@@ -111,7 +113,11 @@ pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinitio
     } else {
         0
     };
+    let thin_sss = lab_specular
+        && flags & (MaterialDefinition::TWO_SIDED | MaterialDefinition::FRONT_ONLY) != 0;
     maps | normal
+        | ((lab_specular as u32) << 16)
+        | ((thin_sss as u32) << 17)
         | emission
         | if flow.emits() && material.control[3] >> 1 != 0 {
             1 << 10
@@ -361,6 +367,9 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
     if m.control[0] == 0 && metal == Weight::Switch && sss != Weight::Blend {
         // 纯金属 texel 的二值 SSS 不参与非金属底层；任何内点都保留完整混合域。
         sss = dielectric_sss.unwrap_or(Weight::Zero);
+    }
+    if flags & M::LAB_SPECULAR != 0 && flags & (M::TWO_SIDED | M::FRONT_ONLY) == 0 {
+        sss = Weight::Zero;
     }
     if flags & M::AUXILIARY != 0
         && m.control[3] & M::AUTHORED_NORMAL != 0

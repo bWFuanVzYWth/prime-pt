@@ -74,6 +74,38 @@ fn animation_source_keeps_declared_order_duration_and_full_rgba_sheet() {
 }
 
 #[test]
+#[ignore = "需使用 SPBR-22_6.zip 运行 Gradle labPbrFixture"]
+fn spbr_materials_reach_the_gpu_atlas() {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/lab-pbr-fixture.bin"
+    ))
+    .unwrap();
+    let mut catalog = Catalog::default();
+    let mut candidate = catalog.stage_resources(&bytes).unwrap();
+    let sculk = candidate
+        .sprites()
+        .find(|s| s.name == "minecraft:block/sculk")
+        .unwrap();
+    let layout = sculk.specular.as_ref().unwrap().layout();
+    assert_eq!(layout.frames(), [[0, 20], [1, 20], [2, 20], [3, 20]]);
+    assert!(layout.interpolate());
+    let maps = candidate
+        .material_resources([80, 16], &[255; 80 * 16 * 4])
+        .unwrap();
+    for (tile, mers, aux) in [
+        (0, [255, 0, 35, 0], [62, 62, 0, 255]),
+        (1, [0, 0, 1, 254], [67, 67, 0, 44]),
+        (2, [0, 0, 169, 0], [121, 114, 0, 0]),
+        (4, [0, 253, 127, 255], [105, 96, 0, 0]),
+    ] {
+        let at = tile * 16 * 4;
+        assert_eq!(&maps.mers[at..at + 4], &mers);
+        assert_eq!(&maps.auxiliary[at..at + 4], &aux);
+    }
+}
+
+#[test]
 fn animation_requires_pixels_and_indices_inside_the_declared_sheet() {
     let mut catalog = Catalog::default();
     for bytes in [animated_sprite(2, true), animated_sprite(1, false)] {
