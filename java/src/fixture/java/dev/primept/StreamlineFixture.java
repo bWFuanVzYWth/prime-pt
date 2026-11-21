@@ -8,6 +8,7 @@ import com.mojang.renderpearl.backend.vulkan.VulkanBackend;
 import com.mojang.renderpearl.backend.vulkan.VulkanFeatureSets;
 import com.mojang.renderpearl.backend.vulkan.VulkanPhysicalDevice;
 import com.mojang.renderpearl.backend.vulkan.init.FeatureSet;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
 import java.util.Set;
 import java.nio.ByteBuffer;
 import java.nio.file.Path;
@@ -117,8 +118,27 @@ final class StreamlineFixture {
                 output.clear();
                 for (int i = 0; i < output.capacity(); i++) require(output.get(i) == (byte) 0x5a, "空查询不得写入buffer");
                 System.out.println("Native biome/tint FFM null and direct-buffer queries passed");
+                drawFeaturePackets(renderer);
             }
         }
+    }
+
+    /** 以空命令缓冲触发 DLL 的入参检查，覆盖实时与冻结帧的实际 Java 调用点。 */
+    private static void drawFeaturePackets(Native renderer) {
+        var state = new CameraRenderState();
+        var camera = ByteBuffer.allocateDirect(72);
+        var environment = ByteBuffer.allocateDirect(EnvironmentPacket.BYTES);
+        for (var features : new ByteBuffer[] {WorldFeatures.packet(state), null}) {
+            try {
+                renderer.draw(0L, 0L, 0L, 3840, 2160, camera, environment, features,
+                        Denoiser.OFF, Quality.DLAA, 2, 12);
+                throw new AssertionError("空命令缓冲须由 prime_draw 拒绝");
+            } catch (IllegalStateException failure) {
+                if (!"draw 句柄、尺寸、camera 或 environment 无效".equals(failure.getMessage()))
+                    throw failure;
+            }
+        }
+        System.out.println("实时动态数据和冻结帧的空指针均已通过 FFM 调用 prime_draw");
     }
 
     private static void require(boolean condition, String message) {
