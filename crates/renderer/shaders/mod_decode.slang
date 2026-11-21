@@ -429,7 +429,7 @@ public func decode_surface<C : IDecodeColor, A : IDecodeAux>(input_hit: pt::Hit,
     result.pbr.base_roughness.xyz *= lab_metal_tint(aux.w);
 #endif
     result.pbr.surface = float4(ior, layer.weights.yz, Boundary.thickness(start));
-#if (OPENPBR_VARIANT & 65536) && !(OPENPBR_VARIANT & 131072)
+#if !(OPENPBR_FLOW & 8)
     result.pbr.surface.z = 0;
 #endif
     result.pbr.control.x = Boundary.flags();

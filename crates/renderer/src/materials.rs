@@ -113,11 +113,8 @@ pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinitio
     } else {
         0
     };
-    let thin_sss = lab_specular
-        && flags & (MaterialDefinition::TWO_SIDED | MaterialDefinition::FRONT_ONLY) != 0;
     maps | normal
         | ((lab_specular as u32) << 16)
-        | ((thin_sss as u32) << 17)
         | emission
         | if flow.emits() && material.control[3] >> 1 != 0 {
             1 << 10
@@ -368,7 +365,8 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
         // 纯金属 texel 的二值 SSS 不参与非金属底层；任何内点都保留完整混合域。
         sss = dielectric_sss.unwrap_or(Weight::Zero);
     }
-    if flags & M::LAB_SPECULAR != 0 && flags & (M::TWO_SIDED | M::FRONT_ONLY) == 0 {
+    // TODO：有厚度的材质需要跨表面 BSSRDF；当前把这部分权重交还漫反射底层。
+    if !m.allows_thin_scattering() {
         sss = Weight::Zero;
     }
     if flags & M::AUXILIARY != 0
@@ -435,6 +433,28 @@ mod tests {
         bindings(1, &[m], [1, 1], &[255; 4], &mers, &aux)
             .unwrap()
             .keys[0]
+    }
+
+    #[test]
+    fn closed_surface_uses_the_diffuse_base_even_with_full_scattering_weight() {
+        use MaterialDefinition as M;
+        for flags in [0, M::MERS, M::MERS | M::AUXILIARY | M::LAB_SPECULAR] {
+            let mut material = M::default();
+            material.control[2] = flags;
+            material.surface[2] = 1.;
+            let full = [0, 0, 164, 255];
+            let aux = [128, 128, 0, 10];
+            let closed = key(material, full, aux);
+            let mut diffuse = material;
+            diffuse.surface[2] = 0.;
+            assert_eq!(closed, key(diffuse, [0, 0, 164, 0], aux));
+            assert_ne!(closed.0.bits() & openpbr::FlowKey::DIFFUSE, 0);
+            material.control[2] |= M::TWO_SIDED;
+            assert_ne!(
+                key(material, full, aux).0.bits() & openpbr::FlowKey::SUBSURFACE,
+                0
+            );
+        }
     }
 
     #[test]

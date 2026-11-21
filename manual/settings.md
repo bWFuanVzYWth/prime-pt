@@ -24,6 +24,8 @@
 
 要试用 LabPBR 资源包，在游戏「选项 → 资源包」打开资源包文件夹，把 ZIP 放进去，返回选择它并点击「完成」。查看受阳光照射的金属、钻石块和暗处的萤石，可以分别检查反射、法线与自发光。资源包可单独覆盖法线图（`_n`）和材质图（`_s`），并沿用原版底色。当前材质图集使用动画的首个指定帧。高度视差、环境遮蔽和孔隙吸水属于可选效果，当前材质路径使用法线、平滑度、反射率、薄表面散射和自发光。[LabPBR 材质规范](https://shaderlabs.org/wiki/LabPBR_Material_Standard)
 
+发光方块的任一材质纹理指定了发光区域时，只有纹理标出的区域会发光。整个方块都没有指定发光区域时，使用原版亮度。次表面散射目前用于薄片，苔藓块等有厚度的方块使用漫反射。
+
 开发时可在 mod 根目录的 PowerShell 运行 `.\gradlew.bat labPbrFixture "-PlabPbrPack=C:\资源包\SPBR-22_6.zip"`，再运行 `cargo test --release -p prime_minecraft spbr_materials_reach -- --ignored`。看到 `1 passed` 表示测试贴图已通过游戏资源栈、解码和图集检查。若未生成数据，先检查 ZIP 路径和 Gradle 输出。
 
 在视频设置的「PT 显示」中开启「镜头泛光」，用「泛光模式」选择外观。

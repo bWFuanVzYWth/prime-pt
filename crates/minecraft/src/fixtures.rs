@@ -149,6 +149,57 @@ fn resource_packet_fields(support: u32, falling: bool, generation: u64) -> Vec<u
     b
 }
 
+/// 以指定原版方块与同名 sprite 替换状态 1 的六面模型材质，使用实际内嵌预设。
+/// 图集为 32×16，左半部由调用方填入底色；错误来自原始资源字典的校验。
+pub fn vanilla_cube<'a>(
+    catalog: &'a mut Catalog,
+    name: &str,
+) -> Result<crate::PreparedCatalog<'a>, Error> {
+    let mut prepared = catalog.stage_resources(&resource_packet())?;
+    prepared.next.states.get_mut(&1).unwrap().name = format!("minecraft:{name}");
+    let sprite = prepared.next.sprites.get_mut(&1).unwrap();
+    sprite.name = format!("minecraft:block/{name}");
+    sprite.vanilla = true;
+    Ok(prepared)
+}
+
+/// 26.3 FaceBakery 实测的贴地地衣。两种源面顺序用于核对外露面的选择。
+/// 候选使用 32×16 图集左半部；调用方提供颜色和 alpha，然后提交资源世代。
+pub fn floor_lichen(
+    catalog: &mut Catalog,
+    reverse_order: bool,
+) -> Result<crate::PreparedCatalog<'_>, Error> {
+    use crate::resources::{Model, SourceQuad, State};
+    let mut prepared = vanilla_cube(catalog, "glow_lichen")?;
+    let state = prepared.next.states.get_mut(&1).unwrap();
+    state.flags |= State::MULTIFACE;
+    state.emission = 7;
+    // 26.3 FaceBakery 的 90° UV 锁定变换。背面纹理在同一位置旋转了 180°。
+    let quad = |xz: [[f32; 2]; 4], uv: [[f32; 2]; 4]| SourceQuad {
+        face: 6,
+        tint: -1,
+        layer: 1,
+        sprite: 1,
+        emission: 0,
+        positions: xz.map(|[x, z]| [x, 0.00625, z]),
+        uv: uv.map(|[u, v]| [0.5 * u, v]),
+    };
+    let back = quad(
+        [[0., 1.], [0., 0.], [1., 0.], [1., 1.]],
+        [[1., 0.], [1., 1.], [0., 1.], [0., 0.]],
+    );
+    let front = quad(
+        [[0., 0.], [0., 1.], [1., 1.], [1., 0.]],
+        [[0., 0.], [0., 1.], [1., 1.], [1., 0.]],
+    );
+    let mut faces = vec![back, front];
+    if reverse_order {
+        faces.reverse();
+    }
+    prepared.next.models.insert(1, Model::Mesh(faces));
+    Ok(prepared)
+}
+
 /// 通过真实PRM1解码和资源准备得到可编译Catalog；GPU不参与此CPU fixture。
 pub fn catalog() -> Result<Catalog, Error> {
     let mut catalog = Catalog::default();

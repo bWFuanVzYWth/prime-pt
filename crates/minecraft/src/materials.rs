@@ -5,7 +5,8 @@
 use crate::{
     Error, ImageSource, PreparedCatalog, SpriteSource,
     emission_power::{PowerMoments, textured_amplitude},
-    resources::{BoundQuad, Model, ModelBinding, SourceQuad, State},
+    material_model::{ModelFaces, Side, affine_quad, bilateral},
+    resources::{BoundQuad, ModelBinding, SourceQuad, State},
 };
 use prime_scene::{MaterialDefinition as Definition, MaterialId};
 use simple_engine::light_sampling::{
@@ -69,62 +70,6 @@ fn glass_extinction(reference: [u8; 4]) -> [f32; 3] {
         };
         -value.clamp(1e-3, 1.).ln()
     })
-}
-
-fn exact_sum(a: f64, b: f64) -> (f64, f64) {
-    let sum = a + b;
-    let virtual_b = sum - a;
-    (sum, (a - (sum - virtual_b)) + (b - virtual_b))
-}
-
-fn affine_quad<const N: usize>(corners: &[[f32; N]; 4]) -> bool {
-    (0..N).all(|axis| {
-        exact_sum(f64::from(corners[0][axis]), f64::from(corners[2][axis]))
-            == exact_sum(f64::from(corners[1][axis]), f64::from(corners[3][axis]))
-    })
-}
-
-fn bilateral(quads: &[SourceQuad]) -> (Vec<u8>, Vec<usize>) {
-    let mut sides = vec![0; quads.len()];
-    let mut skipped = Vec::new();
-    for a in 0..quads.len() {
-        if sides[a] != 0 {
-            continue;
-        }
-        for b in a + 1..quads.len() {
-            if sides[b] != 0 {
-                continue;
-            }
-            let first = &quads[a];
-            let second = &quads[b];
-            let mapping = [0usize, 2, 1, 3].into_iter().find_map(|shift| {
-                let map = std::array::from_fn::<_, 4, _>(|i| (shift + 4 - i) % 4);
-                (shift % 2 == 0 || affine_quad(&first.positions)).then_some(())?;
-                (0..4)
-                    .all(|i| first.positions[i] == second.positions[map[i]])
-                    .then_some((map, shift))
-            });
-            let Some((mapping, shift)) = mapping else {
-                continue;
-            };
-            sides[a] = 1;
-            sides[b] = 1;
-            if shift % 2 == 0
-                && first.face == second.face
-                && first.tint == second.tint
-                && first.layer == second.layer
-                && first.sprite == second.sprite
-                && first.emission == second.emission
-                && (0..4).all(|i| first.uv[i] == second.uv[mapping[i]])
-            {
-                sides[a] = 3;
-                sides[b] = 2;
-                skipped.push(b);
-            }
-            break;
-        }
-    }
-    (sides, skipped)
 }
 
 #[derive(Clone, Copy)]
@@ -463,6 +408,7 @@ fn definition(
     q: &SourceQuad,
     s: &SpriteSource,
     m: &SpriteMaps,
+    mapped_block: bool,
 ) -> Definition {
     let mut v = Definition {
         uv_bounds: s.bounds,
@@ -486,7 +432,7 @@ fn definition(
     if m.textured {
         v.control[2] |= Definition::TEXTURED_EMISSION;
         v.emission = [1.; 4];
-    } else if state.emission.max(q.emission) > 0 {
+    } else if !mapped_block && state.emission.max(q.emission) > 0 {
         v.emission = [1., 1., 1., native_amplitude(state.emission.max(q.emission))];
     }
     if q.layer == 1 {
@@ -556,208 +502,190 @@ impl PreparedCatalog<'_> {
         let mut words = vec![0u32];
         let mut word_intern: HashMap<Vec<u32>, u32> = HashMap::new();
         let mut geometry_intern: HashMap<EmissionKey, PreparedEmission> = HashMap::new();
-        let mut sides = HashMap::new();
-        for (&id, model) in &self.next.models {
-            if let Model::Mesh(quads) = model {
-                let (flags, skip) = bilateral(quads);
-                for index in skip {
-                    self.next.skipped_quads.insert((id, index));
-                }
-                sides.insert(id, flags);
+        let mut roots = HashMap::new();
+        let mut masked_blocks = HashSet::new();
+        // 模型、加权变体和流体可被多个方块共享。发光遮罩的优先级属于方块自身。
+        for state in self.next.states.values() {
+            let faces = roots.entry(state.model).or_insert_with(|| {
+                ModelFaces::collect(state.model, &self.next.models, |sprite| {
+                    maps[&sprite].textured
+                })
+            });
+            let fluid_emits = state.fluid_kind != 0
+                && self.next.fluids.get(&state.fluid).is_some_and(|fluid| {
+                    fluid
+                        .sprites
+                        .iter()
+                        .any(|s| maps.get(s).is_some_and(|m| m.textured))
+                });
+            if (faces.mapped_emission || fluid_emits) && !masked_blocks.contains(&state.name) {
+                masked_blocks.insert(state.name.clone());
             }
         }
+        let mut sides = HashMap::new();
         let mut ids: Vec<_> = self.next.states.keys().copied().collect();
         ids.sort_unstable();
         let mut matching_blocks = HashMap::new();
         for state_id in ids {
             let state = &self.next.states[&state_id];
-            let mut stack = vec![state.model];
-            let mut seen = HashSet::new();
-            let mut bindings = Vec::new();
-            let mut face_mask = 0;
-            while let Some(model_id) = stack.pop() {
-                if model_id == 0 || !seen.insert(model_id) {
-                    continue;
-                }
-                match &self.next.models[&model_id] {
-                    Model::Unknown => {
-                        face_mask |= 127;
+            let faces = &roots[&state.model];
+            let mapped_block = masked_blocks.contains(&state.name);
+            let attached = state.flags & State::MULTIFACE != 0;
+            let mut bindings = Vec::with_capacity(faces.meshes.len());
+            let mut face_mask = if faces.unknown { 127 } else { 0 };
+            for &(model_id, quads) in &faces.meshes {
+                let sides = sides
+                    .entry((model_id, attached))
+                    .or_insert_with(|| bilateral(quads, attached));
+                let grass = (state.name == "minecraft:grass_block"
+                    && state.emission == 0
+                    && state.fluid_kind == 0
+                    && state.flags & 768 == 0)
+                    .then(|| grass_sides(quads, &self.next.sprites, &maps));
+                let mut bound = Vec::with_capacity(quads.len());
+                for (index, q) in quads.iter().enumerate() {
+                    let grass = grass
+                        .as_ref()
+                        .map_or(GrassSide::Ordinary, |sides| sides[index]);
+                    if sides[index] == Side::Omit || matches!(grass, GrassSide::Overlay) {
+                        continue;
                     }
-                    Model::Alias(id) => stack.push(*id),
-                    Model::Weighted { children, .. } => {
-                        for &(_, id) in children.iter().rev() {
-                            stack.push(id);
+                    let s = &self.next.sprites[&q.sprite];
+                    let m = &maps[&q.sprite];
+                    let mut v = definition(SurfaceSource::Model, state, q, s, m, mapped_block);
+                    let tint = match grass {
+                        GrassSide::Base { overlay } => {
+                            let top = &quads[overlay];
+                            v.control[2] |= Definition::OVERLAY;
+                            if maps[&top.sprite].mers {
+                                v.control[2] |= Definition::OVERLAY_MERS;
+                            }
+                            v.overlay_bounds = self.next.sprites[&top.sprite].bounds;
+                            top.tint
                         }
-                    }
-                    Model::Multipart(children) => {
-                        for &id in children.iter().rev() {
-                            stack.push(id);
+                        _ => q.tint,
+                    };
+                    let mut area = sentinel;
+                    match sides[index] {
+                        Side::Front => {
+                            v.control[2] |= Definition::FRONT_ONLY;
+                            v.control[1] = 1;
                         }
+                        Side::Both => {
+                            v.control[2] |= Definition::TWO_SIDED;
+                            v.control[1] = 3;
+                        }
+                        Side::Single if faces.planar => v.control[2] |= Definition::PLANAR_SHEET,
+                        _ => {}
                     }
-                    Model::Mesh(quads) => {
-                        let grass = (state.name == "minecraft:grass_block"
-                            && state.emission == 0
-                            && state.fluid_kind == 0
-                            && state.flags & 768 == 0)
-                            .then(|| grass_sides(quads, &self.next.sprites, &maps));
-                        let mut bound = Vec::with_capacity(quads.len());
-                        for (index, q) in quads.iter().enumerate() {
-                            let grass = grass
-                                .as_ref()
-                                .map_or(GrassSide::Ordinary, |sides| sides[index]);
-                            if self.next.skipped_quads.contains(&(model_id, index))
-                                || matches!(grass, GrassSide::Overlay)
-                            {
-                                continue;
-                            }
-                            let s = &self.next.sprites[&q.sprite];
-                            let m = &maps[&q.sprite];
-                            let mut v = definition(SurfaceSource::Model, state, q, s, m);
-                            let tint = match grass {
-                                GrassSide::Base { overlay } => {
-                                    let top = &quads[overlay];
-                                    v.control[2] |= Definition::OVERLAY;
-                                    if maps[&top.sprite].mers {
-                                        v.control[2] |= Definition::OVERLAY_MERS;
-                                    }
-                                    v.overlay_bounds = self.next.sprites[&top.sprite].bounds;
-                                    top.tint
-                                }
-                                _ => q.tint,
-                            };
-                            let mut area = sentinel;
-                            match sides[&model_id][index] {
-                                1 => {
-                                    v.control[2] |= Definition::FRONT_ONLY;
-                                    v.control[1] = 1;
-                                }
-                                3 => {
-                                    v.control[2] |= Definition::TWO_SIDED;
-                                    v.control[1] = 3;
-                                }
-                                _ => {}
-                            }
-                            if v.emission[3] > 0.
-                                && let Ok(geometry) = QuadArea::new(&q.positions)
-                            {
-                                area = geometry.words();
-                                let level = state.emission.max(q.emission);
-                                let power = m.power.as_ref().filter(|_| level > 0);
-                                if m.proposal.is_some() || power.is_some() {
-                                    let uv = q.uv.map(|uv| {
-                                        [
-                                            (uv[0] - s.bounds[0]) / (s.bounds[2] - s.bounds[0]),
-                                            (uv[1] - s.bounds[1]) / (s.bounds[3] - s.bounds[1]),
-                                        ]
-                                    });
-                                    let cutout = q.layer == 1;
-                                    let key = EmissionKey {
-                                        sprite: q.sprite,
-                                        uv: uv.map(|uv| uv.map(f32::to_bits)),
-                                        areas: geometry.areas().map(f64::to_bits),
-                                        cutout,
-                                    };
-                                    let prepared = geometry_intern.entry(key).or_default();
-                                    if let Some(power) = power {
-                                        let ratio =
-                                            *prepared.power_ratio.get_or_insert_with(|| {
-                                                power.ratio(Some((uv, geometry.areas())), cutout)
-                                            });
-                                        v.emission[3] =
-                                            textured_amplitude(native_amplitude(level), ratio);
-                                    }
-                                    if let Some(proposal) = &m.proposal {
-                                        let offset = if let Some(offset) = prepared.alias_offset {
-                                            offset
-                                        } else {
-                                            let coverage = if cutout {
-                                                Coverage::AlphaThreshold(128)
-                                            } else {
-                                                Coverage::Opaque
-                                            };
-                                            let offset = if let Some(table) = EmitterAlias::build(
-                                                q.positions,
-                                                uv,
-                                                coverage,
-                                                proposal,
-                                            )? {
-                                                if let Some(offset) = word_intern.get(table.words())
-                                                {
-                                                    *offset
-                                                } else {
-                                                    let offset = u32::try_from(words.len())
-                                                        .map_err(|_| {
-                                                            Error::Input("资源alias偏移溢出")
-                                                        })?;
-                                                    if offset > u32::MAX >> 1 {
-                                                        return Err(Error::Input(
-                                                            "资源alias偏移超过31bit",
-                                                        ));
-                                                    }
-                                                    words.extend_from_slice(table.words());
-                                                    word_intern
-                                                        .insert(table.words().to_vec(), offset);
-                                                    offset
-                                                }
-                                            } else {
-                                                0
-                                            };
-                                            prepared.alias_offset = Some(offset);
-                                            offset
-                                        };
-                                        v.control[3] |= offset << 1;
-                                    }
-                                }
-                            }
-                            let key = (v.words(), area);
-                            let id = if let Some(id) = intern.get(&key) {
-                                *id
-                            } else {
-                                let id = MaterialId::new(
-                                    u32::try_from(definitions.len())
-                                        .map_err(|_| Error::Input("材质表索引溢出"))?,
-                                );
-                                definitions.push(v);
-                                areas.push(area);
-                                intern.insert(key, id);
-                                id
-                            };
-                            if v.control[2] & (Definition::CUTOUT | Definition::FRONT_ONLY)
-                                == Definition::CUTOUT
-                            {
-                                let key = (id.index(), q.uv.map(|p| p.map(f32::to_bits)));
-                                if !opacity_keys.contains(&key) {
-                                    opacity_keys.try_reserve(1)?;
-                                    opacity_quads.try_reserve(1)?;
-                                    opacity_keys.insert(key);
-                                    opacity_quads.push(simple_engine::opacity::Quad {
-                                        material: id.index(),
-                                        uv: q.uv,
-                                    });
-                                }
-                            }
-                            bound.push(BoundQuad {
-                                index,
-                                material: id,
-                                tint: if tint < 0 {
-                                    None
-                                } else {
-                                    Some(
-                                        self.next
-                                            .tints()
-                                            .ok_or(Error::Input("模型tint缺少准备资源"))?
-                                            .source_id(state_id, tint)?,
-                                    )
-                                },
+                    if v.emission[3] > 0.
+                        && let Ok(geometry) = QuadArea::new(&q.positions)
+                    {
+                        area = geometry.words();
+                        let level = state.emission.max(q.emission);
+                        let power = m.power.as_ref().filter(|_| level > 0);
+                        if m.proposal.is_some() || power.is_some() {
+                            let uv = q.uv.map(|uv| {
+                                [
+                                    (uv[0] - s.bounds[0]) / (s.bounds[2] - s.bounds[0]),
+                                    (uv[1] - s.bounds[1]) / (s.bounds[3] - s.bounds[1]),
+                                ]
                             });
-                            face_mask |= 1 << q.face;
+                            let cutout = q.layer == 1;
+                            let key = EmissionKey {
+                                sprite: q.sprite,
+                                uv: uv.map(|uv| uv.map(f32::to_bits)),
+                                areas: geometry.areas().map(f64::to_bits),
+                                cutout,
+                            };
+                            let prepared = geometry_intern.entry(key).or_default();
+                            if let Some(power) = power {
+                                let ratio = *prepared.power_ratio.get_or_insert_with(|| {
+                                    power.ratio(Some((uv, geometry.areas())), cutout)
+                                });
+                                v.emission[3] = textured_amplitude(native_amplitude(level), ratio);
+                            }
+                            if let Some(proposal) = &m.proposal {
+                                let offset = if let Some(offset) = prepared.alias_offset {
+                                    offset
+                                } else {
+                                    let coverage = if cutout {
+                                        Coverage::AlphaThreshold(128)
+                                    } else {
+                                        Coverage::Opaque
+                                    };
+                                    let offset = if let Some(table) =
+                                        EmitterAlias::build(q.positions, uv, coverage, proposal)?
+                                    {
+                                        if let Some(offset) = word_intern.get(table.words()) {
+                                            *offset
+                                        } else {
+                                            let offset = u32::try_from(words.len())
+                                                .map_err(|_| Error::Input("资源alias偏移溢出"))?;
+                                            if offset > u32::MAX >> 1 {
+                                                return Err(Error::Input("资源alias偏移超过31bit"));
+                                            }
+                                            words.extend_from_slice(table.words());
+                                            word_intern.insert(table.words().to_vec(), offset);
+                                            offset
+                                        }
+                                    } else {
+                                        0
+                                    };
+                                    prepared.alias_offset = Some(offset);
+                                    offset
+                                };
+                                v.control[3] |= offset << 1;
+                            }
                         }
-                        bindings.push(ModelBinding {
-                            model: model_id,
-                            quads: bound,
-                        });
                     }
+                    let key = (v.words(), area);
+                    let id = if let Some(id) = intern.get(&key) {
+                        *id
+                    } else {
+                        let id = MaterialId::new(
+                            u32::try_from(definitions.len())
+                                .map_err(|_| Error::Input("材质表索引溢出"))?,
+                        );
+                        definitions.push(v);
+                        areas.push(area);
+                        intern.insert(key, id);
+                        id
+                    };
+                    if v.control[2] & (Definition::CUTOUT | Definition::FRONT_ONLY)
+                        == Definition::CUTOUT
+                    {
+                        let key = (id.index(), q.uv.map(|p| p.map(f32::to_bits)));
+                        if !opacity_keys.contains(&key) {
+                            opacity_keys.try_reserve(1)?;
+                            opacity_quads.try_reserve(1)?;
+                            opacity_keys.insert(key);
+                            opacity_quads.push(simple_engine::opacity::Quad {
+                                material: id.index(),
+                                uv: q.uv,
+                            });
+                        }
+                    }
+                    bound.push(BoundQuad {
+                        index,
+                        material: id,
+                        tint: if tint < 0 {
+                            None
+                        } else {
+                            Some(
+                                self.next
+                                    .tints()
+                                    .ok_or(Error::Input("模型tint缺少准备资源"))?
+                                    .source_id(state_id, tint)?,
+                            )
+                        },
+                    });
+                    face_mask |= 1 << q.face;
                 }
+                bindings.push(ModelBinding {
+                    model: model_id,
+                    quads: bound,
+                });
             }
             if state.fluid_kind != 0 {
                 let f = self
@@ -786,6 +714,7 @@ impl PreparedCatalog<'_> {
                         &q,
                         &self.next.sprites[&sprite],
                         maps,
+                        mapped_block,
                     );
                     if let Some(power) = &maps.power
                         && state.emission > 0
@@ -864,6 +793,7 @@ impl PreparedCatalog<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resources::Model;
 
     #[test]
     fn waterlogged_model_keeps_its_material_separate_from_fluid() -> Result<(), Error> {
@@ -1026,6 +956,74 @@ mod tests {
     }
 
     #[test]
+    fn custom_emission_masks_other_block_faces_and_states() -> Result<(), Error> {
+        let mut catalog = crate::Catalog::default();
+        let mut prepared = catalog.stage_resources(&crate::fixtures::resource_packet())?;
+        for (id, name) in [(1, "jack_o_lantern"), (2, "pumpkin_side")] {
+            let sprite = prepared.next.sprites.get_mut(&id).unwrap();
+            sprite.name = format!("minecraft:block/{name}");
+            sprite.vanilla = true;
+        }
+        for id in [1, 2] {
+            let state = prepared.next.states.get_mut(&id).unwrap();
+            state.name = "minecraft:jack_o_lantern".into();
+            state.emission = 15;
+            let Model::Mesh(quads) = prepared.next.models.get_mut(&id).unwrap() else {
+                unreachable!("固定六面模型");
+            };
+            for q in quads {
+                if id == 2 || q.face != 2 {
+                    q.sprite = 2;
+                    for uv in &mut q.uv {
+                        uv[0] += 0.5;
+                    }
+                }
+            }
+        }
+        prepared.next.models.insert(
+            3,
+            Model::Weighted {
+                children: vec![(1, 1)],
+                total: 1,
+            },
+        );
+        prepared.next.models.insert(4, Model::Multipart(vec![3]));
+        prepared.next.states.get_mut(&1).unwrap().model = 4;
+        // 独立发光方块复用南瓜侧面的模型和纹理，仍依赖原版亮度。
+        let separate = prepared.next.states.get_mut(&3).unwrap();
+        separate.model = 2;
+        separate.fluid_kind = 0;
+        separate.fluid = 0;
+        separate.emission = 15;
+        let Model::Mesh(quads) = prepared.next.models.get_mut(&2).unwrap() else {
+            unreachable!()
+        };
+        for q in quads {
+            q.tint = -1;
+        }
+        prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+        for id in [1, 2, 3] {
+            for q in &prepared.next.states[&id].leaves[0].quads {
+                let m = prepared.next.definitions[q.material.index() as usize];
+                assert_eq!(
+                    m.emission[3] > 0.,
+                    id == 3 || (id == 1 && q.index == 2),
+                    "state={id}, quad={}",
+                    q.index
+                );
+                assert_eq!(
+                    m.control[2] & Definition::TEXTURED_EMISSION != 0,
+                    id == 1 && q.index == 2
+                );
+                if m.emission[3] == 0. {
+                    assert_eq!(m.control[3] >> 1, 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn bilateral_pairs_preserve_distinct_uv_and_merge_only_identical_attributes() {
         let a = SourceQuad {
             face: 6,
@@ -1054,12 +1052,29 @@ mod tests {
                 [a.uv[0], a.uv[3], a.uv[2], a.uv[1]]
             },
         };
-        let (sides, skipped) = bilateral(&[SourceQuad { ..a }, reverse(true)]);
-        assert_eq!(sides, vec![1, 1]);
-        assert!(skipped.is_empty());
+        assert_eq!(
+            bilateral(&[SourceQuad { ..a }, reverse(true)], false),
+            [Side::Front, Side::Front]
+        );
         let b = reverse(false);
-        let (sides, skip) = bilateral(&[a, b]);
-        assert_eq!(sides, vec![3, 2]);
-        assert_eq!(skip, vec![1]);
+        assert_eq!(bilateral(&[a, b], false), [Side::Both, Side::Omit]);
+    }
+
+    #[test]
+    fn floor_lichen_keeps_the_exposed_coverage_from_either_ray_direction() -> Result<(), Error> {
+        for reverse_order in [false, true] {
+            let mut catalog = crate::Catalog::default();
+            let mut prepared = crate::fixtures::floor_lichen(&mut catalog, reverse_order)?;
+            prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+            let bound = &prepared.next.states[&1].leaves[0].quads;
+            assert_eq!(bound.len(), 1);
+            assert_eq!(bound[0].index, usize::from(!reverse_order));
+            let bits = prepared.next.definitions[bound[0].material.index() as usize].control[2];
+            assert_eq!(
+                bits & (Definition::CUTOUT | Definition::FRONT_ONLY | Definition::TWO_SIDED),
+                Definition::CUTOUT | Definition::TWO_SIDED
+            );
+        }
+        Ok(())
     }
 }

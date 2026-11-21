@@ -2407,8 +2407,19 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::create(false, true)?;
     let mut session = host.gpu()?;
     let gpu = session.gpu();
-    let extent = [32, 32];
-    let output = Image::new(&mut gpu.context, [32, 32, 1], ImageFormat::Rgba8Unorm)?;
+    // 铜块首纹素的切线法线倾斜超过 45°，从斜上方观察使反射光线能射向天空。
+    let camera = Camera {
+        origin: [0., 2.25, 0., 0.],
+        forward: [0., -0.6, 0.8, 0.],
+        up: [0., 0.8, 0.6, 0.],
+        ..camera()
+    };
+    let extent = [33, 33];
+    let output = Image::new(
+        &mut gpu.context,
+        [extent[0], extent[1], 1],
+        ImageFormat::Rgba8Unorm,
+    )?;
     gpu.test_roots.push(output.into());
     let definitions = [0u32, 1].map(|tile| {
         let mut material = MaterialDefinition::default();
@@ -2431,9 +2442,7 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
         light_areas: &[[u32::MAX, 0, 0, 0]; 2],
     })?;
     let options = Options::new(false, streamline::Quality::Dlaa, 2, 4)?.with_nrd();
-    for (tile, expected_roughness, expected_f0, class) in
-        [(0, 35. / 255., 1., 1.), (1, 1. / 255., 44. / 255., 0.)]
-    {
+    for (tile, expected_roughness, class) in [(0, 35. / 255., 1), (1, 1. / 255., 0)] {
         let x = tile as f32 / 5.;
         // 使用每张源图第一个 texel 的内部区域，同时保留二维 UV 导数。
         let mesh = Mesh {
@@ -2450,13 +2459,37 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
             )],
         };
         gpu.set_scene(&mesh)?;
-        host.render_options(gpu, &output, &camera(), Environment::default(), options)?;
+        host.render_options(gpu, &output, &camera, Environment::default(), options)?;
         let guides = gpu.view.as_ref().unwrap().rr.images;
         let n = float_pixel(&guides[3].download(&mut gpu.context)?, extent, 4);
-        let f0 = float_pixel(&guides[5].download(&mut gpu.context)?, extent, 4);
-        eprintln!("SPBR tile={tile} normal_roughness={n:?} F0_class={f0:?}");
+        let specular = float_pixel(&guides[5].download(&mut gpu.context)?, extent, 4);
+        let motion = float_pixel(&guides[0].download(&mut gpu.context)?, extent, 4);
+        let material_class = motion[3] as u32 & 3;
+        eprintln!(
+            "SPBR tile={tile} normal_roughness={n:?} specular={specular:?} class={material_class}"
+        );
         assert!((n[3] - expected_roughness).abs() < 0.001 && n[0].abs() + n[1].abs() > 0.4);
-        assert!(f0[..3].iter().all(|f| (f - expected_f0).abs() < 0.002) && f0[3] == class);
+        assert_eq!(material_class, class);
+        assert!((specular[3] - expected_roughness).abs() < 0.001);
+        // 白底纯金属返回单位能量。钻石的中心像素按贴图法线、视角和 F0 求菲涅尔反射。
+        let reflectance = if tile == 0 {
+            1.
+        } else {
+            let amplitude = (44.0_f32 / 255.).sqrt();
+            let ior = (1. + amplitude) / (1. - amplitude);
+            let incident_cos = (n[1] * camera.forward[1] + n[2] * camera.forward[2]).abs();
+            let transmitted_cos = (1. - (1. - incident_cos.powi(2)) / ior.powi(2)).sqrt();
+            let rs =
+                (incident_cos - ior * transmitted_cos) / (incident_cos + ior * transmitted_cos);
+            let rp =
+                (ior * incident_cos - transmitted_cos) / (ior * incident_cos + transmitted_cos);
+            0.5 * (rs.powi(2) + rp.powi(2))
+        };
+        assert!(
+            specular[..3]
+                .iter()
+                .all(|f| (f - reflectance).abs() < 0.002)
+        );
         if tile == 0 {
             let nrd = gpu.view.as_ref().unwrap().nrd.as_ref().unwrap();
             let [specular, direction, filtered] = nrd.specular_signals();
@@ -2466,10 +2499,10 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
             };
             let input = pixel(specular)?[0];
             let output = pixel(filtered)?[0];
+            eprintln!("SPBR 铜块高光 SH0 输入={input} 输出={output}");
             assert_eq!(pixel(diffuse)?[0], 0., "纯金属没有漫反射");
             assert!(input > 0. && output > 0.);
             assert!(pixel(direction)?[..3].iter().any(|x| x.abs() > 0.001));
-            eprintln!("SPBR 铜块高光 SH0 输入={input} 输出={output}");
         }
     }
     session.finish()?;

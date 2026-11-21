@@ -31,6 +31,11 @@ pub(crate) struct State {
     pub leaves: Vec<ModelBinding>,
 }
 
+impl State {
+    /// 宿主 MultifaceBlock 的薄片附着在相邻方块上，朝向本格内部的一侧外露。
+    pub(crate) const MULTIFACE: u32 = 1 << 11;
+}
+
 pub(crate) struct BoundQuad {
     pub index: usize,
     pub material: prime_scene::MaterialId,
@@ -128,7 +133,6 @@ pub struct Catalog {
     pub(crate) sprites: HashMap<u32, SpriteSource>,
     pub(crate) fluid_materials: HashMap<(u32, usize), prime_scene::MaterialId>,
     pub(crate) definitions: Vec<prime_scene::MaterialDefinition>,
-    pub(crate) skipped_quads: HashSet<(u32, usize)>,
     tints: Option<crate::tint::TintResources>,
 }
 
@@ -255,7 +259,7 @@ fn decode(bytes: &[u8]) -> Result<(Catalog, bool), Error> {
             vertical: r.f32()?,
             seed: r.u32()?,
         };
-        if flags & !2047 != 0
+        if flags & !(2047 | State::MULTIFACE) != 0
             || fluid_kind > 3
             || level > 8
             || falling > 1

@@ -114,6 +114,12 @@ impl MaterialDefinition {
     pub const OVERLAY_MERS: u32 = 1 << 8;
     /// 辅助图 A 保存 LabPBR 原始 F0／金属编号，MERS 已在准备阶段转码。
     pub const LAB_SPECULAR: u32 = 1 << 9;
+    /// 所有可达模型面共面，可使用薄层散射。
+    pub const PLANAR_SHEET: u32 = 1 << 10;
+    /// 几何能确认是薄片的面，包括已配对的正反面。
+    pub const fn allows_thin_scattering(&self) -> bool {
+        self.control[2] & (Self::FRONT_ONLY | Self::TWO_SIDED | Self::PLANAR_SHEET) != 0
+    }
     /// normalFlags的bit0表示实际源中存在作者切线法线。
     pub const AUTHORED_NORMAL: u32 = 1;
 
@@ -156,7 +162,7 @@ impl MaterialDefinition {
             && self.emission.into_iter().all(|v| v >= 0.)
             && self.control[0] & !3 == 0
             && (1..=3).contains(&self.control[1])
-            && flags & !1023 == 0
+            && flags & !2047 == 0
             && (flags & Self::LAB_SPECULAR == 0
                 || flags & (Self::AUXILIARY | Self::MERS) == (Self::AUXILIARY | Self::MERS))
             && self.uv_bounds[0] < self.uv_bounds[2]

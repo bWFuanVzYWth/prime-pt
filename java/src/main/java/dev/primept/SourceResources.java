@@ -212,6 +212,7 @@ final class SourceResources {
         if(s.getBlock()==net.minecraft.world.level.block.Blocks.GLASS||s.getBlock() instanceof net.minecraft.world.level.block.StainedGlassBlock||s.getBlock() instanceof net.minecraft.world.level.block.TintedGlassBlock)flags|=256;
         if(s.getBlock()==net.minecraft.world.level.block.Blocks.GLASS_PANE||s.getBlock() instanceof net.minecraft.world.level.block.StainedGlassPaneBlock)flags|=512;
         if(s.getBlock() instanceof net.minecraft.world.level.block.LeavesBlock)flags|=1024;
+        if(s.getBlock() instanceof net.minecraft.world.level.block.MultifaceBlock)flags|=2048;
         var p=SourcePlacement.prepare(s);if(p.kind()!=0)flags|=2;
         packet.putInt(Block.getId(s));packet.putInt(flags);packet.putInt(modelIds.getOrDefault(modelSet.get(s),0));packet.putString(name);
         VoxelShape[] shapes=(VoxelShape[])get(FACES,s);for(var d:Direction.values())packet.putInt(face(shapes[d.ordinal()],d.getAxis()));

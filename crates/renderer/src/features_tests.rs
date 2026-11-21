@@ -2024,7 +2024,7 @@ fn hardware_pt_exact_opacity_matches_software_and_rebinds_uv()
         })?;
         assert_eq!(gpu.opacity.map.is_some(), enabled);
         publish(gpu, &mesh, 1, 1, [0.; 3])?;
-        let actual = opacity_probe(gpu)?;
+        let actual = opacity_probe(gpu, 64, [c"trace_main", c"query_main"])?;
         assert_eq!(&actual[..64], &actual[64..]);
         assert!(actual.contains(&0) && actual.contains(&1));
         if let Some(expected) = &reference {
@@ -2038,7 +2038,7 @@ fn hardware_pt_exact_opacity_matches_software_and_rebinds_uv()
     mesh.quads[0] = Quad::with_material(positions, rotated, [1.; 3], MaterialId::new(0));
     publish(gpu, &mesh, 1, 2, [0.; 3])?;
     assert_ne!(gpu.region_cache.entries()[0].blas, old);
-    let changed = opacity_probe(gpu)?;
+    let changed = opacity_probe(gpu, 64, [c"trace_main", c"query_main"])?;
     assert_ne!(&changed[..16], &reference.as_ref().unwrap()[..16]);
     assert_eq!(&changed[..64], &changed[64..]);
     session.finish()?;
@@ -2046,8 +2046,185 @@ fn hardware_pt_exact_opacity_matches_software_and_rebinds_uv()
     Ok(())
 }
 
-fn opacity_probe(gpu: &mut Gpu) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
-    let output = Buffer::new(&mut gpu.context, 128 * 4, true)?;
+fn single_block_mesh(catalog: &prime_minecraft::Catalog) -> Result<Mesh, prime_minecraft::Error> {
+    use prime_minecraft::{Neighbor, Neighborhood, SectionStorage, compile_section};
+    let mut words = vec![0; 64];
+    words[0] = 1;
+    let storage = SectionStorage::new(1, vec![0, 1], words)?;
+    let mut sections = [Neighbor::Empty; 27];
+    sections[13] = Neighbor::Available(&storage);
+    Ok(compile_section(
+        catalog,
+        &Neighborhood {
+            key: [0; 3],
+            generation: catalog.generation(),
+            sections,
+        },
+    )?
+    .mesh)
+}
+
+#[test]
+#[ignore = "真实 Vulkan，封闭苔藓方块和清零 SSS 的参照应有相同线性 HDR；PRIME_MOSS_RGBA 可提供原版底色"]
+fn hardware_pt_closed_moss_matches_diffuse() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_ser()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let image = image(gpu)?;
+    let camera = Camera {
+        origin: [0.5, 0.5, -1., 0.],
+        right: [0.4, 0., 0., 0.],
+        up: [0., 0.4, 0., 0.],
+        ..camera()
+    };
+    let env = Environment {
+        sun_direction: [0., 0.8, -0.6],
+        ..Default::default()
+    };
+    let options = Options::new(false, streamline::Quality::Dlaa, pt::REALTIME_SAMPLES, 6)?;
+    let color = if let Some(path) = std::env::var_os("PRIME_MOSS_RGBA") {
+        std::fs::read(path)?
+    } else {
+        [82, 105, 50, 255].repeat(16 * 16)
+    };
+    assert_eq!(color.len(), 16 * 16 * 4);
+    let mut atlas = vec![255; 32 * 16 * 4];
+    for (row, source) in atlas
+        .chunks_exact_mut(32 * 4)
+        .zip(color.chunks_exact(16 * 4))
+    {
+        row[..16 * 4].copy_from_slice(source);
+    }
+    let mut rendered = Vec::new();
+    for diffuse in [false, true] {
+        let mut catalog = prime_minecraft::Catalog::default();
+        let mut stage = prime_minecraft::fixtures::vanilla_cube(&mut catalog, "moss_block")?;
+        let mut maps = stage.material_resources([32, 16], &atlas)?;
+        assert!(maps.mers.chunks_exact(4).any(|p| p[3] > 0));
+        if diffuse {
+            for p in maps.mers.chunks_exact_mut(4) {
+                p[3] = 0;
+            }
+        }
+        gpu.replace_resources(ResourceUpload {
+            generation: gpu.resource_generation + 1,
+            extent: maps.extent,
+            albedo: &atlas,
+            materials: maps.materials,
+            mers: &maps.mers,
+            auxiliary: &maps.auxiliary,
+            emission_alias_words: &maps.emission_alias_words,
+            opacity_quads: &maps.opacity_quads,
+            light_areas: &maps.quad_areas,
+        })?;
+        stage.commit();
+        let mesh = single_block_mesh(&catalog)?;
+        assert_eq!(mesh.quads.len(), 6);
+        publish(
+            gpu,
+            &mesh,
+            u64::from(diffuse) + 1,
+            u64::from(diffuse) + 1,
+            [0.; 3],
+        )?;
+        exposure_view(gpu)?;
+        gpu.test_restart_sample_sequence(0)?;
+        host.render_options(gpu, &image, &camera, env, options)?;
+        rendered.push(accumulated_rgb(gpu)?);
+    }
+    let center = rendered[0][16 * 32 + 16];
+    assert!(center[1] > 0. && center.iter().all(|c| c.is_finite()));
+    assert_eq!(rendered[0], rendered[1]);
+    eprintln!(
+        "封闭苔藓与漫反射参照：{} 个线性 RGB 像素完全一致，中心 {:?}",
+        rendered[0].len(),
+        center
+    );
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "真实 Vulkan，逐纹素核对贴地地衣的主射线与太阳阴影；PRIME_LICHEN_RGBA 可提供原版 16×16 RGBA8"]
+fn hardware_pt_floor_lichen_shadow() -> Result<(), Box<dyn std::error::Error>> {
+    use prime_minecraft::{Catalog, fixtures};
+    let host = Host::new_ser()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let texels = if let Some(path) = std::env::var_os("PRIME_LICHEN_RGBA") {
+        std::fs::read(path)?
+    } else {
+        (0..256)
+            .flat_map(|i| {
+                [
+                    160,
+                    170,
+                    96,
+                    if (i % 16 + 3 * (i / 16)) % 7 < 3 {
+                        255
+                    } else {
+                        0
+                    },
+                ]
+            })
+            .collect()
+    };
+    assert_eq!(texels.len(), 16 * 16 * 4);
+    let mask: Vec<_> = texels
+        .chunks_exact(4)
+        .map(|p| u32::from(p[3] >= 128))
+        .collect();
+    let mut atlas = vec![255; 32 * 16 * 4];
+    for (row, source) in atlas
+        .chunks_exact_mut(32 * 4)
+        .zip(texels.chunks_exact(16 * 4))
+    {
+        row[..16 * 4].copy_from_slice(source);
+    }
+    for omm in [false, true] {
+        if omm && !host.opacity_micromap {
+            continue;
+        }
+        let mut catalog = Catalog::default();
+        let mut staged = fixtures::floor_lichen(&mut catalog, true)?;
+        let maps = staged.material_resources([32, 16], &atlas)?;
+        gpu.replace_resources(ResourceUpload {
+            generation: gpu.resource_generation + 1,
+            extent: maps.extent,
+            albedo: &atlas,
+            materials: maps.materials,
+            mers: &maps.mers,
+            auxiliary: &maps.auxiliary,
+            emission_alias_words: &maps.emission_alias_words,
+            opacity_quads: if omm { &maps.opacity_quads } else { &[] },
+            light_areas: &maps.quad_areas,
+        })?;
+        staged.commit();
+        let mesh = single_block_mesh(&catalog)?;
+        publish(gpu, &mesh, u64::from(omm) + 1, u64::from(omm) + 1, [0.; 3])?;
+        assert_eq!(gpu.opacity.map.is_some(), omm);
+        let hits = opacity_probe(gpu, 256, [c"lichen_camera", c"lichen_sun"])?;
+        assert_eq!(&hits[..256], mask, "主视线 OMM={omm}");
+        assert_eq!(&hits[256..], mask, "接收面朝太阳 OMM={omm}");
+        eprintln!(
+            "地衣 OMM={omm}：主视线和太阳均命中 {} 个纹素，放过 {} 个孔洞",
+            mask.iter().sum::<u32>(),
+            256 - mask.iter().sum::<u32>()
+        );
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+fn opacity_probe(
+    gpu: &mut Gpu,
+    rays: u32,
+    entries: [&CStr; 2],
+) -> Result<Vec<u32>, Box<dyn std::error::Error>> {
+    let bytes_len = u64::from(rays) * 2 * 4;
+    let output = Buffer::new(&mut gpu.context, bytes_len, true)?;
     let mut descriptors = vec![
         Binding::Acceleration(gpu.scene.top),
         Binding::StorageBuffer(gpu.scene.quads),
@@ -2075,8 +2252,8 @@ fn opacity_probe(gpu: &mut Gpu) -> Result<Vec<u32>, Box<dyn std::error::Error>> 
             args: &[],
         })
     };
-    let trace = compile("trace_main", "raygeneration")?;
-    let query = compile("query_main", "compute")?;
+    let trace = compile(entries[0].to_str()?, "raygeneration")?;
+    let query = compile(entries[1].to_str()?, "compute")?;
     let programs = programs(&[], false, gpu.generation.as_ref().unwrap().hit);
     let trace = RayTracingPipeline::new(
         &mut gpu.context,
@@ -2084,7 +2261,7 @@ fn opacity_probe(gpu: &mut Gpu) -> Result<Vec<u32>, Box<dyn std::error::Error>> 
         [
             RayShader {
                 spirv: trace.bytes(),
-                entry: c"trace_main",
+                entry: entries[0],
             },
             programs.miss,
             programs.closest_hit,
@@ -2097,18 +2274,18 @@ fn opacity_probe(gpu: &mut Gpu) -> Result<Vec<u32>, Box<dyn std::error::Error>> 
         bindings,
         RayShader {
             spirv: query.bytes(),
-            entry: c"query_main",
+            entry: entries[1],
         },
     )?;
     let mut commands = Commands::new(&gpu.context)?;
-    commands.trace(trace, [64, 1])?;
+    commands.trace(trace, [rays, 1])?;
     commands.barrier();
-    commands.dispatch(query, [1, 1, 1])?;
+    commands.dispatch(query, [rays.div_ceil(64), 1, 1])?;
     commands.barrier();
     commands
         .finish(&mut gpu.context)?
         .submit_and_wait(&mut gpu.context)?;
-    let mut bytes = vec![0u8; 128 * 4];
+    let mut bytes = vec![0u8; bytes_len as usize];
     output.read(&mut gpu.context, 0, &mut bytes)?;
     Ok(bytes
         .chunks_exact(4)

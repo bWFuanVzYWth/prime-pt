@@ -21,6 +21,7 @@ mod emission_power;
 pub mod fixtures;
 mod fluid;
 mod lab_pbr;
+mod material_model;
 mod materials;
 mod palette;
 mod resources;
