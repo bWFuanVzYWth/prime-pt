@@ -450,7 +450,7 @@ public func resolve_material<let has_aux : bool = false, let read_color : bool =
         result.pbr.surface.z = mers.w;
     }
     // 未知命中的导引和参考路径遵守与资源期相同的薄片判定。
-    if ((material.control.z & (32u | 64u | 1024u)) == 0)
+    if ((material.control.z & (32u | 64u | 1024u | 16384u)) == 0)
         result.pbr.surface.z = 0;
     var medium : float4 = material.extinction;
     if ((mask & 2u) != 0)

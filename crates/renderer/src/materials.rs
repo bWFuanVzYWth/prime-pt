@@ -287,8 +287,14 @@ pub(super) fn bindings<'a>(
     keys.try_reserve_exact(definitions.len())
         .map_err(scene_cache::Error::from)?;
     for (id, source) in definitions.iter().enumerate() {
-        let key = match bind(&mut atlas, source) {
-            Ok(key) => key,
+        let mut material = *source;
+        let key = match bind(&mut atlas, &mut material) {
+            Ok(key) => {
+                if material.control[2] != source.control[2] {
+                    effective.to_mut()[id] = material;
+                }
+                key
+            }
             Err(reason) => {
                 eprintln!(
                     "[prime_pt] WARN 材质世代 {generation}，材质 {id} 回退普通非金属：{reason}"
@@ -304,8 +310,9 @@ pub(super) fn bindings<'a>(
                 {
                     default.uv_bounds = source.uv_bounds;
                 }
+                let key = bind(&mut atlas, &mut default).map_err(Error::Invalid)?;
                 effective.to_mut()[id] = default;
-                bind(&mut atlas, &default).map_err(Error::Invalid)?
+                key
             }
         };
         keys.push(key);
@@ -316,7 +323,7 @@ pub(super) fn bindings<'a>(
     })
 }
 
-fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static str> {
+fn bind(atlas: &mut Atlas<'_>, m: &mut MaterialDefinition) -> Result<Key, &'static str> {
     use MaterialDefinition as M;
     use openpbr::{Base, Range, Recipe, Weight};
     if !m.valid() || !m.uv_bounds.into_iter().all(|v| (0. ..=1.).contains(&v)) {
@@ -330,6 +337,10 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
         None
     };
     let source = atlas.tile(m.uv_bounds, flags & M::CUTOUT != 0);
+    m.control[2] &= !M::PERFORATED;
+    if !overlay && source.is_some_and(|t| !t.fully_covered) {
+        m.control[2] |= M::PERFORATED;
+    }
     let base = if top.is_some_and(|t| t.fully_covered) {
         None
     } else {
@@ -471,6 +482,29 @@ mod tests {
             assert_ne!(
                 key(material, full, aux).0.bits() & openpbr::FlowKey::SUBSURFACE,
                 0
+            );
+        }
+    }
+
+    #[test]
+    fn cutout_cube_scattering_follows_visible_coverage() {
+        let mut leaf = MaterialDefinition::default();
+        leaf.surface[2] = 1.;
+        let defs = [leaf];
+        for alpha in [0, 255] {
+            let bound = bindings(
+                1,
+                &defs,
+                [2, 1],
+                &[255, 255, 255, 255, 255, 255, 255, alpha],
+                &[0; 8],
+                &[0; 8],
+            )
+            .unwrap();
+            assert_eq!(bound.definitions[0].allows_thin_scattering(), alpha == 0);
+            assert_eq!(
+                bound.keys[0].0.bits() & openpbr::FlowKey::SUBSURFACE != 0,
+                alpha == 0
             );
         }
     }

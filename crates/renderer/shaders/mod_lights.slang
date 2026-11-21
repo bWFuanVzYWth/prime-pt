@@ -195,48 +195,6 @@ public var mixed_tree : StructuredBuffer<uint4>;
 static const let selectors = 1u << 24u;
 static const let leaf_bit = 0x80000000u;
 
-func mixed_interval<let reverse : bool>(receiver: float3, selector: uint, rank: uint, header: uint4)
-    ->light_bvh::SelectedInterval
-{
-    var remaining = selector;
-    var count = selectors;
-    var node = header.z;
-    while ((node & leaf_bit) == 0)
-    {
-        let at = 4u * header.y + 3u * node;
-        let a = asfloat(mixed_tree[at]);
-        let b = asfloat(mixed_tree[at + 1u]);
-        let children = mixed_tree[at + 2u];
-        var left = count;
-        if (a.w <= 0)
-            left = 0u;
-        else if (b.w > 0)
-        {
-            let da = a.xyz - receiver;
-            let db = b.xyz - receiver;
-            left = light_bvh::split_selectors(float2(max(dot(da, da), 1.0e-6), a.w),
-                                              float2(max(dot(db, db), 1.0e-6), b.w), children.z,
-                                              children.w, count);
-        }
-        let right = reverse ? rank >= node : remaining >= left;
-        if (right)
-        {
-            if (!reverse)
-                remaining -= left;
-            count -= left;
-            node = children.y;
-        }
-        else
-        {
-            count = left;
-            node = children.x;
-        }
-        if (count == 0)
-            break;
-    }
-    return { node & ~leaf_bit, remaining, count };
-}
-
 public func sample_quad_light(surface_point: geometry::SurfacePoint, random_sample: float3,
                               params: Params)
     ->light_sampling::LightSample
@@ -249,8 +207,8 @@ public func sample_quad_light(surface_point: geometry::SurfacePoint, random_samp
             surface_point, random_sample.xy, params,
             light_bvh::sample_light_world(world, receiver, anchor, random_sample.z));
     let header = mixed_tree[0];
-    let selected =
-        mixed_interval<false>(receiver, uint(random_sample.z * float(selectors)), 0u, header);
+    let selected = light_bvh::mixed_interval<false>(
+        mixed_tree, receiver, uint(random_sample.z * float(selectors)), 0u, header);
     let meta = mixed_tree[2u * header.y + selected.index];
     if ((meta.w & leaf_bit) != 0)
     {
@@ -304,7 +262,7 @@ public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float
         {
             let header = mixed_tree[0];
             let rank = mixed_tree[3u * header.y + group].x;
-            let selected = mixed_interval<true>(previous, 0u, rank, header);
+            let selected = light_bvh::mixed_interval<true>(mixed_tree, previous, 0u, rank, header);
             let entry = world.regions[group];
             let separate = selected.count < entry.count;
             let count = light_bvh::light_region_interval_count(
@@ -323,7 +281,7 @@ public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float
     let header = mixed_tree[0];
     let rank = id - 1u;
     let meta = mixed_tree[2u * header.y + rank];
-    let selected = mixed_interval<true>(previous, 0u, rank, header);
+    let selected = light_bvh::mixed_interval<true>(mixed_tree, previous, 0u, rank, header);
     let emitter : light_sampling::LightSurfaceProposal = { meta, 0u };
     return light_sampling::quad_emitter_pdf(
         light_sampling::UniformEmitterAlias(), emitter, float(selected.count) / float(selectors),

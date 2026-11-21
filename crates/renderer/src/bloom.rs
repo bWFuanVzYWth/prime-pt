@@ -1,10 +1,7 @@
 //! Prime PT 设置选择的两个引擎滤波器，选择只影响下一次视图绑定。
 use simple_engine::{
     circular_bloom, fft_bloom,
-    vulkan::{
-        self,
-        native::{Context, Image, ImagePasses, Resource},
-    },
+    vulkan::native::{Context, Image, ImagePasses, Resource},
 };
 
 /// Prime PT 在显示变换前使用的镜头滤波器。
@@ -29,7 +26,7 @@ pub(crate) struct BloomFilters {
 }
 
 impl BloomFilters {
-    pub(crate) fn new(ctx: &mut Context) -> Result<Self, vulkan::Error> {
+    pub(crate) fn new(ctx: &mut Context) -> Result<Self, fft_bloom::Error> {
         Ok(Self {
             fft: fft_bloom::gpu::Lens::new(ctx, fft_bloom::gpu::PROGRAMS)?,
             circular: circular_bloom::Filter::new(ctx)?,
@@ -58,10 +55,10 @@ impl BloomFilters {
         &mut self,
         ctx: &mut Context,
         input: Image,
-    ) -> Result<Option<ImagePasses>, vulkan::Error> {
+    ) -> Result<Option<ImagePasses>, fft_bloom::Error> {
         match self.mode {
             Some(LensMode::Diffraction(_)) => self.fft.bind(ctx, input).map(|v| Some(v.into())),
-            Some(LensMode::FastCircular) => self.circular.bind(ctx, input).map(Some),
+            Some(LensMode::FastCircular) => Ok(Some(self.circular.bind(ctx, input)?)),
             None => Ok(None),
         }
     }

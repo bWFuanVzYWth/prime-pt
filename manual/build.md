@@ -1,11 +1,11 @@
 # 安装、构建与开发运行
 
-已经有 `prime-pt-0.1.0.jar`，从「安装发行包」开始。手上只有源码，先走「准备源码环境」和「构建发行包」。
+已经有 `prime-pt-0.2.0.jar`，从「安装发行包」开始。手上只有源码，先走「准备源码环境」和「构建发行包」。
 
 ## 安装发行包
 
 1. 在启动器中创建或选择 **Minecraft Java 版 26.3** 的游戏实例。实例就是一份独立的游戏目录和启动配置。为它选择 **Fabric Loader 0.19.5 或更新版本**及 **Java 25**。可从 Fabric 官方页面按所用启动器安装。[Fabric 安装入口](https://fabricmc.net/use/installer/)
-2. 在启动器里找到这个实例使用的游戏目录。打开其中的 `mods/`，如果没有该目录就新建它。把 `prime-pt-0.1.0.jar` 原样放进去，保留 `.jar` 扩展名。
+2. 在启动器里找到这个实例使用的游戏目录。打开其中的 `mods/`，如果没有该目录就新建它。把 `prime-pt-0.2.0.jar` 原样放进去，保留 `.jar` 扩展名。
 3. 在实例的**游戏参数**里加上 `--graphicsBackend VULKAN`。这是传给 Minecraft 的参数，请放在启动器提供的游戏参数位置。
 4. 启动这个实例，打开视频设置，检查是否出现 Prime PT 的设置项。进入一个世界即可观察方块场景。首次启动会在游戏目录下的 `.primept/runtime/` 校验并提取运行时，发行包已自带所需的原生库、Slang、着色器及 Fabric 资源加载模块。
 
@@ -63,7 +63,7 @@ NRD 还需要 Git、CMake 和带有 DXC 编译器的 Vulkan SDK。在本终端�
 ./scripts/build-release.ps1
 ```
 
-脚本会准备 Slang（用于编译 GPU 程序），也可以通过 `SLANGC` 指定已有发行包中的编译器。看到 `BUILD SUCCESSFUL` 后，在 `build/libs/` 找到 `prime-pt-0.1.0.jar`，再按[安装发行包](#安装发行包)操作。打包过程会检查原生库路径，并从成品 JAR 验证解包、原生库加载和运行时着色器编译。
+脚本会准备 Slang（用于编译 GPU 程序），也可以通过 `SLANGC` 指定已有发行包中的编译器。看到 `BUILD SUCCESSFUL` 后，在 `build/libs/` 找到 `prime-pt-0.2.0.jar`，再按[安装发行包](#安装发行包)操作。打包过程会检查原生库路径，并从成品 JAR 验证解包、原生库加载和运行时着色器编译。
 
 离线构建可加 `-Offline`，需事先准备 Gradle、Cargo 和 Slang 缓存。找不到 MSVC CRT（C++ 运行库）时，可通过 Gradle 的 `-PvcRedistDir` 指向 x64 可再发行目录。默认的 `release-lto` 是带优化且省略着色器调试信息的发行配置。
 

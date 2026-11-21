@@ -124,9 +124,13 @@ impl MaterialDefinition {
     pub const OVERLAY_NORMAL: u32 = 1 << 12;
     /// 覆盖层辅助图的 A 通道采用 LabPBR 的 F0／金属编号。
     pub const OVERLAY_LAB_SPECULAR: u32 = 1 << 13;
-    /// 几何能确认是薄片的面，包括已配对的正反面。
+    /// 图集准备时确认底层裁切纹理同时有覆盖与镂空。
+    pub const PERFORATED: u32 = 1 << 14;
+    /// 几何薄片和镂空表面允许薄壁散射。
     pub const fn allows_thin_scattering(&self) -> bool {
-        self.control[2] & (Self::FRONT_ONLY | Self::TWO_SIDED | Self::PLANAR_SHEET) != 0
+        self.control[2]
+            & (Self::FRONT_ONLY | Self::TWO_SIDED | Self::PLANAR_SHEET | Self::PERFORATED)
+            != 0
     }
     /// normalFlags的bit0表示实际源中存在作者切线法线。
     pub const AUTHORED_NORMAL: u32 = 1;
@@ -176,7 +180,7 @@ impl MaterialDefinition {
             && self.emission.into_iter().all(|v| v >= 0.)
             && self.control[0] & !3 == 0
             && (1..=3).contains(&self.control[1])
-            && flags & !16383 == 0
+            && flags & !32767 == 0
             && (flags & Self::LAB_SPECULAR == 0
                 || flags & (Self::AUXILIARY | Self::MERS) == (Self::AUXILIARY | Self::MERS))
             && self.uv_bounds[0] < self.uv_bounds[2]

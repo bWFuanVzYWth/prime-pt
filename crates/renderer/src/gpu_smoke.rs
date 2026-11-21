@@ -1825,7 +1825,8 @@ fn hardware_pt_aperture_toggle() -> Result<(), Box<dyn std::error::Error>> {
         (fft_bloom::Aperture::Camera, original_center),
         (fft_bloom::Aperture::Pupil, rounded_center),
     ] {
-        let psf = shape.rgb32le().as_chunks::<12>().0;
+        let bytes = shape.rgb32le()?;
+        let psf = bytes.as_chunks::<12>().0;
         let green = f32::from_le_bytes(psf[psf.len() / 2].as_chunks::<4>().0[1]);
         assert!((center_value[1] - 2048. * green).abs() < 0.001);
     }

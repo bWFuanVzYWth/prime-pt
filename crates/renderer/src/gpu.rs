@@ -120,6 +120,9 @@ pub enum Error {
     /// 积分预算无效。
     #[error(transparent)]
     Settings(#[from] pt::Error),
+    /// 标定镜头的权重展开、上传或 GPU 视图绑定失败。
+    #[error(transparent)]
+    Bloom(#[from] simple_engine::fft_bloom::Error),
     /// 显示设置无效。
     #[error(transparent)]
     Display(#[from] simple_engine::display::Error),

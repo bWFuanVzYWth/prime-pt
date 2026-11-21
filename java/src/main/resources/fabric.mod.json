@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "id": "prime_pt",
-  "version": "0.1.0",
+  "version": "${modVersion}",
   "name": "Prime PT",
   "description": "使用 Slang、Vulkan 和 DLSS RR 的路径追踪客户端 Mod。",
   "environment": "client",
