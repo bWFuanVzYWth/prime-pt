@@ -10,6 +10,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.particle.SingleQuadParticle;
 import net.minecraft.client.renderer.StagedVertexBuffer;
@@ -20,6 +21,9 @@ import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.util.LightCoordsUtil;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
 
 /** 从原版实际提交捕获来源身份、图元布局及 Sampler0；设备句柄只借给本次宿主帧。 */
@@ -93,7 +97,7 @@ public final class WorldFeatures {
     }
     private static final LinkedHashMap<SingleQuadParticle.Layer, Billboards> billboards =
             new LinkedHashMap<>();
-    private static long particleOwner, firstPersonOwner;
+    private static long particleOwner, cameraHiddenOwner;
     private static int particleFace;
     private static long nextId, owner;
     private static int part, chunk, count;
@@ -116,7 +120,7 @@ public final class WorldFeatures {
         packet = new Packet(4096);
     }
     public static void extraction() {
-        firstPersonOwner = 0;
+        cameraHiddenOwner = 0;
         particleOwner = 0;
         for (var group : billboards.values()) {
             group.count = 0;
@@ -156,12 +160,20 @@ public final class WorldFeatures {
         if (state != null)
             ((SourceState) state).primept$sourceId(((Owner) source).primept$id());
     }
-    public static void firstPerson(Object source) {
-        firstPersonOwner = ((Owner) source).primept$id();
+    /** 压墙的第三人称相机也可能进入观察实体；只隐藏该实体的直视命中。 */
+    public static void cameraBody(Entity observer, Vec3 eye, float partial, boolean attached) {
+        if (attached || intersectsCamera(eye, observer.getBoundingBox(), observer.position(),
+                                observer.getPosition(partial))) {
+            cameraHiddenOwner = ((Owner) observer).primept$id();
+        }
+    }
+    static boolean intersectsCamera(Vec3 eye, AABB bounds, Vec3 current, Vec3 rendered) {
+        return bounds.inflate(Camera.PROJECTION_Z_NEAR).contains(eye.x + (current.x - rendered.x),
+                eye.y + (current.y - rendered.y), eye.z + (current.z - rendered.z));
     }
     private static int appearance(int flags) {
         return flags | (luminousText && (flags & 8) != 0 ? 4 : 0)
-                | (owner != 0 && owner == firstPersonOwner ? 64 : 0);
+                | (owner != 0 && owner == cameraHiddenOwner ? 64 : 0);
     }
     public static void submitting(Object state) {
         if (active && submissionDepth++ == 0) {

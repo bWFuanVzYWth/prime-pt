@@ -67,10 +67,18 @@ public func region_primitive(instance: uint, local_primitive: uint)->uint
     return instance_quad_bases[instance] * 2u + local_primitive;
 }
 
-/// 第一人称身体只对相机之后的路径和阴影可见。相机射线从同一定位后的针孔出发。
+/// TLAS 使用独立的相机、散射和阴影可见位。没有功能实例的世代保留默认掩码。
+public func path_visibility_mask(primary: bool)->uint
+{
+    return world_features::configured
+               ? (primary ? world_features::camera_mask : world_features::scattering_mask)
+               : 0xffu;
+}
+
+/// 通用导引查询同时接收针孔射线和从表面偏移后的延续射线。
 public func visibility_mask(origin: float3)->uint
 {
-    return world_features::configured && all(origin == parameters[0].origin.xyz) ? 2u : 0xffu;
+    return path_visibility_mask(all(origin == parameters[0].origin.xyz));
 }
 
 public func sun_contains(direction: float3)->bool

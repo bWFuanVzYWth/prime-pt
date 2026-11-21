@@ -9,6 +9,8 @@ public static const let configured = PRIMEPT_WORLD_FEATURES != 0;
 public static const let instance_bit = 0x800000u;
 public static const let primitive_bit = 0x80000000u;
 public static const let shadow_mask = 1u;
+public static const let camera_mask = 2u;
+public static const let scattering_mask = 4u;
 public struct Surface
 {
     public var material : uint4;     // 材质、宿主覆盖标志、纹理起点、宽度

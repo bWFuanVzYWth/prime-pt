@@ -42,6 +42,46 @@ fn frame(gpu: &mut Gpu, faces: &[(u64, u32, [f32; 3], f32)]) -> Result<(), Error
     unsafe { gpu.set_world_features(&src) }
 }
 #[test]
+#[ignore = "真实 Vulkan RT；近处玩家与后方发光面在实时、离线共享直视规则"]
+fn hardware_camera_body_visibility_matches_offline() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::new_ser()?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    world(gpu)?;
+    let output = image(gpu)?;
+    let env = Environment {
+        sun_direction: [0.; 3],
+        ..Default::default()
+    };
+    let opts = Options::new(false, streamline::Quality::Dlaa, 2, 4)?;
+    for mode in [
+        prime_scene::RenderMode::Realtime,
+        prime_scene::RenderMode::Offline,
+    ] {
+        gpu.set_rendering(mode)?;
+        for (flags, visible_world) in [(64, true), (0, false)] {
+            frame(
+                gpu,
+                &[(1, flags, [0., 0., 0.1], 1.), (2, 4, [0., 0., 3.], 4.)],
+            )?;
+            gpu.invalidate()?;
+            host.render_options(gpu, &output, &camera(), env, opts)?;
+            let pixels = output.download(&mut gpu.context)?;
+            let color = center(&pixels);
+            assert!(
+                color[..3]
+                    .iter()
+                    .all(|v| if visible_world { *v > 100 } else { *v < 5 }),
+                "{mode:?} 玩家可见标志 {flags}，中心 RGB {color:?}"
+            );
+        }
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实 PT 阴影掩码和相机命中"]
 fn hardware_world_feature_shadow_visibility() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new()?;
@@ -62,6 +102,11 @@ fn hardware_world_feature_shadow_visibility() -> Result<(), Box<dyn std::error::
         host.render_environment(gpu, &output, &eye, env)
     };
     let opaque = center(&illuminate(gpu, 0)?).to_vec();
+    assert_eq!(
+        center(&illuminate(gpu, 64)?),
+        opaque,
+        "隐藏直视的玩家仍投射同样的阴影"
+    );
     let text = center(&illuminate(gpu, 1 | 8)?).to_vec();
     let beam = center(&illuminate(gpu, 2 | 4 | 8 | 32)?).to_vec();
     assert!(
@@ -189,7 +234,8 @@ fn hardware_world_bone_texture_history() -> Result<(), Box<dyn std::error::Error
                   angle: f32,
                   shift: f32,
                   z: f32,
-                  revision: u64|
+                  revision: u64,
+                  hidden: bool|
      -> Result<(), Box<dyn std::error::Error>> {
         let (s, c) = angle.sin_cos();
         let mut packet = b"PTF1".to_vec();
@@ -200,7 +246,7 @@ fn hardware_world_bone_texture_history() -> Result<(), Box<dyn std::error::Error
         packet.extend_from_slice(&32u64.to_le_bytes());
         packet.extend_from_slice(bytemuck::cast_slice(&[
             0u32,
-            1 | 4 | 8,
+            1 | 4 | 8 | (u32::from(hidden) << 6),
             0,
             0,
             1,
@@ -223,11 +269,11 @@ fn hardware_world_bone_texture_history() -> Result<(), Box<dyn std::error::Error
         host.render_options(gpu, &output, &eye, Environment::default(), options)?;
         Ok(())
     };
-    render(gpu, 0., 0., 4., 1)?;
-    render(gpu, 0., 0., 4., 1)?;
+    render(gpu, 0., 0., 4., 1, false)?;
+    render(gpu, 0., 0., 4., 1, false)?;
     let angle = 0.22f32;
     let shift = 0.125;
-    render(gpu, angle, shift, 4., 1)?;
+    render(gpu, angle, shift, 4., 1, false)?;
     let guide = gpu.view.as_ref().unwrap();
     let depth = guide.rr.images[1].download(&mut gpu.context)?;
     let motion = guide.rr.nrd_motion[0].download(&mut gpu.context)?;
@@ -254,7 +300,7 @@ fn hardware_world_bone_texture_history() -> Result<(), Box<dyn std::error::Error
     assert!(worst < 0.2);
     // 仅改变宿主纹理内容及版本，命中掩码随之换边。
     tex.upload(&mut gpu.context, &[0, 255, 0, 255, 255, 0, 0, 0])?;
-    render(gpu, 0., 0., 4., 2)?;
+    render(gpu, 0., 0., 4., 2, false)?;
     let depth = gpu.view.as_ref().unwrap().rr.images[1].download(&mut gpu.context)?;
     assert!(
         (float_component(&depth, at(3 * w / 8), 4) - 4.).abs() < 0.01
@@ -274,7 +320,7 @@ fn hardware_world_bone_texture_history() -> Result<(), Box<dyn std::error::Error
         }],
         anchor: [0.; 3],
     })?;
-    render(gpu, 0., 2., -2., 2)?;
+    render(gpu, 0., 2., -2., 2, true)?;
     let prefix = gpu.view.as_ref().unwrap().prefix;
     let pickup = Buffer::new(&mut gpu.context, 16 * u64::from(w) * u64::from(h), true)?;
     let color = linear_pixel(&mut gpu.context, prefix, pickup, (at(w / 2) * 16) as u64)?;

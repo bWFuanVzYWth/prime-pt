@@ -58,6 +58,10 @@ var accumulation : RWStructuredBuffer<float4>;
 var sample_counts : RWStructuredBuffer<uint>;
 public struct HitScene : pt::IHitScene
 {
+    public override func path_mask(primary: bool)->uint
+    {
+        return path_visibility_mask(primary);
+    }
     public func guides_enabled()->bool
     {
         return PRIMEPT_RECONSTRUCTION != 0 && parameters[0].reconstruction.w == 2;
@@ -146,8 +150,8 @@ func cache_primary<let frame_film : bool>()->void
     let direction = primary_direction<frame_film>(p, coordinate);
     let ray : RayDesc = { p.origin.xyz, 0, direction, pt::FAR };
     var unused : uint = 0;
-    var found : HitObject = HitObject::TraceRay(scene, RAY_FLAG_NONE, visibility_mask(ray.Origin),
-                                                0, 1, 0, ray, unused);
+    var found : HitObject = HitObject::TraceRay(scene, RAY_FLAG_NONE, path_visibility_mask(true), 0,
+                                                1, 0, ray, unused);
     var identity = uint4(0xffffffffu, 0, 0, 0);
     var distance : float = pt::FAR;
     if (found.IsHit())

@@ -3,6 +3,7 @@ package dev.primept;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 /** 验证首帧投影等待，以及有效相机的中心方向和视锥尺寸；不启动游戏。 */
@@ -30,7 +31,16 @@ final class CameraFixture {
         camera.projectionMatrix.m11(-camera.projectionMatrix.m11());
         require(CameraPacket.write(camera, output), "Vulkan 翻转投影应可提交");
         near(output.getFloat(60), 1, "世界向上与投影 Y 符号无关");
-        System.out.println("Camera readiness/projection fixture passed");
+        var current = new Vec3(30_000_001, 64, 0);
+        var rendered = new Vec3(30_000_000, 64, 0);
+        var bounds = new AABB(current.x - 0.3, 64, -0.3, current.x + 0.3, 65.8, 0.3);
+        for (int side : new int[]{-1, 1}) {
+            require(WorldFeatures.intersectsCamera(rendered.add(0, 1.62, side * 0.32), bounds, current, rendered),
+                    "第三人称相机被墙推回正在插值的玩家时应隐藏自身直视");
+            require(!WorldFeatures.intersectsCamera(rendered.add(0, 1.62, side * 4), bounds, current, rendered),
+                    "前、后第三人称在常规距离应看见玩家");
+        }
+        System.out.println("Camera readiness/projection and observer visibility fixture passed");
     }
 
     private static void near(float actual, float expected, String message) {

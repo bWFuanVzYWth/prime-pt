@@ -76,11 +76,13 @@ abstract class ExtractorMixin {
             volume.prepare(eye.x, eye.y, eye.z);
             extractVisibleEntities(camera, volume, delta, levelRenderState);
             var observer = camera.entity();
-            if (!camera.isDetached() && observer != null && !observer.isSpectator()
-                    && !(observer instanceof LivingEntity living && living.isSleeping())) {
-                var body = extractEntity(observer, partial);
-                WorldFeatures.firstPerson(observer);
-                levelRenderState.entityRenderStates.add(body);
+            if (observer != null && !observer.isSpectator()) {
+                boolean attached = !camera.isDetached()
+                        && !(observer instanceof LivingEntity living && living.isSleeping());
+                float entityPartial =
+                        delta.getGameTimeDeltaPartialTick(!level.tickRateManager().isEntityFrozen(observer));
+                WorldFeatures.cameraBody(observer, eye, entityPartial, attached);
+                if (attached) levelRenderState.entityRenderStates.add(extractEntity(observer, entityPartial));
             }
             ((TerrainSnapshot.Cache) level.getChunkSource())
                     .primept$blockEntities(level, levelRenderer, camera, partial, levelRenderState);

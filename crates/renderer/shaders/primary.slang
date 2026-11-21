@@ -396,7 +396,7 @@ func render_fused()->void
         let ray : RayDesc = { data.path.origin, 0, data.path.direction, pt::FAR };
         var unused : uint = 0;
         var found : HitObject = HitObject::TraceRay(
-                        scene, RAY_FLAG_NONE, visibility_mask(ray.Origin), 0, 1, 0, ray, unused);
+                        scene, RAY_FLAG_NONE, path_visibility_mask(true), 0, 1, 0, ray, unused);
         if (!found.IsHit())
         {
             pt::escape(provider, data.path);
