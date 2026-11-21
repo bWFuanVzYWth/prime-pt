@@ -1,4 +1,6 @@
 //! 宿主无关的quad、材质身份及相机输入；不拥有游戏源、调度器或GPU资源。
+mod item_emission;
+pub use item_emission::{ItemEmissionMask, ItemMaterials};
 mod rendering;
 pub use rendering::{RenderMode, RenderTuning};
 use simple_engine::camera;

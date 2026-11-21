@@ -245,3 +245,21 @@ cargo test --release --locked -p prime_renderer hardware_pt_aperture_ -- --ignor
 成功时七项测试通过。点光源用例报告 RGB 总通量，两个 FFT 镜头另报告相对导出核的最大逐像素绝对误差。太阳用例给出横、纵两个方向比天空亮 1% 的半径，单位为输出像素。切换用例覆盖更换光瞳、关闭泛光和恢复原选择，同时核对图像、累积历史与显存回收。
 
 在输出目录中并排打开 `camera-sun-display.png`、`pupil-sun-display.png` 和 `fast-sun-display.png`。同一前缀下，`*-point-display.png` 显示单像素白点，`*-linear.rgba32f` 保留对应的线性 HDR 回读，`*-point.json` 记录输入位置和通量。验证层或设备初始化失败时，先检查 Vulkan SDK 和显卡驱动。
+
+## 单独测量世界灯树
+
+准备好[构建工具](build.md)和 Vulkan 光追显卡，在 Prime PT 根目录的 PowerShell 中运行：
+
+```powershell
+cargo test --release --locked -p prime_renderer --lib hardware_light_tree_build_cost -- --ignored --nocapture --test-threads=1
+```
+
+场景以 32 个 Minecraft 区块为半径，取 65 × 65 个区块的水平包围盒。引擎按 64 格立方体维护静态子树，每个参与的区域放一个固定灯。单层有 289 棵静态子树，覆盖主世界六个高度层时有 1,734 棵。10,000 个运动实例复用准备好的模型，在 GPU 上每帧变换。单面模型提供 10,000 个发光面，六面模型提供 60,000 个。
+
+每行 `tree_us` 给出 24 帧预热后 120 次测量的中位数与 P95，单位为微秒。`CPU_setup` 是宿主准备范围和绑定的耗时，`CPU_encode` 是把灯树阶段和诊断时间戳追加到命令序列的耗时。`GPU` 用设备时间戳圈住从扫描实例表面到产出可采样世界树的全部计算，包括提取、排序、功率归约和拓扑生成。姿态展开在计时区间之前完成。零实例一行可查看空时间戳开销。要保留逐帧纳秒值，在同一 PowerShell 中设置 `$env:PRIME_LIGHT_BENCH_RAW = '1'`。
+
+要对照相同六层场景的整帧耗时，在同一目录运行以下命令。测试使用原生 3840 × 2160、DLAA 和每像素两个样本，输出整帧绘制的 GPU 时间、单独包住建树的 GPU 时间戳，以及包含实例提交、TLAS 和等待的墙钟时间。该场景用于对照渲染开销，实际存档的几何密度和可见光源分布会影响帧率。
+
+```powershell
+cargo test --release --locked -p prime_renderer --lib hardware_light_tree_frame_cost -- --ignored --nocapture --test-threads=1
+```

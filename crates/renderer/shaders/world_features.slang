@@ -9,8 +9,6 @@ public static const let configured = PRIMEPT_WORLD_FEATURES != 0;
 public static const let instance_bit = 0x800000u;
 public static const let primitive_bit = 0x80000000u;
 public static const let shadow_mask = 1u;
-public static const let camera_mask = 2u;
-public static const let scattering_mask = 4u;
 public struct Surface
 {
     public var material : uint4;     // 材质、宿主覆盖标志、纹理起点、宽度
@@ -43,10 +41,20 @@ func linear_rgb(s: float3)->float3
 {
     return select(s <= 0.04045, s / 12.92, pow((s + 0.055) / 1.055, 2.4));
 }
+public func emitter_tint(word: uint)->float
+{
+    let tint = unpack_rgba(word);
+    return dot(linear_rgb(tint.rgb), float3(0.2126, 0.7152, 0.0722)) * tint.a;
+}
 func corner_uv(StructuredBuffer<Surface> source, face: uint, index: uint)->float2
 {
     let pair = source[face].uv[index >> 1u];
     return (index & 1u) == 0 ? pair.xy : pair.zw;
+}
+public func uv_at(StructuredBuffer<Surface> source, uint face, uint3 tri, float3 w)->float2
+{
+    return corner_uv(source, face, tri.x) * w.x + corner_uv(source, face, tri.y) * w.y +
+           corner_uv(source, face, tri.z) * w.z;
 }
 public func color_at(StructuredBuffer<Surface> source, StructuredBuffer<uint> bank, primitive: uint,
                      bary: float2, terrain: Texture2D<float4>)
@@ -56,8 +64,7 @@ public func color_at(StructuredBuffer<Surface> source, StructuredBuffer<uint> ba
     let tri = indices(primitive);
     let w = float3(1 - bary.x - bary.y, bary);
     let m = source[n].material;
-    let uv = corner_uv(source, n, tri.x) * w.x + corner_uv(source, n, tri.y) * w.y +
-             corner_uv(source, n, tri.z) * w.z;
+    let uv = uv_at(source, n, tri, w);
     let tint = unpack_rgba(asuint(source[n].position[tri.x].w)) * w.x +
                unpack_rgba(asuint(source[n].position[tri.y].w)) * w.y +
                unpack_rgba(asuint(source[n].position[tri.z].w)) * w.z;

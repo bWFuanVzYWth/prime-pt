@@ -131,6 +131,7 @@ pub struct Catalog {
     pub(crate) faces: HashMap<u32, Face>,
     pub(crate) fluids: HashMap<u32, Fluid>,
     pub(crate) sprites: HashMap<u32, SpriteSource>,
+    pub(crate) item_sprites: HashMap<u32, SpriteSource>,
     pub(crate) fluid_materials: HashMap<(u32, usize), prime_scene::MaterialId>,
     pub(crate) definitions: Vec<prime_scene::MaterialDefinition>,
     tints: Option<crate::tint::TintResources>,
@@ -435,7 +436,7 @@ fn decode(bytes: &[u8]) -> Result<(Catalog, bool), Error> {
             || bounds[1] >= bounds[3]
             || bounds.into_iter().any(|value| !(0. ..=1.).contains(&value))
             || extent.into_iter().any(|n| n == 0 || n > 16384)
-            || flags > 3
+            || flags > 7
         {
             return Err(Error::Input("sprite源描述无效"));
         }
@@ -471,8 +472,15 @@ fn decode(bytes: &[u8]) -> Result<(Catalog, bool), Error> {
         }
         let normal = optional_image(&mut r, base, extent, &frames, flags & 2 != 0)?;
         let specular = optional_image(&mut r, base, extent, &frames, flags & 2 != 0)?;
+        if next.sprites.contains_key(&id) || next.item_sprites.contains_key(&id) {
+            return Err(Error::Input("同包 sprite ID 重复"));
+        }
         insert(
-            &mut next.sprites,
+            if flags & 4 != 0 {
+                &mut next.item_sprites
+            } else {
+                &mut next.sprites
+            },
             id,
             SpriteSource {
                 id,

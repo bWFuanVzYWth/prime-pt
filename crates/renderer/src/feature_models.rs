@@ -4,9 +4,15 @@ use feature_source::{read, take};
 pub(super) struct Catalog {
     pub mesh: Vec<(u32, u32, vulkan::TriangleBlas)>,
     pub vertices: Buffer,
+    pub items: prime_scene::ItemMaterials,
 }
 impl Catalog {
-    pub fn prepare(ctx: &mut Context, bytes: &[u8], placeholder: Buffer) -> Result<Self, Error> {
+    pub fn prepare(
+        ctx: &mut Context,
+        bytes: &[u8],
+        placeholder: Buffer,
+        items: prime_scene::ItemMaterials,
+    ) -> Result<Self, Error> {
         let mut input = bytes;
         let [tag, count] = read::<[u32; 2]>(&mut input)?;
         if tag != u32::from_le_bytes(*b"PFM1") || count > 100000 {
@@ -56,7 +62,11 @@ impl Catalog {
         } else {
             Buffer::upload(ctx, bytemuck::cast_slice(&vertices))?
         };
-        Ok(Self { mesh, vertices })
+        Ok(Self {
+            mesh,
+            vertices,
+            items,
+        })
     }
     pub fn roots(&self, r: &mut Vec<vulkan::native::Resource>) {
         r.push(self.vertices.into());

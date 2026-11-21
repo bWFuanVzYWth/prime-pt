@@ -15,7 +15,6 @@ import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.client.renderer.state.level.PlayerRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.entity.Entity;
-import net.minecraft.world.entity.LivingEntity;
 import org.joml.Matrix4f;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -32,7 +31,6 @@ abstract class ExtractorMixin {
     @Shadow private ClientLevel level;
     @Shadow @Final private Minecraft minecraft;
     @Shadow @Final private LevelRenderer levelRenderer;
-    @Shadow protected abstract EntityRenderState extractEntity(Entity entity, float partial);
     @Shadow
     protected abstract void extractVisibleEntities(
             Camera camera, Frustum frustum, DeltaTracker delta, LevelRenderState state);
@@ -42,6 +40,12 @@ abstract class ExtractorMixin {
             Entity entity, float partial, CallbackInfoReturnable<EntityRenderState> ci) {
         if (Renderer.active())
             WorldFeatures.link(ci.getReturnValue(), entity);
+    }
+    @Inject(method = "isEntityVisible", at = @At("HEAD"), cancellable = true)
+    private void primept$localPlayer(Entity entity, Frustum frustum, double x, double y, double z,
+            float partial, long fade, CallbackInfoReturnable<Boolean> ci) {
+        if (Renderer.active() && entity == minecraft.player && minecraft.options.getCameraType().isFirstPerson())
+            ci.setReturnValue(false);
     }
     @Redirect(method = "isEntityVisible",
             at = @At(value = "INVOKE",
@@ -75,15 +79,6 @@ abstract class ExtractorMixin {
                     new Matrix4f().ortho(-radius, radius, -radius, radius, -radius, radius));
             volume.prepare(eye.x, eye.y, eye.z);
             extractVisibleEntities(camera, volume, delta, levelRenderState);
-            var observer = camera.entity();
-            if (observer != null && !observer.isSpectator()) {
-                boolean attached = !camera.isDetached()
-                        && !(observer instanceof LivingEntity living && living.isSleeping());
-                float entityPartial =
-                        delta.getGameTimeDeltaPartialTick(!level.tickRateManager().isEntityFrozen(observer));
-                WorldFeatures.cameraBody(observer, eye, entityPartial, attached);
-                if (attached) levelRenderState.entityRenderStates.add(extractEntity(observer, entityPartial));
-            }
             ((TerrainSnapshot.Cache) level.getChunkSource())
                     .primept$blockEntities(level, levelRenderer, camera, partial, levelRenderState);
             minecraft.particleEngine.extract(

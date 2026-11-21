@@ -343,7 +343,7 @@ fn upload_auxiliary(
     })
 }
 
-fn publish(
+pub(super) fn publish(
     gpu: &mut Gpu,
     mesh: &Mesh,
     geometry: u64,
@@ -990,7 +990,7 @@ fn hardware_pt_region_instance_order_is_independent_of_attribute_slot()
     Ok(())
 }
 
-fn scene() -> Mesh {
+pub(super) fn scene() -> Mesh {
     Mesh {
         quads: vec![
             Quad::with_material(
@@ -1446,12 +1446,12 @@ fn hardware_pt_static_emission_alias_and_dynamic_area_match_reverse_pdf()
     Ok(())
 }
 
-fn assert_light_pdfs(
+pub(super) fn read_light_probes(
     host: &Host,
     gpu: &mut Gpu,
     image: &Image,
-    label: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+    count: u32,
+) -> Result<Vec<[f32; 4]>, Box<dyn std::error::Error>> {
     host.render_environment(
         gpu,
         image,
@@ -1469,7 +1469,7 @@ fn assert_light_pdfs(
         gpu.material_gpu,
         gpu.lighting_gpu,
     );
-    let output = Buffer::new(&mut gpu.context, 32 * 16, true)?;
+    let output = Buffer::new(&mut gpu.context, u64::from(count) * 16, true)?;
     bindings[39] = Binding::StorageBuffer(output);
     let bindings = Bindings::new(&mut gpu.context, &bindings)?;
     let pipeline = ComputePipeline::new(
@@ -1481,26 +1481,34 @@ fn assert_light_pdfs(
         ),
     )?;
     let mut commands = Commands::new(&gpu.context)?;
-    commands.dispatch(pipeline, [1, 1, 1])?;
+    commands.dispatch(pipeline, [count.div_ceil(32), 1, 1])?;
     commands
         .finish(&mut gpu.context)?
         .submit_and_wait(&mut gpu.context)?;
-    let mut bytes = vec![0; 32 * 16];
-    output.read(&mut gpu.context, 0, &mut bytes)?;
-    for record in bytes.as_chunks::<16>().0 {
-        let value: [f32; 4] = std::array::from_fn(|i| {
-            f32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap())
-        });
+    let mut bytes = vec![[0f32; 4]; count as usize];
+    output.read(&mut gpu.context, 0, bytemuck::cast_slice_mut(&mut bytes))?;
+    Ok(bytes)
+}
+
+pub(super) fn assert_light_pdfs(
+    host: &Host,
+    gpu: &mut Gpu,
+    image: &Image,
+    label: &str,
+) -> Result<[usize; 2], Box<dyn std::error::Error>> {
+    let mut counts = [0; 2];
+    for value in read_light_probes(host, gpu, image, 32)? {
         assert!(
-            value.iter().all(|v| v.is_finite()) && value[3] == 1.,
+            value.iter().all(|v| v.is_finite()) && (value[3] == 1. || value[3] == 2.),
             "mode={label}, probe={value:?}"
         );
+        counts[value[3] as usize - 1] += 1;
         assert!(
             (value[0] - value[1]).abs() / (1. + value[0].max(value[1])) < 1e-5,
             "mode={label}, forward/reverse={value:?}"
         );
     }
-    Ok(())
+    Ok(counts)
 }
 
 #[test]

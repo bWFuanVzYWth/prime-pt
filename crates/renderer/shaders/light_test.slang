@@ -2,13 +2,15 @@
 module light_test;
 import mod_scene;
 import mod_lights;
+import world_features;
 import params;
 import pt.scene;
 import geometry.ray;
 import light_sampling.area;
 import light_sampling.sample;
 
-/// 每lane输出[forward_pdf,reverse_pdf,真实发光BT.709亮度,有效样本]；仅测试额外binding。
+/// 每lane输出[forward_pdf,reverse_pdf,真实发光BT.709亮度,有效域（1 静态、2
+/// 动态）]；仅测试额外binding。
 [[vk::binding(39, 0)]]
 var probes : RWStructuredBuffer<float4>;
 
@@ -45,13 +47,16 @@ func triangle_identity_probe_main(lane: uint3: SV_DispatchThreadID)->void
 [numthreads(32, 1, 1)]
 func light_probe_main(id: uint3: SV_DispatchThreadID)->void
 {
-    if (id.x >= 32u)
+    var count : uint;
+    var stride : uint;
+    probes.GetDimensions(count, stride);
+    if (id.x >= count)
         return;
     let surface_point : geometry::SurfacePoint = { float3(2, 0, 4), float3(0, 0, -1), 1.0e-5 };
     // 固定开区间格点覆盖alias列与片内warp，不读取帧随机状态。
     let lane = float(id.x) + 0.5;
     let random =
-        float3(lane * (1.0 / 32.0), frac(lane * 0.61803398875), frac(lane * 0.75487766625));
+        float3(lane / float(count), frac(lane * 0.61803398875), frac(lane * 0.75487766625));
     let p : Params = parameters[0];
     let light_sample : light_sampling::LightSample = sample_quad_light(surface_point, random, p);
     if (!(light_sample.pdf > 0))
@@ -59,11 +64,38 @@ func light_probe_main(id: uint3: SV_DispatchThreadID)->void
         probes[id.x] = 0;
         return;
     }
+    if (count > 32u)
+    {
+        let emitted = quad_light_emission(light_sample, p.block_emission_scale);
+        let estimate = dot(emitted, float3(0.2126, 0.7152, 0.0722)) *
+                       max(-light_sample.direction.z, 0.0) / light_sample.pdf;
+        let moving = (light_sample.emission_reference & world_features::primitive_bit) != 0;
+        probes[id.x] =
+            float4(estimate, float(moving && light_sample.distance < 4.0), float(moving), 1);
+        return;
+    }
     let index : uint = light_sample.emission_reference;
     let flags : uint = asuint(light_sample.emission.z);
     let area : light_sampling::QuadAreaSample = { flags & 1u, light_sample.emission.xy, 0 };
-    let vertices : light_sampling::LightQuadVertices = emitter_vertices(index);
-    let translation = float3(light_regions[index].xyz - p.anchor_region.xyz) * 64.0;
+    let dynamic = (index & world_features::primitive_bit) != 0;
+    let slot = index & ~world_features::primitive_bit;
+    var vertices : light_sampling::LightQuadVertices;
+    var translation = float3(0);
+    var primitive : uint;
+    if (dynamic)
+    {
+        vertices = { world_features::faces[slot].position[0].xyz,
+                     world_features::faces[slot].position[1].xyz,
+                     world_features::faces[slot].position[2].xyz,
+                     world_features::faces[slot].position[3].xyz };
+        primitive = world_features::primitive_bit | (slot * 2u + area.half);
+    }
+    else
+    {
+        vertices = emitter_vertices(index);
+        translation = float3(light_regions[index].xyz - p.anchor_region.xyz) * 64.0;
+        primitive = light_meta[index].w * 2u + area.half;
+    }
     let transform =
         float3x4(1, 0, 0, translation.x, 0, 1, 0, translation.y, 0, 0, 1, translation.z);
     let inverse =
@@ -72,7 +104,7 @@ func light_probe_main(id: uint3: SV_DispatchThreadID)->void
                        light_sampling::quad_endpoint(vertices, area, transform, inverse);
     var hit : pt::Hit = {};
     hit.surface = { endpoint.position, endpoint.normal, endpoint.base_offset };
-    hit.identity = uint4(light_meta[index].w * 2u + area.half, asuint(area.bary), 0);
+    hit.identity = uint4(primitive, asuint(area.bary), 0);
     hit.front = (flags & 2u) != 0;
     hit.distance = light_sample.distance;
     let reverse : float = quad_emission_pdf<PublishedArea>(hit, surface_point.position,
@@ -81,5 +113,6 @@ func light_probe_main(id: uint3: SV_DispatchThreadID)->void
     let luminance : float = dot(emission, float3(0.2126, 0.7152, 0.0722));
     let valid : bool = isfinite(light_sample.pdf) && reverse > 0 && isfinite(reverse) &&
                        all(isfinite(emission)) && luminance > 0;
-    probes[id.x] = float4(light_sample.pdf, reverse, luminance, float(valid));
+    probes[id.x] =
+        float4(light_sample.pdf, reverse, luminance, valid ? (dynamic ? 2.0 : 1.0) : 0.0);
 }

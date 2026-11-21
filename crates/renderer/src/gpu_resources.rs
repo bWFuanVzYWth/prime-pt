@@ -295,7 +295,7 @@ impl Gpu {
         let emitter_capabilities =
             materials::emitter_capabilities(&definitions[..static_count], &keys[..static_count]);
         let emitters = format!("-DPRIMEPT_EMITTER_CAPABILITIES={emitter_capabilities}");
-        let lights = if keys[..static_count].iter().any(|(flow, _)| flow.emits()) {
+        let lights = if keys.iter().any(|(flow, _)| flow.emits()) {
             "-DPRIMEPT_LIGHT_MASK=3"
         } else {
             "-DPRIMEPT_LIGHT_MASK=1"

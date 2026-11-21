@@ -8,9 +8,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(TranslucentFeatureRenderPhase.class)
 abstract class TranslucentNodeMixin {
     @Inject(method = "submit(Lnet/minecraft/client/renderer/feature/submit/TranslucentSubmit;)V",
-            at = @At("HEAD"))
+            at = @At("HEAD"), cancellable = true)
     private void
     primept$source(TranslucentSubmit node, CallbackInfo ci) {
-        WorldFeatures.tag(node);
+        if (WorldFeatures.collect(node)) ci.cancel();
     }
 }

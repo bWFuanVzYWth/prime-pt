@@ -9,6 +9,7 @@ public final class Atlas {
     private static byte[] pixels;
     private static int width, height;
     private static java.util.Collection<net.minecraft.client.renderer.texture.TextureAtlasSprite> sprites = java.util.List.of();
+    private static java.util.Collection<net.minecraft.client.renderer.texture.TextureAtlasSprite> itemSprites = java.util.List.of();
     static long generation;
     private static boolean accepted;
     private Atlas() {}
@@ -16,6 +17,10 @@ public final class Atlas {
     /** 原版仍拥有 sprite 图像，本方法不保留其指针。 */
     public static void capture(TextureAtlas atlas, SpriteLoader.Preparations source) {
         if (!Bootstrap.rayTracingEnabled()) return;
+        if (atlas.location().equals(TextureAtlas.LOCATION_ITEMS)) {
+            itemSprites = java.util.List.copyOf(source.regions().values());
+            return;
+        }
         if (!atlas.location().equals(TextureAtlas.LOCATION_BLOCKS)) return;
         int w = source.width(), h = source.height();
         byte[] rgba = new byte[Math.multiplyExact(Math.multiplyExact(w, h), 4)];
@@ -37,6 +42,7 @@ public final class Atlas {
 
     static boolean ready() { return accepted; }
     static java.util.Collection<net.minecraft.client.renderer.texture.TextureAtlasSprite> sprites() { return sprites; }
+    static java.util.Collection<net.minecraft.client.renderer.texture.TextureAtlasSprite> itemSprites() { return itemSprites; }
     static void send(Native renderer) { renderer.atlas(pixels, width, height); }
-    static void accepted() { pixels=null; sprites=java.util.List.of(); accepted=true; }
+    static void accepted() { pixels=null; sprites=java.util.List.of(); itemSprites=java.util.List.of(); accepted=true; }
 }

@@ -29,9 +29,6 @@ var light_inverse : StructuredBuffer<uint4>;
 /// regionKey.xyz 与 (localIndex<<2)|sideMask；局部编号不随其他区块变化。
 [[vk::binding(34, 0)]]
 public var light_regions : StructuredBuffer<int4>;
-/// 每资源世代唯一的静态纹理内alias，control.w>>1给出header word偏移。
-[[vk::binding(35, 0)]]
-var emission_alias_words : ByteAddressBuffer;
 
 public func emitter_vertices(index: uint)->light_sampling::LightQuadVertices
 {
@@ -107,16 +104,14 @@ public typedef UniformArea SelectedEmitterArea;
 public typedef PublishedArea SelectedEmitterArea;
 #endif
 
-public func sample_quad_light(surface_point: geometry::SurfacePoint, random_sample: float3,
-                              params: Params)
+func sample_region_quad(surface_point: geometry::SurfacePoint, uv_sample: float2, params: Params,
+                        selected: light_bvh::LightWorldSample)
     ->light_sampling::LightSample
 {
     var result : light_sampling::LightSample = {};
-    let world = light_tree[0];
-    let selected = light_bvh::sample_light_world(world, surface_point.position,
-                                                 params.anchor_region.xyz, random_sample.z);
     if (selected.pmf <= 0)
         return result;
+    let world = light_tree[0];
     let region = world.regions[selected.region];
     let slots = (uint *)(region.words + light_bvh::region_payload(region.count));
     let index = slots[selected.local];
@@ -137,7 +132,7 @@ public func sample_quad_light(surface_point: geometry::SurfacePoint, random_samp
     let inverse =
         float3x4(1, 0, 0, -translation.x, 0, 1, 0, -translation.y, 0, 0, 1, -translation.z);
     result = light_sampling::sample_quad_emitter(
-        distribution, emitter, vertices, surface_point, random_sample.xy, selected.pmf,
+        distribution, emitter, vertices, surface_point, uv_sample, selected.pmf,
         uint(light_regions[index].w) & 3u, transform, inverse, area);
     // 遮挡确认后才按实际 bary 读取发光纹理。
     result.emission = float3(area.bary, asfloat(area.half));
@@ -150,17 +145,24 @@ public func quad_light_emission(light_sample: light_sampling::LightSample,
     ->float3
 {
     let flags : uint = asuint(light_sample.emission.z);
+    if (world_features::configured &&
+        (light_sample.emission_reference & world_features::primitive_bit) != 0)
+    {
+        let slot = light_sample.emission_reference & ~world_features::primitive_bit;
+        let primitive = world_features::primitive_bit | (slot << 1u) | (flags & 1u);
+        let bary = light_sample.emission.xy;
+        if (!world_features::accepts(world_features::faces, world_features::pixels, primitive, bary,
+                                     atlas))
+            return 0;
+        return material_emission(primitive, bary, true, block_emission_scale);
+    }
     let primitive : uint = light_meta[light_sample.emission_reference].w * 2u + (flags & 1u);
     return sampled_material_emission(primitive, light_sample.emission.xy, block_emission_scale);
 }
-public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float3,
-                                                   anchor_region: int3)
+func static_quad_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float3, index: uint,
+                                          selection_pmf: float)
     ->float
 {
-    let index : uint = light_index(hit.identity.x >> 1u);
-    if (index == 0xffffffffu)
-        return 0;
-    let world = light_tree[0];
     var meta : uint4 = light_meta[index];
     let alias_offset : uint = Area.alias_offset(hit.identity.x);
     var uv : float2 = 0;
@@ -182,10 +184,148 @@ public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float
     let distribution : light_sampling::TexturedEmitterAlias = { emission_alias_words };
     let region = light_regions[index];
     let emitter_flags = asuint(region.w);
-    let group = light_bvh::light_world_find_region(world, region.xyz);
-    let selection_pmf =
-        light_bvh::light_world_pmf(world, group, emitter_flags >> 2u, previous, anchor_region);
     return light_sampling::quad_emitter_pdf(distribution, emitter, selection_pmf, previous,
                                             hit.surface.position, hit.surface.normal,
                                             hit.identity.x & 1u, uv, emitter_flags & 3u);
+}
+
+// 叶引用为区块目录索引或当前帧的实例面。区块下的静态树独立发布、跨帧复用。
+[[vk::binding(49, 0)]]
+public var mixed_tree : StructuredBuffer<uint4>;
+static const let selectors = 1u << 24u;
+static const let leaf_bit = 0x80000000u;
+
+func mixed_interval<let reverse : bool>(receiver: float3, selector: uint, rank: uint, header: uint4)
+    ->light_bvh::SelectedInterval
+{
+    var remaining = selector;
+    var count = selectors;
+    var node = header.z;
+    while ((node & leaf_bit) == 0)
+    {
+        let at = 4u * header.y + 3u * node;
+        let a = asfloat(mixed_tree[at]);
+        let b = asfloat(mixed_tree[at + 1u]);
+        let children = mixed_tree[at + 2u];
+        var left = count;
+        if (a.w <= 0)
+            left = 0u;
+        else if (b.w > 0)
+        {
+            let da = a.xyz - receiver;
+            let db = b.xyz - receiver;
+            left = light_bvh::split_selectors(float2(max(dot(da, da), 1.0e-6), a.w),
+                                              float2(max(dot(db, db), 1.0e-6), b.w), children.z,
+                                              children.w, count);
+        }
+        let right = reverse ? rank >= node : remaining >= left;
+        if (right)
+        {
+            if (!reverse)
+                remaining -= left;
+            count -= left;
+            node = children.y;
+        }
+        else
+        {
+            count = left;
+            node = children.x;
+        }
+        if (count == 0)
+            break;
+    }
+    return { node & ~leaf_bit, remaining, count };
+}
+
+public func sample_quad_light(surface_point: geometry::SurfacePoint, random_sample: float3,
+                              params: Params)
+    ->light_sampling::LightSample
+{
+    let world = light_tree[0];
+    let anchor = params.anchor_region.xyz;
+    let receiver = surface_point.position;
+    if (!world_features::configured || mixed_tree[0].x == 0)
+        return sample_region_quad(
+            surface_point, random_sample.xy, params,
+            light_bvh::sample_light_world(world, receiver, anchor, random_sample.z));
+    let header = mixed_tree[0];
+    let selected =
+        mixed_interval<false>(receiver, uint(random_sample.z * float(selectors)), 0u, header);
+    let meta = mixed_tree[2u * header.y + selected.index];
+    if ((meta.w & leaf_bit) != 0)
+    {
+        let index = meta.w & ~leaf_bit;
+        let entry = world.regions[index];
+        // 超过一个 24 位域时才另用独立维度进区块，继续给每个静态灯保留支持。
+        let separate = selected.count < entry.count;
+        let local = light_bvh::select_light_region(
+            entry, receiver, anchor,
+            separate ? uint(random_sample.x * float(selectors)) : selected.selector,
+            separate ? selectors : selected.count);
+        let pmf = float(local.count) / float(selectors) *
+                  (separate ? float(selected.count) / float(selectors) : 1.0);
+        let xy = separate
+                     ? float2(float(selected.selector) / float(selected.count), random_sample.y)
+                     : random_sample.xy;
+        let pick : light_bvh::LightWorldSample = { index, local.index, pmf };
+        return sample_region_quad(surface_point, xy, params, pick);
+    }
+    let slot = meta.w;
+    let vertices : light_sampling::LightQuadVertices = {
+        world_features::faces[slot].position[0].xyz, world_features::faces[slot].position[1].xyz,
+        world_features::faces[slot].position[2].xyz, world_features::faces[slot].position[3].xyz
+    };
+    let emitter : light_sampling::LightSurfaceProposal = { meta, 0u };
+    var area : light_sampling::QuadAreaSample;
+    var result = light_sampling::sample_quad_emitter(
+        light_sampling::UniformEmitterAlias(), emitter, vertices, surface_point, random_sample.xy,
+        float(selected.count) / float(selectors), 3u, area);
+    result.emission = float3(area.bary, asfloat(area.half));
+    result.emission_reference = world_features::primitive_bit | slot;
+    return result;
+}
+
+public func quad_emission_pdf<Area : IEmitterArea>(hit: pt::Hit, previous: float3, anchor: int3)
+    ->float
+{
+    if (!world_features::active(hit.identity.x))
+    {
+        let index = light_index(hit.identity.x >> 1u);
+        if (index == 0xffffffffu)
+            return 0;
+        let world = light_tree[0];
+        let region = light_regions[index];
+        let group = light_bvh::light_world_find_region(world, region.xyz);
+        let local = asuint(region.w) >> 2u;
+        var pmf : float;
+        if (!world_features::configured || mixed_tree[0].x == 0)
+            pmf = light_bvh::light_world_pmf(world, group, local, previous, anchor);
+        else
+        {
+            let header = mixed_tree[0];
+            let rank = mixed_tree[3u * header.y + group].x;
+            let selected = mixed_interval<true>(previous, 0u, rank, header);
+            let entry = world.regions[group];
+            let separate = selected.count < entry.count;
+            let count = light_bvh::light_region_interval_count(
+                entry, local, previous, anchor, separate ? selectors : selected.count);
+            pmf = float(count) / float(selectors) *
+                  (separate ? float(selected.count) / float(selectors) : 1.0);
+        }
+        return static_quad_pdf<Area>(hit, previous, index, pmf);
+    }
+    let slot = world_features::slot(hit.identity.x);
+    if ((world_features::faces[slot].material.y & 4u) == 0u)
+        return 0;
+    let id = asuint(world_features::faces[slot].previous[2].w);
+    if (id == 0u)
+        return 0;
+    let header = mixed_tree[0];
+    let rank = id - 1u;
+    let meta = mixed_tree[2u * header.y + rank];
+    let selected = mixed_interval<true>(previous, 0u, rank, header);
+    let emitter : light_sampling::LightSurfaceProposal = { meta, 0u };
+    return light_sampling::quad_emitter_pdf(
+        light_sampling::UniformEmitterAlias(), emitter, float(selected.count) / float(selectors),
+        previous, hit.surface.position, hit.surface.normal, hit.identity.x & 1u, float2(0), 3u);
 }

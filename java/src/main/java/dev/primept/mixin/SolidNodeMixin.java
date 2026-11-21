@@ -8,9 +8,9 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 @Mixin(SimpleFeatureRenderPhase.class)
 abstract class SolidNodeMixin {
     @Inject(method = "submit(Lnet/minecraft/client/renderer/feature/submit/SubmitNode;)V",
-            at = @At("HEAD"))
+            at = @At("HEAD"), cancellable = true)
     private void
     primept$source(SubmitNode node, CallbackInfo ci) {
-        WorldFeatures.tag(node);
+        if (WorldFeatures.collect(node)) ci.cancel();
     }
 }

@@ -40,6 +40,9 @@ struct TextureCopy {
     kernel: ComputePipeline,
 }
 pub(super) struct Features {
+    pub lights: feature_lights::Lights,
+    #[cfg(test)]
+    pub(super) light_timer: Option<vulkan::native::TimestampQueries>,
     shapes: [vulkan::TriangleBlas; 2],
     pub surfaces: Buffer,
     surface_capacity: usize,
@@ -64,7 +67,12 @@ pub(super) struct Features {
     pose_count: u32,
 }
 impl Features {
-    pub fn new(ctx: &mut Context, atlas: Image, placeholder: Buffer) -> Result<Self, Error> {
+    pub fn new(
+        ctx: &mut Context,
+        atlas: Image,
+        placeholder: Buffer,
+        empty_world: vulkan::native::LightWorld,
+    ) -> Result<Self, Error> {
         let tri = [[A, B, D]];
         let quad = [[A, B, C], [A, C, D]];
         let batch =
@@ -104,6 +112,9 @@ impl Features {
             ),
         )?;
         Ok(Self {
+            lights: feature_lights::Lights::new(ctx, placeholder, empty_world)?,
+            #[cfg(test)]
+            light_timer: None,
             catalog: None,
             candidate: None,
             pose_program,
@@ -143,6 +154,7 @@ impl Features {
         self.first_material = None;
     }
     pub fn reset(&mut self, placeholder: Buffer) {
+        self.lights.reset();
         self.pose_buffer = placeholder;
         self.surfaces = placeholder;
         self.pixels = placeholder;
@@ -187,6 +199,7 @@ impl Features {
         self.dirty.clear();
     }
     pub fn roots(&self, roots: &mut Vec<vulkan::native::Resource>) {
+        self.lights.roots(roots);
         roots.extend(self.shapes.map(vulkan::native::Resource::from));
         roots.extend([self.surfaces, self.pixels].map(vulkan::native::Resource::from));
         if let Some(c) = &self.catalog {
@@ -206,8 +219,21 @@ impl Features {
                 .map(|t| vulkan::native::Resource::from(t.kernel)),
         );
     }
+    pub(super) fn record_poses(&self, commands: &mut Commands) -> Result<(), Error> {
+        if self.pose_count != 0 {
+            commands.dispatch(
+                self.pose_kernel.expect("有活动模型时已绑定源顶点与姿态"),
+                [
+                    self.pose_count.min(65535),
+                    self.pose_count.div_ceil(65535),
+                    1,
+                ],
+            )?;
+        }
+        Ok(())
+    }
     pub fn record_textures(&self, ctx: &mut Context) -> Result<Option<Recorded>, Error> {
-        if self.dirty.is_empty() && self.pose_count == 0 {
+        if self.dirty.is_empty() && self.pose_count == 0 && !self.lights.active() {
             return Ok(None);
         }
         let mut commands = Commands::new(ctx)?;
@@ -223,17 +249,21 @@ impl Features {
                 ],
             )?;
         }
-        if self.pose_count != 0 {
-            commands.dispatch(
-                self.pose_kernel.expect("有活动模型时已绑定源顶点与姿态"),
-                [
-                    self.pose_count.min(65535),
-                    self.pose_count.div_ceil(65535),
-                    1,
-                ],
-            )?;
+        self.record_poses(&mut commands)?;
+        #[cfg(test)]
+        if let Some(timer) = self.light_timer {
+            commands.reset_timestamps(timer)?;
+            commands.barrier();
+            commands.write_timestamp(timer, 0)?;
         }
+        self.lights.record_sort(&mut commands)?;
+        self.lights.record_power(&mut commands)?;
+        self.lights.record_branches(&mut commands)?;
         commands.barrier();
+        #[cfg(test)]
+        if let Some(timer) = self.light_timer {
+            commands.write_timestamp(timer, 1)?;
+        }
         Ok(Some(commands.finish(ctx)?))
     }
     // 宿主在同队列已结束上帧，在本次渲染完成前保活包内视图。
@@ -321,8 +351,7 @@ fn relative(p: [f32; 3], origin: [f64; 3], anchor: [f64; 3]) -> [f32; 3] {
     std::array::from_fn(|i| ((origin[i] - anchor[i]) + f64::from(p[i])) as f32)
 }
 const fn feature_mask(flags: u32) -> u8 {
-    let visibility = if flags & 64 != 0 { 4 } else { 6 };
-    visibility | if flags & 8 == 0 { 1 } else { 0 }
+    if flags & 8 == 0 { 0xff } else { 0xfe }
 }
 fn matrix(p: [[f32; 3]; 4], tri: bool) -> Option<[[f32; 4]; 3]> {
     let x: [f32; 3] = std::array::from_fn(|i| p[1][i] - p[0][i]);
@@ -346,7 +375,11 @@ impl Gpu {
         &mut self,
         source: ResourceUpload<'_>,
         models: &[u8],
+        items: prime_scene::ItemMaterials,
     ) -> Result<(), Error> {
+        if !items.valid_for(source.emission_alias_words) {
+            return Err(Error::Invalid("物品发光遮罩与资源数据不匹配"));
+        }
         let first =
             u32::try_from(source.materials.len()).map_err(|_| Error::Invalid("材质过多"))?;
         let mut defs = source.materials.to_vec();
@@ -367,6 +400,7 @@ impl Gpu {
             &mut self.context,
             models,
             self.geometry_placeholder,
+            items,
         ) {
             Ok(catalog) => catalog,
             Err(error) => {
@@ -396,7 +430,7 @@ impl Gpu {
     /// 拒绝无效源、未准备世代，以及容量、设备和 TLAS 提交失败。
     pub unsafe fn set_world_features(&mut self, bytes: &[u8]) -> Result<(), Error> {
         self.complete_previous()?;
-        let source = Source::decode(bytes)?;
+        let source = Source::decode(bytes, self.features.catalog.as_ref().map(|c| &c.items))?;
         if source.faces.is_empty()
             && source.models.is_empty()
             && self.features.top.is_none()
@@ -516,7 +550,15 @@ impl Gpu {
                             f32::from_bits(vertices[i].color),
                         ]
                     }),
-                    previous: old.map(|p| [p[0], p[1], p[2], 0.]),
+                    // 前两顶点的空闲 w 携带只读发光遮罩地址和强度，不参与运动向量。
+                    previous: std::array::from_fn(|i| {
+                        [
+                            old[i][0],
+                            old[i][1],
+                            old[i][2],
+                            [f32::from_bits(face.emission.0), face.emission.1, 0., 0.][i],
+                        ]
+                    }),
                     uv,
                 });
             }
@@ -704,6 +746,7 @@ impl Gpu {
                 .surfaces
                 .write(&mut self.context, 0, bytemuck::cast_slice(&surfaces))?;
         }
+        self.features.lights.set_surface_count(next_slot);
         self.features.top = top;
         self.features.terrain = Some(self.scene.top);
         self.features.placements = placements;

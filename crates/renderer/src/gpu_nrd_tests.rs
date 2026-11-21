@@ -3,6 +3,8 @@ use super::*;
 use vulkan::nrd::SIGNAL_BYTES_PER_PIXEL;
 #[path = "feature_gpu_tests.rs"]
 mod features;
+#[path = "light_tree_bench.rs"]
+mod light_tree_bench;
 #[path = "gpu_projection_tests.rs"]
 mod projection;
 
@@ -1238,6 +1240,12 @@ fn hardware_world_instance_cost() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::create(true, true)?;
     let mut session = host.gpu()?;
     let gpu = session.gpu();
+    let luminous = std::env::var_os("PRIME_BENCH_EMITTING_MODELS").is_some();
+    let dark = MaterialDefinition::default();
+    let lamp = MaterialDefinition {
+        emission: [1., 1., 1., 5.],
+        ..dark
+    };
     let started = std::time::Instant::now();
     gpu.replace_world_resources(
         ResourceUpload {
@@ -1246,12 +1254,13 @@ fn hardware_world_instance_cost() -> Result<(), Box<dyn std::error::Error>> {
             albedo: &[255; 4],
             mers: &[0; 4],
             auxiliary: &[0; 4],
-            materials: &[MaterialDefinition::default()],
-            light_areas: &[[u32::MAX, 0, 0, 0]],
+            materials: &[dark, lamp],
+            light_areas: &[[u32::MAX, 0, 0, 0]; 2],
             emission_alias_words: &[],
             opacity_quads: &[],
         },
         &bytes,
+        Default::default(),
     )?;
     let preparation = started.elapsed();
     let n = u32::from_le_bytes(bytes[4..8].try_into()?);
@@ -1271,6 +1280,24 @@ fn hardware_world_instance_cost() -> Result<(), Box<dyn std::error::Error>> {
     let mut draw = Vec::new();
     let mut wall = Vec::new();
     let mut packet = Vec::new();
+    if luminous {
+        let lamp_mesh = Mesh {
+            quads: vec![plane(28., 32., 34., 1)],
+        };
+        let regions: Vec<_> = (0..128)
+            .map(|k| prime_scene::RenderRegion {
+                key: [k / 8 - 8, 0, k % 8 - 4],
+                geometry_revision: 1,
+                content_revision: 1,
+                mesh: (&lamp_mesh).into(),
+            })
+            .collect();
+        gpu.set_regions(prime_scene::RenderView {
+            generation: gpu.resource_generation,
+            anchor: [0.; 3],
+            regions: &regions,
+        })?;
+    }
     for tick in 0..25 {
         packet.clear();
         packet.extend_from_slice(b"PTF1");
@@ -1280,7 +1307,7 @@ fn hardware_world_instance_cost() -> Result<(), Box<dyn std::error::Error>> {
             packet.extend_from_slice(&(u64::from(k) + 1).to_le_bytes());
             packet.extend_from_slice(bytemuck::cast_slice(&[
                 0u32,
-                0,
+                if luminous { 4 } else { 0 },
                 u32::MAX,
                 0,
                 1,
@@ -1326,7 +1353,7 @@ fn hardware_world_instance_cost() -> Result<(), Box<dyn std::error::Error>> {
     let m = cpu.len() / 2;
     assert!(draw[m] > 0. && gpu.view.as_ref().unwrap().rr_enabled);
     eprintln!(
-        "动态模型 原生4K DLAA 2spp 512部件 {n}种 资源准备含材质 {:.2} ms，宿主实例提交 {:.3} ms，绘制GPU {:.3} ms，含TLAS和等待的整帧墙钟 {:.3} ms",
+        "动态模型 原生4K DLAA 2spp 512部件 {n}种 动态发光={luminous} 资源准备含材质 {:.2} ms，宿主实例提交 {:.3} ms，绘制GPU {:.3} ms，含TLAS和等待的整帧墙钟 {:.3} ms",
         preparation.as_secs_f64() * 1e3,
         cpu[m],
         draw[m],

@@ -80,7 +80,7 @@ final class Native implements AutoCloseable {
         setLensBloom = bindLensBloom(symbols);
         setLightingOptions = bindLightingOptions(symbols);
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
-        sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG,ADDRESS,JAVA_LONG));
+        sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG,ADDRESS,JAVA_LONG,ADDRESS,JAVA_INT));
         cameraMedium = bind(symbols, "prime_camera_medium", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         tintRequests = bind(symbols,"prime_tint_requests",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
         tints = bind(symbols,"prime_tints",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
@@ -262,8 +262,8 @@ final class Native implements AutoCloseable {
         catch (Throwable e) { throw unchecked(e); }
     }
 
-    void sources(ByteBuffer bytes,ByteBuffer models) {
-        try { check((int) sources.invokeExact(handle,MemorySegment.ofBuffer(bytes),(long)bytes.remaining(),MemorySegment.ofBuffer(models),(long)models.remaining())); }
+    void sources(ByteBuffer bytes,ByteBuffer models,ByteBuffer emittingSprites) {
+        try { check((int) sources.invokeExact(handle,MemorySegment.ofBuffer(bytes),(long)bytes.remaining(),MemorySegment.ofBuffer(models),(long)models.remaining(),MemorySegment.ofBuffer(emittingSprites),emittingSprites.remaining())); }
         catch(Throwable e){throw unchecked(e);}
     }
 

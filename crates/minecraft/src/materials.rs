@@ -27,6 +27,8 @@ pub struct MaterialResources<'a> {
     pub auxiliary: Vec<u8>,
     /// 全局唯一静态alias words，word0保留为uniform fallback。
     pub emission_alias_words: Vec<u32>,
+    /// 可移动物品的表面发光索引，与发光数据中的逐纹素遮罩同世代。
+    pub item_materials: prime_scene::ItemMaterials,
     /// 与materials等长的静态两三角面积，过程几何以0xffffffff为sentinel。
     pub quad_areas: Vec<[u32; 4]>,
     /// 资源期收集的唯一 cutout quad UV；渲染器仅对精确对齐者准备 OMM。
@@ -392,7 +394,47 @@ fn color_luminance([r, g, b, _]: [u8; 4]) -> f32 {
 }
 
 fn native_amplitude(level: u32) -> f32 {
-    (level as f32 / 15.).powi(2)
+    prime_scene::ItemMaterials::native_amplitude(level)
+}
+
+fn append_item_mask(
+    items: &mut prime_scene::ItemMaterials,
+    words: &mut Vec<u32>,
+    sprite: &SpriteSource,
+    size: [u32; 2],
+    ratios: [f64; 2],
+    sample: impl Fn([u32; 2]) -> u8,
+) -> Result<(), Error> {
+    let [w, h] = size;
+    let word = u32::try_from(words.len()).map_err(|_| Error::Input("发光数据偏移溢出"))?;
+    let len = (w * h).div_ceil(4) as usize;
+    if words.len() + 5 + len > u32::MAX as usize / 4 {
+        return Err(Error::Input("物品发光数据超过设备寻址范围"));
+    }
+    words.try_reserve(5 + len)?;
+    words.extend(sprite.bounds.map(f32::to_bits));
+    words.push(w | h << 16);
+    let first = words.len();
+    words.resize(first + len, 0);
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            words[first + i / 4] |= u32::from(sample([x, y])) << ((i % 4) * 8);
+        }
+    }
+    let gains = ratios.map(|ratio| {
+        std::array::from_fn(|level| {
+            if level == 0 {
+                1.
+            } else {
+                textured_amplitude(native_amplitude(level as u32), ratio)
+            }
+        })
+    });
+    items
+        .masks
+        .insert(sprite.id, prime_scene::ItemEmissionMask { word, gains });
+    Ok(())
 }
 
 enum SurfaceSource {
@@ -520,6 +562,7 @@ impl PreparedCatalog<'_> {
                 masked_blocks.insert(state.name.clone());
             }
         }
+        let mut item_materials = prime_scene::ItemMaterials::default();
         let mut sides = HashMap::new();
         let mut ids: Vec<_> = self.next.states.keys().copied().collect();
         ids.sort_unstable();
@@ -528,6 +571,9 @@ impl PreparedCatalog<'_> {
             let state = &self.next.states[&state_id];
             let faces = &roots[&state.model];
             let mapped_block = masked_blocks.contains(&state.name);
+            item_materials
+                .states
+                .insert(state_id, (state.emission as u8, mapped_block));
             let attached = state.flags & State::MULTIFACE != 0;
             let mut bindings = Vec::with_capacity(faces.meshes.len());
             let mut face_mask = if faces.unknown { 127 } else { 0 };
@@ -777,6 +823,40 @@ impl PreparedCatalog<'_> {
             state.blocks_motion = blocks_motion;
             state.fluid_tint = fluid_tint;
         }
+        // 地形复用已解码的 MERS 与光功率。物品图集仅保存真正发光的 R8 子图。
+        for s in self.next.sprites.values() {
+            let m = &maps[&s.id];
+            if let Some(power) = &m.power {
+                let ratios = [power.ratio(None, false), power.ratio(None, true)];
+                // 零尺寸头引用原有方块 MERS 图集，避免重复上传已准备的纹素。
+                append_item_mask(&mut item_materials, &mut words, s, [0; 2], ratios, |_| 0)?;
+            }
+        }
+        for (_, s) in std::mem::take(&mut self.next.item_sprites) {
+            let Some(spec) = &s.specular else { continue };
+            if !spec
+                .image
+                .pixels
+                .chunks_exact(4)
+                .any(|p| crate::lab_pbr::emission(p[3]) != 0)
+            {
+                continue;
+            }
+            let layout = spec.layout();
+            let frame = layout.frames().first().map_or(0, |f| f[0]);
+            append_item_mask(
+                &mut item_materials,
+                &mut words,
+                &s,
+                s.extent,
+                [1.; 2],
+                |p| {
+                    crate::lab_pbr::emission(
+                        sample_material(&spec.image, layout, frame, p, s.extent)[3],
+                    )
+                },
+            )?;
+        }
         self.next.definitions = definitions;
         Ok(MaterialResources {
             materials: &self.next.definitions,
@@ -784,6 +864,7 @@ impl PreparedCatalog<'_> {
             mers,
             auxiliary,
             emission_alias_words: words,
+            item_materials,
             quad_areas: areas,
             opacity_quads,
         })
@@ -1001,7 +1082,15 @@ mod tests {
         for q in quads {
             q.tint = -1;
         }
-        prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+        let maps = prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
+        assert_eq!(
+            maps.item_materials.surface(Some(2), 2, 0, false),
+            Some((0, 0.))
+        );
+        assert_eq!(
+            maps.item_materials.surface(Some(3), 2, 0, false),
+            Some((0, 1.))
+        );
         for id in [1, 2, 3] {
             for q in &prepared.next.states[&id].leaves[0].quads {
                 let m = prepared.next.definitions[q.material.index() as usize];

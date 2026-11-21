@@ -51,12 +51,26 @@ public final class WorldFeatureFixture {
                          "com.mojang.renderpearl.backend.vulkan.VulkanGpuTexture",
                          "net.minecraft.client.renderer.blockentity.StandingSignRenderer",
                          "net.minecraft.client.renderer.blockentity.BeaconRenderer",
+                         "net.minecraft.client.renderer.item.ItemModelResolver",
+                         "net.minecraft.client.renderer.item.ItemStackRenderState",
+                         "net.minecraft.client.renderer.item.ItemStackRenderState$LayerRenderState",
+                         "net.minecraft.client.renderer.entity.ItemEntityRenderer",
+                         "net.minecraft.client.renderer.entity.layers.ItemInHandLayer",
                          "net.minecraft.client.renderer.entity.ItemFrameRenderer",
                          "net.minecraft.client.renderer.entity.PaintingRenderer",
                          "net.minecraft.client.renderer.MapRenderer"})
                 Class.forName(name, false, loader);
             if (!WorldFeatures.SourceRenderer.class.isAssignableFrom(LevelRenderer.class))
                 throw new AssertionError("未应用动态提交钩子");
+            var lamp = net.minecraft.world.level.block.Blocks.SEA_LANTERN;
+            var state = WorldFeatures.blockState(lamp.asItem(), null);
+            if (net.minecraft.world.level.block.Block.stateById(state).getLightEmission() != 15
+                    || WorldFeatures.blockState(net.minecraft.world.item.Items.STICK, null) != -1)
+                throw new AssertionError("海晶灯物品必须保留亮度 15，非方块物品不应继承方块");
+            var item = new net.minecraft.client.renderer.item.ItemStackRenderState();
+            ((WorldFeatures.ItemLayers)item).primept$block(state);
+            var itemLayer = (WorldFeatures.ItemLayers)item.newLayer();
+            if (itemLayer.primept$block(-1) != state) throw new AssertionError("烘焙物品图层丢失方块身份");
             var set = EntityModelSet.vanilla();
             var catalog = FeatureModels.prepare(set);
             var bytes = catalog.packet();

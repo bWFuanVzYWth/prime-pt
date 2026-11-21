@@ -10,20 +10,24 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
-import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.particle.SingleQuadParticle;
 import net.minecraft.client.renderer.StagedVertexBuffer;
 import net.minecraft.client.renderer.feature.TextFeatureRenderer;
+import net.minecraft.client.renderer.feature.ItemFeatureRenderer;
+import net.minecraft.client.resources.model.geometry.ItemQuads;
+import net.minecraft.client.renderer.SubmitNodeCollector;
+import net.minecraft.client.renderer.state.level.PlayerRenderState;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.client.renderer.feature.submit.SubmitNode;
 import net.minecraft.client.renderer.rendertype.PreparedRenderType;
 import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.util.LightCoordsUtil;
-import net.minecraft.world.entity.Entity;
-import net.minecraft.world.phys.AABB;
-import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
 
 /** 从原版实际提交捕获来源身份、图元布局及 Sampler0；设备句柄只借给本次宿主帧。 */
@@ -40,15 +44,22 @@ public final class WorldFeatures {
         long primept$revision();
         void primept$written();
     }
+    public interface ItemLayers {
+        int primept$block(int state);
+        boolean primept$emits();
+    }
+    public interface HandRenderer {
+        void primept$hands(CameraRenderState camera, PlayerRenderState player, SubmitNodeCollector collector);
+    }
     public interface SourceRenderer {
-        void primept$features(CameraRenderState camera);
+        void primept$features(CameraRenderState camera, boolean viewHands);
     }
     public interface Pages {
         void primept$finish();
         void primept$drain();
     }
     private record Material(int texture, int flags, int topology) {}
-    private record Node(long owner, int part) {}
+    private record Node(long owner, int part, int block) {}
     private static Packet spans = new Packet(4096), packet = new Packet(4096);
     private static int submissionDepth;
     private static final IdentityHashMap<SubmitNode, Node> nodes = new IdentityHashMap<>();
@@ -97,12 +108,53 @@ public final class WorldFeatures {
     }
     private static final LinkedHashMap<SingleQuadParticle.Layer, Billboards> billboards =
             new LinkedHashMap<>();
-    private static long particleOwner, cameraHiddenOwner;
+    private static long particleOwner;
     private static int particleFace;
     private static long nextId, owner;
     private static int part, chunk, count;
+    private static final int[] handParts = new int[2];
     private static final Long2IntOpenHashMap boneOccurrences = new Long2IntOpenHashMap();
     private static boolean active, luminousText;
+    private static final long HAND_OWNER = allocateId();
+    private static int itemBlock = -1;
+    private static final IdentityHashMap<ItemLayers, Boolean> capturedLayers = new IdentityHashMap<>();
+    public static int blockState(ItemStack stack) {
+        return blockState(stack.getItem(), stack.get(DataComponents.BLOCK_STATE));
+    }
+    static int blockState(net.minecraft.world.item.Item item, net.minecraft.world.item.component.BlockItemStateProperties properties) {
+        if (!(item instanceof BlockItem block)) return -1;
+        var state = block.getBlock().defaultBlockState();
+        return Block.getId(properties == null ? state : properties.apply(state));
+    }
+    public static boolean emits(int block, ItemQuads quads) {
+        if (quads == null || quads.isEmpty()) return false;
+        if (block >= 0 && Block.stateById(block).getLightEmission() != 0) return true;
+        var resources = SourceResources.prepared();
+        for (var q : quads.all()) {
+            var m = q.materialInfo();
+            if (m.lightEmission() != 0 || resources.emits(m.sprite())) return true;
+        }
+        return false;
+    }
+    public static int itemBlock(int state) {
+        int old = itemBlock;
+        itemBlock = state;
+        return old;
+    }
+    public static void beginHands() {
+        owner = HAND_OWNER;
+        handParts[0] = handParts[1] = 0;
+    }
+    public static void submittedHands() {
+        owner = 0;
+    }
+    public static boolean collectingHand() { return active && owner == HAND_OWNER; }
+    public static boolean capturedHands() { return !capturedLayers.isEmpty(); }
+    public static boolean capturedLayer(ItemLayers layer) { return capturedLayers.containsKey(layer); }
+    public static int spanCount() { return count; }
+    public static void captureLayer(ItemLayers layer, int before) {
+        if (count != before) capturedLayers.put(layer, true);
+    }
     public static synchronized long allocateId() {
         return nextId = Math.incrementExact(nextId);
     }
@@ -111,6 +163,7 @@ public final class WorldFeatures {
     }
     public static void releaseWorld() {
         end();
+        capturedLayers.clear();
         textureSlots.clear();
         textures.clear();
         billboards.clear();
@@ -120,7 +173,6 @@ public final class WorldFeatures {
         packet = new Packet(4096);
     }
     public static void extraction() {
-        cameraHiddenOwner = 0;
         particleOwner = 0;
         for (var group : billboards.values()) {
             group.count = 0;
@@ -160,20 +212,8 @@ public final class WorldFeatures {
         if (state != null)
             ((SourceState) state).primept$sourceId(((Owner) source).primept$id());
     }
-    /** 压墙的第三人称相机也可能进入观察实体；只隐藏该实体的直视命中。 */
-    public static void cameraBody(Entity observer, Vec3 eye, float partial, boolean attached) {
-        if (attached || intersectsCamera(eye, observer.getBoundingBox(), observer.position(),
-                                observer.getPosition(partial))) {
-            cameraHiddenOwner = ((Owner) observer).primept$id();
-        }
-    }
-    static boolean intersectsCamera(Vec3 eye, AABB bounds, Vec3 current, Vec3 rendered) {
-        return bounds.inflate(Camera.PROJECTION_Z_NEAR).contains(eye.x + (current.x - rendered.x),
-                eye.y + (current.y - rendered.y), eye.z + (current.z - rendered.z));
-    }
     private static int appearance(int flags) {
-        return flags | (luminousText && (flags & 8) != 0 ? 4 : 0)
-                | (owner != 0 && owner == cameraHiddenOwner ? 64 : 0);
+        return flags | (luminousText && (flags & 8) != 0 ? 4 : 0);
     }
     public static void submitting(Object state) {
         if (active && submissionDepth++ == 0) {
@@ -197,9 +237,19 @@ public final class WorldFeatures {
     public static void built() {
         owner = 0;
     }
-    public static void tag(SubmitNode node) {
+    /** 手持物使用原版姿态直接写入世界一次；手臂、地图底板等继续由原版画在屏幕上。 */
+    public static boolean collect(SubmitNode node) {
+        if (collectingHand()) {
+            if (node instanceof ItemFeatureRenderer.Submit item) {
+                int side = item.displayContext().leftHand() ? 0 : 1;
+                part = handParts[side]++ * 2 + side;
+                item(item, itemBlock);
+            }
+            return true;
+        }
         if (active && owner != 0)
-            nodes.putIfAbsent(node, new Node(owner, part++));
+            nodes.putIfAbsent(node, new Node(owner, part++, itemBlock));
+        return false;
     }
     public static void building(SubmitNode node) {
         luminousText = node instanceof TextFeatureRenderer.Submit text
@@ -217,6 +267,8 @@ public final class WorldFeatures {
         part = 0;
         chunk = 0;
         count = 0;
+        capturedLayers.clear();
+        itemBlock = -1;
         nodes.clear();
         materials.clear();
         builders.clear();
@@ -290,6 +342,44 @@ public final class WorldFeatures {
                         flags(name, type.hasBlending(),
                                 type.pipeline().getShaderDefines().values().containsKey("ALPHA_CUTOUT")),
                         topology));
+    }
+    /** 直接取烘焙面的真实 sprite、方块状态和自光亮度，所有面共享一次姿态。 */
+    public static void item(ItemFeatureRenderer.Submit node) {
+        var source = nodes.get(node);
+        item(node, source == null ? -1 : source.block);
+    }
+    private static void item(ItemFeatureRenderer.Submit node, int block) {
+        if (node.outlineColor() != 0 || node.quads().isEmpty()) return;
+        var resources = SourceResources.prepared();
+        var textures = Minecraft.getInstance().getTextureManager();
+        spans.putLong(owner);
+        spans.putInt(part);
+        spans.putInt(0);
+        spans.putInt(-1);
+        spans.putInt(2);
+        spans.putInt(node.quads().size());
+        spans.putInt(96);
+        spans.putInt(0);
+        spans.putInt(-1);
+        spans.putInt(-1);
+        spans.putInt(block);
+        var pose = node.pose().pose();
+        for (int row = 0; row < 3; row++)
+            for (int col = 0; col < 4; col++) spans.putFloat(pose.get(col, row));
+        var tints = node.tintLayers();
+        for (var quad : node.quads()) {
+            var m = quad.materialInfo();
+            var sprite = m.sprite();
+            int texture = sprite.atlasLocation().equals(TextureAtlas.LOCATION_BLOCKS) ? -2
+                    : texture(textures.getTexture(sprite.atlasLocation()).getTextureView());
+            int i = m.tintIndex();
+            int tint = m.isTinted() && i >= 0 && i < tints.length ? tints[i] : -1;
+            spans.putInt(texture);
+            spans.putInt(resources.itemSprite(sprite));
+            spans.putInt(m.layer().ordinal() | (m.lightEmission() << 8));
+            spans.quad(quad, tint);
+        }
+        count++;
     }
     public static void mesh(StagedVertexBuffer.Draw draw, MeshData data) {
         if (!active)

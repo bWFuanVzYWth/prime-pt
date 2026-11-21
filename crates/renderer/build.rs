@@ -130,6 +130,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         ("shaders/post.slang", "post_main", "post.spv"),
         (
+            "shaders/feature_lights.slang",
+            "feature_lights_collect",
+            "feature_lights_collect.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_schedule",
+            "feature_lights_schedule.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_sort",
+            "feature_lights_sort.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_merge",
+            "feature_lights_merge.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_radix",
+            "feature_lights_radix.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_1",
+            "feature_lights_1.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_64",
+            "feature_lights_64.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_4096",
+            "feature_lights_4096.spv",
+        ),
+        (
+            "shaders/feature_lights.slang",
+            "feature_lights_262144",
+            "feature_lights_262144.spv",
+        ),
+        (
             "shaders/feature_texture.slang",
             "feature_texture",
             "feature_texture.spv",

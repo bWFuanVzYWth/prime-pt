@@ -31,7 +31,7 @@ abstract class LevelRendererMixin implements WorldFeatures.SourceRenderer {
     @Shadow
     protected abstract void submitBlockEntities(
             PoseStack pose, LevelRenderState state, SubmitNodeCollector collector);
-    public void primept$features(CameraRenderState camera) {
+    public void primept$features(CameraRenderState camera, boolean viewHands) {
         var poses = new PoseStack();
         WorldFeatures.begin();
         try {
@@ -39,6 +39,9 @@ abstract class LevelRendererMixin implements WorldFeatures.SourceRenderer {
             submitEntities(poses, levelRenderState, submitNodeStorage);
             submitBlockEntities(poses, levelRenderState, submitNodeStorage);
             levelRenderState.particlesRenderState.submit(submitNodeStorage, camera);
+            if (viewHands)
+                ((WorldFeatures.HandRenderer) net.minecraft.client.Minecraft.getInstance().gameRenderer)
+                        .primept$hands(camera, levelRenderState.playerRenderState, submitNodeStorage);
             featureRenderDispatcher.prepareFrame(submitNodeStorage).close();
         } finally {
             WorldFeatures.end();

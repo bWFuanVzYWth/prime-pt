@@ -6,7 +6,7 @@ import org.joml.Matrix4f;
 import org.joml.Vector3f;
 
 /** 只在宿主透视投影就绪后写入 native Camera；进入世界时 initialized 可以先于投影有效。 */
-final class CameraPacket {
+public final class CameraPacket {
     private CameraPacket() {}
 
     static boolean write(CameraRenderState camera, ByteBuffer output) {
@@ -28,6 +28,15 @@ final class CameraPacket {
         vector(output, up.x, up.y, up.z);
         output.flip();
         return true;
+    }
+
+    /** 保留手持物的原版距离和摆动，同时匹配独立的手部视野。 */
+    public static Matrix4f handTransform(CameraRenderState camera, int width, int height) {
+        float tan = (float) Math.tan(Math.toRadians(camera.hudFov) * 0.5);
+        float sx = height / (width * tan * Math.abs(camera.projectionMatrix.m00()));
+        float sy = 1f / (tan * Math.abs(camera.projectionMatrix.m11()));
+        return new Matrix4f(camera.viewRotationMatrix).invert()
+                .scale(sx, sy, 1f);
     }
 
     private static void vector(ByteBuffer output, float x, float y, float z) {

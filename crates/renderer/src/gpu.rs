@@ -19,6 +19,8 @@
 //! 实时双样本与离线采用独立入口及最小链接集；有限film、合成和显示程序在准备阶段建立，
 //! FramePlan统一选择录制与参数，帧内只重绑和选择已有程序。
 
+#[path = "feature_lights.rs"]
+mod feature_lights;
 #[path = "feature_models.rs"]
 mod feature_models;
 #[path = "feature_source.rs"]
@@ -1181,7 +1183,12 @@ impl Gpu {
             ],
         )?;
 
-        let features = world_features::Features::new(&mut context, atlas, geometry_placeholder)?;
+        let features = world_features::Features::new(
+            &mut context,
+            atlas,
+            geometry_placeholder,
+            lighting_gpu.tree,
+        )?;
         let gpu = Self {
             features,
             diagnostic_sync: std::env::var_os("PRIME_PT_DIAGNOSTIC_SYNC")

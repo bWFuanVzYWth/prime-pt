@@ -3,7 +3,6 @@ package dev.primept;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
-import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
 
 /** 验证首帧投影等待，以及有效相机的中心方向和视锥尺寸；不启动游戏。 */
@@ -31,16 +30,18 @@ final class CameraFixture {
         camera.projectionMatrix.m11(-camera.projectionMatrix.m11());
         require(CameraPacket.write(camera, output), "Vulkan 翻转投影应可提交");
         near(output.getFloat(60), 1, "世界向上与投影 Y 符号无关");
-        var current = new Vec3(30_000_001, 64, 0);
-        var rendered = new Vec3(30_000_000, 64, 0);
-        var bounds = new AABB(current.x - 0.3, 64, -0.3, current.x + 0.3, 65.8, 0.3);
-        for (int side : new int[]{-1, 1}) {
-            require(WorldFeatures.intersectsCamera(rendered.add(0, 1.62, side * 0.32), bounds, current, rendered),
-                    "第三人称相机被墙推回正在插值的玩家时应隐藏自身直视");
-            require(!WorldFeatures.intersectsCamera(rendered.add(0, 1.62, side * 4), bounds, current, rendered),
-                    "前、后第三人称在常规距离应看见玩家");
-        }
-        System.out.println("Camera readiness/projection and observer visibility fixture passed");
+        camera.hudFov = 70;
+        var hand = new org.joml.Vector4f(0.3f, -0.2f, -0.7f, 1);
+        var hud = new org.joml.Matrix4f().setPerspective((float)Math.toRadians(camera.hudFov), 2f, 0.05f, 1000f);
+        hud.m11(Math.copySign(hud.m11(), camera.projectionMatrix.m11()));
+        var expected = hud.transform(new org.joml.Vector4f(hand));
+        var world = CameraPacket.handTransform(camera, 3840, 1920).transform(new org.joml.Vector4f(hand));
+        var view = camera.viewRotationMatrix.transform(world);
+        near(view.z, hand.z, "手持灯保留世界距离");
+        var actual = camera.projectionMatrix.transform(view);
+        near(actual.x/actual.w, expected.x/expected.w, "手持物水平投影");
+        near(actual.y/actual.w, expected.y/expected.w, "手持物垂直投影");
+        System.out.println("Camera readiness/projection and hand projection fixture passed");
     }
 
     private static void near(float actual, float expected, String message) {

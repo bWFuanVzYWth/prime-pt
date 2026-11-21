@@ -56,6 +56,34 @@ public var material_words : ByteAddressBuffer;
 public var mers_atlas : Texture2D<float4>;
 [[vk::binding(29, 0)]]
 public var aux_atlas : Texture2D<float4>;
+/// 发光资源只读表。地形灯读取 alias，物品命中读取烘焙时同世代准备的 R8 遮罩。
+[[vk::binding(35, 0)]]
+public var emission_alias_words : ByteAddressBuffer;
+
+public func instance_emission(primitive: uint, bary: float2)->float
+{
+    if (!world_features::active(primitive))
+        return 1.0;
+    let face = world_features::slot(primitive);
+    if ((world_features::faces[face].material.y & 256u) == 0)
+        return 1.0;
+    let gain = world_features::faces[face].previous[1].w;
+    let start = asuint(world_features::faces[face].previous[0].w) * 4u;
+    if (start == 0)
+        return gain;
+    let bounds = asfloat(emission_alias_words.Load4(start));
+    let packed = emission_alias_words.Load(start + 16u);
+    let size = uint2(packed & 65535u, packed >> 16u);
+    let uv = world_features::uv_at(world_features::faces, face, world_features::indices(primitive),
+                                   float3(1.0 - bary.x - bary.y, bary));
+    if (packed == 0)
+        return gain * mers_atlas.Load(prime_coverage::sprite_address(atlas, uv, bounds)).y;
+    let xy =
+        min(uint2(saturate((uv - bounds.xy) / (bounds.zw - bounds.xy)) * float2(size)), size - 1u);
+    let index = xy.y * size.x + xy.x;
+    let texels = emission_alias_words.Load(start + 20u + (index & ~3u));
+    return gain * float((texels >> ((index & 3u) * 8u)) & 255u) * (1.0 / 255.0);
+}
 
 /// 前112B/材质保持源布局；逐块load供最终消费者裁剪，导引槽不进入物理材料值。
 public func material_at(index: uint)->ModMaterial
@@ -249,7 +277,7 @@ public func material_emission<let accepted_sample : bool = false>(primitive: uin
     var result : float3 = material.emission.xyz * material.emission.w * texel.xyz;
     if ((material.control.z & 4u) != 0)
         result *= mers_atlas.Load(sprite_address(uv, material.uv_bounds)).y;
-    return result * block_emission_scale;
+    return result * (block_emission_scale * instance_emission(primitive, bary));
 }
 func normal_sign(value: float2)->float2
 {
@@ -447,7 +475,8 @@ public func resolve_material<let has_aux : bool = false, let read_color : bool =
         result.emission = material.emission.xyz * material.emission.w * hit.texel.xyz;
         if (textured_emission)
             result.emission *= mers.y;
-        result.emission *= block_emission_scale;
+        result.emission *=
+            block_emission_scale * instance_emission(primitive, asfloat(hit.identity.yz));
     }
     result.boundary_filter = 1;
     return result;

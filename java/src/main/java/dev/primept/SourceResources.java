@@ -68,6 +68,7 @@ final class SourceResources {
     private final Packet packet = new Packet();
     final SourceBiomes biomes;
     private boolean accepted;
+    private final ByteBuffer emittingSprites;
     private record ModelRow(Object source, int kind, int[] children, int[] weights) {}
     private record FaceRow(VoxelShape shape, Direction.Axis normal) {}
 
@@ -79,6 +80,10 @@ final class SourceResources {
         for (var sprite : Atlas.sprites()) sprite(sprite);
         for (BlockState state : Block.BLOCK_STATE_REGISTRY) state(state);
         for (BlockState state : states) registerTints(state);
+        for (var sprite : Atlas.itemSprites())
+            if (minecraft.getResourceManager().getResource(LabPbrSource.companion(sprite.contents().name(), "_s")).isPresent())
+                sprite(sprite);
+        emittingSprites = ByteBuffer.allocateDirect(sprites.size() + 1);
     }
 
     @SuppressWarnings("unchecked")
@@ -201,8 +206,12 @@ final class SourceResources {
         var tint=biomes.packet();packet.putInt(tint.remaining());packet.putBuffer(tint);
         return packet.finish();
     }
-    void accepted(){accepted=true;prepared=this;packet.discard();biomes.accepted();states.clear();modelIds.clear();models.clear();faceIds.clear();faces.clear();fluidIds.clear();fluids.clear();spriteIds.clear();sprites.clear();}
+    void accepted(){accepted=true;prepared=this;packet.discard();biomes.accepted();states.clear();modelIds.clear();models.clear();faceIds.clear();faces.clear();fluidIds.clear();fluids.clear();sprites.clear();}
     void empty(Packet out,BlockState air){if(!statesKnown.get(Block.getId(air)))throw new IllegalStateException("空section引用未准备状态");out.putInt(1);out.putInt(0);out.putInt(1);out.putInt(0);out.putInt(Block.getId(air));}
+
+    ByteBuffer emissionOutput() { return emittingSprites; }
+    int itemSprite(TextureAtlasSprite sprite) { return spriteIds.getOrDefault(sprite, 0); }
+    boolean emits(TextureAtlasSprite sprite) { return emittingSprites.get(itemSprite(sprite)) != 0; }
 
     private void writeState(BlockState s) {
         int flags=(s.isAir()?1:0)|((boolean)get(SOLID,s)?4:0)|(s.getRenderShape()!=RenderShape.MODEL?16:0)|(s.isSolid()?32:0);
@@ -255,14 +264,16 @@ final class SourceResources {
         var c=s.contents();packet.putInt(id);packet.putString(c.name().toString());packet.putFloat(s.getU0());packet.putFloat(s.getV0());packet.putFloat(s.getU1());packet.putFloat(s.getV1());packet.putInt(c.width());packet.putInt(c.height());
         var resource=minecraft.getResourceManager().getResource(net.minecraft.resources.Identifier.fromNamespaceAndPath(c.name().getNamespace(),"textures/"+c.name().getPath()+".png"));
         var animation=SourceAnimation.metadata(c);
-        packet.putInt((resource.isPresent()&&resource.get().sourcePackId().equals("vanilla")?1:0)|(animation.interpolate()?2:0));
+        boolean item = s.atlasLocation().equals(net.minecraft.client.renderer.texture.TextureAtlas.LOCATION_ITEMS);
+        packet.putInt((item?4:0)|(resource.isPresent()&&resource.get().sourcePackId().equals("vanilla")?1:0)|(animation.interpolate()?2:0));
         var frames=animation.frames();packet.putInt(frames.size());
         for(Object frame:frames){packet.putInt(SourceAnimation.index(frame));packet.putInt(SourceAnimation.duration(frame));}
         packet.putInt(1);
         var image=((dev.primept.mixin.SpriteAccess)c).primept$image();packet.putInt(image.getWidth());packet.putInt(image.getHeight());
         if(frames.isEmpty())packet.putInt(0);
         else{int count=Math.multiplyExact(Math.multiplyExact(image.getWidth(),image.getHeight()),4);packet.putInt(count);var pixels=image.getPixelBytes().duplicate();pixels.position(0).limit(count);packet.putBuffer(pixels);}
-        LabPbrSource.write(packet,minecraft.getResourceManager(),c.name(),"_n");
+        if(item)packet.putInt(0);
+        else LabPbrSource.write(packet,minecraft.getResourceManager(),c.name(),"_n");
         LabPbrSource.write(packet,minecraft.getResourceManager(),c.name(),"_s");
     }
     private static Field field(Class<?> owner,String name){try{var f=owner.getDeclaredField(name);f.setAccessible(true);return f;}catch(ReflectiveOperationException e){throw new ExceptionInInitializerError(e);}}

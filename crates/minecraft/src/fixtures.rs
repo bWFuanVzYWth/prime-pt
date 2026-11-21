@@ -163,6 +163,34 @@ pub fn vanilla_cube<'a>(
     Ok(prepared)
 }
 
+/// 海晶灯方块及其物品共用的 16×16 sprite。可提供资源包的第一帧 LabPBR 参数。
+pub fn sea_lantern(
+    catalog: &mut Catalog,
+    specular: Option<Vec<u8>>,
+) -> Result<crate::PreparedCatalog<'_>, Error> {
+    let mut staged = vanilla_cube(catalog, "sea_lantern")?;
+    staged.next.states.get_mut(&1).unwrap().emission = 15;
+    if let Some(pixels) = specular {
+        if pixels.len() != 16 * 16 * 4 {
+            return Err(Error::Input("海晶灯夹具需要 16×16 RGBA8 参数图"));
+        }
+        let sprite = staged.next.sprites.get_mut(&1).unwrap();
+        sprite.vanilla = false;
+        sprite.specular = Some(crate::lab_pbr::MaterialImage::inherited(
+            crate::ImageSource {
+                width: 16,
+                height: 16,
+                pixels,
+            },
+            &sprite.images[0],
+            sprite.extent,
+            &sprite.frames,
+            sprite.interpolate,
+        )?);
+    }
+    Ok(staged)
+}
+
 /// 26.3 FaceBakery 实测的贴地地衣。两种源面顺序用于核对外露面的选择。
 /// 候选使用 32×16 图集左半部；调用方提供颜色和 alpha，然后提交资源世代。
 pub fn floor_lichen(

@@ -44,7 +44,7 @@ final class Packet {
 
     void quad(BakedQuad quad, int tint) {
         reserve(84);
-        bytes.putInt(tint | 0xff000000);
+        bytes.putInt(tint);
         for (int i = 0; i < 4; i++) {
             var p = quad.position(i);
             long uv = quad.packedUV(i);

@@ -54,7 +54,7 @@ public final class Renderer {
         frozen=false;hasFrame=false;
         var next=SourceResources.prepareReload(Minecraft.getInstance());
         var models=FeatureModels.prepare(Minecraft.getInstance().getModelManager().entityModels().get());
-        Atlas.send(renderer);renderer.sources(next.packet(),models.packet());models.publish();next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;CHANGES.clear();
+        Atlas.send(renderer);renderer.sources(next.packet(),models.packet(),next.emissionOutput());models.publish();next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;CHANGES.clear();
     }
 
     /** 在外层提取边界交接原版与 Prime；完成证明后才改变 native 模式。 */
@@ -130,7 +130,7 @@ public final class Renderer {
         renderer.tints(CAPTURE.tints(minecraft,tintRequests,count));
     }
 
-    /** 替代原版世界绘制；相机、手持物和 UI 继续使用宿主路径。 */
+    /** 替代世界绘制；带自发光的手持物在本帧 HDR 中合成。 */
     public static void render(CameraRenderState camera, RenderTarget target) {
         try { renderFrame(camera, target); }
         catch (GpuDeviceLossException failure) { reportDeviceLoss(failure); throw failure; }
@@ -155,8 +155,8 @@ public final class Renderer {
         boolean resetWorld = CAPTURE.select(minecraft.level) || resetRequested;
         boolean resume = frozen && !Settings.offline();
         ByteBuffer features=null;
-        if (!Settings.offline()||!hasFrame||resetWorld) {
-            ((WorldFeatures.SourceRenderer)minecraft.levelRenderer).primept$features(camera);
+        if (!Settings.offline()||!hasFrame||resetWorld||WorldFeatures.capturedHands()) {
+            ((WorldFeatures.SourceRenderer)minecraft.levelRenderer).primept$features(camera, !Settings.offline());
             features=WorldFeatures.packet(camera);
         }
         long started = System.nanoTime();

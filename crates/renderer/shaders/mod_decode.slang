@@ -216,7 +216,12 @@ struct ConstantEmission<let sides : uint> : IEmission
         if (((hit.front ? 1u : 2u) & sides) == 0u)
             return 0;
         let emission : float4 = asfloat(material_words.Load4(start + 48u));
-        return emission.xyz * emission.w * hit.texel.xyz * scale;
+#if OPENPBR_VARIANT & 131072
+        let gain = scale * instance_emission(hit.identity.x, asfloat(hit.identity.yz));
+#else
+        let gain = scale;
+#endif
+        return emission.xyz * emission.w * hit.texel.xyz * gain;
     }
 };
 struct TexturedEmission<let sides : uint> : IEmission

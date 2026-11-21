@@ -67,20 +67,6 @@ public func region_primitive(instance: uint, local_primitive: uint)->uint
     return instance_quad_bases[instance] * 2u + local_primitive;
 }
 
-/// TLAS 使用独立的相机、散射和阴影可见位。没有功能实例的世代保留默认掩码。
-public func path_visibility_mask(primary: bool)->uint
-{
-    return world_features::configured
-               ? (primary ? world_features::camera_mask : world_features::scattering_mask)
-               : 0xffu;
-}
-
-/// 通用导引查询同时接收针孔射线和从表面偏移后的延续射线。
-public func visibility_mask(origin: float3)->uint
-{
-    return path_visibility_mask(all(origin == parameters[0].origin.xyz));
-}
-
 public func sun_contains(direction: float3)->bool
 {
     return sampling::cone_contains_chord(parameters[0].lighting.xyz,
@@ -175,7 +161,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         let ray : RayDesc = { origin, 0, direction, pt::FAR };
         var ray_payload : TracePayload = (TracePayload)0;
         ray_payload.primitive = 0xffffffffu;
-        TraceRay(scene, RAY_FLAG_NONE, visibility_mask(ray.Origin), 0, 1, 0, ray, ray_payload);
+        TraceRay(scene, RAY_FLAG_NONE, 0xffu, 0, 1, 0, ray, ray_payload);
         if (ray_payload.primitive == 0xffffffffu)
             return false;
         hit.surface = ray_payload.surface;
@@ -272,8 +258,6 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public func emission_pdf(hit: pt::Hit, previous: float3)->float
     {
-        if (world_features::active(hit.identity.x))
-            return 0;
         return quad_emission_pdf<SelectedEmitterArea>(hit, previous,
                                                       parameters[0].anchor_region.xyz);
     }
@@ -282,7 +266,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
     {
         let ray : RayDesc = { connection.origin, connection.t_min, connection.direction,
                               connection.t_max };
-#if PRIMEPT_COVERAGE_MASK == 0
+#if PRIMEPT_COVERAGE_MASK == 0 && defined(PRIMEPT_WORLD_FEATURES) && !PRIMEPT_WORLD_FEATURES
         {
             var opaque : RayQuery<(first ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : 0) |
                                   RAY_FLAG_FORCE_OPAQUE>;

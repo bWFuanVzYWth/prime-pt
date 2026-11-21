@@ -10,8 +10,12 @@ import net.minecraft.server.packs.resources.ResourceManager;
 final class LabPbrSource {
     private LabPbrSource() {}
 
+    static Identifier companion(Identifier sprite, String suffix) {
+        return Identifier.fromNamespaceAndPath(sprite.getNamespace(), "textures/" + sprite.getPath() + suffix + ".png");
+    }
+
     static void write(Packet packet, ResourceManager resources, Identifier sprite, String suffix) {
-        var id = Identifier.fromNamespaceAndPath(sprite.getNamespace(), "textures/" + sprite.getPath() + suffix + ".png");
+        var id = companion(sprite, suffix);
         var selected = resources.getResource(id);
         if (selected.isEmpty()) {
             packet.putInt(0);

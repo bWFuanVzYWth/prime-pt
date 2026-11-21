@@ -47,7 +47,8 @@ pub unsafe extern "C" fn prime_atlas(
 /// 候选shader/SBT/材质/alias全部就绪后才发布，运行期section不得调用本入口追加资源。
 ///
 /// # Safety
-/// data 与 model_data 在调用内分别借出完整的 len 和 model_len 字节；宿主已完成此前命令且独占graphics queue。
+/// data 与 model_data 在调用内分别借出完整的 len 和 model_len 字节；emitting_sprites
+/// 独占借出 sprite_capacity 字节，不与输入重叠。宿主已完成此前命令且独占 graphics queue。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn prime_sources(
     id: u64,
@@ -55,6 +56,8 @@ pub unsafe extern "C" fn prime_sources(
     len: u64,
     model_data: *const u8,
     model_len: u64,
+    emitting_sprites: *mut u8,
+    sprite_capacity: u32,
 ) -> i32 {
     guarded(-1, || {
         let len = usize::try_from(len).map_err(|_| Error::Input("资源包长度越界"))?;
@@ -93,7 +96,28 @@ pub unsafe extern "C" fn prime_sources(
                 }
                 // SAFETY: 宿主随本次资源世代借出 model_len 字节，返回后复制或准备已经完成。
                 let models = unsafe { std::slice::from_raw_parts(model_data, model_len as usize) };
-                engine.gpu.replace_world_resources(source, models)?;
+                if emitting_sprites.is_null()
+                    || sprite_capacity == 0
+                    || sprite_capacity as usize > prime_minecraft::MAX_PACKET
+                    || materials
+                        .item_materials
+                        .masks
+                        .keys()
+                        .any(|&id| id >= sprite_capacity)
+                {
+                    return Err(Error::Input("物品发光 sprite 返回缓冲无效"));
+                }
+                // SAFETY: 输出由宿主独占借出，容量与所有实际写入的 sprite 编号已校验。
+                let visibility = unsafe {
+                    std::slice::from_raw_parts_mut(emitting_sprites, sprite_capacity as usize)
+                };
+                visibility.fill(0);
+                for &id in materials.item_materials.masks.keys() {
+                    visibility[id as usize] = 1;
+                }
+                engine
+                    .gpu
+                    .replace_world_resources(source, models, materials.item_materials)?;
             }
             prepared.commit();
             world.commit();

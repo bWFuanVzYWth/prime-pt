@@ -70,6 +70,11 @@ impl Gpu {
             Binding::StorageImage(view.rr.rr_specular_motion),
             buffer(&feature_surfaces),
             buffer(&feature_pixels),
+            buffer(&if std::ptr::eq(scene, &self.scene) {
+                self.features.lights.tree()
+            } else {
+                self.features.lights.empty()
+            }),
         ]);
         let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![
@@ -155,6 +160,10 @@ impl Gpu {
         rr_enabled: bool,
     ) -> Result<Vec<Recorded>, Error> {
         self.complete_previous()?;
+        let target_root = match &target {
+            Binding::StorageImage(image) => Some(vulkan::native::Resource::from(*image)),
+            _ => None,
+        };
         // 换光瞳或重新开启时，先回收已完成的旧 FFT 工作区，再为当前视图分配。
         if self.bloom_filter.enabled()
             && self
@@ -162,10 +171,7 @@ impl Gpu {
                 .as_ref()
                 .is_some_and(|v| v.presentation.bloom.is_none())
         {
-            match &target {
-                Binding::StorageImage(image) => self.collect_with(&[(*image).into()])?,
-                _ => self.collect_with(&[])?,
-            }
+            self.collect_with(target_root.as_slice())?;
         }
         let samples = self.frame_samples(self.settings.samples);
         let next_absolute = self
@@ -179,6 +185,20 @@ impl Gpu {
         let mut result = Vec::with_capacity(4);
         let mut rr_reconfigured = false;
         let recording = (|| -> Result<(), Error> {
+            let old_tree = self.features.lights.tree();
+            let rebound = self.features.lights.prepare(
+                &mut self.context,
+                self.features.surfaces,
+                self.lighting_gpu.tree,
+                self.anchor,
+            )?;
+            if old_tree != self.features.lights.tree() {
+                self.renderer = None;
+                self.guide_pipeline = None;
+            }
+            if rebound {
+                self.collect_with(target_root.as_slice())?;
+            }
             if let Some(read) = self.features.record_textures(&mut self.context)? {
                 result.push(read);
             }

@@ -25,8 +25,12 @@ abstract class FeatureGroupMixin {
         for (var node : nodes) {
             WorldFeatures.building(node);
             try {
-                build.call(self, context, List.of(node));
-                pages.primept$finish();
+                if (node instanceof net.minecraft.client.renderer.feature.ItemFeatureRenderer.Submit item) {
+                    WorldFeatures.item(item);
+                } else {
+                    build.call(self, context, List.of(node));
+                    pages.primept$finish();
+                }
             } finally {
                 WorldFeatures.built();
             }
