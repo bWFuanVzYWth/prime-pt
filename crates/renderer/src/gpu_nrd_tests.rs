@@ -733,6 +733,53 @@ fn hardware_rr_refracted_history() -> Result<(), Box<dyn std::error::Error>> {
     refracted_history(true)
 }
 
+#[test]
+#[ignore = "原生 4K DLAA，横移相机前的不透明漫反射平面和天空，整帧 GPU 时间"]
+fn hardware_rr_opaque_motion_cost() -> Result<(), Box<dyn std::error::Error>> {
+    let host = Host::create(true, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let output = Image::new(&mut gpu.context, [3840, 2160, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    materials(gpu, &[MaterialDefinition::default()], [0; 4])?;
+    gpu.set_scene(&Mesh {
+        quads: vec![plane(-12., 0.5, 4., 0)],
+    })?;
+    let options = Options::new(true, streamline::Quality::Dlaa, 2, 8)?;
+    let mut camera = camera();
+    camera.up[1] = 0.5625 * camera.right[0];
+    let queries = [
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+    ];
+    gpu.test_roots
+        .extend(queries.map(vulkan::native::Resource::from));
+    let mut times = Vec::new();
+    for i in 0..25 {
+        camera.origin[0] = if i % 2 == 0 { 0. } else { 0.55 };
+        let [_, ns] = host.render_profiled(
+            gpu,
+            &output,
+            &camera,
+            Environment::default(),
+            options,
+            Some(queries),
+        )?;
+        if i >= 6 {
+            times.push(ns);
+        }
+    }
+    times.sort_unstable();
+    assert!(gpu.view.as_ref().unwrap().rr_enabled && times[0] > 0);
+    eprintln!(
+        "moving opaque RR native=3840x2160 spp=2 depth=8 gpu_median_ms={:.3}",
+        times[times.len() / 2] as f64 * 1e-6
+    );
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
 fn refracted_history(rr: bool) -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::create(rr, std::env::var_os("PRIME_NRD_CALLABLE").is_none())?;
     let mut session = host.gpu()?;

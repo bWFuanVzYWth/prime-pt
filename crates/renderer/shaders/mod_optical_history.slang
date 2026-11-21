@@ -6,9 +6,9 @@ import mod_scene;
 import params;
 
 [[vk::binding(43, 0)]]
-var optical_even : RWStructuredBuffer<uint4>;
+var optical_even : RWStructuredBuffer<uint2>;
 [[vk::binding(44, 0)]]
-var optical_odd : RWStructuredBuffer<uint4>;
+var optical_odd : RWStructuredBuffer<uint2>;
 
 public struct OpticalKey : pt::IOpticalPathKey
 {
@@ -27,11 +27,9 @@ public func optical_record(end: pt::GuideEndpoint)->uint2
     if ((end.flags & pt::GUIDE_SKY) != 0)
         return pt::optical_sky(end.optical_key, end.direction);
     let id = end.hit.identity;
-    let b = asfloat(id.yz);
-    // ABC 和 ACD 的重心坐标映入同一 quad，连续性可以跨越内部对角线。
-    let uv = (id.x & 1u) == 0 ? float2(b.x + b.y, b.y) : float2(b.x, b.x + b.y);
-    return pt::optical_sample(
-        pt::optical_key(end.optical_key, stable_triangle(id.x).xy, uint(end.hit.front) + 2u), uv);
+    return pt::optical_quad(
+        pt::optical_key(end.optical_key, stable_triangle(id.x).xy, uint(end.hit.front) + 2u), id.x,
+        asfloat(id.yz));
 }
 
 public func publish_optics(pixel: uint2, record: uint4)->void
@@ -39,9 +37,9 @@ public func publish_optics(pixel: uint2, record: uint4)->void
     let p = parameters[0];
     let index = pixel.y * p.image.x + pixel.x;
     if ((p.output_size.w & 1u) == 0)
-        optical_even[index] = record;
+        pt::store_optical_pair(optical_even, index, p.image.x * p.image.y, record);
     else
-        optical_odd[index] = record;
+        pt::store_optical_pair(optical_odd, index, p.image.x * p.image.y, record);
 }
 
 /// 已显露的直达表面可能与旧折射像深度相同。检查旧投影最近的实际采样属于哪条光路。
@@ -54,7 +52,7 @@ public func previous_optics(film_pixel: float2)->uint2
     let xy = uint2(raster);
     let index = xy.y * p.image.x + xy.x;
     let pair = (p.output_size.w & 1u) == 0 ? optical_odd[index] : optical_even[index];
-    return pair.xz;
+    return pair >> 8;
 }
 
 public func uncovered_paths(keys: uint2, previous_primary: float2, previous_reflected: float2)

@@ -3,6 +3,7 @@ module mod_guides;
 import mod_scene;
 import params;
 import mod_optical_history;
+import pt.rr_optics;
 import pt.integrator;
 import pt.reconstruction;
 import pt.key_guides;
@@ -31,25 +32,6 @@ var guide_distance : RWTexture2D<float>;
 [[vk::binding(46, 0)]]
 [[vk::image_format("rg32f")]]
 var guide_specular_motion : RWTexture2D<float2>;
-[[vk::binding(45, 0)]]
-[[vk::image_format("r8")]]
-var disocclusion : RWTexture2D<float>;
-
-func match_rr_motion<let reflected : bool>(record: uint2, film_pixel: float2, inout motion: float2)
-    ->bool
-{
-    let p = parameters[0];
-    let previous_jitter = float2(p.previous_right.w, p.previous_up.w);
-    let previous_sample_origin = 0.5 + previous_jitter;
-    let seed = film_pixel + motion - previous_sample_origin;
-    var match_pixel : float2;
-    if (!match_optics<reflected>(record, seed, match_pixel))
-        return false;
-    // 只在访问旧采样格时减去旧 jitter。SDK 接收未加两帧 jitter 差的像素位移。
-    motion = match_pixel + previous_sample_origin - film_pixel;
-    return true;
-}
-
 struct RrOptics : pt::IGuideHistory
 {
     static func boundary(key: uint, id: uint4, front: bool, reflection: bool, eta: float)->uint
@@ -63,24 +45,9 @@ struct RrOptics : pt::IGuideHistory
     {
         if (parameters[0].reconstruction.w != 2)
             return;
-        let inside = optical_record(primary);
-        let outside = optical_record(reflected);
+        let inside = pt::rr_optical_record(optical_record(primary), primary.flags);
+        let outside = pt::rr_optical_record(optical_record(reflected), reflected.flags);
         publish_optics(pixel, uint4(inside, outside));
-        var reject = frame.history && ((primary.flags | reflected.flags) &
-                                       (pt::GUIDE_INVALID | pt::GUIDE_SURFACE_PROXY)) != 0;
-        let film_pixel = film * float2(frame.extent);
-        if (frame.history)
-        {
-            reject = reject || (inside.x == 0 && (primary.flags & pt::GUIDE_UNPROJECTABLE) != 0) ||
-                     (outside.x == 0 && (reflected.flags & pt::GUIDE_UNPROJECTABLE) != 0);
-            reject = reject || any(uncovered_paths(uint2(inside.x, outside.x), film_pixel + motion,
-                                                   film_pixel + specular_motion));
-            if (inside.x != 0 && !match_rr_motion<false>(inside, film_pixel, motion))
-                reject = true;
-            if (outside.x != 0 && !match_rr_motion<true>(outside, film_pixel, specular_motion))
-                reject = true;
-        }
-        disocclusion[pixel] = float(reject);
     }
 };
 
@@ -185,10 +152,8 @@ public struct Guides : pt::IPrefixGuides, pt::IHitGuides
         let sky = pt::write_sky_guide(images(), p, coordinate, film, direction, 0);
         if (parameters[0].reconstruction.w == 2)
         {
-            publish_optics(coordinate, 0);
-            disocclusion[coordinate] = float(
-                p.history && ((sky.flags & pt::GUIDE_UNPROJECTABLE) != 0 ||
-                              any(previous_optics(film * float2(p.extent) + sky.motion) != 0)));
+            let lane = pt::rr_optical_record(0, sky.flags);
+            publish_optics(coordinate, uint4(lane, lane));
         }
     }
 };

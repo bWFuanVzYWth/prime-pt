@@ -427,6 +427,7 @@ struct View {
     output: Buffer,
     accumulation: Buffer,
     counts: Buffer,
+    frame_local: bool,
     landing: Vec<Buffer>,
     signal_lanes: Buffer,
     optical_history: [Buffer; 2],
@@ -450,10 +451,10 @@ struct Presentation {
 }
 
 /// SDK 借用这些 image，所有权和退役边界仍在 mod 视图内。
-/// 顺序与 bridge 的 Resource 数组一致，48 B/输入像素 + 8 B/输出像素；关闭仅保留 1×1 占位。
+/// RR 的九张图像按 bridge 顺序共用 56 B/输入像素和 8 B/输出像素，显露掩码另占 1 B/输入像素。
 /// noisy/output 为未曝光的线性 BT.709；depth 为正 view-Z，运动为输入像素
-/// previous-current，normal/linear roughness 与方向 albedo 来自首个实际表面。
-/// distance 仅用于 mod 诊断；SDK 使用额外理想反射射线生成的局部平面 specular motion。
+/// previous-current。方向 albedo、法线与粗糙度由稳定导引给出，反射与透射各自重投影。
+/// distance 供 mod 诊断，SDK 接收显式的 specular motion。
 struct RrImages {
     images: [Image; 9],
     nrd_motion: [Image; 2],
@@ -1119,6 +1120,7 @@ impl Gpu {
             &mut context,
             None,
             [[1, 1]; 2],
+            false,
             Denoiser::Off,
             streamline::Quality::Dlaa,
             None,

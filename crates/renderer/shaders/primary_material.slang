@@ -24,11 +24,12 @@ func shade_primary(inout call: pt::MaterialCall)->void
     call.initialize_primary(parameters[0].initial_medium);
     let pixel : uint = primary_pixel();
     var hit : pt::Hit = {};
-    hit.identity = primary_identity[pixel];
+    let cached = primary_hit[pixel];
+    hit.identity = uint4(cached.xyz, 0);
     hit.surface = geometry::surface_point(known_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
-    let ray : float4 = primary_ray[pixel];
-    hit.distance = ray.w;
-    hit.front = dot(ray.xyz, hit.surface.normal) < 0;
+    let direction = primary_direction(parameters[0], DispatchRaysIndex().xy);
+    hit.distance = asfloat(cached.w);
+    hit.front = dot(direction, hit.surface.normal) < 0;
     let auxiliary : float4 =
                         material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
     hit.identity.w =
@@ -41,14 +42,14 @@ func shade_primary(inout call: pt::MaterialCall)->void
         let incident = call.medium;
         var signals : pt::PrimaryLighting;
         pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
-            ModScene(), call, hit, material, ray.xyz, settings(parameters[0]), lane, signals);
+            ModScene(), call, hit, material, direction, settings(parameters[0]), lane, signals);
         let blocker = begin_signal<OPENPBR_FLOW>(pixel * 2 + lane, signals, hit, material, incident,
-                                                 -ray.xyz, call.previous_pdf);
+                                                 -direction, call.previous_pdf);
         if (blocker == pt::FAR)
             call.radiance += signals.sun;
         return;
     }
     pt::shade_material<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true>(
-        ModScene(), call, hit, material, ray.xyz, settings(parameters[0]),
+        ModScene(), call, hit, material, direction, settings(parameters[0]),
         asuint(call.origin_pixel.y));
 }

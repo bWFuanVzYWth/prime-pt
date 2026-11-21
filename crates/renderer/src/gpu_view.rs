@@ -155,6 +155,7 @@ impl View {
             context,
             Some(filter),
             [extent; 2],
+            false,
             if rr_enabled {
                 Denoiser::Dlss
             } else {
@@ -170,6 +171,7 @@ impl View {
         context: &mut Context,
         filter: Option<&mut BloomFilters>,
         [extent, output_extent]: [[u32; 2]; 2],
+        frame_local: bool,
         mode: Denoiser,
         quality: streamline::Quality,
         previous_display: Option<&exposure::Display>,
@@ -183,11 +185,20 @@ impl View {
             return Err(Error::Invalid("视图尺寸须属于 1..=65536"));
         }
         let pixels = u64::from(extent[0]) * u64::from(extent[1]);
-        // 五个命中plane另加16B identity，供导引和照明共用首视线。
-        let landing = [16, 16, 4, 8, 4, 16]
-            .map(|stride| Buffer::new(context, pixels * stride, false))
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        // 时域 HitObject 只交接图元、重心和距离。五张旧交接面只供兼容管线。
+        let history_pixels = if frame_local { 1 } else { pixels };
+        let landing = [
+            history_pixels,
+            history_pixels,
+            history_pixels,
+            history_pixels,
+            history_pixels,
+            pixels,
+        ]
+        .into_iter()
+        .zip([16, 16, 4, 8, 4, 16])
+        .map(|(count, stride)| Buffer::new(context, count * stride, false))
+        .collect::<Result<Vec<_>, _>>()?;
         let signal_lanes = Buffer::new(
             context,
             if mode == Denoiser::Nrd {
@@ -276,6 +287,13 @@ impl View {
                 Binding::StorageBuffer(params),
                 Binding::StorageBuffer(output),
                 Binding::StorageImage(rr.images[0]),
+                Binding::SampledImage(rr.images[6]),
+                Binding::StorageImage(linear_hdr),
+                Binding::StorageBuffer(optical_history[0]),
+                Binding::StorageBuffer(optical_history[1]),
+                Binding::StorageImage(rr.images[2]),
+                Binding::StorageImage(rr.rr_specular_motion),
+                Binding::StorageImage(rr.disocclusion),
             ],
         )?;
         let pack = if let Some(templates) = templates {
@@ -331,12 +349,17 @@ impl View {
             output_extent,
             params,
             output,
-            accumulation: Buffer::new(context, pixels * 16, false)?,
-            counts: Buffer::new(context, pixels * 4, false)?,
-            landing,
+            frame_local,
+            accumulation: Buffer::new(context, history_pixels * 16, false)?,
+            counts: Buffer::new(context, history_pixels * 4, false)?,
             signal_lanes,
             optical_history,
-            prefix: Buffer::new(context, pixels * 16, false)?,
+            prefix: if frame_local && rr_enabled {
+                landing[5]
+            } else {
+                Buffer::new(context, pixels * 16, false)?
+            },
+            landing,
             progress: history::Accumulation::new(),
             jitter: [0.; 2],
             presentation: Presentation {

@@ -12,8 +12,7 @@ func write_guides<let cached : bool>()->void
     let p : Params = parameters[0];
     let pixel : uint2 = DispatchRaysIndex().xy;
     let film = camera::camera_sample_uv_offset(pixel, p.inverse_extent, 0.5 + p.reconstruction.xy);
-    var direction : float3 =
-                        camera::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
+    let direction = camera::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
     var trace : GuideTrace;
     var first : pt::KeyGuideVertex;
     var identity : uint4;
@@ -21,9 +20,8 @@ func write_guides<let cached : bool>()->void
     if (cached)
     {
         let index : uint = primary_pixel();
-        identity = primary_identity[index];
+        identity = uint4(primary_hit[index].xyz, 0);
         let primitive : uint = identity.x;
-        direction = primary_ray[index].xyz;
         found = primitive != 0xffffffffu;
         first = {};
         if (found)

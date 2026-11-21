@@ -51,14 +51,15 @@ func guide_primary(inout call: pt::KeyGuideCall)->void
 {
     let pixel : uint = primary_pixel();
     var hit : pt::Hit = {};
-    hit.identity = primary_identity[pixel];
+    let cached = primary_hit[pixel];
+    hit.identity = uint4(cached.xyz, 0);
     hit.surface = geometry::surface_point(known_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
-    let ray : float4 = primary_ray[pixel];
+    let direction = primary_direction<true>(parameters[0], DispatchRaysIndex().xy);
     let auxiliary : float4 =
                         material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
     hit.identity.w =
         known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
-    hit.front = dot(ray.xyz, hit.surface.normal) < 0;
-    hit.distance = ray.w;
-    call.value = guide_value(hit, ray.xyz, call.value.medium, auxiliary);
+    hit.front = dot(direction, hit.surface.normal) < 0;
+    hit.distance = asfloat(cached.w);
+    call.value = guide_value(hit, direction, call.value.medium, auxiliary);
 }

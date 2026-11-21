@@ -45,10 +45,17 @@ func post_pixel<let paths : uint, let composite : uint, let frame_film : bool,
             sample_counts[pixel]++;
         return;
     }
-    var sum : float4 = accumulation[pixel];
+    let frame_local = (params.output_size.z & 64u) != 0;
+    var sum = float4(0);
+    var count = 0u;
+    if (!frame_local && !denoised)
+    {
+        sum = accumulation[pixel];
+        count = sample_counts[pixel];
+    }
     let tail : float4 = output_image[pixel];
-    var count : uint = sample_counts[pixel];
-    let prefix : float4 = prefix_image[pixel];
+    let stored = prefix_image[pixel];
+    let prefix = frame_local && params.reconstruction.w == 2 ? float4(0, 0, 0, stored.w) : stored;
     // NRD 的 prefix 只含当前像素固定光路上的自发光，和已滤波照明一起进入相机段大气。
     var radiance : float3 = prefix.xyz + tail.xyz;
     if (composite != 0 && tail.w >= 0 &&
@@ -83,9 +90,12 @@ func post_pixel<let paths : uint, let composite : uint, let frame_film : bool,
     // 本次均值代表1或2条输运路径，累积计数仍按实际路径计。
     for (var lane: uint = 0; lane < paths; lane++)
         pt::accumulate_sample(sum, count, radiance, tail.w);
-    accumulation[pixel] = sum;
-    sample_counts[pixel] = count;
-    if (sum.w < 0 || count == params.image.z + params.image.w)
+    if (!frame_local)
+    {
+        accumulation[pixel] = sum;
+        sample_counts[pixel] = count;
+    }
+    if (frame_local || sum.w < 0 || count == params.image.z + params.image.w)
         output_image[pixel] = pt::resolve_linear_hdr(sum, count);
 }
 

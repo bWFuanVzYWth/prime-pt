@@ -143,12 +143,7 @@ func cache_primary<let frame_film : bool>()->void
     let p : Params = parameters[0];
     let coordinate : uint2 = DispatchRaysIndex().xy;
     let pixel : uint = primary_pixel();
-    let sampler : pt::PathSampler =
-                      pt::path_sampler(coordinate, p.rr_sample, p.options.z, p.options.x);
-    let offset : float2 = frame_film ? 0.5 + p.reconstruction.xy : sampler.film();
-    let film = camera::camera_sample_uv_offset(coordinate, p.inverse_extent, offset);
-    let direction : float3 =
-                        camera::camera_scaled_direction(p.forward.xyz, p.right.xyz, p.up.xyz, film);
+    let direction = primary_direction<frame_film>(p, coordinate);
     let ray : RayDesc = { p.origin.xyz, 0, direction, pt::FAR };
     var unused : uint = 0;
     var found : HitObject = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
@@ -162,8 +157,7 @@ func cache_primary<let frame_film : bool>()->void
                          asuint(attributes.barycentrics), 0);
         distance = found.GetRayDesc().TMax;
     }
-    primary_identity[pixel] = identity;
-    primary_ray[pixel] = float4(direction, distance);
+    primary_hit[pixel] = uint4(identity.xyz, asuint(distance));
 }
 
 [shader("raygeneration")]
@@ -285,8 +279,8 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
     }
     public func start_path(inout data: pt::TransportCall, lane: uint)->float2
     {
-        data.path.direction = primary_ray[pixel].xyz;
-        let primitive = primary_identity[pixel].x;
+        data.path.direction = primary_direction(parameters[0], coordinate);
+        let primitive = primary_hit[pixel].x;
         if (primitive == 0xffffffffu)
         {
             if (lane == 0 && parameters[0].reconstruction.w == 3)
@@ -299,8 +293,8 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
             if (lane == 0 && parameters[0].reconstruction.w == 3 &&
                 fixed_guide_candidate(material_words.Load(start + 8u) >> 20))
             {
-                data.hit =
-                    known_hit(primary_identity[pixel], data.path.direction, primary_ray[pixel].w);
+                data.hit = known_hit(uint4(primary_hit[pixel].xyz, 0), data.path.direction,
+                                     asfloat(primary_hit[pixel].w));
                 write_fixed_guides(HitGuideScene(), data);
             }
             let program = material_words.Load(start) >> 2u;
@@ -314,7 +308,7 @@ public struct RealtimePixelAdapter : pt::IPixelTransport
     }
     public func trace(inout data: pt::TransportCall, film: float2)->float
     {
-        if (parameters[0].reconstruction.w == 3 && primary_identity[pixel].x != 0xffffffffu)
+        if (parameters[0].reconstruction.w == 3 && primary_hit[pixel].x != 0xffffffffu)
         {
             let before = data.path.radiance;
             data.path.radiance = 0;
@@ -372,7 +366,8 @@ func render_pixel<A : pt::IPixelTransport, let realtime : bool, let lane : int,
                   let ignore_failure : bool>(adapter: A, pixel: uint, coordinate: uint2)
     ->void
 {
-    if (!ignore_failure && accumulation[pixel].w < 0)
+    if (!ignore_failure && (!realtime || (parameters[0].output_size.z & 64u) == 0) &&
+        accumulation[pixel].w < 0)
     {
         output_image[pixel] = float4(0, 0, 0, accumulation[pixel].w);
         return;
@@ -381,9 +376,9 @@ func render_pixel<A : pt::IPixelTransport, let realtime : bool, let lane : int,
     if (lane == 1)
         previous = output_image[pixel];
     let result = pt::integrate_pixel<A, realtime, lane>(adapter, coordinate, previous);
-    if (lane != 1)
+    if (lane != 1 && (!realtime || parameters[0].reconstruction.w != 2))
     {
-        let distance = realtime ? primary_ray[pixel].w : result.distance;
+        let distance = realtime ? asfloat(primary_hit[pixel].w) : result.distance;
         if (realtime && parameters[0].reconstruction.w == 3 && distance != pt::FAR)
             prefix_image[pixel].w = distance;
         else

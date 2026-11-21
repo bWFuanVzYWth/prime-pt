@@ -2,6 +2,7 @@
 module rr;
 import params;
 import pt.guide_output;
+import pt.rr_optics;
 
 [[vk::binding(0, 0)]]
 var parameters : StructuredBuffer<Params>;
@@ -15,6 +16,19 @@ var reconstructed : Texture2D<float4>;
 [[vk::binding(4, 0)]]
 [[vk::image_format("rgba32f")]]
 var linear_hdr : RWTexture2D<float4>;
+[[vk::binding(5, 0)]]
+var optical_even : RWStructuredBuffer<uint2>;
+[[vk::binding(6, 0)]]
+var optical_odd : RWStructuredBuffer<uint2>;
+[[vk::binding(7, 0)]]
+[[vk::image_format("rg32f")]]
+var motion : RWTexture2D<float2>;
+[[vk::binding(8, 0)]]
+[[vk::image_format("rg32f")]]
+var specular_motion : RWTexture2D<float2>;
+[[vk::binding(9, 0)]]
+[[vk::image_format("r8")]]
+var disocclusion : RWTexture2D<float>;
 [shader("compute")]
 [numthreads(8, 8, 1)]
 func pack_main(id: uint3: SV_DispatchThreadID)->void
@@ -23,7 +37,11 @@ func pack_main(id: uint3: SV_DispatchThreadID)->void
     if (any(id.xy >= p.image.xy))
         return;
     let hdr : float4 = pixels[id.y * p.image.x + id.x];
-    noisy[id.xy] = pt::reconstruction_input(hdr.xyz);
+    let inputs : pt::RrInputs = { noisy,  optical_even,    optical_odd,
+                                  motion, specular_motion, disocclusion };
+    inputs.store(hdr.xyz, id.xy, p.image.xy, p.output_size.w,
+                 p.reconstruction.xy - float2(p.previous_right.w, p.previous_up.w),
+                 p.reconstruction.z > 0);
 }
 
 [shader("compute")]

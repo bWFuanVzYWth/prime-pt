@@ -205,8 +205,12 @@ impl Gpu {
                 }
             }
             let nrd_enabled = self.requested_nrd && !rr_enabled && !self.offline && !diagnostic;
+            let realtime_pt =
+                !self.offline && !diagnostic && self.generation.as_ref().unwrap().dispatch == 8;
+            let frame_local = realtime_pt && (rr_enabled || nrd_enabled);
             if self.view.as_ref().is_none_or(|view| {
-                view.output_extent != extent
+                view.frame_local != frame_local
+                    || view.output_extent != extent
                     || view.rr_enabled != rr_enabled
                     || view.nrd.is_some() != nrd_enabled
                     || (rr_enabled && view.quality != self.rr_quality)
@@ -245,6 +249,7 @@ impl Gpu {
                     &mut self.context,
                     Some(&mut self.bloom_filter),
                     [input, extent],
+                    frame_local,
                     if nrd_enabled {
                         Denoiser::Nrd
                     } else if rr_enabled {
@@ -295,8 +300,6 @@ impl Gpu {
                     .bind(&mut self.context, view.presentation.linear_hdr)?;
             }
 
-            let realtime_pt =
-                !self.offline && !diagnostic && self.generation.as_ref().unwrap().dispatch == 8;
             let composite = if !sky_enabled || self.initial_medium != [1., 0., 0., 0.] {
                 Composite::None
             } else if self.terrain_light.shadowed() {
@@ -433,7 +436,8 @@ impl Gpu {
                             .as_ref()
                             .is_some_and(|g| g.hit.authored_normals),
                     ) << 2)
-                    | (u32::from(realtime_pt) << 5),
+                    | (u32::from(realtime_pt) << 5)
+                    | (u32::from(frame_local) << 6),
                 self.rr_index & 1,
             ]);
             words.extend(self.anchor.map(|v| ((v / 64.) as i32) as u32));
@@ -461,7 +465,7 @@ impl Gpu {
             if sky_enabled && let Some(recorded) = self.atmosphere.record(&mut self.context)? {
                 result.push(recorded);
             }
-            if batch.first() == 0 {
+            if batch.first() == 0 && !view.frame_local {
                 let mut clear = Commands::new(&self.context)?;
                 clear.clear_buffer(view.accumulation)?;
                 clear.clear_buffer(view.counts)?;
