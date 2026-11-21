@@ -30,10 +30,9 @@ func shade_primary(inout call: pt::MaterialCall)->void
     let direction = primary_direction(parameters[0], DispatchRaysIndex().xy);
     hit.distance = asfloat(cached.w);
     hit.front = dot(direction, hit.surface.normal) < 0;
-    let auxiliary : float4 =
-                        material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
-    hit.identity.w =
-        known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
+    let auxiliary = material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
+    hit.identity.w = known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.normal_ndf.xy,
+                                                      hit.surface.normal);
     let material : transport::SurfaceMaterial = decode_surface<AtlasColor, CachedAux>(
                        hit, parameters[0].block_emission_scale, { auxiliary });
     if (parameters[0].reconstruction.w == 3)

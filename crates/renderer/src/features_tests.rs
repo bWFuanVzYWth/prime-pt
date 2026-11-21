@@ -1827,6 +1827,174 @@ fn hardware_pt_grass_overlay_selects_tinted_grass_and_untinted_dirt()
 }
 
 #[test]
+#[ignore = "真实 NRD 引导；PRIME_GRASS_MAPS 可指定 SPBR 两张侧面纹理及其 _n、_s 的 16×16 RGBA8 目录"]
+fn hardware_pt_grass_lab_layers_match_individual_surfaces() -> Result<(), Box<dyn std::error::Error>>
+{
+    use prime_minecraft::{Catalog, ImageSource, fixtures};
+    let directory = std::env::var_os("PRIME_GRASS_MAPS").map(std::path::PathBuf::from);
+    let mut atlas = vec![0; 32 * 16 * 4];
+    let mut lab = Vec::new();
+    for (layer, name) in ["grass_block_side", "grass_block_side_overlay"]
+        .into_iter()
+        .enumerate()
+    {
+        let image = |suffix: &str, texel: [u8; 4]| -> std::io::Result<ImageSource> {
+            let mut pixels = texel.repeat(256);
+            if let Some(dir) = &directory {
+                pixels = std::fs::read(dir.join(format!("{name}{suffix}.rgba8")))?;
+            } else if layer == 1 && suffix.is_empty() {
+                for p in pixels[..128 * 4].chunks_exact_mut(4) {
+                    p[3] = 0;
+                }
+            }
+            assert_eq!(pixels.len(), 16 * 16 * 4);
+            Ok(ImageSource {
+                width: 16,
+                height: 16,
+                pixels,
+            })
+        };
+        let base = image(
+            "",
+            if layer == 0 {
+                [124, 83, 48, 255]
+            } else {
+                [196, 196, 196, 255]
+            },
+        )?;
+        for (y, row) in base.pixels.chunks_exact(64).enumerate() {
+            let start = (32 * y + 16 * layer) * 4;
+            atlas[start..start + 64].copy_from_slice(row);
+        }
+        lab.push((
+            image(
+                "_n",
+                if layer == 0 {
+                    [152, 100, 245, 255]
+                } else {
+                    [94, 169, 255, 255]
+                },
+            )?,
+            image(
+                "_s",
+                if layer == 0 {
+                    [30, 12, 0, 255]
+                } else {
+                    [168, 45, 0, 255]
+                },
+            )?,
+        ));
+    }
+    let mut catalog = Catalog::default();
+    let mut stage =
+        fixtures::grass_block(&mut catalog, Some(lab.try_into().ok().expect("上下两层")))?;
+    let maps = stage.material_resources([32, 16], &atlas)?;
+    let joined = *maps
+        .materials
+        .iter()
+        .find(|m| m.control[2] & MaterialDefinition::OVERLAY != 0)
+        .expect("准备后的共面草侧面");
+    let single = MaterialDefinition {
+        control: [
+            0,
+            1,
+            MaterialDefinition::MERS
+                | MaterialDefinition::AUXILIARY
+                | MaterialDefinition::LAB_SPECULAR,
+            MaterialDefinition::AUTHORED_NORMAL,
+        ],
+        ..joined
+    };
+    let host = Host::create(false, true)?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    gpu.replace_resources(ResourceUpload {
+        generation: gpu.resource_generation + 1,
+        extent: maps.extent,
+        albedo: &atlas,
+        materials: &[
+            joined,
+            single,
+            MaterialDefinition {
+                uv_bounds: joined.overlay_bounds,
+                ..single
+            },
+        ],
+        mers: &maps.mers,
+        auxiliary: &maps.auxiliary,
+        light_areas: &[[u32::MAX, 0, 0, 0]; 3],
+        emission_alias_words: &[],
+        opacity_quads: &[],
+    })?;
+    let output = image(gpu)?;
+    let options = Options::new(false, streamline::Quality::Dlaa, 2, 4)?.with_nrd();
+    for covered in [false, true] {
+        let (x, y) = (0..16)
+            .flat_map(|y| (0..16).map(move |x| (x, y)))
+            .filter(|&(x, y)| (atlas[(y * 32 + x + 16) * 4 + 3] >= 128) == covered)
+            .max_by_key(|&(x, y)| {
+                let i = (y * 32 + x) * 4;
+                maps.mers[i + 2].abs_diff(maps.mers[i + 16 * 4 + 2])
+            })
+            .expect("图集具有覆盖与裸土");
+        let render = |gpu: &mut Gpu,
+                      material: u32,
+                      tile: usize,
+                      tint: [f32; 3]|
+         -> Result<_, Box<dyn std::error::Error>> {
+            let uv = [[0.2, 0.8], [0.2, 0.2], [0.8, 0.2], [0.8, 0.8]]
+                .map(|[dx, dy]| [((tile * 16 + x) as f32 + dx) / 32., (y as f32 + dy) / 16.]);
+            let mesh = Mesh {
+                quads: vec![Quad::with_material(
+                    [[-4., -4., 3.], [-4., 4., 3.], [4., 4., 3.], [4., -4., 3.]],
+                    uv,
+                    tint,
+                    MaterialId::new(material),
+                )],
+            };
+            gpu.set_scene(&mesh)?;
+            host.render_options(gpu, &output, &camera(), Environment::default(), options)?;
+            let guides = gpu.view.as_ref().unwrap().rr.images;
+            let mut signals = [[0.; 4]; 3];
+            for (signal, guide) in signals.iter_mut().zip(&guides[3..6]) {
+                signal.copy_from_slice(&float_pixel(
+                    &guide.download(&mut gpu.context)?,
+                    [32, 32],
+                    4,
+                ));
+            }
+            Ok(signals)
+        };
+        let green = [0., 1., 0.];
+        let combined = render(gpu, 0, 0, green)?;
+        let reference = render(
+            gpu,
+            if covered { 2 } else { 1 },
+            usize::from(covered),
+            if covered { green } else { [1.; 3] },
+        )?;
+        eprintln!(
+            "覆盖={covered} 纹素=({x},{y}) 漫反射={:?} 法线及粗糙度={:?}",
+            combined[1], combined[0]
+        );
+        assert!(combined[1][1] > 0.01 && (combined[1][0] < 0.001) == covered);
+        for (observed, expected) in combined
+            .into_iter()
+            .flatten()
+            .zip(reference.into_iter().flatten())
+        {
+            assert!(
+                (observed - expected).abs() < 0.002,
+                "覆盖={covered} {observed} != {expected}"
+            );
+        }
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "真实EXT SER/Vulkan RT；HG保留法线贴图在几何背面产生的连续光照支持"]
 fn hardware_pt_hit_group_preserves_authored_normal_light_support()
 -> Result<(), Box<dyn std::error::Error>> {

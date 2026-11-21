@@ -200,6 +200,70 @@ pub fn floor_lichen(
     Ok(prepared)
 }
 
+/// 原版草方块的四张共面侧面和染色源；可为底色及覆盖层各提供一对 LabPBR 法线、参数图。
+/// 图集固定为 32×16，底色在左，覆盖在右。返回尚未准备 GPU 材质的候选世代。
+pub fn grass_block(
+    catalog: &mut Catalog,
+    lab: Option<[(crate::ImageSource, crate::ImageSource); 2]>,
+) -> Result<crate::PreparedCatalog<'_>, Error> {
+    use crate::resources::{Model, SourceQuad};
+    let mut prepared = catalog.stage_resources(&resource_packet())?;
+    prepared.next.states.get_mut(&2).unwrap().name = "minecraft:grass_block".into();
+    let layers = lab.map_or([None, None], |pair| pair.map(Some));
+    for (index, (name, sources)) in ["grass_block_side", "grass_block_side_overlay"]
+        .into_iter()
+        .zip(layers)
+        .enumerate()
+    {
+        let sprite = prepared.next.sprites.get_mut(&(index as u32 + 1)).unwrap();
+        sprite.name = format!("minecraft:block/{name}");
+        sprite.vanilla = sources.is_none();
+        if let Some((normal, specular)) = sources {
+            let map = |image: crate::ImageSource| {
+                if !(1..=16384).contains(&image.width)
+                    || !(1..=16384).contains(&image.height)
+                    || u64::from(image.width) * u64::from(image.height) * 4
+                        != image.pixels.len() as u64
+                {
+                    return Err(Error::Input("草方块测试材质需要完整的非空 RGBA8 图像"));
+                }
+                crate::lab_pbr::MaterialImage::inherited(
+                    image,
+                    &sprite.images[0],
+                    sprite.extent,
+                    &sprite.frames,
+                    sprite.interpolate,
+                )
+            };
+            sprite.normal = Some(map(normal)?);
+            sprite.specular = Some(map(specular)?);
+        }
+    }
+    let Model::Mesh(quads) = prepared.next.models.get_mut(&2).unwrap() else {
+        unreachable!("固定测试模型")
+    };
+    let base = std::mem::take(quads);
+    for mut q in base {
+        if (2..6).contains(&q.face) {
+            // 四个侧面与不同顶点起点，覆盖层先于底层。
+            let first = q.face as usize % 4;
+            quads.push(SourceQuad {
+                positions: std::array::from_fn(|i| q.positions[(i + first) % 4]),
+                uv: std::array::from_fn(|i| {
+                    let [u, v] = q.uv[(i + first) % 4];
+                    [u + 0.5, v]
+                }),
+                sprite: 2,
+                ..q
+            });
+            q.layer = 0;
+            q.tint = -1;
+        }
+        quads.push(q);
+    }
+    Ok(prepared)
+}
+
 /// 通过真实PRM1解码和资源准备得到可编译Catalog；GPU不参与此CPU fixture。
 pub fn catalog() -> Result<Catalog, Error> {
     let mut catalog = Catalog::default();

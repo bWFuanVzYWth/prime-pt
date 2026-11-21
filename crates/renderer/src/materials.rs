@@ -31,8 +31,7 @@ pub(super) fn hit_features(definitions: &[MaterialDefinition]) -> HitFeatures {
     };
     for definition in definitions {
         features.coverage |= coverage_flags(definition);
-        features.authored_normals |=
-            definition.control[3] & MaterialDefinition::AUTHORED_NORMAL != 0;
+        features.authored_normals |= definition.has_authored_normal();
     }
     features
 }
@@ -89,12 +88,12 @@ pub(super) fn emission_weights(definitions: &[MaterialDefinition]) -> Result<Vec
 pub(super) const fn variant(flow: openpbr::FlowKey, material: &MaterialDefinition) -> u32 {
     let flags = material.control[2];
     let mut maps = flags & (MaterialDefinition::MERS | MaterialDefinition::AUXILIARY);
-    let normal = if (maps & MaterialDefinition::AUXILIARY) != 0 {
-        (material.control[3] & MaterialDefinition::AUTHORED_NORMAL) << 3
-    } else {
-        0
-    };
-    let lab_specular = flags & MaterialDefinition::LAB_SPECULAR != 0;
+    if flags & MaterialDefinition::OVERLAY_AUXILIARY != 0 {
+        maps |= MaterialDefinition::AUXILIARY;
+    }
+    let normal = (material.has_authored_normal() as u32) << 3;
+    let lab_specular =
+        flags & (MaterialDefinition::LAB_SPECULAR | MaterialDefinition::OVERLAY_LAB_SPECULAR) != 0;
     if normal == 0
         && !lab_specular
         && flow.bits() & openpbr::FlowKey::CONDUCTOR_REFLECTION != 0
@@ -330,7 +329,6 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
     } else {
         None
     };
-    // 覆盖层只替换散射/MERS；作者法线和命中发光仍消费源底图。
     let source = atlas.tile(m.uv_bounds, flags & M::CUTOUT != 0);
     let base = if top.is_some_and(|t| t.fully_covered) {
         None
@@ -344,18 +342,38 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
             Range::point(m.base_roughness[3]).map_err(|_| "粗糙度越界")?,
         ))
     };
-    let layer = |t: Option<Tile>, mapped: bool| -> Result<_, &'static str> {
-        if mapped && let Some(t) = t {
-            Ok((t.metal, t.sss, t.dielectric_sss, t.rough))
+    let layer = |t: Option<Tile>, mapped: bool, authored: bool| -> Result<_, &'static str> {
+        let (metal, sss, dielectric, mut rough) = if mapped && let Some(t) = t {
+            (t.metal, t.sss, t.dielectric_sss, t.rough)
         } else {
             let (metal, sss, rough) = scalar()?;
-            Ok((metal, sss, (metal != Weight::One).then_some(sss), rough))
+            (metal, sss, (metal != Weight::One).then_some(sss), rough)
+        };
+        if authored && let Some(t) = t {
+            rough = rough
+                .with_normal_distribution(t.ndf)
+                .map_err(|_| "法线分布越界")?;
         }
+        Ok((metal, sss, dielectric, rough))
     };
-    let (metal, mut sss, dielectric_sss, mut rough) = match (base, top) {
+    let base_surface = || {
+        layer(
+            base,
+            flags & M::MERS != 0,
+            flags & M::AUXILIARY != 0 && m.control[3] & M::AUTHORED_NORMAL != 0,
+        )
+    };
+    let top_surface = || {
+        layer(
+            top,
+            flags & M::OVERLAY_MERS != 0,
+            flags & M::OVERLAY_NORMAL != 0,
+        )
+    };
+    let (metal, mut sss, dielectric_sss, rough) = match (base, top) {
         (Some(_), Some(_)) => {
-            let (m, s, d, r) = layer(base, flags & M::MERS != 0)?;
-            let (tm, ts, td, tr) = layer(top, flags & M::OVERLAY_MERS != 0)?;
+            let (m, s, d, r) = base_surface()?;
+            let (tm, ts, td, tr) = top_surface()?;
             (
                 m.union(tm),
                 s.union(ts),
@@ -366,8 +384,8 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
                 r.union(tr),
             )
         }
-        (None, Some(_)) => layer(top, flags & M::OVERLAY_MERS != 0)?,
-        _ => layer(base, flags & M::MERS != 0)?,
+        (None, Some(_)) => top_surface()?,
+        _ => base_surface()?,
     };
     if m.control[0] == 0 && metal == Weight::Switch && sss != Weight::Blend {
         // 纯金属 texel 的二值 SSS 不参与非金属底层；任何内点都保留完整混合域。
@@ -376,14 +394,6 @@ fn bind(atlas: &mut Atlas<'_>, m: &MaterialDefinition) -> Result<Key, &'static s
     // TODO：有厚度的材质需要跨表面 BSSRDF；当前把这部分权重交还漫反射底层。
     if !m.allows_thin_scattering() {
         sss = Weight::Zero;
-    }
-    if flags & M::AUXILIARY != 0
-        && m.control[3] & M::AUTHORED_NORMAL != 0
-        && let Some(t) = source
-    {
-        rough = rough
-            .with_normal_distribution(t.ndf)
-            .map_err(|_| "法线分布越界")?;
     }
     let channels = |rgb: &[f32]| {
         u8::from(rgb[0] > 0.) | u8::from(rgb[1] > 0.) << 1 | u8::from(rgb[2] > 0.) << 2

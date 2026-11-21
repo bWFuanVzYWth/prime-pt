@@ -13,7 +13,7 @@ import transport.surface_material;
 #error OPENPBR_FLOW must come from resource preparation
 #endif
 
-func guide_value(hit: pt::Hit, incoming: float3, incident: float4, auxiliary: float4)
+func guide_value(hit: pt::Hit, incoming: float3, incident: float4, auxiliary: SurfaceAux)
     ->pt::KeyGuideVertex
 {
     var provider : ModScene;
@@ -34,11 +34,11 @@ func guide_hit(inout call: pt::KeyGuideCall, attributes: BuiltInTriangleIntersec
     hit.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
                                            WorldToObject3x4());
     let primitive : uint = region_primitive(InstanceID(), PrimitiveIndex());
-    let auxiliary : float4 = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
+    let auxiliary = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
     var normal : uint = 0;
     if ((OPENPBR_VARIANT & 8u) != 0)
-        normal = map_normal_xy(primitive, auxiliary.xy, b - a, c - a, (float3x3)ObjectToWorld3x4(),
-                               hit.surface.normal);
+        normal = map_normal_xy(primitive, auxiliary.normal_ndf.xy, b - a, c - a,
+                               (float3x3)ObjectToWorld3x4(), hit.surface.normal);
     hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
     hit.distance = RayTCurrent();
     hit.front = dot(WorldRayDirection(), hit.surface.normal) < 0;
@@ -55,10 +55,9 @@ func guide_primary(inout call: pt::KeyGuideCall)->void
     hit.identity = uint4(cached.xyz, 0);
     hit.surface = geometry::surface_point(known_endpoint(hit.identity.x, asfloat(hit.identity.yz)));
     let direction = primary_direction<true>(parameters[0], DispatchRaysIndex().xy);
-    let auxiliary : float4 =
-                        material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
-    hit.identity.w =
-        known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.xy, hit.surface.normal);
+    let auxiliary = material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
+    hit.identity.w = known_normal_xy<OPENPBR_VARIANT>(hit.identity.x, auxiliary.normal_ndf.xy,
+                                                      hit.surface.normal);
     hit.front = dot(direction, hit.surface.normal) < 0;
     hit.distance = asfloat(cached.w);
     call.value = guide_value(hit, direction, call.value.medium, auxiliary);

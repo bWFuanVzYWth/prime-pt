@@ -70,22 +70,25 @@ public struct AtlasColor : IDecodeColor
 };
 public interface IDecodeAux
 {
-    func read(hit: pt::Hit, start: uint)->float4;
+    func read(hit: pt::Hit, start: uint)->SurfaceAux;
 };
 public struct CachedAux : IDecodeAux
 {
-    public var value : float4;
-    public func read(hit: pt::Hit, start: uint)->float4
+    public var value : SurfaceAux;
+    public func read(hit: pt::Hit, start: uint)->SurfaceAux
     {
         return value;
     }
 };
 public struct FetchAux : IDecodeAux
 {
-    public func read(hit: pt::Hit, start: uint)->float4
+    public func read(hit: pt::Hit, start: uint)->SurfaceAux
     {
-        return aux_atlas.Load(sprite_address(material_uv(hit.identity.x, asfloat(hit.identity.yz)),
-                                             material_bounds(start)));
+#ifdef OPENPBR_VARIANT
+        return material_aux<OPENPBR_VARIANT>(hit.identity.x, asfloat(hit.identity.yz));
+#else
+        return material_aux(hit.identity.x, asfloat(hit.identity.yz));
+#endif
     }
 };
 
@@ -148,8 +151,7 @@ struct CoveredOverlay<Top : IWeights> : IDecodeLayer
         let uv : float2 = material_uv(hit.identity.x, asfloat(hit.identity.yz));
         let bounds : float4 = material_bounds(start);
         let top : float4 = asfloat(material_words.Load4(start + 96u));
-        let address : int3 = sprite_address(
-                          lerp(top.xy, top.zw, (uv - bounds.xy) / (bounds.zw - bounds.xy)), top);
+        let address : int3 = overlay_address(uv, bounds, top);
         return { address, C.layer(hit, address, true), Top.read(start, address) };
     }
 };
@@ -169,9 +171,7 @@ struct OverlayLayer<Base : IWeights, Top : IWeights> : IDecodeLayer
         let uv : float2 = material_uv(hit.identity.x, asfloat(hit.identity.yz));
         let bounds : float4 = material_bounds(start);
         let top_bounds : float4 = asfloat(material_words.Load4(start + 96u));
-        let local : float2 = (uv - bounds.xy) / (bounds.zw - bounds.xy);
-        let top_address : int3 =
-                              sprite_address(lerp(top_bounds.xy, top_bounds.zw, local), top_bounds);
+        let top_address = overlay_address(uv, bounds, top_bounds);
         let top : float4 = atlas.Load(top_address);
         if (top.a >= 0.5)
             return { top_address, C.tint(hit, top.rgb), Top.read(start, top_address) };
@@ -284,27 +284,27 @@ struct ThinBoundary : IBoundary
 };
 interface IAuxResponse
 {
-    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->float4;
-    static func ior(start: uint, auxiliary: float4)->float;
-    static func medium_ior(start: uint, auxiliary: float4)->float;
-    static func roughness(roughness: float, auxiliary: float4)->float;
+    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->SurfaceAux;
+    static func ior(start: uint, auxiliary: SurfaceAux)->float;
+    static func medium_ior(start: uint, auxiliary: SurfaceAux)->float;
+    static func roughness(roughness: float, auxiliary: SurfaceAux)->float;
     static func normal(hit: pt::Hit)->float3;
 };
 struct UniformSurface : IAuxResponse
 {
-    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->float4
+    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->SurfaceAux
     {
-        return 0;
+        return {};
     }
-    static func ior(start: uint, auxiliary: float4)->float
+    static func ior(start: uint, auxiliary: SurfaceAux)->float
     {
         return asfloat(material_words.Load(start + 16u));
     }
-    static func medium_ior(start: uint, auxiliary: float4)->float
+    static func medium_ior(start: uint, auxiliary: SurfaceAux)->float
     {
         return asfloat(material_words.Load(start + 32u));
     }
-    static func roughness(roughness: float, auxiliary: float4)->float
+    static func roughness(roughness: float, auxiliary: SurfaceAux)->float
     {
         return roughness;
     }
@@ -315,23 +315,19 @@ struct UniformSurface : IAuxResponse
 };
 struct MappedIor : IAuxResponse
 {
-    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->float4
+    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->SurfaceAux
     {
         return source.read(hit, start);
     }
-    static func ior(start: uint, auxiliary: float4)->float
+    static func ior(start: uint, auxiliary: SurfaceAux)->float
     {
-#if defined(OPENPBR_VARIANT) && (OPENPBR_VARIANT & 65536)
-        return lab_ior(auxiliary.w);
-#else
-        return 1.0 + 1.5 * (round(saturate(auxiliary.w) * 255.0) * (1.0 / 255.0));
-#endif
+        return auxiliary.ior;
     }
-    static func medium_ior(start: uint, auxiliary: float4)->float
+    static func medium_ior(start: uint, auxiliary: SurfaceAux)->float
     {
         return ior(start, auxiliary);
     }
-    static func roughness(roughness: float, auxiliary: float4)->float
+    static func roughness(roughness: float, auxiliary: SurfaceAux)->float
     {
         return roughness;
     }
@@ -342,22 +338,22 @@ struct MappedIor : IAuxResponse
 };
 struct MappedNormal : IAuxResponse
 {
-    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->float4
+    static func read<A : IDecodeAux>(hit: pt::Hit, start: uint, source: A)->SurfaceAux
     {
         return source.read(hit, start);
     }
-    static func ior(start: uint, auxiliary: float4)->float
+    static func ior(start: uint, auxiliary: SurfaceAux)->float
     {
         return MappedIor.ior(start, auxiliary);
     }
-    static func medium_ior(start: uint, auxiliary: float4)->float
+    static func medium_ior(start: uint, auxiliary: SurfaceAux)->float
     {
         return ior(start, auxiliary);
     }
-    static func roughness(roughness: float, auxiliary: float4)->float
+    static func roughness(roughness: float, auxiliary: SurfaceAux)->float
     {
         let alpha : float = roughness * roughness;
-        let distribution : float = auxiliary.z * auxiliary.z;
+        let distribution : float = auxiliary.normal_ndf.z * auxiliary.normal_ndf.z;
         return sqrt(sqrt(min(alpha * alpha + distribution * distribution, 1.0)));
     }
     static func normal(hit: pt::Hit)->float3
@@ -429,13 +425,13 @@ public func decode_surface<C : IDecodeColor, A : IDecodeAux>(input_hit: pt::Hit,
 #else
     let layer : LayerValue = Layers.read<NoColor>(hit, start);
 #endif
-    let aux : float4 = AuxResponse.read(hit, start, auxiliary);
+    let aux = AuxResponse.read(hit, start, auxiliary);
     let ior : float = AuxResponse.ior(start, aux);
     var result : transport::SurfaceMaterial = {};
     result.pbr.base_roughness =
         float4(ColorResponse.read(start, layer.color), AuxResponse.roughness(layer.weights.x, aux));
 #if OPENPBR_VARIANT & 65536
-    result.pbr.base_roughness.xyz *= lab_metal_tint(aux.w);
+    result.pbr.base_roughness.xyz *= aux.metal_tint;
 #endif
     result.pbr.surface = float4(ior, layer.weights.yz, Boundary.thickness(start));
 #if !(OPENPBR_FLOW & 8)

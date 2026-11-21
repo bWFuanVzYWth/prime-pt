@@ -90,12 +90,52 @@ public func sprite_address(uv: float2, bounds: float4)->int3
     return prime_coverage::sprite_address(atlas, uv, bounds);
 }
 
-public func material_aux<let variant : uint = ~0u>(primitive: uint, bary: float2)->float4
+static const let overlay_auxiliary = 1u << 11u;
+static const let overlay_normal = 1u << 12u;
+static const let overlay_lab = 1u << 13u;
+
+public func overlay_address(uv: float2, base: float4, top: float4)->int3
+{
+    return sprite_address(lerp(top.xy, top.zw, (uv - base.xy) / (base.zw - base.xy)), top);
+}
+
+/// 法线 XY、法线分布宽度及已按命中图层的编码解出的界面参数。
+public struct SurfaceAux
+{
+    public var normal_ndf : float3;
+    public var ior : float;
+    public var metal_tint : float3;
+};
+
+public func material_aux<let variant : uint = ~0u>(primitive: uint, bary: float2)->SurfaceAux
 {
     if ((variant & 2u) == 0)
-        return 0;
-    let bounds : float4 = asfloat(material_words.Load4(material_id(primitive) * 112u + 80u));
-    return aux_atlas.Load(sprite_address(material_uv(primitive, bary), bounds));
+        return {};
+    let start = material_id(primitive) * 112u;
+    let bounds = asfloat(material_words.Load4(start + 80u));
+    let uv = material_uv(primitive, bary);
+    var address = sprite_address(uv, bounds);
+    let flags = material_words.Load(start + 72u);
+    var lab = variant == ~0u ? (flags & 512u) != 0 : (variant & 65536u) != 0;
+    var authored = (variant & 8u) != 0;
+    if ((variant & variant_overlay) != 0 && (variant != ~0u || (flags & 128u) != 0))
+    {
+        let top = overlay_address(uv, bounds, asfloat(material_words.Load4(start + 96u)));
+        let covered = variant == ~0u || (variant & (16384u | 32768u)) == 0
+                          ? atlas.Load(top).a >= 0.5
+                          : (variant & 16384u) != 0;
+        if ((flags & (covered ? overlay_auxiliary : 2u)) == 0)
+            return { float3(128.0 / 255, 128.0 / 255, 0), asfloat(material_words.Load(start + 16u)),
+                     1 };
+        address = covered ? top : address;
+        lab = (flags & (covered ? overlay_lab : 512u)) != 0;
+        authored =
+            covered ? (flags & overlay_normal) != 0 : (material_words.Load(start + 76u) & 1u) != 0;
+    }
+    let value = aux_atlas.Load(address);
+    return { authored ? value.xyz : float3(128.0 / 255, 128.0 / 255, 0),
+             lab ? lab_ior(value.w) : 1.0 + 1.5 * (round(value.w * 255) * (1.0 / 255)),
+             lab ? lab_metal_tint(value.w) : float3(1) };
 }
 
 public func quad_tint(primitive: uint)->float3
@@ -265,15 +305,23 @@ public func mapped_shading_normal_known(primitive: uint, bary: float2, local_e1:
                                         local_e2: float3, object_to_world: float3x3, normal: float3)
     ->uint
 {
-    return map_normal_xy(primitive, material_aux(primitive, bary).xy, local_e1, local_e2,
+    return map_normal_xy(primitive, material_aux(primitive, bary).normal_ndf.xy, local_e1, local_e2,
                          object_to_world, normal);
+}
+func material_has_authored_normal(flags: uint2)->bool
+{
+    return ((flags.x & 2u) != 0 && (flags.y & 1u) != 0) || (flags.x & overlay_normal) != 0;
+}
+public func has_authored_normal(primitive: uint)->bool
+{
+    return material_has_authored_normal(material_words.Load2(material_id(primitive) * 112u + 72u));
 }
 /// 未知命中的独立导引路径；照明叶子按资源期能力直接调用known版本。
 public func mapped_shading_normal(primitive: uint, bary: float2, local_e1: float3, local_e2: float3,
                                   object_to_world: float3x3, normal: float3)
     ->uint
 {
-    if ((material_words.Load(material_id(primitive) * 112u + 76u) & 1u) == 0)
+    if (!has_authored_normal(primitive))
         return 0;
     return mapped_shading_normal_known(primitive, bary, local_e1, local_e2, object_to_world,
                                        normal);
@@ -284,9 +332,10 @@ func material_variant(material: ModMaterial)->uint
     let flags : uint = material.control.z;
     let sides : uint = material.control.y & ((flags & 32u) != 0 ? 1u : 3u);
     let emission : uint = material.emission.w > 0 ? (sides << 4u) | (flags & 4u) : 0;
-    return (flags & 3u) | ((material.control.w & 1u) << 3u) | emission |
+    return (flags & 3u) | (uint((flags & overlay_auxiliary) != 0) << 1u) |
+           (uint(material_has_authored_normal(material.control.zw)) << 3u) | emission |
            ((material.control.x & 3u) << 6u) | ((flags & material_overlay_flags) << 1u) |
-           ((flags & 512u) << 7u);
+           (uint((flags & (512u | overlay_lab)) != 0) << 16u);
 }
 
 /// shaderLABS LabPBR 1.3 规定介质的绿色通道为线性 F0。金属的界面不进入介质栈。
@@ -315,7 +364,7 @@ public func lab_metal_tint(encoded: float)->float3
 /// 消费已通过覆盖测试的命中；callable 的 Flow 和 variant 都在资源准备时特化。
 public func resolve_material<let has_aux : bool = false, let read_color : bool = false>(
     input_hit: pt::Hit, flow: uint, variant: uint, block_emission_scale: float,
-    sampled_aux: float4 = float4(0))
+    sampled_aux: SurfaceAux = {})
     ->transport::SurfaceMaterial
 {
     var hit = input_hit;
@@ -378,17 +427,14 @@ public func resolve_material<let has_aux : bool = false, let read_color : bool =
     var medium : float4 = material.extinction;
     if ((mask & 2u) != 0)
     {
-        let auxiliary : float4 = has_aux ? sampled_aux : aux_atlas.Load(sprite_address(uv, bounds));
-        let lab = (mask & 65536u) != 0;
-        let ior = lab ? lab_ior(auxiliary.w) : 1.0 + 1.5 * auxiliary.w;
-        if (lab)
-            result.pbr.base_roughness.xyz *= lab_metal_tint(auxiliary.w);
-        result.pbr.surface.x = ior;
-        medium.x = ior;
+        let auxiliary = has_aux ? sampled_aux : material_aux(primitive, asfloat(hit.identity.yz));
+        result.pbr.base_roughness.xyz *= auxiliary.metal_tint;
+        result.pbr.surface.x = auxiliary.ior;
+        medium.x = auxiliary.ior;
         if ((mask & 8u) != 0)
         {
             let alpha : float = result.pbr.base_roughness.w * result.pbr.base_roughness.w;
-            let distribution : float = auxiliary.z * auxiliary.z;
+            let distribution = auxiliary.normal_ndf.z * auxiliary.normal_ndf.z;
             result.pbr.base_roughness.w =
                 sqrt(sqrt(min(alpha * alpha + distribution * distribution, 1.0)));
             result.normal = decode_shading_normal(hit.identity.w);

@@ -128,11 +128,11 @@ func shade_hit(inout call: pt::MaterialCall, attributes: BuiltInTriangleIntersec
     hit.surface = geometry::triangle_point(a, b, c, attributes.barycentrics, ObjectToWorld3x4(),
                                            WorldToObject3x4());
     let primitive : uint = region_primitive(InstanceID(), PrimitiveIndex());
-    let auxiliary : float4 = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
+    let auxiliary = material_aux<OPENPBR_VARIANT>(primitive, attributes.barycentrics);
     var normal : uint = 0;
     if ((OPENPBR_VARIANT & 8u) != 0)
-        normal = map_normal_xy(primitive, auxiliary.xy, b - a, c - a, (float3x3)ObjectToWorld3x4(),
-                               hit.surface.normal);
+        normal = map_normal_xy(primitive, auxiliary.normal_ndf.xy, b - a, c - a,
+                               (float3x3)ObjectToWorld3x4(), hit.surface.normal);
     hit.identity = uint4(primitive, asuint(attributes.barycentrics), normal);
     hit.distance = RayTCurrent();
     hit.front = dot(WorldRayDirection(), hit.surface.normal) < 0;
@@ -226,7 +226,7 @@ func known_hit(identity: uint4, direction: float3, distance: float)->pt::Hit
     let bary = asfloat(identity.yz);
     hit.surface = geometry::surface_point(known_endpoint(identity.x, bary));
     hit.identity = identity;
-    if ((material_words.Load(material_id(identity.x) * 112u + 76u) & 1u) != 0)
+    if (has_authored_normal(identity.x))
         hit.identity.w = known_normal<~0u>(identity.x, bary, hit.surface.normal);
     hit.front = dot(direction, hit.surface.normal) < 0;
     hit.distance = distance;

@@ -28,7 +28,8 @@ public func known_normal<let variant : uint>(primitive: uint, bary: float2, norm
 {
     if ((variant & 8u) == 0)
         return 0;
-    return known_normal_xy<variant>(primitive, material_aux(primitive, bary).xy, normal);
+    return known_normal_xy<variant>(primitive, material_aux<variant>(primitive, bary).normal_ndf.xy,
+                                    normal);
 }
 
 public func known_endpoint(primitive: uint, bary: float2)->geometry::TriangleEndpoint

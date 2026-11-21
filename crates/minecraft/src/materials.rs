@@ -122,7 +122,6 @@ fn grass_sides(
             || base.layer != 0
             || base.emission != 0
             || bottom_maps.textured
-            || bottom_maps.auxiliary
             || bottom.name != "minecraft:block/grass_block_side"
         {
             continue;
@@ -135,7 +134,6 @@ fn grass_sides(
                 && top.layer == 1
                 && top.emission == 0
                 && !top_maps.textured
-                && !top_maps.auxiliary
                 && sprite.name == "minecraft:block/grass_block_side_overlay"
                 && aligned_layers(base, bottom.bounds, top, sprite.bounds)
         }) {
@@ -557,9 +555,11 @@ impl PreparedCatalog<'_> {
                         GrassSide::Base { overlay } => {
                             let top = &quads[overlay];
                             v.control[2] |= Definition::OVERLAY;
-                            if maps[&top.sprite].mers {
-                                v.control[2] |= Definition::OVERLAY_MERS;
-                            }
+                            let maps = &maps[&top.sprite];
+                            v.control[2] |= u32::from(maps.mers) * Definition::OVERLAY_MERS
+                                | u32::from(maps.auxiliary) * Definition::OVERLAY_AUXILIARY
+                                | u32::from(maps.authored) * Definition::OVERLAY_NORMAL
+                                | u32::from(maps.lab_specular) * Definition::OVERLAY_LAB_SPECULAR;
                             v.overlay_bounds = self.next.sprites[&top.sprite].bounds;
                             top.tint
                         }
@@ -888,36 +888,25 @@ mod tests {
 
     #[test]
     fn grass_sides_bind_only_one_quad_with_the_overlay_tint() -> Result<(), Error> {
+        check_grass_layers(false)
+    }
+
+    #[test]
+    fn grass_with_lab_maps_keeps_the_biome_layer_on_each_side() -> Result<(), Error> {
+        check_grass_layers(true)
+    }
+
+    fn check_grass_layers(lab: bool) -> Result<(), Error> {
         let mut catalog = crate::Catalog::default();
-        let mut prepared = catalog.stage_resources(&crate::fixtures::resource_packet())?;
-        prepared.next.states.get_mut(&2).unwrap().name = "minecraft:grass_block".into();
-        for (id, name) in [(1, "grass_block_side"), (2, "grass_block_side_overlay")] {
-            let sprite = prepared.next.sprites.get_mut(&id).unwrap();
-            sprite.name = format!("minecraft:block/{name}");
-            sprite.vanilla = true;
-        }
-        let Model::Mesh(quads) = prepared.next.models.get_mut(&2).unwrap() else {
-            unreachable!("固定测试模型")
+        let image = |rgba: [u8; 4]| ImageSource {
+            width: 1,
+            height: 1,
+            pixels: rgba.to_vec(),
         };
-        let base = std::mem::take(quads);
-        for mut q in base {
-            if (2..6).contains(&q.face) {
-                // 四个侧面与不同顶点起点，覆盖层先于底层。
-                let first = q.face as usize % 4;
-                quads.push(SourceQuad {
-                    positions: std::array::from_fn(|i| q.positions[(i + first) % 4]),
-                    uv: std::array::from_fn(|i| {
-                        let [u, v] = q.uv[(i + first) % 4];
-                        [u + 0.5, v]
-                    }),
-                    sprite: 2,
-                    ..q
-                });
-                q.layer = 0;
-                q.tint = -1;
-            }
-            quads.push(q);
-        }
+        let maps = lab.then(|| {
+            std::array::from_fn(|_| (image([133, 127, 250, 255]), image([86, 10, 0, 255])))
+        });
+        let mut prepared = crate::fixtures::grass_block(&mut catalog, maps)?;
         prepared.material_resources([32, 16], &[255; 32 * 16 * 4])?;
         let state = &prepared.next.states[&2];
         let bound = &state.leaves[0].quads;
@@ -935,10 +924,21 @@ mod tests {
                 face.tint,
                 Some(prepared.next.tints().unwrap().source_id(2, 0)?)
             );
+            let maps = Definition::MERS | Definition::OVERLAY | Definition::OVERLAY_MERS;
+            let lab_maps = Definition::AUXILIARY
+                | Definition::LAB_SPECULAR
+                | Definition::OVERLAY_AUXILIARY
+                | Definition::OVERLAY_NORMAL
+                | Definition::OVERLAY_LAB_SPECULAR;
             assert_eq!(
                 material.control[2],
-                Definition::MERS | Definition::OVERLAY | Definition::OVERLAY_MERS
+                if lab { maps | lab_maps } else { maps }
             );
+            assert_eq!(
+                material.control[3],
+                if lab { Definition::AUTHORED_NORMAL } else { 0 }
+            );
+            assert!(material.valid());
             assert_eq!(material.overlay_bounds, [0.5, 0., 1., 1.]);
         }
         Ok(())

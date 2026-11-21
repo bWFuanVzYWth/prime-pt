@@ -116,12 +116,24 @@ impl MaterialDefinition {
     pub const LAB_SPECULAR: u32 = 1 << 9;
     /// 所有可达模型面共面，可使用薄层散射。
     pub const PLANAR_SHEET: u32 = 1 << 10;
+    /// 覆盖层的辅助图、法线与 F0 编码独立于底层。
+    pub const OVERLAY_AUXILIARY: u32 = 1 << 11;
+    /// 覆盖层辅助图提供作者切线法线。
+    pub const OVERLAY_NORMAL: u32 = 1 << 12;
+    /// 覆盖层辅助图的 A 通道采用 LabPBR 的 F0／金属编号。
+    pub const OVERLAY_LAB_SPECULAR: u32 = 1 << 13;
     /// 几何能确认是薄片的面，包括已配对的正反面。
     pub const fn allows_thin_scattering(&self) -> bool {
         self.control[2] & (Self::FRONT_ONLY | Self::TWO_SIDED | Self::PLANAR_SHEET) != 0
     }
     /// normalFlags的bit0表示实际源中存在作者切线法线。
     pub const AUTHORED_NORMAL: u32 = 1;
+
+    /// 任一可见图层可能使用作者法线，供命中程序准备能力。
+    pub const fn has_authored_normal(&self) -> bool {
+        self.control[2] & Self::AUXILIARY != 0 && self.control[3] & Self::AUTHORED_NORMAL != 0
+            || self.control[2] & Self::OVERLAY_NORMAL != 0
+    }
 
     /// 输出七个16B原位属性块，GPU顺序同字段声明并保留全部浮点位值。
     pub const fn words(self) -> [[u32; 4]; 7] {
@@ -162,20 +174,19 @@ impl MaterialDefinition {
             && self.emission.into_iter().all(|v| v >= 0.)
             && self.control[0] & !3 == 0
             && (1..=3).contains(&self.control[1])
-            && flags & !2047 == 0
+            && flags & !16383 == 0
             && (flags & Self::LAB_SPECULAR == 0
                 || flags & (Self::AUXILIARY | Self::MERS) == (Self::AUXILIARY | Self::MERS))
             && self.uv_bounds[0] < self.uv_bounds[2]
             && self.uv_bounds[1] < self.uv_bounds[3]
             && if flags & Self::OVERLAY != 0 {
                 self.control[0] == 0
-                    && self.control[3] == 0
-                    && flags
-                        & (Self::AUXILIARY
-                            | Self::TEXTURED_EMISSION
-                            | Self::CUTOUT
-                            | Self::TRANSLUCENT)
-                        == 0
+                    && self.control[3] & !Self::AUTHORED_NORMAL == 0
+                    && flags & (Self::TEXTURED_EMISSION | Self::CUTOUT | Self::TRANSLUCENT) == 0
+                    && (flags & Self::OVERLAY_NORMAL == 0 || flags & Self::OVERLAY_AUXILIARY != 0)
+                    && (flags & Self::OVERLAY_LAB_SPECULAR == 0
+                        || flags & (Self::OVERLAY_AUXILIARY | Self::OVERLAY_MERS)
+                            == (Self::OVERLAY_AUXILIARY | Self::OVERLAY_MERS))
                     && self.emission[3] == 0.
                     && self
                         .overlay_bounds
@@ -184,7 +195,12 @@ impl MaterialDefinition {
                     && self.overlay_bounds[0] < self.overlay_bounds[2]
                     && self.overlay_bounds[1] < self.overlay_bounds[3]
             } else {
-                flags & Self::OVERLAY_MERS == 0
+                flags
+                    & (Self::OVERLAY_MERS
+                        | Self::OVERLAY_AUXILIARY
+                        | Self::OVERLAY_NORMAL
+                        | Self::OVERLAY_LAB_SPECULAR)
+                    == 0
             }
     }
 }
