@@ -152,9 +152,11 @@ public func physical_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, incid
 {
     let p = parameters[0];
     let pos = hit.surface.position;
-    var inside =
-        geometry_guide(pos, energies.normal_roughness.xyz, pos,
-                       dot(pos - p.previous_position.xyz, p.previous_forward.xyz), false, true);
+    let pose = ModScene().guide_pose(hit);
+    var inside = geometry_guide(
+        pos, energies.normal_roughness.xyz, pose.previous_position,
+        dot(pose.previous_position - p.previous_position.xyz, p.previous_forward.xyz), false,
+        pose.known);
     inside.roughness = mat.pbr.base_roughness.w;
     inside.use_sh_color = (mat.pbr.control.x & 1u) != 0;
     inside.material = material_class(hit, mat);
@@ -191,7 +193,8 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     }
     var target = sky ? end.camera_direction : position + pt::psr_direction(end.psr, pose_delta);
     var previous_z = dot(position - p.previous_position.xyz, p.previous_forward.xyz);
-    var valid = (end.flags & (pt::GUIDE_SURFACE_PROXY | pt::GUIDE_INVALID)) == 0;
+    var valid =
+        (end.flags & (pt::GUIDE_SURFACE_PROXY | pt::GUIDE_INVALID)) == 0 && (sky || end.pose.known);
     let record = optical_record(end);
     if ((end.sampled_motion || (replaced && end.optical_motion.moving)) && p.reconstruction.z > 0)
     {

@@ -136,7 +136,7 @@ impl Gpu {
             }
             let region_cache = scene_cache::Cache::new()?;
             let lighting = lighting::Lighting::new()?;
-            let prepared = materials::bindings(
+            let mut prepared = materials::bindings(
                 source.generation,
                 source.materials,
                 source.extent,
@@ -144,6 +144,7 @@ impl Gpu {
                 source.mers,
                 source.auxiliary,
             )?;
+            self.features.mark_materials(&mut prepared.keys);
             let definitions = prepared.definitions.as_ref();
             let keys = &prepared.keys;
             validate_aliases(definitions, source.emission_alias_words)?;
@@ -160,17 +161,21 @@ impl Gpu {
             }));
             let opacity = opacity::Prepared::new(&mut self.context, &source, definitions)?;
             let has_emission = light_sides.iter().any(|&side| side != 0);
-            let light_weights = materials::emission_weights(definitions)?;
+            // 三种实例表面只供射线命中；地形输入边界与灯树只接受原始材质编号。
+            let terrain_count = materials::terrain_material_count(keys);
+            let terrain_definitions = &definitions[..terrain_count];
+            light_sides.truncate(terrain_count);
+            let light_weights = materials::emission_weights(terrain_definitions)?;
             let mut material_coverage = Vec::new();
             material_coverage
-                .try_reserve_exact(definitions.len())
+                .try_reserve_exact(terrain_count)
                 .map_err(scene_cache::Error::from)?;
-            material_coverage.extend(definitions.iter().map(materials::tests_coverage));
+            material_coverage.extend(terrain_definitions.iter().map(materials::tests_coverage));
             let mut light_areas = Vec::new();
             light_areas
-                .try_reserve_exact(source.light_areas.len())
+                .try_reserve_exact(terrain_count)
                 .map_err(scene_cache::Error::from)?;
-            light_areas.extend_from_slice(source.light_areas);
+            light_areas.extend_from_slice(&source.light_areas[..terrain_count]);
             let extent = [source.extent[0], source.extent[1], 1];
             let atlas = Image::new(&mut self.context, extent, ImageFormat::Rgba8Srgb)?;
             atlas.upload(&mut self.context, source.albedo)?;
@@ -215,6 +220,8 @@ impl Gpu {
             self.light_sides = light_sides;
             self.light_weights = light_weights;
             self.has_emission = has_emission;
+            self.features.reset(self.geometry_placeholder);
+            self.features.retire_catalog();
             self.region_cache = region_cache;
             self.terrain_uploads.clear();
             self.pending_storage = None;
@@ -279,9 +286,16 @@ impl Gpu {
         let mut batch = self.compiler.batch();
         let hit = materials::hit_features(definitions);
         let coverage = format!("-DPRIMEPT_COVERAGE_MASK={}", hit.coverage);
-        let emitter_capabilities = materials::emitter_capabilities(definitions, keys);
+        let static_count = materials::terrain_material_count(keys);
+        let feature_scene = if static_count == keys.len() {
+            "-DPRIMEPT_WORLD_FEATURES=0"
+        } else {
+            "-DPRIMEPT_WORLD_FEATURES=1"
+        };
+        let emitter_capabilities =
+            materials::emitter_capabilities(&definitions[..static_count], &keys[..static_count]);
         let emitters = format!("-DPRIMEPT_EMITTER_CAPABILITIES={emitter_capabilities}");
-        let lights = if keys.iter().any(|(flow, _)| flow.emits()) {
+        let lights = if keys[..static_count].iter().any(|(flow, _)| flow.emits()) {
             "-DPRIMEPT_LIGHT_MASK=3"
         } else {
             "-DPRIMEPT_LIGHT_MASK=1"
@@ -317,6 +331,7 @@ impl Gpu {
                     "-DOPENPBR_RECIPE_VARIANT=1",
                     lights,
                     &coverage,
+                    feature_scene,
                     &emitters,
                     omm,
                     "-capability",
@@ -330,6 +345,7 @@ impl Gpu {
             "-DOPENPBR_RECIPE_VARIANT=1",
             lights,
             &coverage,
+            feature_scene,
             &emitters,
             omm,
         ];
@@ -400,6 +416,7 @@ impl Gpu {
             "spvRayTracingPositionFetchKHR",
             &dispatch_arg,
             &coverage,
+            feature_scene,
             &emitters,
             no_material[0],
             no_material[1],
@@ -552,6 +569,7 @@ impl Gpu {
                     "precise",
                     "-DOPENPBR_RECIPE_VARIANT=1",
                     &coverage,
+                    feature_scene,
                     "-capability",
                     "spvRayTracingPositionFetchKHR",
                 ],

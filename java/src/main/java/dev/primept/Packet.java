@@ -8,7 +8,9 @@ import net.minecraft.client.resources.model.geometry.BakedQuad;
 /** 可复用的小端捕获源包；只复制源字段，mesh 展开归 Rust。 */
 final class Packet {
     private static final int MAX_BYTES = 256 * 1024 * 1024;
-    private ByteBuffer bytes = ByteBuffer.allocateDirect(1 << 20).order(ByteOrder.LITTLE_ENDIAN);
+    private ByteBuffer bytes;
+    Packet(){this(1<<20);}
+    Packet(int initial){bytes=ByteBuffer.allocateDirect(initial).order(ByteOrder.LITTLE_ENDIAN);}
     private byte[] streamBuffer;
 
     void clear() { bytes.clear(); }

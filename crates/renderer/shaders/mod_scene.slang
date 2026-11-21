@@ -52,13 +52,25 @@ var resident_quad_tokens : StructuredBuffer<uint2>;
 /// 当前驻留 quad 的 64 位身份与其有向半面；各帧的 primitive 槽可不同。
 public func stable_triangle(primitive: uint)->uint3
 {
+    if (world_features::active(primitive))
+        return uint3(world_features::faces[world_features::slot(primitive)].identity.xy,
+                     primitive & 1u);
     return uint3(resident_quad_tokens[primitive >> 1u], primitive & 1u);
 }
 
 /// 实例自定义索引只选择对应区块的属性起点。每个 quad 在 BLAS 中占两个三角形。
 public func region_primitive(instance: uint, local_primitive: uint)->uint
 {
+    if (world_features::configured && (instance & world_features::instance_bit) != 0)
+        return world_features::primitive_bit |
+               ((instance & ~world_features::instance_bit) * 2u + local_primitive);
     return instance_quad_bases[instance] * 2u + local_primitive;
+}
+
+/// 第一人称身体只对相机之后的路径和阴影可见。相机射线从同一定位后的针孔出发。
+public func visibility_mask(origin: float3)->uint
+{
+    return world_features::configured && all(origin == parameters[0].origin.xyz) ? 2u : 0xffu;
 }
 
 public func sun_contains(direction: float3)->bool
@@ -132,8 +144,14 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 {
     public func guide_pose(hit: pt::Hit)->pt::GuidePose
     {
-        // 捕获网格没有跨帧实例/顶点对应；保留相机代理，不猜测物体静止。
-        return { hit.surface.position, false, false };
+        let primitive = hit.identity.x;
+        if (world_features::active(primitive))
+        {
+            let known = world_features::faces[world_features::slot(primitive)].identity.w != 0;
+            return { world_features::previous_position(primitive, asfloat(hit.identity.yz)), known,
+                     false };
+        }
+        return { hit.surface.position, true, true };
     }
 
     public func guide_material(input_hit: pt::Hit, incident: float4)->transport::SurfaceMaterial
@@ -149,7 +167,7 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         let ray : RayDesc = { origin, 0, direction, pt::FAR };
         var ray_payload : TracePayload = (TracePayload)0;
         ray_payload.primitive = 0xffffffffu;
-        TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, ray_payload);
+        TraceRay(scene, RAY_FLAG_NONE, visibility_mask(ray.Origin), 0, 1, 0, ray, ray_payload);
         if (ray_payload.primitive == 0xffffffffu)
             return false;
         hit.surface = ray_payload.surface;
@@ -246,6 +264,8 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
 
     public func emission_pdf(hit: pt::Hit, previous: float3)->float
     {
+        if (world_features::active(hit.identity.x))
+            return 0;
         return quad_emission_pdf<SelectedEmitterArea>(hit, previous,
                                                       parameters[0].anchor_region.xyz);
     }
@@ -258,13 +278,13 @@ public struct ModScene : pt::ITraceScene, pt::IGuideScene, pt::IFlowScene
         {
             var opaque : RayQuery<(first ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : 0) |
                                   RAY_FLAG_FORCE_OPAQUE>;
-            opaque.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
+            opaque.TraceRayInline(scene, RAY_FLAG_NONE, world_features::shadow_mask, ray);
             opaque.Proceed();
             return opaque.CommittedStatus() == COMMITTED_NOTHING ? pt::FAR : opaque.CommittedRayT();
         }
 #else
         var query : RayQuery<first ? RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH : 0>;
-        query.TraceRayInline(scene, RAY_FLAG_NONE, 0xff, ray);
+        query.TraceRayInline(scene, RAY_FLAG_NONE, world_features::shadow_mask, ray);
         while (query.Proceed())
         {
             // RayQuery 不执行 any-hit；候选必须使用与主查询相同的覆盖规则。

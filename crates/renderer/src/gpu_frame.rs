@@ -12,8 +12,21 @@ impl Gpu {
         lighting: LightingGpu,
     ) -> (Vec<Binding>, Vec<Binding>) {
         let buffer = |buffer: &Buffer| Binding::StorageBuffer(*buffer);
+        let (top, feature_surfaces, feature_pixels) = if std::ptr::eq(scene, &self.scene) {
+            (
+                self.features.top.unwrap_or(scene.top),
+                self.features.surfaces,
+                self.features.pixels,
+            )
+        } else {
+            (
+                scene.top,
+                self.geometry_placeholder,
+                self.geometry_placeholder,
+            )
+        };
         let mut trace = vec![
-            Binding::Acceleration(scene.top),
+            Binding::Acceleration(top),
             buffer(&scene.quads),
             Binding::SampledImage(*atlas),
             Binding::Sampler(self.nearest),
@@ -55,6 +68,8 @@ impl Gpu {
             buffer(&view.optical_history[1]),
             Binding::StorageImage(view.rr.disocclusion),
             Binding::StorageImage(view.rr.rr_specular_motion),
+            buffer(&feature_surfaces),
+            buffer(&feature_pixels),
         ]);
         let (terrain_frame, terrain_radiance, first_hits) = self.terrain_light.outputs();
         let post = vec![
@@ -164,6 +179,9 @@ impl Gpu {
         let mut result = Vec::with_capacity(4);
         let mut rr_reconfigured = false;
         let recording = (|| -> Result<(), Error> {
+            if let Some(read) = self.features.record_textures(&mut self.context)? {
+                result.push(read);
+            }
             let sky_enabled = environment.enabled();
             let solar_scale = if sky_enabled {
                 self.solar_reference_scale * self.sun_gain

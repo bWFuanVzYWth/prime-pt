@@ -129,6 +129,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "triangle_identity_probe.spv",
         ),
         ("shaders/post.slang", "post_main", "post.spv"),
+        (
+            "shaders/feature_texture.slang",
+            "feature_texture",
+            "feature_texture.spv",
+        ),
+        (
+            "shaders/feature_models.slang",
+            "feature_models",
+            "feature_models.spv",
+        ),
         ("shaders/post.slang", "post_nrd", "post_nrd.spv"),
         (
             "shaders/shadow_columns.slang",

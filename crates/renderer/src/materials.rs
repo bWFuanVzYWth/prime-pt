@@ -252,6 +252,14 @@ impl Atlas<'_> {
 }
 
 pub(super) type Key = (openpbr::FlowKey, u32);
+/// 稳定的组件材质从实例表读取颜色；地形仍使用资源世代的 atlas。
+pub(super) const INSTANCE_COLOR: u32 = 1 << 17;
+
+pub(super) fn terrain_material_count(keys: &[Key]) -> usize {
+    keys.iter()
+        .position(|(_, v)| v & INSTANCE_COLOR != 0)
+        .unwrap_or(keys.len())
+}
 
 /// 越界组合保留源编号和覆盖，完整参数表、SBT、OMM及发光表共同使用有效定义。
 pub(super) struct Bindings<'a> {

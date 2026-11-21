@@ -19,6 +19,10 @@
 //! 实时双样本与离线采用独立入口及最小链接集；有限film、合成和显示程序在准备阶段建立，
 //! FramePlan统一选择录制与参数，帧内只重绑和选择已有程序。
 
+#[path = "feature_models.rs"]
+mod feature_models;
+#[path = "feature_source.rs"]
+mod feature_source;
 #[path = "gpu_frame.rs"]
 mod gpu_frame;
 #[path = "gpu_nrd.rs"]
@@ -29,6 +33,8 @@ mod gpu_resources;
 mod gpu_scene;
 #[path = "gpu_view.rs"]
 mod gpu_view;
+#[path = "world_features.rs"]
+mod world_features;
 use gpu_nrd::NrdView;
 
 use crate::{
@@ -724,6 +730,7 @@ pub struct Gpu {
     attribute_slot_limit: u32,
     scene: Scene,
     anchor: [f64; 3],
+    features: world_features::Features,
     region_cache: scene_cache::Cache<RegionGpu>,
     terrain_uploads: vulkan::TerrainUploads,
     pending_storage: Option<PendingStorage>,
@@ -754,7 +761,15 @@ pub struct Gpu {
     terrain_light: atmosphere::terrain::TerrainLight,
     terrain_input: Buffer,
     shadow_resolver: ComputePipeline,
-    shadow_scene: (AccelerationStructure, Buffer, Buffer, Image, Buffer),
+    shadow_scene: (
+        AccelerationStructure,
+        Buffer,
+        Buffer,
+        Image,
+        Buffer,
+        Buffer,
+        Buffer,
+    ),
     atmosphere_pending: bool,
     solar_reference_scale: f32,
     sun_gain: f32,
@@ -865,6 +880,7 @@ impl Gpu {
             tokens: self.program_scene.tokens,
             instance_quad_bases: self.program_scene.instance_quad_bases,
         };
+        self.features.reset(self.geometry_placeholder);
         self.region_cache = scene_cache::Cache::new()?;
         self.terrain_uploads.clear();
         self.pending_storage = None;
@@ -1137,12 +1153,15 @@ impl Gpu {
         let model = atmosphere.terrain_model(&mut context)?;
         let terrain_light =
             atmosphere::terrain::TerrainLight::new(&mut context, model, terrain_input)?;
+        let geometry_placeholder = Buffer::mapped_device_local(&mut context, 64)?;
         let shadow_scene = (
             scene.top,
             scene.quads,
             scene.instance_quad_bases,
             atlas,
             material_gpu.table,
+            geometry_placeholder,
+            geometry_placeholder,
         );
         let shadow_resolver = terrain_light.resolver(
             &mut context,
@@ -1157,11 +1176,14 @@ impl Gpu {
                 Binding::StorageBuffer(scene.instance_quad_bases),
                 Binding::SampledImage(atlas),
                 Binding::StorageBuffer(material_gpu.table),
+                Binding::StorageBuffer(geometry_placeholder),
+                Binding::StorageBuffer(geometry_placeholder),
             ],
         )?;
-        let geometry_placeholder = Buffer::mapped_device_local(&mut context, 64)?;
 
+        let features = world_features::Features::new(&mut context, atlas, geometry_placeholder)?;
         let gpu = Self {
+            features,
             diagnostic_sync: std::env::var_os("PRIME_PT_DIAGNOSTIC_SYNC")
                 .is_some_and(|value| value == "1"),
             #[cfg(test)]
@@ -1390,6 +1412,7 @@ impl Gpu {
             if self.diagnostic_sync {
                 eprintln!("[prime_pt] gpu_checkpoint sample_next={next} state=host_complete");
             }
+            self.features.accepted();
             self.absolute_sample = next;
         }
         Ok(())

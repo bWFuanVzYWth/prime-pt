@@ -1113,11 +1113,13 @@ impl Gpu {
     // 单场景和两个视图的固定根；录制命令另由Context保护短命绑定。
     pub(super) fn refresh_shadow_scene(&mut self) -> Result<(), Error> {
         let key = (
-            self.scene.top,
+            self.features.top.unwrap_or(self.scene.top),
             self.scene.quads,
             self.scene.instance_quad_bases,
             self.atlas,
             self.material_gpu.table,
+            self.features.surfaces,
+            self.features.pixels,
         );
         if key != self.shadow_scene {
             self.shadow_resolver = self.terrain_light.resolver(
@@ -1133,6 +1135,8 @@ impl Gpu {
                     Binding::StorageBuffer(key.2),
                     Binding::SampledImage(key.3),
                     Binding::StorageBuffer(key.4),
+                    Binding::StorageBuffer(key.5),
+                    Binding::StorageBuffer(key.6),
                 ],
             )?;
             self.shadow_scene = key;
@@ -1201,6 +1205,7 @@ impl Gpu {
                 roots.push(t.instance_quad_bases.into());
             }
         }
+        self.features.roots(&mut roots);
         roots.extend_from_slice(extra);
         self.context.collect(&roots)?;
         Ok(())

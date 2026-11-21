@@ -47,9 +47,15 @@ pub unsafe extern "C" fn prime_atlas(
 /// 候选shader/SBT/材质/alias全部就绪后才发布，运行期section不得调用本入口追加资源。
 ///
 /// # Safety
-/// data在调用内借出完整len字节；宿主已完成此前命令且独占graphics queue。
+/// data 与 model_data 在调用内分别借出完整的 len 和 model_len 字节；宿主已完成此前命令且独占graphics queue。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i32 {
+pub unsafe extern "C" fn prime_sources(
+    id: u64,
+    data: *const u8,
+    len: u64,
+    model_data: *const u8,
+    model_len: u64,
+) -> i32 {
     guarded(-1, || {
         let len = usize::try_from(len).map_err(|_| Error::Input("资源包长度越界"))?;
         if data.is_null() || len == 0 || len > prime_minecraft::MAX_PACKET {
@@ -82,7 +88,12 @@ pub unsafe extern "C" fn prime_sources(id: u64, data: *const u8, len: u64) -> i3
                     gpu::capture::write_resources(&capture.directory, &source)
                         .map_err(gpu::Error::DiagnosticOutput)?;
                 }
-                engine.gpu.replace_resources(source)?;
+                if model_data.is_null() || model_len > scene::MAX_PACKET as u64 {
+                    return Err(Error::Input("模型部件源包无效"));
+                }
+                // SAFETY: 宿主随本次资源世代借出 model_len 字节，返回后复制或准备已经完成。
+                let models = unsafe { std::slice::from_raw_parts(model_data, model_len as usize) };
+                engine.gpu.replace_world_resources(source, models)?;
             }
             prepared.commit();
             world.commit();

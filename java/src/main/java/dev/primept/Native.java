@@ -80,7 +80,7 @@ final class Native implements AutoCloseable {
         setLensBloom = bindLensBloom(symbols);
         setLightingOptions = bindLightingOptions(symbols);
         batch = bind(symbols, "prime_batch", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
-        sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG));
+        sources = bind(symbols, "prime_sources", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG,ADDRESS,JAVA_LONG));
         cameraMedium = bind(symbols, "prime_camera_medium", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT));
         tintRequests = bind(symbols,"prime_tint_requests",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
         tints = bind(symbols,"prime_tints",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
@@ -90,7 +90,7 @@ final class Native implements AutoCloseable {
         biomeSamples = bind(symbols,"prime_biome_samples",FunctionDescriptor.of(JAVA_INT,JAVA_LONG,ADDRESS,JAVA_INT));
         atlas = bind(symbols, "prime_atlas", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS, JAVA_LONG, JAVA_INT, JAVA_INT));
         draw = bind(symbols, "prime_draw", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG,
-                JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT));
+                JAVA_LONG, JAVA_LONG, JAVA_INT, JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,ADDRESS,JAVA_INT));
         error = bind(symbols, "prime_error", FunctionDescriptor.of(ADDRESS));
         try {
             handle = ser || checkpoints || omm
@@ -262,8 +262,8 @@ final class Native implements AutoCloseable {
         catch (Throwable e) { throw unchecked(e); }
     }
 
-    void sources(ByteBuffer bytes) {
-        try { check((int) sources.invokeExact(handle,MemorySegment.ofBuffer(bytes),(long)bytes.remaining())); }
+    void sources(ByteBuffer bytes,ByteBuffer models) {
+        try { check((int) sources.invokeExact(handle,MemorySegment.ofBuffer(bytes),(long)bytes.remaining(),MemorySegment.ofBuffer(models),(long)models.remaining())); }
         catch(Throwable e){throw unchecked(e);}
     }
 
@@ -309,12 +309,12 @@ final class Native implements AutoCloseable {
         } catch (Throwable e) { throw unchecked(e); }
     }
 
-    void draw(long command, long image, long view, int width, int height, ByteBuffer camera, ByteBuffer environment,
+    void draw(long command, long image, long view, int width, int height, ByteBuffer camera, ByteBuffer environment, ByteBuffer features,
             Denoiser denoiser, Quality quality, int samples, int bounces) {
         try { check((int) draw.invokeExact(handle, command, image, view, width, height,
                 MemorySegment.ofBuffer(camera), MemorySegment.ofBuffer(environment),
                 denoiser == Denoiser.DLSS && !Bootstrap.nrdAvailable() ? 3 : denoiser.wire,
-                quality.wireId(), samples, bounces)); }
+                quality.wireId(), samples, bounces,features==null?MemorySegment.NULL:MemorySegment.ofBuffer(features),features==null?0:features.remaining())); }
         catch (Throwable e) { throw unchecked(e); }
     }
 

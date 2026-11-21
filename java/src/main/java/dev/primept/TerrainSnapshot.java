@@ -2,8 +2,12 @@ package dev.primept;
 
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.util.concurrent.atomic.AtomicReferenceArray;
+import net.minecraft.client.Camera;
 import net.minecraft.client.multiplayer.ClientChunkCache;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.SectionOcclusionGraph;
+import net.minecraft.client.renderer.state.level.LevelRenderState;
 import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -15,6 +19,10 @@ public final class TerrainSnapshot {
 
     /** 数组归当前 ClientChunkCache 所有，Storage 换代时立即替换借用。 */
     public interface Cache {
+        void primept$blockEntities(ClientLevel level, LevelRenderer renderer, Camera camera,
+                float partial, LevelRenderState state);
+        void primept$releaseBlockEntities();
+        void primept$blockEntitiesChanged(LevelChunk chunk);
         void primept$bindChunks(AtomicReferenceArray<LevelChunk> chunks);
         void primept$restoreTerrain(SectionOcclusionGraph graph);
     }
@@ -26,9 +34,11 @@ public final class TerrainSnapshot {
         var none = new LongOpenHashSet();
         for (int i = 0; i < chunks.length(); i++) {
             var chunk = chunks.get(i);
-            if (chunk == null) continue;
+            if (chunk == null)
+                continue;
             var pos = chunk.getPos();
-            if (cache.getChunk(pos.x(), pos.z(), ChunkStatus.FULL, false) != chunk) continue;
+            if (cache.getChunk(pos.x(), pos.z(), ChunkStatus.FULL, false) != chunk)
+                continue;
             loaded.add(ChunkPos.pack(pos.x(), pos.z()));
             var sections = chunk.getSections();
             for (int y = 0; y < sections.length; y++)

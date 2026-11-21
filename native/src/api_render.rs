@@ -69,6 +69,7 @@ pub unsafe extern "C" fn prime_profile(
 /// 输出第 0 行对应宿主画面底部；相机 up 保持世界向上的视锥向量。
 /// camera 指向一份活动的 72B [`WorldCamera`]；函数返回后借用结束。
 /// 场景和相机统一在 64m 网格 anchor 下计算；重定位保留 BLAS 与 RR 世界空间历史。
+/// features 借出 feature_bytes 个 PTF1 字节；其中的 sampled view 属于本设备，在本次提交完成前为 GENERAL 并保活。冻结时可传空。
 /// environment 指向一份活动的 16B [`FrameEnvironment`]。曝光只影响呈现。
 /// rr=0 使用原始累积，rr=1 使用已完成早期 SDK 接入的 RR；其余值拒绝。
 /// quality=0..=4 对应 DLAA/Quality/Balanced/Performance/UltraPerformance；SDK 决定输入尺寸。
@@ -93,6 +94,8 @@ pub unsafe extern "C" fn prime_draw(
     quality: u32,
     samples: u32,
     bounces: u32,
+    features: *const u8,
+    feature_bytes: u32,
 ) -> i32 {
     guarded(-1, || {
         if rr > 3
@@ -213,6 +216,18 @@ pub unsafe extern "C" fn prime_draw(
                 return Err(Error::Input(
                     "离线样本达到精确累积上限；请显式重新进入离线模式",
                 ));
+            }
+            if feature_bytes != 0 {
+                if features.is_null() || feature_bytes as usize > scene::MAX_PACKET {
+                    return Err(Error::Input("动态网格源包指针或大小无效"));
+                }
+                // SAFETY: 本入口借用完整 PTF1 和同设备纹理；设备、布局和保活由宿主维持。
+                unsafe {
+                    engine.gpu.set_world_features(std::slice::from_raw_parts(
+                        features,
+                        feature_bytes as usize,
+                    ))?;
+                }
             }
             let published_anchor = engine.gpu.scene_anchor();
             let camera = frame.camera.relative(published_anchor)?;

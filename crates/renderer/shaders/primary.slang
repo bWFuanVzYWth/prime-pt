@@ -328,10 +328,11 @@ func shadow_occluded(connection: geometry::Ray)
         let ray : RayDesc = { connection.origin, connection.t_min, connection.direction,
                               connection.t_max };
         var unused : uint = 0;
-        var shadow : HitObject = HitObject::TraceRay(scene,
-                                                     RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
-                                                         RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-                                                     0xff, 0, 1, 0, ray, unused);
+        var shadow : HitObject =
+                         HitObject::TraceRay(scene,
+                                             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH |
+                                                 RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+                                             world_features::shadow_mask, 0, 1, 0, ray, unused);
         return shadow.IsHit();
     }
     return ModScene().occluded(connection);
@@ -394,8 +395,8 @@ func render_fused()->void
     {
         let ray : RayDesc = { data.path.origin, 0, data.path.direction, pt::FAR };
         var unused : uint = 0;
-        var found : HitObject =
-                        HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+        var found : HitObject = HitObject::TraceRay(
+                        scene, RAY_FLAG_NONE, visibility_mask(ray.Origin), 0, 1, 0, ray, unused);
         if (!found.IsHit())
         {
             pt::escape(provider, data.path);

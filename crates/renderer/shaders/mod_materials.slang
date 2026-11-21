@@ -1,5 +1,6 @@
 /// 资源世代的材质表、真实quad UV/tint与PBR纹理；不查询宿主或拥有GPU资源。
 module mod_materials;
+__exported import world_features;
 import pt.scene;
 import mod_coverage;
 import openpbr.api;
@@ -74,10 +75,14 @@ public func guide_slot(primitive: uint)->uint
 
 public func material_id(primitive: uint)->uint
 {
+    if (world_features::active(primitive))
+        return world_features::faces[world_features::slot(primitive)].material.x;
     return quads[(primitive >> 1) * 3u + 2u].w;
 }
 public func material_uv(primitive: uint, barycentrics: float2)->float2
 {
+    if (world_features::active(primitive))
+        return 0;
     return prime_coverage::material_uv(quads, primitive, barycentrics);
 }
 public func sprite_address(uv: float2, bounds: float4)->int3
@@ -99,6 +104,8 @@ public func quad_tint(primitive: uint)->float3
 }
 func sample_tinted_texel(primitive: uint, barycentrics: float2, uv: float2)->float4
 {
+    if (world_features::active(primitive))
+        return world_features::sample(primitive, barycentrics, atlas);
     let value : float4 = atlas.Load(sprite_address(
                     uv, asfloat(material_words.Load4(material_id(primitive) * 112u + 80u))));
     return float4(value.xyz * quad_tint(primitive), value.w);
@@ -111,6 +118,9 @@ public func material_texel(primitive: uint, barycentrics: float2)->float4
 /// CUTOUT来自实际源layer；opaque/透射界面不将alpha误解释为二值孔洞。
 public func material_accepts(primitive: uint, bary: float2, front: bool)->bool
 {
+    if (world_features::active(primitive))
+        return world_features::accepts(world_features::faces, world_features::pixels, primitive,
+                                       bary, atlas);
     return prime_coverage::accepts<PRIMEPT_COVERAGE_MASK>(quads, atlas, material_words, primitive,
                                                           bary, front);
 }
@@ -330,7 +340,7 @@ public func resolve_material<let has_aux : bool = false, let read_color : bool =
         uv = material_uv(primitive, asfloat(hit.identity.yz));
     var bounds : float4 = material.uv_bounds;
     if (read_base)
-        hit.texel.xyz = atlas.Load(sprite_address(uv, bounds)).rgb * quad_tint(primitive);
+        hit.texel.xyz = sample_tinted_texel(primitive, asfloat(hit.identity.yz), uv).rgb;
     var base_color : float3 = hit.texel.xyz;
     var reads_mers : bool = (mask & 1u) != 0;
     if (overlay)

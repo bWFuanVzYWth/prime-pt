@@ -155,7 +155,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         into 'slang'
     }
     from('crates/renderer/shaders') {
-        include 'nrd_path.slang', 'nrd_guides.slang'
+        include 'nrd_path.slang', 'nrd_guides.slang', 'world_features.slang'
         include 'primary.slang', 'pt_hit.slang', 'guides.slang', 'guide_material.slang', 'primary_cache.slang', 'primary_material.slang',
                 'params.slang', 'mod_*.slang', 'known_geometry.slang'
         into 'shaders/prime'
@@ -177,7 +177,7 @@ def bundleRuntime = tasks.register('bundleRuntime', Sync) {
         def required = nativeFiles + vcFiles + (slangFiles + vcFiles).collect { 'slang/' + it } +
                 ['slang/LICENSE', 'shaders/prime/primary.slang', 'shaders/prime/pt_hit.slang',
                  'shaders/prime/guides.slang', 'shaders/prime/guide_material.slang', 'shaders/prime/primary_cache.slang', 'shaders/prime/primary_material.slang',
-                 'shaders/prime/known_geometry.slang', 'shaders/prime/nrd_path.slang', 'shaders/prime/nrd_guides.slang', 'shaders/engine/denoise/nrd_signal.slang',
+                 'shaders/prime/known_geometry.slang', 'shaders/prime/world_features.slang', 'shaders/prime/nrd_path.slang', 'shaders/prime/nrd_guides.slang', 'shaders/engine/denoise/nrd_signal.slang',
                  'shaders/engine/pt/scene.slang', 'shaders/engine/pt/hit_transport.slang',
                  'shaders/engine/pt/key_guides.slang',
                  'shaders/engine/sampling/sobol_bits.slang', 'shaders/engine/math/constants.slang',
@@ -240,6 +240,19 @@ tasks.register('buildRelease') {
     dependsOn tasks.named('build'), bundledRuntimeFixture
     doLast { logger.lifecycle(releaseJar.get().asFile.absolutePath) }
 }
+tasks.register('worldFeatureFixture', JavaExec) {
+    dependsOn fixtureClasses
+    classpath = sourceSets.fixture.runtimeClasspath
+    mainClass = 'dev.primept.WorldFeatureFixture'
+    workingDir layout.buildDirectory
+    systemProperty 'java.awt.headless', 'true'
+    systemProperty 'fabric.development', 'true'
+    systemProperty 'fabric.defaultModDistributionNamespace', 'official'
+    systemProperty 'fabric.defaultMixinRemapType', 'static'
+    systemProperty 'fabric.classPathGroups', (sourceSets.main.output.files + sourceSets.fixture.output.classesDirs.files).collect { it.absolutePath }.join(File.pathSeparator)
+    args layout.buildDirectory.file('fixtures/world-models.pfm').get().asFile.absolutePath
+}
+
 tasks.register('wireFixture', JavaExec) {
     dependsOn fixtureClasses
     classpath = sourceSets.fixture.runtimeClasspath
@@ -362,7 +375,7 @@ tasks.register('unsupportedDeviceFixture', JavaExec) {
 
 tasks.named('check') {
     dependsOn tasks.named('startupSupportFixture')
-    dependsOn tasks.named('terrainSnapshotFixture')
+    dependsOn tasks.named('terrainSnapshotFixture'), tasks.named('worldFeatureFixture')
     dependsOn tasks.named('renderTuningFixture')
     dependsOn tasks.named('cameraFixture'), tasks.named('environmentFixture'), tasks.named('exposureFixture'),
             tasks.named('videoOptionsFixture'), tasks.named('settingsLanguageFixture'), tasks.named('commandHintsFixture'),

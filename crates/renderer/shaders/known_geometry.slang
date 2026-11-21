@@ -11,6 +11,8 @@ public func known_normal_xy<let variant : uint>(primitive: uint, encoded: float2
 {
     if ((variant & 8u) == 0)
         return 0;
+    if (world_features::active(primitive))
+        return 0;
     let start : uint = (primitive >> 1u) * 4u;
     let vertices : light_sampling::LightQuadVertices = { asfloat(known_positions[start].xyz),
                                                          asfloat(known_positions[start + 1u].xyz),
@@ -31,6 +33,15 @@ public func known_normal<let variant : uint>(primitive: uint, bary: float2, norm
 
 public func known_endpoint(primitive: uint, bary: float2)->geometry::TriangleEndpoint
 {
+    if (world_features::active(primitive))
+    {
+        let n = world_features::slot(primitive);
+        let i = world_features::indices(primitive);
+        let unit = float3x4(1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0);
+        return geometry::triangle_endpoint(
+            world_features::faces[n].position[i.x].xyz, world_features::faces[n].position[i.y].xyz,
+            world_features::faces[n].position[i.z].xyz, bary, unit, unit);
+    }
     let start : uint = (primitive >> 1u) * 4u;
     let vertices : light_sampling::LightQuadVertices = { asfloat(known_positions[start].xyz),
                                                          asfloat(known_positions[start + 1u].xyz),

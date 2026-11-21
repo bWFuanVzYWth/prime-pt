@@ -146,7 +146,8 @@ func cache_primary<let frame_film : bool>()->void
     let direction = primary_direction<frame_film>(p, coordinate);
     let ray : RayDesc = { p.origin.xyz, 0, direction, pt::FAR };
     var unused : uint = 0;
-    var found : HitObject = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+    var found : HitObject = HitObject::TraceRay(scene, RAY_FLAG_NONE, visibility_mask(ray.Origin),
+                                                0, 1, 0, ray, unused);
     var identity = uint4(0xffffffffu, 0, 0, 0);
     var distance : float = pt::FAR;
     if (found.IsHit())
@@ -234,7 +235,8 @@ struct HitGuideScene : pt::IGuideScene
     {
         let ray : RayDesc = { origin, 0, direction, pt::FAR };
         var unused = 0u;
-        var found = HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+        var found = HitObject::TraceRay(scene, RAY_FLAG_NONE, visibility_mask(ray.Origin), 0, 1, 0,
+                                        ray, unused);
         hit = {};
         if (!found.IsHit())
             return false;

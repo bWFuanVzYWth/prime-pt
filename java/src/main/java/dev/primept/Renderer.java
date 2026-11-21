@@ -53,7 +53,8 @@ public final class Renderer {
         renderer.rendering(RenderMode.REALTIME);
         frozen=false;hasFrame=false;
         var next=SourceResources.prepareReload(Minecraft.getInstance());
-        Atlas.send(renderer);renderer.sources(next.packet());next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;CHANGES.clear();
+        var models=FeatureModels.prepare(Minecraft.getInstance().getModelManager().entityModels().get());
+        Atlas.send(renderer);renderer.sources(next.packet(),models.packet());models.publish();next.accepted();Atlas.accepted();generation=next.generation;biomeWorld=null;CHANGES.clear();
     }
 
     /** 在外层提取边界交接原版与 Prime；完成证明后才改变 native 模式。 */
@@ -74,6 +75,11 @@ public final class Renderer {
             resetRequested = true;
             CHANGES.clear();
             var minecraft = Minecraft.getInstance();
+            if (!enabled) {
+                WorldFeatures.releaseWorld();
+                if (minecraft.level != null)
+                    ((TerrainSnapshot.Cache)minecraft.level.getChunkSource()).primept$releaseBlockEntities();
+            }
             vanillaRestore = active ? null : minecraft.level;
             minecraft.levelExtractor.allChanged();
         }
@@ -148,6 +154,11 @@ public final class Renderer {
         var updateBudget = Settings.updateBudget();
         boolean resetWorld = CAPTURE.select(minecraft.level) || resetRequested;
         boolean resume = frozen && !Settings.offline();
+        ByteBuffer features=null;
+        if (!Settings.offline()||!hasFrame||resetWorld) {
+            ((WorldFeatures.SourceRenderer)minecraft.levelRenderer).primept$features(camera);
+            features=WorldFeatures.packet(camera);
+        }
         long started = System.nanoTime();
         try (var fence = encoder.createFence()) {
             encoder.submit();
@@ -191,7 +202,7 @@ public final class Renderer {
         var command = encoder.allocateAndBeginTransientCommandBuffer();
         ENVIRONMENT.putFloat(EnvironmentPacket.EXPOSURE_OFFSET, Settings.exposure());
         renderer.draw(command.address(), texture.vkImage(), view.vkImageView(), target.width, target.height,
-                CAMERA, ENVIRONMENT, Settings.activeDenoiser(), Settings.quality(), Settings.samples(), Settings.bounces());
+                CAMERA, ENVIRONMENT, features, Settings.activeDenoiser(), Settings.quality(), Settings.samples(), Settings.bounces());
         hasFrame = true;
         int status = VK10.vkEndCommandBuffer(command);
         if (status != VK10.VK_SUCCESS) throw new IllegalStateException("vkEndCommandBuffer: " + status);

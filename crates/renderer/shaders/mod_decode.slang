@@ -1,6 +1,7 @@
 /// 资源白名单的解码组合。每个部件只读取自身字段；未知命中的参考解码留在 mod_materials。
 module mod_decode;
 import mod_materials;
+import mod_coverage;
 import pt.scene;
 import transport.surface_material;
 
@@ -54,9 +55,17 @@ public struct AtlasColor : IDecodeColor
     public static func read(hit: pt::Hit, start: uint)->float3
     {
         let bary : float2 = asfloat(hit.identity.yz);
-        return atlas.Load(sprite_address(material_uv(hit.identity.x, bary), material_bounds(start)))
-                   .rgb *
+#if defined(OPENPBR_VARIANT) && OPENPBR_VARIANT != 0xffffffffu
+#if OPENPBR_VARIANT & 131072
+        return world_features::sample(hit.identity.x, bary, atlas).rgb;
+#else
+        let uv = prime_coverage::material_uv(quads, hit.identity.x, bary);
+        return atlas.Load(sprite_address(uv, material_bounds(start))).rgb *
                quad_tint(hit.identity.x);
+#endif
+#else
+        return material_texel(hit.identity.x, bary).rgb;
+#endif
     }
 };
 public interface IDecodeAux

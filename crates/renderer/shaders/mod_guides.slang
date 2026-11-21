@@ -62,8 +62,8 @@ public struct GuideTrace : pt::IIdentifiedGuideTrace
         identity = 0;
         let ray : RayDesc = { origin, 0, direction, pt::FAR };
         var unused : uint = 0;
-        var found : HitObject =
-                        HitObject::TraceRay(scene, RAY_FLAG_NONE, 0xff, 0, 1, 0, ray, unused);
+        var found : HitObject = HitObject::TraceRay(
+                        scene, RAY_FLAG_NONE, visibility_mask(ray.Origin), 0, 1, 0, ray, unused);
         if (!found.IsHit())
             return false;
         let primitive : uint = region_primitive(found.GetInstanceID(), found.GetPrimitiveIndex());

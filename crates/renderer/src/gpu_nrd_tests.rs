@@ -1,6 +1,8 @@
 //! 通过两种实际追踪入口检查透明接收面及几何边缘的太阳信号。
 use super::*;
 use vulkan::nrd::SIGNAL_BYTES_PER_PIXEL;
+#[path = "feature_gpu_tests.rs"]
+mod features;
 #[path = "gpu_projection_tests.rs"]
 mod projection;
 
@@ -1222,6 +1224,114 @@ fn hardware_nrd_sun_contact_edge() -> Result<(), Box<dyn std::error::Error>> {
     assert!(radius[3..].iter().all(|v| *v >= 65504.));
     assert!(direct[..3].iter().all(|v| v.abs() < 1e-5));
     assert!(direct[3..].iter().all(|v| *v > 0.01));
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "先运行 worldFeatureFixture；测量真实模型目录、512 个运动部件及原生 4K DLAA"]
+fn hardware_world_instance_cost() -> Result<(), Box<dyn std::error::Error>> {
+    let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../build/fixtures/world-models.pfm");
+    let bytes = std::fs::read(file)?;
+    let host = Host::create(true, true)?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    let started = std::time::Instant::now();
+    gpu.replace_world_resources(
+        ResourceUpload {
+            generation: gpu.resource_generation + 1,
+            extent: [1, 1],
+            albedo: &[255; 4],
+            mers: &[0; 4],
+            auxiliary: &[0; 4],
+            materials: &[MaterialDefinition::default()],
+            light_areas: &[[u32::MAX, 0, 0, 0]],
+            emission_alias_words: &[],
+            opacity_quads: &[],
+        },
+        &bytes,
+    )?;
+    let preparation = started.elapsed();
+    let n = u32::from_le_bytes(bytes[4..8].try_into()?);
+    assert!(n >= 100);
+    let output = Image::new(&mut gpu.context, [3840, 2160, 1], ImageFormat::Rgba8Unorm)?;
+    gpu.test_roots.push(output.into());
+    let queries = [
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+        vulkan::native::TimestampQueries::new(&mut gpu.context, 1)?,
+    ];
+    gpu.test_roots
+        .extend(queries.map(vulkan::native::Resource::from));
+    let options = Options::new(true, streamline::Quality::Dlaa, 2, 8)?;
+    let mut camera = camera();
+    camera.up[1] = 0.5625;
+    let mut cpu = Vec::new();
+    let mut draw = Vec::new();
+    let mut wall = Vec::new();
+    let mut packet = Vec::new();
+    for tick in 0..25 {
+        packet.clear();
+        packet.extend_from_slice(b"PTF1");
+        packet.extend_from_slice(bytemuck::cast_slice(&[0u32, 512, 0]));
+        packet.extend_from_slice(&[0; 24]);
+        for k in 0..512u32 {
+            packet.extend_from_slice(&(u64::from(k) + 1).to_le_bytes());
+            packet.extend_from_slice(bytemuck::cast_slice(&[
+                0u32,
+                0,
+                u32::MAX,
+                0,
+                1,
+                64,
+                0,
+                u32::MAX,
+                u32::MAX,
+            ]));
+            packet.extend_from_slice(&1u64.to_le_bytes());
+            packet.extend_from_slice(bytemuck::cast_slice(&[(k * 17) % n, u32::MAX]));
+            let x = (k % 32) as f32 * 0.5 - 8.;
+            let y = (k / 32) as f32 * 0.5 - 4.;
+            let (s, c) = (0.016 * tick as f32 + 0.03 * k as f32).sin_cos();
+            packet.extend_from_slice(bytemuck::cast_slice(&[
+                [c, 0., s, x],
+                [0., 1., 0., y],
+                [-s, 0., c, 9.],
+            ]));
+        }
+        let start = std::time::Instant::now();
+        // SAFETY: 测试包只引用资源期目录和白色纹理，上一帧已经完成。
+        unsafe {
+            gpu.set_world_features(&packet)?;
+        }
+        let update = start.elapsed().as_secs_f64() * 1e3;
+        let [_, ns] = host.render_profiled(
+            gpu,
+            &output,
+            &camera,
+            Environment::default(),
+            options,
+            Some(queries),
+        )?;
+        if tick >= 6 {
+            cpu.push(update);
+            draw.push(ns as f64 * 1e-6);
+            wall.push(start.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+    for t in [&mut cpu, &mut draw, &mut wall] {
+        t.sort_by(f64::total_cmp);
+    }
+    let m = cpu.len() / 2;
+    assert!(draw[m] > 0. && gpu.view.as_ref().unwrap().rr_enabled);
+    eprintln!(
+        "动态模型 原生4K DLAA 2spp 512部件 {n}种 资源准备含材质 {:.2} ms，宿主实例提交 {:.3} ms，绘制GPU {:.3} ms，含TLAS和等待的整帧墙钟 {:.3} ms",
+        preparation.as_secs_f64() * 1e3,
+        cpu[m],
+        draw[m],
+        wall[m]
+    );
     session.finish()?;
     assert_eq!(host.errors.load(Ordering::Relaxed), 0);
     Ok(())
