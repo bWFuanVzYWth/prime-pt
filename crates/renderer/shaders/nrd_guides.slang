@@ -178,12 +178,13 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     let replaced = end.psr.count != 0;
     let glass = (front.pbr.control.x & 1u) != 0;
     var position = first.hit.surface.position;
-    var normal = pt::shading_normal(first.hit, front);
+    var normal = pt::shading_normal(first.hit, front, -first.path.direction);
     var pose_delta : float3 = 0;
     if (!sky)
     {
         pt::psr_surface(end.psr, end.camera_origin, end.camera_direction, end.hit.surface.position,
-                        end.hit.surface.normal, pt::shading_normal(end.hit, end.material), position,
+                        end.hit.surface.normal,
+                        pt::shading_normal(end.hit, end.material, -end.direction), position,
                         normal);
         if (end.pose.known)
             pose_delta = end.pose.previous_position - end.hit.surface.position;
@@ -233,7 +234,7 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
                 // 贴图镜面的反射法线和几何法线不同。旧射线落在界面的另一点，
                 // 需以该点展开旧终面，才能给 NRD 正确的 previous view-Z。
                 let interface_normal = first.hit.surface.normal;
-                let optical_normal = pt::shading_normal(first.hit, front);
+                let optical_normal = pt::shading_normal(first.hit, front, -first.path.direction);
                 let pose = scene.guide_pose(first.hit);
                 let previous_point =
                     pose.known ? pose.previous_position : first.hit.surface.position;
@@ -281,8 +282,8 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
     if (!sky)
     {
         let e = pt::denoise_surface(scene.energy(), end.material,
-                                    pt::shading_normal(end.hit, end.material), -end.direction,
-                                    end.incident);
+                                    pt::shading_normal(end.hit, end.material, -end.direction),
+                                    -end.direction, end.incident);
         // 进入虚拟面后两种终点波瓣均属于同一相机分量。
         terminal = replaced     ? e.diffuse_albedo + e.specular_albedo
                    : reflection ? e.specular_albedo
@@ -299,10 +300,11 @@ public func write_fixed_guides<Scene : pt::IGuideScene>(scene: Scene, first: pt:
     if (!discrete && ((front.pbr.control.x & 1u) != 0 ||
                       front.pbr.base_roughness.w * front.pbr.base_roughness.w >= 1e-4))
     {
-        physical_guides(first.hit, front, first.path.medium,
-                        pt::denoise_surface(scene.energy(), front,
-                                            pt::shading_normal(first.hit, front),
-                                            -first.path.direction, first.path.medium));
+        physical_guides(
+            first.hit, front, first.path.medium,
+            pt::denoise_surface(scene.energy(), front,
+                                pt::shading_normal(first.hit, front, -first.path.direction),
+                                -first.path.direction, first.path.medium));
         return;
     }
     let inside = lobe_surface<false>(scene, first, front);

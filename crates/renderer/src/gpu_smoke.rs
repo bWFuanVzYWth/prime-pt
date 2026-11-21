@@ -2415,12 +2415,12 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
         ..camera()
     };
     let extent = [33, 33];
-    let output = Image::new(
+    let output_image = Image::new(
         &mut gpu.context,
         [extent[0], extent[1], 1],
         ImageFormat::Rgba8Unorm,
     )?;
-    gpu.test_roots.push(output.into());
+    gpu.test_roots.push(output_image.into());
     let definitions = [0u32, 1].map(|tile| {
         let mut material = MaterialDefinition::default();
         material.control[2] = MaterialDefinition::MERS
@@ -2459,7 +2459,7 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
             )],
         };
         gpu.set_scene(&mesh)?;
-        host.render_options(gpu, &output, &camera, Environment::default(), options)?;
+        host.render_options(gpu, &output_image, &camera, Environment::default(), options)?;
         let guides = gpu.view.as_ref().unwrap().rr.images;
         let n = float_pixel(&guides[3].download(&mut gpu.context)?, extent, 4);
         let specular = float_pixel(&guides[5].download(&mut gpu.context)?, extent, 4);
@@ -2503,6 +2503,29 @@ fn hardware_spbr_surface() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(pixel(diffuse)?[0], 0., "纯金属没有漫反射");
             assert!(input > 0. && output > 0.);
             assert!(pixel(direction)?[..3].iter().any(|x| x.abs() > 0.001));
+            // 沿纹理斜率反向掠视铜块，原始 Ns 将理想反射指入实心几何。
+            let ray_x = 0.999_f32.sqrt();
+            let ray_z = 0.001_f32.sqrt();
+            let grazing = Camera {
+                origin: [-3. * ray_x, 0., 3. - 3. * ray_z, 0.],
+                forward: [ray_x, 0., ray_z, 0.],
+                right: [ray_z, 0., -ray_x, 0.],
+                up: [0., 1., 0., 0.],
+            };
+            host.render_options(
+                gpu,
+                &output_image,
+                &grazing,
+                Environment::default(),
+                options,
+            )?;
+            let corrected = float_pixel(&guides[3].download(&mut gpu.context)?, extent, 4);
+            let nv = -corrected[0] * ray_x - corrected[2] * ray_z;
+            let reflected_cos = -2. * nv * corrected[2] - ray_z;
+            assert!(
+                nv > 0. && (reflected_cos - 0.01).abs() < 0.001,
+                "修正后的掠射余弦 {reflected_cos}，法线 {corrected:?}"
+            );
         }
     }
     session.finish()?;

@@ -1852,7 +1852,7 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
                 [1.; 3],
                 MaterialId::new(0),
             ),
-            // 灯位于Ng背侧，中心到接收面方向约(.95,0,.32)，但处于Ns前侧。
+            // 绿色灯在几何面背侧，红色灯位于同侧，两个波长分别验证遮光与照明。
             Quad::with_material(
                 [
                     [3., -0.5, 4.7],
@@ -1861,7 +1861,18 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
                     [3., 0.5, 4.7],
                 ],
                 uv,
-                [1.; 3],
+                [0., 1., 0.],
+                MaterialId::new(1),
+            ),
+            Quad::with_material(
+                [
+                    [3., -0.5, 1.7],
+                    [3., -0.5, 2.3],
+                    [3., 0.5, 2.3],
+                    [3., 0.5, 1.7],
+                ],
+                uv,
+                [1., 0., 0.],
                 MaterialId::new(1),
             ),
         ],
@@ -1934,11 +1945,15 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
             .map(|pixel| f64::from(pixels[pixel][0]))
             .sum::<f64>()
             / 64.;
+        assert!(
+            center_mean > 0.001,
+            "mode={dispatch}, 同侧红光缺失: {center_mean}"
+        );
+        assert!(
+            (12..20).all(|y| (12..20).all(|x| pixels[y * 32 + x][1] <= 1e-8)),
+            "背面的绿光穿过了接收面"
+        );
         if authored {
-            assert!(
-                center_mean > 0.01,
-                "mode={dispatch}, tilted normal must receive backside light: {center_mean}"
-            );
             if dispatch == 0 {
                 reference = pixels;
             } else {
@@ -1958,11 +1973,6 @@ fn authored_normal_light_support(staged: bool) -> Result<(), Box<dyn std::error:
                     "mode={dispatch}, maximum scaled error={error}"
                 );
             }
-        } else {
-            assert!(
-                center_mean <= 1e-8,
-                "flat normal must reject the same backside light: {center_mean}"
-            );
         }
         session.finish()?;
     }

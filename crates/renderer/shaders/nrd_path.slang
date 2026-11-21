@@ -62,7 +62,7 @@ public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLigh
                                           view: float3, inout previous_pdf: float)
     ->float
 {
-    let normal = pt::shading_normal(hit, mat);
+    let normal = pt::shading_normal(hit, mat, view);
     let glass = (mat.pbr.control.x & 1u) != 0;
     if ((index & 1u) == 0 && !fixed_guide_candidate(flow))
         physical_guides(
