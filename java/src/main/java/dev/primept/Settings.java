@@ -50,9 +50,7 @@ public final class Settings {
     static void setDenoiser(Denoiser mode) throws IOException { Holder.CONFIG.setDenoiser(mode); }
     static Denoiser activeDenoiser() {
         if (!enabled() || offline() || diagnostic()) return Denoiser.OFF;
-        var choice = denoiser();
-        if (choice == Denoiser.DLSS && StreamlineBootstrap.available()) return choice;
-        return choice != Denoiser.OFF && Bootstrap.nrdAvailable() ? Denoiser.NRD : Denoiser.OFF;
+        return denoiser().resolve(StreamlineBootstrap.available(), Bootstrap.nrdAvailable());
     }
 
     /** 保存成功后才发布新值；输入无效抛出 IllegalArgumentException，IO 失败抛出 IOException。 */

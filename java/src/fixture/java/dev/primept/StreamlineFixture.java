@@ -16,7 +16,8 @@ import java.nio.file.Path;
 /** 无窗口验证 early interposer、Vulkan 1.4 与宿主真实 feature 创建链。 */
 final class StreamlineFixture {
     public static void main(String[] arguments) throws Exception {
-        if (arguments.length == 1 && arguments[0].equals("--bundled"))
+        var options = java.util.List.of(arguments);
+        if (options.contains("--bundled"))
             NativeRuntime.locateBundled(Path.of(".primept/runtime"));
         StreamlineBootstrap.install();
         require(StreamlineBootstrap.installed(), StreamlineBootstrap.status());
@@ -29,7 +30,7 @@ final class StreamlineFixture {
                 long lwjgl = VK.getFunctionProvider().getFunctionAddress("vkGetInstanceProcAddr");
                 long sdl = SDLVulkan.SDL_Vulkan_GetVkGetInstanceProcAddr();
                 require(lwjgl != 0 && lwjgl == sdl, "SDL 与 LWJGL 的 Vulkan dispatch 不一致");
-                device(java.util.List.of(arguments).contains("--unsupported"));
+                device(options.contains("--unsupported"), options.contains("--nrd-only"));
             } finally {
                 SDLVulkan.SDL_Vulkan_UnloadLibrary();
             }
@@ -41,7 +42,7 @@ final class StreamlineFixture {
         }
     }
 
-    private static void device(boolean unsupported) throws Exception {
+    private static void device(boolean unsupported, boolean nrdOnly) throws Exception {
         try (var stack = MemoryStack.stackPush()) {
             var application = VkApplicationInfo.calloc(stack).sType$Default().apiVersion(Bootstrap.instanceApi(VK12.VK_API_VERSION_1_2));
             var extensions = SDLVulkan.SDL_Vulkan_GetInstanceExtensions();
@@ -60,6 +61,9 @@ final class StreamlineFixture {
                 try (var physical = new VulkanPhysicalDevice(new VkPhysicalDevice(devices.get(0), instance)) {
                     @Override public boolean hasDeviceExtension(String extension) {
                         return !(unsupported && extension.equals("VK_KHR_ray_tracing_position_fetch"))
+                                && !(nrdOnly && (extension.startsWith("VK_NVX_")
+                                        || extension.equals("VK_EXT_ray_tracing_invocation_reorder")
+                                        || extension.equals("VK_KHR_opacity_micromap")))
                                 && super.hasDeviceExtension(extension);
                     }
                 }) {
@@ -82,8 +86,16 @@ final class StreamlineFixture {
                         require(Bootstrap.rayTracingEnabled(), "Prime 必需能力完整启用后才可准备资源");
                         require(device.getCapabilities().Vulkan14, "逻辑设备实际未使用 Vulkan 1.4");
                         require(device.getCapabilities().VK_KHR_device_address_commands, "deviceAddressCommands 扩展未启用");
-                        require(StreamlineBootstrap.available(), StreamlineBootstrap.status());
-                        System.out.println("Vulkan 1.4 / deviceAddressCommands / synchronization2 / RR device enabled; " + Bootstrap.serStatus());
+                        require(Bootstrap.nrdAvailable(), "NRD 必须能在独立 Vulkan 设备上启用");
+                        if (nrdOnly) {
+                            require(!Bootstrap.invocationReorder(device) && !Bootstrap.opacityMicromap(device)
+                                    && !StreamlineBootstrap.available(), "夹具只启用标准光追与 NRD");
+                            require(Denoiser.DLSS.resolve(false, true) == Denoiser.NRD
+                                    && Denoiser.NRD.resolve(false, true) == Denoiser.NRD,
+                                    "RR 不可用时自动选择和显式指定都应启用 NRD");
+                        } else {
+                            require(StreamlineBootstrap.available(), StreamlineBootstrap.status());
+                        }
                         nativeQueries(instance, physical, device);
                         require(VK10.vkDeviceWaitIdle(device) == VK10.VK_SUCCESS, "设备等待失败");
                     } finally {
@@ -106,6 +118,7 @@ final class StreamlineFixture {
             try (var renderer = new Native(instance.address(), physical.vkPhysicalDevice().address(),
                     device.address(), queue.get(0), graphics.leftInt(), graphics.rightInt(),
                     Bootstrap.invocationReorder(device), false)) {
+                require(!renderer.sectionPublished(-1, 0, 0), "刚创建的会话不能提前放行区块等待器");
                 renderer.beginTints(0);
                 var output = ByteBuffer.allocateDirect(48);
                 for (int i = 0; i < output.capacity(); i++) output.put(i, (byte) 0x5a);

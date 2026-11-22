@@ -248,6 +248,17 @@ fn key(value: Chunk) -> [i32; 3] {
 }
 
 impl Scene {
+    /// 给宿主进世界的等待器查询 16 格 section。真实空气也算就绪，未发布、缺源或因预算排除的区域继续等待。
+    pub fn section_published(&self, section: [i32; 3]) -> bool {
+        let Some(handle) = self.state.find(chunk(region(section))) else {
+            return false;
+        };
+        self.state.is_visible(handle)
+            && self.state.resource(handle).is_some_and(|mesh| {
+                !mesh.excluded && mesh.missing_sections & (1u64 << slot(section)) == 0
+            })
+    }
+
     /// 创建独占工作池及可增长的稀疏State，使用默认逻辑payload预算。
     pub fn new() -> Result<Self, Error> {
         let threads = std::thread::available_parallelism()

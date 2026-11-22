@@ -171,6 +171,10 @@ fn unavailable_is_a_resolved_negative_cache_distinct_from_real_empty() -> Result
     empty.apply(&responses(&requests))?;
     let handle = empty.state.find(chunk([0; 3])).unwrap();
     assert_eq!(empty.state.resource(handle).unwrap().missing_sections, 0);
+    assert!(!empty.section_published([0; 3]));
+    publish(&mut empty)?;
+    assert!(empty.section_published([0; 3]));
+    assert!(!empty.section_published([-1, 0, 0]));
     let mut missing = Scene::new()?;
     let request = one_region(&mut missing)?[0];
     missing.apply(&unavailable(request))?;
@@ -180,6 +184,7 @@ fn unavailable_is_a_resolved_negative_cache_distinct_from_real_empty() -> Result
     assert!(resource.view().is_empty());
     assert!(missing.jobs.is_empty() && missing.captures.is_empty());
     publish(&mut missing)?;
+    assert!(!missing.section_published(request.section));
     assert!(!missing.pending());
     Ok(())
 }

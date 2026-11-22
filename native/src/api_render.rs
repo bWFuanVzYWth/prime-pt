@@ -71,7 +71,7 @@ pub unsafe extern "C" fn prime_profile(
 /// 场景和相机统一在 64m 网格 anchor 下计算；重定位保留 BLAS 与 RR 世界空间历史。
 /// features 借出 feature_bytes 个 PTF1 字节；其中的 sampled view 属于本设备，在本次提交完成前为 GENERAL 并保活。冻结时可传空。
 /// environment 指向一份活动的 16B [`FrameEnvironment`]。曝光只影响呈现。
-/// rr=0 使用原始累积，rr=1 使用已完成早期 SDK 接入的 RR；其余值拒绝。
+/// rr=0 使用原始累积，1 请求 DLSS RR 并允许回退 NRD，2 指定 NRD，3 请求 DLSS RR 并仅允许回退原始累积。
 /// quality=0..=4 对应 DLAA/Quality/Balanced/Performance/UltraPerformance；SDK 决定输入尺寸。
 /// 实时固定 2 spp，samples=1..=64 仅用于离线批大小。RR 重建本帧样本均值，原始 PT 保留逐帧累积。bounces=1..=64 为最多表面反弹次数，默认12；末顶点保留发光与NEE。
 /// [`prime_set_rendering`] 选择离线时固定最近已接受帧的场景、相机、光照和路径预算，

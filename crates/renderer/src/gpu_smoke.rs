@@ -173,6 +173,14 @@ impl Host {
     }
 
     fn create(rr: bool, invocation_reorder: bool) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::create_with_omm(rr, invocation_reorder, true)
+    }
+
+    fn create_with_omm(
+        rr: bool,
+        invocation_reorder: bool,
+        allow_omm: bool,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let streamline = if rr {
             let executable = std::env::current_exe()?;
             let directory = executable.parent().ok_or("测试程序目录缺失")?;
@@ -336,10 +344,11 @@ impl Host {
                 else {
                     continue;
                 };
-                let supports_omm = extensions.iter().any(|extension| {
-                    CStr::from_ptr(extension.extension_name.as_ptr())
-                        == ash::khr::opacity_micromap::NAME
-                });
+                let supports_omm = allow_omm
+                    && extensions.iter().any(|extension| {
+                        CStr::from_ptr(extension.extension_name.as_ptr())
+                            == ash::khr::opacity_micromap::NAME
+                    });
                 let push_descriptors = extensions.iter().any(|e| {
                     CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME
                 });
@@ -458,10 +467,11 @@ impl Host {
                 host.queue = host.device.get_device_queue(host.family, 0);
                 let properties = host.instance.get_physical_device_properties(physical);
                 eprintln!(
-                    "硬件光追 smoke：{}，instance=1.4 physical={}.{} deviceAddressCommands=true synchronization2=true EXT_SER={invocation_reorder}",
+                    "硬件光追 smoke：{}，instance=1.4 physical={}.{} EXT_SER={invocation_reorder} OMM={} NRD={nrd}",
                     CStr::from_ptr(properties.device_name.as_ptr()).to_string_lossy(),
                     vk::api_version_major(properties.api_version),
-                    vk::api_version_minor(properties.api_version)
+                    vk::api_version_minor(properties.api_version),
+                    host.opacity_micromap
                 );
                 return Ok(host);
             }

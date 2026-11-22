@@ -84,6 +84,8 @@ fn unavailable_source_and_air_remain_distinct_at_rest() -> Result<(), Error> {
     ));
     let handle = scene.state.find(chunk([0; 3])).unwrap();
     assert_eq!(scene.state.resource(handle).unwrap().missing_sections, 1);
+    assert!(!scene.section_published([0; 3]));
+    assert!(scene.section_published([1, 0, 0]));
     assert!(scene.render_regions().next().is_none());
     Ok(())
 }

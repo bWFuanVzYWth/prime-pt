@@ -379,9 +379,7 @@ func render_pixel<A : pt::IPixelTransport, let realtime : bool, let lane : int,
     if (lane != 1 && (!realtime || parameters[0].reconstruction.w != 2))
     {
         let distance = realtime ? asfloat(primary_hit[pixel].w) : result.distance;
-        if (realtime && parameters[0].reconstruction.w == 3 && distance != pt::FAR)
-            prefix_image[pixel].w = distance;
-        else
+        if (!realtime || parameters[0].reconstruction.w != 3 || distance == pt::FAR)
             prefix_image[pixel] = float4(0, 0, 0, distance);
     }
     output_image[pixel] = result.radiance;

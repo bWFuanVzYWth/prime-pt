@@ -283,18 +283,19 @@ impl Gpu {
                 } else {
                     extent
                 };
+                let denoiser = if nrd_enabled {
+                    Denoiser::Nrd
+                } else if rr_enabled {
+                    Denoiser::Dlss
+                } else {
+                    Denoiser::Off
+                };
                 let mut next = View::new_scaled(
                     &mut self.context,
                     Some(&mut self.bloom_filter),
                     [input, extent],
                     frame_local,
-                    if nrd_enabled {
-                        Denoiser::Nrd
-                    } else if rr_enabled {
-                        Denoiser::Dlss
-                    } else {
-                        Denoiser::Off
-                    },
+                    denoiser,
                     self.rr_quality,
                     Some(
                         self.view
@@ -326,6 +327,14 @@ impl Gpu {
                     self.rr_runtime = None;
                 }
                 self.transition_history(history::Event::ViewStorage(storage_event))?;
+                let trace = if self.generation.as_ref().unwrap().dispatch == 8 {
+                    "EXT HitObject"
+                } else {
+                    "KHR TraceRay"
+                };
+                eprintln!(
+                    "[prime_pt] reconstruction configured={denoiser:?} trace={trace} diagnostic={diagnostic} input={input:?} output={extent:?}"
+                );
                 self.view = Some(next);
                 self.renderer = None;
                 self.guide_pipeline = None;

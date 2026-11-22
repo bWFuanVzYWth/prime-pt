@@ -6,7 +6,7 @@ import java.util.HexFormat
 plugins {
     id 'net.fabricmc.fabric-loom' version '1.18.1'
 }
-version = '0.2.0'
+version = '0.2.1'
 group = 'dev.primept'
 base { archivesName = 'prime-pt' }
 repositories { mavenCentral() }
@@ -339,6 +339,7 @@ tasks.register('sourceChangesFixture', JavaExec) {
 
 tasks.register('streamlineFixture', JavaExec) {
     dependsOn fixtureClasses
+    if (providers.gradleProperty('nrdOnly').getOrElse('false').toBoolean()) args '--nrd-only'
     if (providers.gradleProperty('bundledRuntime').getOrElse('false').toBoolean()) {
         dependsOn tasks.named('jar')
         classpath = files(sourceSets.fixture.runtimeClasspath - sourceSets.main.output, releaseJar)

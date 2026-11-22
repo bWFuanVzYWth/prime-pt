@@ -87,6 +87,10 @@ public final class Bootstrap {
         return supported >= VK14.VK_API_VERSION_1_4 ? Math.max(original, VK14.VK_API_VERSION_1_4) : original;
     }
 
+    static boolean useReorder(boolean feature, int hint) {
+        return feature && hint == EXTRayTracingInvocationReorder.VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT;
+    }
+
     static FeatureSet unsupported(FeatureSet original, List<String> missing) {
         ptPhysical = ptDevice = 0;
         serStatus = "Prime PT 所需设备能力不可用";
@@ -150,10 +154,18 @@ public final class Bootstrap {
             var available = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default()
                     .pNext(address).pNext(commands).pNext(synchronization).pNext(acceleration).pNext(pipeline).pNext(query).pNext(position).pNext(subgroup);
             VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), available);
-            if (physical.hasDeviceExtension(NRD_PUSH) && address.descriptorBindingPartiallyBound() && address.shaderFloat16() && available.features().shaderInt16()
-                    && available.features().shaderStorageImageWriteWithoutFormat()) {
+            var nrdMissing = new ArrayList<String>();
+            if (!physical.hasDeviceExtension(NRD_PUSH)) nrdMissing.add(NRD_PUSH);
+            if (!address.descriptorBindingPartiallyBound()) nrdMissing.add("descriptorBindingPartiallyBound");
+            if (!address.shaderFloat16()) nrdMissing.add("shaderFloat16");
+            if (!available.features().shaderInt16()) nrdMissing.add("shaderInt16");
+            if (!available.features().shaderStorageImageWriteWithoutFormat()) nrdMissing.add("shaderStorageImageWriteWithoutFormat");
+            if (nrdMissing.isEmpty()) {
                 extensions.add(NRD_PUSH);
                 features.addAll(NRD_FEATURES);
+            } else {
+                System.getLogger("prime_pt").log(System.Logger.Level.INFO,
+                        "NRD 不可用，缺少 " + String.join(", ", nrdMissing));
             }
             if (!address.bufferDeviceAddress()) missing.add("bufferDeviceAddress");
             if (!acceleration.accelerationStructure()) missing.add("accelerationStructure");
@@ -189,7 +201,12 @@ public final class Bootstrap {
                 var reorder = VkPhysicalDeviceRayTracingInvocationReorderFeaturesEXT.calloc(stack).sType$Default();
                 var ser = VkPhysicalDeviceFeatures2.calloc(stack).sType$Default().pNext(reorder);
                 VK12.vkGetPhysicalDeviceFeatures2(physical.vkPhysicalDevice(), ser);
-                supported = reorder.rayTracingInvocationReorder();
+                var props = VkPhysicalDeviceRayTracingInvocationReorderPropertiesEXT.calloc(stack).sType$Default();
+                VK12.vkGetPhysicalDeviceProperties2(physical.vkPhysicalDevice(),
+                        VkPhysicalDeviceProperties2.calloc(stack).sType$Default().pNext(props));
+                supported = useReorder(reorder.rayTracingInvocationReorder(), props.rayTracingInvocationReorderReorderingHint());
+                if (reorder.rayTracingInvocationReorder() && !supported)
+                    serStatus = "设备的重排提示为 NONE";
             }
             if (supported) {
                 extensions.add(SER_EXTENSION);
@@ -197,8 +214,7 @@ public final class Bootstrap {
                 serPhysical = physical.vkPhysicalDevice().address();
                 serStatus = "等待宿主逻辑设备确认";
             } else {
-                System.getLogger("prime_pt").log(System.Logger.Level.WARNING,
-                        "SER 不可用：缺少 EXT 扩展或特性，使用普通 RT pipeline");
+                System.getLogger("prime_pt").log(System.Logger.Level.INFO, "使用 KHR 光追，" + serStatus);
             }
             if (StreamlineBootstrap.installed()) {
                 var privateData = VkPhysicalDevicePrivateDataFeatures.calloc(stack).sType$Default();
@@ -240,6 +256,8 @@ public final class Bootstrap {
         }
         ptDevice = device.address();
         nrdDevice = enabled.extensions().contains(NRD_PUSH) && enabled.features().containsAll(NRD_FEATURES) ? ptDevice : 0;
+        System.getLogger("prime_pt").log(System.Logger.Level.INFO,
+                "NRD 宿主 Vulkan 特性" + (nrdAvailable() ? "已启用" : "未启用"));
         ommDevice = ommPhysical == device.getPhysicalDevice().address() && enabled.extensions().contains(OMM_EXTENSION)
                 && enabled.features().contains(OMM_FEATURE) ? device.address() : 0;
         if ("1".equals(System.getenv("PRIME_PT_DIAGNOSTIC_CHECKPOINTS"))

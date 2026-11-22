@@ -29,6 +29,75 @@ fn publish_stream(
 }
 
 #[test]
+#[ignore = "真实 Vulkan：无 RR、无 OMM 的设备从纯天空流入地形，验收正常模式 NRD 的首帧"]
+fn streamed_terrain_replaces_sky_in_nrd() -> Result<(), Box<dyn std::error::Error>> {
+    let hit_object = std::env::var_os("PRIME_NRD_CALLABLE").is_none();
+    let host = Host::create_with_omm(false, hit_object, false)?;
+    let mut session = host.gpu()?;
+    let gpu = session.gpu();
+    upload(
+        gpu,
+        &[MaterialDefinition::default()],
+        &[],
+        &[[u32::MAX, 0, 0, 0]],
+    )?;
+    let extent = if std::env::var_os("PRIME_NRD_4K").is_some() {
+        [3840, 2160]
+    } else {
+        [128, 96]
+    };
+    let output = Image::new(
+        &mut gpu.context,
+        [extent[0], extent[1], 1],
+        ImageFormat::Rgba8Unorm,
+    )?;
+    gpu.test_roots.push(output.into());
+    let options = Options::new(false, streamline::Quality::Dlaa, 2, 4)?.with_nrd();
+    let sky = Environment {
+        sun_direction: [0., 0.8, -0.6],
+        ..Default::default()
+    };
+    host.render_options(gpu, &output, &camera(), sky, options)?;
+    let view = gpu.view.as_ref().unwrap();
+    let depth = view.rr.images[1];
+    assert!(view.nrd.is_some() && !view.rr_enabled);
+    assert!(float_pixel(&depth.download(&mut gpu.context)?, extent, 1)[0] > 1e6);
+
+    let mut mesh = Mesh::default();
+    add_quad(&mut mesh, 3., [0.5; 2], [0.9, 0.1, 0.05], 8.);
+    publish_stream(gpu, &mesh, 1, 1, [0.; 3])?;
+    host.render_options(gpu, &output, &camera(), sky, options)?;
+    let display = output.download(&mut gpu.context)?;
+    let view = gpu.view.as_ref().unwrap();
+    assert_eq!(depth, view.rr.images[1], "地形发布应继续使用原降噪视图");
+    let z = float_pixel(&depth.download(&mut gpu.context)?, extent, 1)[0];
+    let hdr = float_pixel(
+        &view.presentation.linear_hdr.download(&mut gpu.context)?,
+        extent,
+        4,
+    );
+    let at = ((extent[1] / 2 * extent[0] + extent[0] / 2) * 4) as usize;
+    eprintln!(
+        "NRD 首帧地形 {:?} viewZ={z} HDR={hdr:?} display={:?}",
+        extent,
+        &display[at..at + 4]
+    );
+    assert!((z - 3.).abs() < 0.01);
+    assert!(hdr[0].is_finite() && hdr[0] > hdr[1] * 1.5 && hdr[1] > 0.);
+    assert!(display[at] > display[at + 1]);
+    for diagnostic in [true, false] {
+        gpu.set_render_tuning(prime_scene::RenderTuning::new(diagnostic))?;
+        host.render_options(gpu, &output, &camera(), sky, options)?;
+        assert_eq!(gpu.view.as_ref().unwrap().nrd.is_some(), !diagnostic);
+        let display = output.download(&mut gpu.context)?;
+        assert!(display[at] > display[at + 1], "切换诊断后应仍显示红色地形");
+    }
+    session.finish()?;
+    assert_eq!(host.errors.load(Ordering::Relaxed), 0);
+    Ok(())
+}
+
+#[test]
 #[ignore = "独立进程：4K RR 与 SER，流式光源树发布后立即绘制首帧"]
 fn streamed_light_world_is_ready_for_the_first_frame() -> Result<(), Box<dyn std::error::Error>> {
     let host = Host::new_rr_ser()?;

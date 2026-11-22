@@ -44,7 +44,7 @@ pub use api_settings::{
 mod api_capture;
 pub use api_capture::{
     prime_batch, prime_fail_capture, prime_invalidate_all, prime_invalidate_batch,
-    prime_invalidate_section, prime_plan,
+    prime_invalidate_section, prime_plan, prime_section_published,
 };
 
 mod api_resources;

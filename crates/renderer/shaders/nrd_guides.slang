@@ -21,7 +21,7 @@ public var prefix_image : RWStructuredBuffer<float4>;
 var depth_image : RWTexture2D<float>;
 [[vk::binding(41, 0)]]
 [[vk::image_format("rgba32f")]]
-var motion_image : RWTexture2D<float4>;
+globallycoherent var motion_image : RWTexture2D<float4>;
 [[vk::binding(21, 0)]]
 [[vk::image_format("rgba16f")]]
 var normal_image : RWTexture2D<float4>;
@@ -40,10 +40,31 @@ var reflected_depth : RWTexture2D<float>;
 var reflected_normal : RWTexture2D<float2>;
 [[vk::binding(42, 0)]]
 [[vk::image_format("rgba32f")]]
-var reflected_motion : RWTexture2D<float4>;
+globallycoherent var reflected_motion : RWTexture2D<float4>;
+
+// Vulkan 的 shader-call-order 跨越两个 invocation；普通 storage 资源需要配对的发布与获取。
+// SPIR-V ScopeShaderCallKHR、MemorySemanticsMask，见 Vulkan Memory Model 的 Shader Call Order。
+public enum CallStorage : uint
+{
+    Buffer = 0x40,
+    Image = 0x800
+}
+public enum CallOrder : uint
+{
+    Acquire = 2,
+    Release = 4
+}
+public func call_barrier<let storage : CallStorage, let order : CallOrder>()->void
+{
+    let scope = 6u;
+    let semantics = uint(storage) | uint(order);
+    spirv_asm
+    {
+        OpMemoryBarrier $scope $semantics;
+    };
+}
 public func sky_signal(pixel: uint2)->void
 {
-    prefix_image[pixel.y * parameters[0].image.x + pixel.x].xyz = 0;
     depth_image[pixel] = reflected_depth[pixel] = 1e7;
     motion_image[pixel] = reflected_motion[pixel] = 0;
     normal_image[pixel] = float4(0, 0, 1, 1);
@@ -104,7 +125,7 @@ func geometry_guide(position: float3, normal: float3, previous_target: float3,
     }
     return g;
 }
-func write_guides(interior: SurfaceGuide, reflection: SurfaceGuide)->void
+func write_guides(interior: SurfaceGuide, reflection: SurfaceGuide, distance: float)->void
 {
     let pixel = DispatchRaysIndex().xy;
     var interior = interior;
@@ -121,8 +142,8 @@ func write_guides(interior: SurfaceGuide, reflection: SurfaceGuide)->void
         if (uncovered.y)
             reflection.motion = float3(float2(p.image.xy), 0);
     }
-    prefix_image[pixel.y * parameters[0].image.x + pixel.x].xyz =
-        interior.emission + reflection.emission;
+    prefix_image[pixel.y * parameters[0].image.x + pixel.x] =
+        float4(interior.emission + reflection.emission, distance);
     publish_optics(pixel, uint4(interior.optical, reflection.optical));
     depth_image[pixel] = interior.depth;
     normal_image[pixel] = float4(interior.normal, interior.roughness);
@@ -141,6 +162,7 @@ func write_guides(interior: SurfaceGuide, reflection: SurfaceGuide)->void
 /// 首个离散事件已经选定采样分量，剩余的固定顶点只扣除自身发光。
 public func emission_prefix(pixel: uint2, reflection: bool)->float
 {
+    call_barrier<CallStorage.Image, CallOrder.Acquire>();
     let flags = reflection ? reflected_motion[pixel].w : motion_image[pixel].w;
     let vertices = uint(flags) >> 4;
     return -float(max(1u, vertices) - 1u);
@@ -165,7 +187,7 @@ public func physical_guides(hit: pt::Hit, mat: transport::SurfaceMaterial, incid
     inside.factor = beer * energies.diffuse_albedo;
     inside.emission = beer * mat.emission;
     outside.factor = beer * energies.specular_albedo;
-    write_guides(inside, outside);
+    write_guides(inside, outside, hit.distance);
 }
 
 func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
@@ -308,9 +330,12 @@ public func write_fixed_guides<Scene : pt::IGuideScene>(scene: Scene, first: pt:
             pt::denoise_surface(scene.energy(), front,
                                 pt::shading_normal(first.hit, front, -first.path.direction),
                                 -first.path.direction, first.path.medium));
-        return;
     }
-    let inside = lobe_surface<false>(scene, first, front);
-    let outside = lobe_surface<true>(scene, first, front);
-    write_guides(inside, outside);
+    else
+    {
+        let inside = lobe_surface<false>(scene, first, front);
+        let outside = lobe_surface<true>(scene, first, front);
+        write_guides(inside, outside, first.hit.distance);
+    }
+    call_barrier<CallStorage.Image, CallOrder.Release>();
 }

@@ -10,7 +10,7 @@ import transport.surface_material;
 import openpbr.flow;
 
 [[vk::binding(40, 0)]]
-public var signal_lanes : RWStructuredBuffer<SignalLane>;
+public globallycoherent var signal_lanes : RWStructuredBuffer<SignalLane>;
 
 /// 用相同闭包的有色与黑色介质求值之差分离底层响应。对金属混合保留原有覆盖权重。
 public func diffuse_fraction<let flow : uint>(mat: transport::SurfaceMaterial, normal: float3,
@@ -104,11 +104,13 @@ public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLigh
     else
         lane.sun = pack_signal(float4(observed.sun, blocker));
     signal_lanes[index] = lane;
+    call_barrier<CallStorage.Buffer, CallOrder.Release>();
     return blocker;
 }
 
 public func finish_signal(index: uint, tail: float3, direction: float3, distance: float)->void
 {
+    call_barrier<CallStorage.Buffer, CallOrder.Acquire>();
     var lane = signal_lanes[index];
     let events = uint(unpack_signal(lane.specular_direction).w);
     let interior = (events & (openpbr::DIFFUSE | openpbr::TRANSMISSION)) != 0;

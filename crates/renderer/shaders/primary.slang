@@ -182,9 +182,7 @@ func prefix_main()->void
     else
         pt::trace_prefix(provider, data, settings(params), distance);
     store_landing(pixel, data);
-    if (params.reconstruction.w == 3 && distance != pt::FAR)
-        prefix_image[pixel].w = distance;
-    else
+    if (params.reconstruction.w != 3 || distance == pt::FAR)
         prefix_image[pixel] = float4(data.path.radiance, distance);
 }
 
@@ -263,7 +261,7 @@ func shade_opaque(inout call: ModTransportCall)->void
         let mat = provider.resolve_flow(data.hit, OPENPBR_FLOW, data.path.medium);
         var first = pt::MaterialCall::primary_input(data.sample, lane, data.path.radiance);
         first.initialize_primary(data.path.medium);
-        data.hit.distance = length(data.hit.surface.position - parameters[0].origin.xyz);
+        data.hit.distance = landing_distance[pixel];
         var signals : pt::PrimaryLighting;
         pt::shade_material_observed<OPENPBR_FLOW, ModScene, PRIMEPT_LIGHT_MASK, true, true>(
             provider, first, data.hit, mat, data.path.direction, settings(parameters[0]), lane,

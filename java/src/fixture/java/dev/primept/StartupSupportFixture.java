@@ -3,6 +3,7 @@ package dev.primept;
 import com.mojang.renderpearl.backend.vulkan.init.FeatureSet;
 import java.util.List;
 import java.util.Set;
+import static org.lwjgl.vulkan.EXTRayTracingInvocationReorder.*;
 import org.lwjgl.vulkan.VK12;
 import org.lwjgl.vulkan.VK13;
 import org.lwjgl.vulkan.VK14;
@@ -11,10 +12,20 @@ import org.lwjgl.vulkan.VK14;
 final class StartupSupportFixture {
     public static void main(String[] arguments) {
         preservesHostApiWhenLoaderIsTooOld();
+        selectsReorderOnlyWhenEffective();
         missingCapabilitiesKeepVanillaFeatures();
         openGlKeepsItsOwnReason();
         SupportNotice.supported();
         System.out.println("Startup support fallback fixture passed");
+    }
+
+    private static void selectsReorderOnlyWhenEffective() {
+        require(!Bootstrap.useReorder(true, VK_RAY_TRACING_INVOCATION_REORDER_MODE_NONE_EXT),
+                "兼容性扩展的 NONE 提示应选择 KHR 光追");
+        require(!Bootstrap.useReorder(false, VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT),
+                "物理属性不能替代逻辑设备特性");
+        require(Bootstrap.useReorder(true, VK_RAY_TRACING_INVOCATION_REORDER_MODE_REORDER_EXT),
+                "支持实际重排时保留 SER");
     }
 
     private static void preservesHostApiWhenLoaderIsTooOld() {

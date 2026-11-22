@@ -16,6 +16,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.SectionPos;
 import org.joml.Vector4f;
 import org.lwjgl.vulkan.VK10;
 
@@ -209,6 +210,12 @@ public final class Renderer {
         STAGES.putLong(88, System.nanoTime() - stage);
         stage = System.nanoTime();
         encoder.execute(command);
+        var connection = minecraft.getConnection();
+        var ready = connection == null ? null : connection.getPlayerCompiledSectionCallback();
+        if (ready != null && minecraft.player != null) {
+            var section = SectionPos.of(minecraft.player.blockPosition());
+            if (renderer.sectionPublished(section.x(), section.y(), section.z())) ready.run();
+        }
         STAGES.putLong(96, System.nanoTime() - stage);
         long completed = System.nanoTime();
         long elapsed = lastCompleted == 0 || minecraft.isPaused() ? 0 : completed - lastCompleted;

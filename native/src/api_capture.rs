@@ -173,3 +173,16 @@ pub unsafe extern "C" fn prime_batch(id: u64, data: *const u8, len: u64) -> i32 
         })
     })
 }
+
+/// 查询宿主玩家所在的 16 格 section 是否已有已发布的覆盖。返回 1 表示就绪，0 表示仍在等待，-1 表示句柄错误。
+#[unsafe(no_mangle)]
+pub extern "C" fn prime_section_published(id: u64, x: i32, y: i32, z: i32) -> i32 {
+    guarded(-1, || {
+        let mut ready = false;
+        with_engine(id, |engine| {
+            ready = engine.scene.section_published([x, y, z]);
+            Ok(())
+        })?;
+        Ok(i32::from(ready))
+    })
+}

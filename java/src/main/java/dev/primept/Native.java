@@ -15,6 +15,7 @@ final class Native implements AutoCloseable {
     private final MethodHandle destroy, reset, plan, profile, invalidateSection, invalidateAll, invalidateTints, invalidateBatch, failCapture, batch, sources, cameraMedium, tintBegin, tintRequests, tints, biomeWorld, biomeRequests, biomeSamples, atlas, draw, setSer, error;
     private final long handle;
     private final MethodHandle setUpdateBudget;
+    private final MethodHandle sectionPublished;
     private final MethodHandle reportDeviceLoss;
     private UpdateBudget updateBudget;
     private final MethodHandle setSolarOrbit;
@@ -62,6 +63,8 @@ final class Native implements AutoCloseable {
         destroy = bind(symbols, "prime_destroy", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         reportDeviceLoss = bind(symbols, "prime_report_device_loss", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
         reset = bind(symbols, "prime_reset", FunctionDescriptor.of(JAVA_INT, JAVA_LONG));
+        sectionPublished = bind(symbols, "prime_section_published",
+                FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_INT, JAVA_INT, JAVA_INT));
         plan = bind(symbols, "prime_plan", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, ADDRESS,
                 JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_INT));
         profile = bind(symbols, "prime_profile", FunctionDescriptor.of(JAVA_INT, JAVA_LONG, JAVA_LONG,
@@ -121,6 +124,14 @@ final class Native implements AutoCloseable {
 
     void reset() {
         try { check((int) reset.invokeExact(handle)); } catch (Throwable e) { throw unchecked(e); }
+    }
+
+    boolean sectionPublished(int x, int y, int z) {
+        try {
+            int ready = (int) sectionPublished.invokeExact(handle, x, y, z);
+            if (ready < 0) throw failure();
+            return ready != 0;
+        } catch (Throwable e) { throw unchecked(e); }
     }
 
     void updateRenderTuning(RenderTuning next) {

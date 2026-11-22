@@ -9,6 +9,10 @@ enum Denoiser {
         this.key = key;
         this.wire = wire;
     }
+    Denoiser resolve(boolean rr, boolean nrd) {
+        if (this == DLSS && rr) return DLSS;
+        return this != OFF && nrd ? NRD : OFF;
+    }
     static Denoiser parse(String text) {
         for (var mode : values()) if (mode.key.equalsIgnoreCase(text)) return mode;
         throw new IllegalArgumentException("降噪器可选 dlss、nrd 或 off");

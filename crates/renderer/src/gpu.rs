@@ -423,7 +423,7 @@ enum HdrSource {
     ScaledRaw,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Denoiser {
     Off,
     Dlss,
