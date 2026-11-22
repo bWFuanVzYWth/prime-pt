@@ -208,7 +208,7 @@ func lobe_surface<let reflection : bool, Scene : pt::IGuideScene>(scene: Scene,
                                               p.previous_right, p.previous_up };
             let projection = camera::camera_project_direction(previous, previous_ray, p.image.xy);
             let seed = projection.pixel - 0.5;
-            var matched : float2;
+            var matched = seed;
             valid = solved && projection.valid && match_optics<reflection>(record, seed, matched);
             if (!valid)
             {

@@ -69,9 +69,13 @@ public func begin_signal<let flow : uint>(index: uint, observed: pt::PrimaryLigh
             hit, mat, incident,
             pt::denoise_surface_flow<flow>(ModScene().energy(), mat, normal, view, incident));
     let side = dot(view, hit.surface.normal);
-    let local_diffuse = glass ? float3(side * dot(observed.local_light.xyz, hit.surface.normal) < 0)
+    var local_diffuse = float3(0);
+    if (any(observed.local != 0))
+    {
+        local_diffuse = glass ? float3(side * dot(observed.local_light.xyz, hit.surface.normal) < 0)
                               : diffuse_fraction<flow>(mat, normal, view, observed.local_light.xyz,
                                                        incident, false);
+    }
     let blocker = any(observed.sun > 0) ? ModScene().blocker_distance<false>(observed.sun_ray) : 0;
     var lane : SignalLane = {};
     lane.diffuse = pack_signal(float4(observed.local * local_diffuse, observed.local_light.w));

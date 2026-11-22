@@ -817,6 +817,28 @@ pub struct Gpu {
     offline_metered: bool,
 }
 
+// NativeRuntime 按清单 SHA-256 提取发行版。共享缓存首次启动时只查找本设备的旧快照。
+fn previous_pipeline_directory(root: &Path, file: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::fs::read_dir(root.parent()?)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let version = entry.file_name();
+            let name = version.to_str()?;
+            if name.len() != 64
+                || !name.bytes().all(|c| c.is_ascii_hexdigit())
+                || !entry.file_type().ok()?.is_dir()
+            {
+                return None;
+            }
+            let dir = entry.path().join("cache/pipeline-cache");
+            let meta = dir.join(file).metadata().ok()?;
+            meta.is_file().then(|| (meta.modified().ok(), dir))
+        })
+        .max()
+        .map(|(_, dir)| dir)
+}
+
 impl Gpu {
     pub(super) const fn frame_samples(&self, offline_batch: u32) -> u32 {
         if self.offline {
@@ -1016,7 +1038,7 @@ impl Gpu {
 
     /// `runtime_root` 指向已提取并校验的发行资源。开发宿主传 `None`，从当前工作目录向上定位项目源码并使用本机 Slang。
     /// 独立诊断运行目录可通过 `PRIME_PT_SOURCE_ROOT` 显式指定源码树；不影响发行资源来源。
-    /// 发行资源的两套 shader 源码在会话期间保持有效，派生缓存写入同根 `cache/`。
+    /// 发行资源的两套 shader 源码在会话期间保持有效，派生缓存由各发行版本共用，写入提取目录旁的 `cache/`。
     /// # Safety
     /// 句柄属于同一活动设备，已启用 RT pipeline、RayQuery、device address 与 position fetch；family/index
     /// 对应借出的 queue。宿主独占 queue，并在每次调用和销毁前等待前次命令完成。
@@ -1041,7 +1063,9 @@ impl Gpu {
         let (cache, prime_shaders, engine_shaders, display_shaders) =
             if let Some(root) = runtime_root {
                 (
-                    root.join("cache"),
+                    root.parent()
+                        .ok_or(Error::Invalid("发行资源目录缺少父目录"))?
+                        .join("cache"),
                     root.join("shaders/prime"),
                     root.join("shaders/engine"),
                     None,
@@ -1070,8 +1094,9 @@ impl Gpu {
         includes.extend(display_shaders.as_deref());
         let shader_cache = cache.join("shaders");
         let compiler = if let Some(root) = runtime_root {
-            shader_build::RuntimeCompiler::from_executable(
-                &root.join("slang/slangc.exe"),
+            shader_build::RuntimeCompiler::from_package(
+                root,
+                Path::new("slang/slangc.exe"),
                 shader_cache,
                 &includes,
                 &[],
@@ -1098,7 +1123,9 @@ impl Gpu {
         };
         // SAFETY: 外部生命周期由导出会话契约维持；本对象不销毁宿主句柄。
         let mut context = unsafe { Context::from_raw(raw)? };
-        context.enable_pipeline_cache(&cache.join("pipeline-cache"));
+        context.enable_pipeline_cache_with_seed(&cache.join("pipeline-cache"), |name| {
+            runtime_root.and_then(|root| previous_pipeline_directory(root, name))
+        });
         context.prepare_quad_expansion()?;
         let attribute_slots = context.max_storage_buffer_range() / 64;
         let attribute_slot_limit = attribute_slots
@@ -1577,6 +1604,42 @@ mod smoke;
 #[cfg(test)]
 mod tests {
     use simple_engine::openpbr;
+
+    #[test]
+    fn upgrade_selects_the_latest_release_with_this_device_cache() -> std::io::Result<()> {
+        use std::{
+            ffi::OsStr,
+            fs,
+            time::{Duration, SystemTime},
+        };
+
+        let directory = std::env::temp_dir().join(format!(
+            "prime-pipeline-release-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_err(std::io::Error::other)?
+                .as_nanos()
+        ));
+        fs::create_dir(&directory)?;
+        let root = directory.join("d".repeat(64));
+        let name = OsStr::new("native-device.bin");
+        let create = |release: &str, file: &OsStr, age| -> std::io::Result<_> {
+            let cache = directory.join(release).join("cache/pipeline-cache");
+            fs::create_dir_all(&cache)?;
+            fs::File::create(cache.join(file))?
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(age))?;
+            Ok(cache)
+        };
+        let expected = create(&"a".repeat(64), name, 200)?;
+        create(&"b".repeat(64), name, 100)?;
+        create(&"c".repeat(64), OsStr::new("native-other.bin"), 300)?;
+        create("cache", name, 300)?;
+        let selected = super::previous_pipeline_directory(&root, name);
+        fs::remove_dir_all(&directory)?;
+        assert_eq!(selected, Some(expected));
+        Ok(())
+    }
 
     #[test]
     fn invisible_atlas_color_cannot_enable_a_diffuse_path() {

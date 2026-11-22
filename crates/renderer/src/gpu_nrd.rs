@@ -48,7 +48,7 @@ impl NrdView {
             texture(context, half)?,
             texture(context, half)?,
             texture(context, scalar)?,
-            texture(context, scalar)?,
+            texture(context, ImageFormat::R8Unorm)?,
             texture(context, half)?,
             texture(context, half)?,
             texture(context, half)?,
@@ -57,7 +57,7 @@ impl NrdView {
             rr[0],
             texture(context, ImageFormat::Rgb10a2Unorm)?,
             rr[7],
-            texture(context, scalar)?,
+            texture(context, ImageFormat::R8Unorm)?,
         ];
         let mut external = [nrd::Image::new(0, 0); 18];
         for (dest, image) in external.iter_mut().zip(images) {

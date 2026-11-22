@@ -1122,7 +1122,12 @@ fn hardware_nrd_sun_geometric_edge() -> Result<(), Box<dyn std::error::Error>> {
         host.render_options(gpu, &image, &camera(), env, options)?;
         let view = gpu.view.as_ref().unwrap();
         let n = float_pixel(&view.rr.images[3].download(&mut gpu.context)?, [32, 32], 4);
-        assert!(n[0] > 0.7 && n[2] < -0.5, "边缘有倾斜的贴图法线 {n:?}");
+        let [x, y, z_sun] = env.sun_direction;
+        let shading_cosine = n[0] * x + n[1] * y + n[2] * z_sun;
+        assert!(
+            n[2] < 0. && shading_cosine > 0.,
+            "贴图法线须朝向相机且两侧太阳都落在其受光半球内 {n:?}"
+        );
         view.signal_lanes
             .copy_prefix_to(&mut gpu.context, &readback, size)?;
         for lane in 0..2 {

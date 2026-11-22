@@ -69,10 +69,9 @@ func feature_lights_collect(group: uint3: SV_GroupID, lane: uint: SV_GroupIndex)
         let c = surfaces[slot].position[2].xyz;
         let d = surfaces[slot].position[3].xyz;
         let vertices : light_sampling::LightQuadVertices = { a, b, c, d };
-        let area = light_sampling::dynamic_quad_area(vertices);
-        let first_area = length(cross(b - a, c - a));
-        let second_area = length(cross(c - a, d - a));
-        let total = first_area + second_area;
+        var double_area : float2;
+        let area = light_sampling::dynamic_quad_area(vertices, double_area);
+        let total = double_area.x + double_area.y;
         if (total > 0 && isfinite(total))
         {
             let gain = (surfaces[slot].material.y & 256u) != 0 ? surfaces[slot].previous[1].w : 1.0;
@@ -83,7 +82,7 @@ func feature_lights_collect(group: uint3: SV_GroupID, lane: uint: SV_GroupIndex)
                        0.25;
             // 双面因子与三角形面积中的 1/2 抵消。保留受遮罩亮点的提案支持。
             let power = total * gain * max(tint, 1.0e-6);
-            metric = float4((a + c + lerp(d, b, first_area / total)) / 3.0, power);
+            metric = float4((a + c + lerp(d, b, double_area.x / total)) / 3.0, power);
         }
         meta = uint4(area.xyz, slot);
     }
